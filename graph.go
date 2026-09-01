@@ -7,8 +7,6 @@ import (
 
 type NodeID uint64
 
-const NoNode NodeID = 0
-
 type Relationship struct {
 	From NodeID
 	To   NodeID
@@ -28,11 +26,9 @@ var (
 //
 // The separate outgoing/incoming maps are implementation indexes.
 // They are not additional semantic primitives.
-//
-// NodeID 0 is reserved as NoNode. In relationship queries, NoNode is
-// also used as a wildcard.
 type Graph struct {
-	nextID NodeID
+	nextID    NodeID
+	exhausted bool
 
 	nodes map[NodeID]struct{}
 
@@ -50,23 +46,28 @@ type Graph struct {
 func (g *Graph) CreateNode() (NodeID, error) {
 	g.ensureInitialized()
 
-	if g.nextID == ^NodeID(0) {
-		return NoNode, ErrNodeIDExhausted
+	if g.exhausted {
+		return 0, ErrNodeIDExhausted
 	}
 
 	id := g.nextID
-	g.nextID++
 
 	g.nodes[id] = struct{}{}
 	g.outgoing[id] = make(map[NodeID]struct{})
 	g.incoming[id] = make(map[NodeID]struct{})
+
+	if id == ^NodeID(0) {
+		g.exhausted = true
+	} else {
+		g.nextID++
+	}
 
 	return id, nil
 }
 
 // NodeExists reports whether id currently identifies an existing node.
 func (g *Graph) NodeExists(id NodeID) bool {
-	return id != NoNode && g.nodeExists(id)
+	return g.nodeExists(id)
 }
 
 // AddRelationship creates the primitive relationship (a, b).
@@ -127,72 +128,93 @@ func (g *Graph) HasRelationship(a, b NodeID) bool {
 	return exists
 }
 
-// FindRelationships finds primitive relationships matching the supplied
-// endpoints.
+// FindRelationship reports whether the exact primitive relationship (from, to)
+// exists.
+func (g *Graph) FindRelationship(from, to NodeID) (Relationship, bool, error) {
+	if !g.nodeExists(from) {
+		return Relationship{}, false, ErrNodeNotFound
+	}
+
+	if !g.nodeExists(to) {
+		return Relationship{}, false, ErrNodeNotFound
+	}
+
+	if _, exists := g.outgoing[from][to]; !exists {
+		return Relationship{}, false, nil
+	}
+
+	return Relationship{
+		From: from,
+		To:   to,
+	}, true, nil
+}
+
+// FindOutgoing returns all primitive relationships whose source is from.
 //
-// NoNode (0) means "wildcard":
-//
-//	FindRelationships(0, B) -> all (X, B)
-//	FindRelationships(A, 0) -> all (A, X)
-//	FindRelationships(A, B) -> the exact fact (A, B), if it exists
-//	FindRelationships(0, 0) -> all relationships
-//
-// Returned relationships are sorted by From, then To. This ordering is
-// only deterministic presentation order; it has no semantic meaning.
-func (g *Graph) FindRelationships(from, to NodeID) ([]Relationship, error) {
-	if from != NoNode && !g.nodeExists(from) {
+// In other words, it finds every X for which (from, X) exists.
+func (g *Graph) FindOutgoing(from NodeID) ([]Relationship, error) {
+	if !g.nodeExists(from) {
 		return nil, ErrNodeNotFound
 	}
 
-	if to != NoNode && !g.nodeExists(to) {
+	relationships := make([]Relationship, 0, len(g.outgoing[from]))
+
+	for to := range g.outgoing[from] {
+		relationships = append(relationships, Relationship{
+			From: from,
+			To:   to,
+		})
+	}
+
+	sort.Slice(relationships, func(i, j int) bool {
+		return relationships[i].To < relationships[j].To
+	})
+
+	return relationships, nil
+}
+
+// FindIncoming returns all primitive relationships whose target is to.
+//
+// In other words, it finds every X for which (X, to) exists.
+func (g *Graph) FindIncoming(to NodeID) ([]Relationship, error) {
+	if !g.nodeExists(to) {
 		return nil, ErrNodeNotFound
 	}
 
-	var relationships []Relationship
+	relationships := make([]Relationship, 0, len(g.incoming[to]))
 
-	switch {
-	case from != NoNode && to != NoNode:
-		if _, exists := g.outgoing[from][to]; exists {
-			relationships = []Relationship{
-				{From: from, To: to},
-			}
-		}
+	for from := range g.incoming[to] {
+		relationships = append(relationships, Relationship{
+			From: from,
+			To:   to,
+		})
+	}
 
-	case from != NoNode:
-		relationships = make([]Relationship, 0, len(g.outgoing[from]))
+	sort.Slice(relationships, func(i, j int) bool {
+		return relationships[i].From < relationships[j].From
+	})
 
-		for target := range g.outgoing[from] {
+	return relationships, nil
+}
+
+// FindRelationships returns every primitive relationship in the graph.
+//
+// The returned relationships are sorted by From, then To. This ordering
+// has no semantic meaning.
+func (g *Graph) FindRelationships() []Relationship {
+	total := 0
+	for _, targets := range g.outgoing {
+		total += len(targets)
+	}
+
+	relationships := make([]Relationship, 0, total)
+
+	for from, targets := range g.outgoing {
+		for to := range targets {
 			relationships = append(relationships, Relationship{
 				From: from,
-				To:   target,
-			})
-		}
-
-	case to != NoNode:
-		relationships = make([]Relationship, 0, len(g.incoming[to]))
-
-		for source := range g.incoming[to] {
-			relationships = append(relationships, Relationship{
-				From: source,
 				To:   to,
 			})
-		}
-
-	default:
-		total := 0
-		for _, targets := range g.outgoing {
-			total += len(targets)
-		}
-
-		relationships = make([]Relationship, 0, total)
-
-		for source, targets := range g.outgoing {
-			for target := range targets {
-				relationships = append(relationships, Relationship{
-					From: source,
-					To:   target,
-				})
-			}
 		}
 	}
 
@@ -203,7 +225,7 @@ func (g *Graph) FindRelationships(from, to NodeID) ([]Relationship, error) {
 		return relationships[i].To < relationships[j].To
 	})
 
-	return relationships, nil
+	return relationships
 }
 
 // DeleteNode deletes a node only when it has no relationships.
@@ -226,10 +248,6 @@ func (g *Graph) DeleteNode(id NodeID) error {
 }
 
 func (g *Graph) ensureInitialized() {
-	if g.nextID == 0 {
-		g.nextID = 1
-	}
-
 	if g.nodes == nil {
 		g.nodes = make(map[NodeID]struct{})
 	}
