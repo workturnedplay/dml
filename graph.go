@@ -7,12 +7,17 @@ import (
 
 type NodeID uint64
 
+const NoNode NodeID = 0
+
+type Relationship struct {
+	From NodeID
+	To   NodeID
+}
+
 var (
-	ErrNodeNotFound         = errors.New("node not found")
-	ErrNodeNotEmpty         = errors.New("node has relationships")
-	ErrRelationshipExist    = errors.New("relationship already exists")
-	ErrRelationshipNotFound = errors.New("relationship not found")
-	ErrNodeIDExhausted      = errors.New("node ID space exhausted")
+	ErrNodeNotFound    = errors.New("node not found")
+	ErrNodeNotEmpty    = errors.New("node has relationships")
+	ErrNodeIDExhausted = errors.New("node ID space exhausted")
 )
 
 // Graph is the primitive graph.
@@ -23,6 +28,9 @@ var (
 //
 // The separate outgoing/incoming maps are implementation indexes.
 // They are not additional semantic primitives.
+//
+// NodeID 0 is reserved as NoNode. In relationship queries, NoNode is
+// also used as a wildcard.
 type Graph struct {
 	nextID NodeID
 
@@ -37,14 +45,13 @@ type Graph struct {
 
 // CreateNode creates a new node and returns its NodeID.
 //
-// NodeID 0 is reserved as "no NodeID". IDs currently increase
-// monotonically. Reuse of deleted IDs is deliberately not implemented
-// yet; the theory leaves the exact representation open.
+// IDs currently increase monotonically. Reuse of deleted IDs is
+// deliberately not implemented yet.
 func (g *Graph) CreateNode() (NodeID, error) {
 	g.ensureInitialized()
 
 	if g.nextID == ^NodeID(0) {
-		return 0, ErrNodeIDExhausted
+		return NoNode, ErrNodeIDExhausted
 	}
 
 	id := g.nextID
@@ -59,19 +66,16 @@ func (g *Graph) CreateNode() (NodeID, error) {
 
 // NodeExists reports whether id currently identifies an existing node.
 func (g *Graph) NodeExists(id NodeID) bool {
-	return id != 0 && g.nodeExists(id)
+	return id != NoNode && g.nodeExists(id)
 }
 
 // AddRelationship creates the primitive relationship (a, b).
 //
 // Both nodes must already exist.
 //
-// Relationships are unique. Adding the same relationship twice does not
-// create a second relationship; the returned bool is false on the second
-// attempt.
-//
-// The bool reports whether a new relationship was actually created.
-func (g *Graph) AddRelationship(a, b NodeID) (bool, error) {
+// Relationships are unique. Adding the same relationship again simply
+// reports created=false.
+func (g *Graph) AddRelationship(a, b NodeID) (created bool, err error) {
 	g.ensureInitialized()
 
 	if !g.nodeExists(a) {
@@ -95,8 +99,11 @@ func (g *Graph) AddRelationship(a, b NodeID) (bool, error) {
 //
 // The returned bool reports whether a relationship actually existed and
 // was removed.
-func (g *Graph) RemoveRelationship(a, b NodeID) (bool, error) {
-	if !g.nodeExists(a) || !g.nodeExists(b) {
+func (g *Graph) RemoveRelationship(a, b NodeID) (removed bool, err error) {
+	if !g.nodeExists(a) {
+		return false, ErrNodeNotFound
+	}
+	if !g.nodeExists(b) {
 		return false, ErrNodeNotFound
 	}
 
@@ -120,51 +127,88 @@ func (g *Graph) HasRelationship(a, b NodeID) bool {
 	return exists
 }
 
-// Children returns all X for which (a, X) exists.
+// FindRelationships finds primitive relationships matching the supplied
+// endpoints.
 //
-// The returned slice has no semantic ordering. It is sorted only so that
-// callers and tests receive deterministic output.
-func (g *Graph) Children(a NodeID) ([]NodeID, error) {
-	if !g.nodeExists(a) {
+// NoNode (0) means "wildcard":
+//
+//	FindRelationships(0, B) -> all (X, B)
+//	FindRelationships(A, 0) -> all (A, X)
+//	FindRelationships(A, B) -> the exact fact (A, B), if it exists
+//	FindRelationships(0, 0) -> all relationships
+//
+// Returned relationships are sorted by From, then To. This ordering is
+// only deterministic presentation order; it has no semantic meaning.
+func (g *Graph) FindRelationships(from, to NodeID) ([]Relationship, error) {
+	if from != NoNode && !g.nodeExists(from) {
 		return nil, ErrNodeNotFound
 	}
 
-	children := make([]NodeID, 0, len(g.outgoing[a]))
-	for child := range g.outgoing[a] {
-		children = append(children, child)
-	}
-
-	sort.Slice(children, func(i, j int) bool {
-		return children[i] < children[j]
-	})
-
-	return children, nil
-}
-
-// Parents returns all X for which (X, a) exists.
-//
-// The returned slice has no semantic ordering. It is sorted only so that
-// callers and tests receive deterministic output.
-func (g *Graph) Parents(a NodeID) ([]NodeID, error) {
-	if !g.nodeExists(a) {
+	if to != NoNode && !g.nodeExists(to) {
 		return nil, ErrNodeNotFound
 	}
 
-	parents := make([]NodeID, 0, len(g.incoming[a]))
-	for parent := range g.incoming[a] {
-		parents = append(parents, parent)
+	var relationships []Relationship
+
+	switch {
+	case from != NoNode && to != NoNode:
+		if _, exists := g.outgoing[from][to]; exists {
+			relationships = []Relationship{
+				{From: from, To: to},
+			}
+		}
+
+	case from != NoNode:
+		relationships = make([]Relationship, 0, len(g.outgoing[from]))
+
+		for target := range g.outgoing[from] {
+			relationships = append(relationships, Relationship{
+				From: from,
+				To:   target,
+			})
+		}
+
+	case to != NoNode:
+		relationships = make([]Relationship, 0, len(g.incoming[to]))
+
+		for source := range g.incoming[to] {
+			relationships = append(relationships, Relationship{
+				From: source,
+				To:   to,
+			})
+		}
+
+	default:
+		total := 0
+		for _, targets := range g.outgoing {
+			total += len(targets)
+		}
+
+		relationships = make([]Relationship, 0, total)
+
+		for source, targets := range g.outgoing {
+			for target := range targets {
+				relationships = append(relationships, Relationship{
+					From: source,
+					To:   target,
+				})
+			}
+		}
 	}
 
-	sort.Slice(parents, func(i, j int) bool {
-		return parents[i] < parents[j]
+	sort.Slice(relationships, func(i, j int) bool {
+		if relationships[i].From != relationships[j].From {
+			return relationships[i].From < relationships[j].From
+		}
+		return relationships[i].To < relationships[j].To
 	})
 
-	return parents, nil
+	return relationships, nil
 }
 
 // DeleteNode deletes a node only when it has no relationships.
 //
-// Atomic cascade deletion is deliberately not part of this primitive API.
+// Cascade deletion is deliberately not part of this primitive API.
 func (g *Graph) DeleteNode(id NodeID) error {
 	if !g.nodeExists(id) {
 		return ErrNodeNotFound

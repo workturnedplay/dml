@@ -19,8 +19,8 @@ func TestCreateNode(t *testing.T) {
 		t.Fatalf("CreateNode() returned error: %v", err)
 	}
 
-	if a == 0 || b == 0 {
-		t.Fatalf("CreateNode() returned reserved NodeID 0: a=%d b=%d", a, b)
+	if a == NoNode || b == NoNode {
+		t.Fatalf("CreateNode() returned NoNode: a=%d b=%d", a, b)
 	}
 
 	if a == b {
@@ -44,22 +44,22 @@ func TestNodeCanExistWithoutRelationships(t *testing.T) {
 		t.Fatalf("CreateNode() returned error: %v", err)
 	}
 
-	children, err := g.Children(a)
+	relationships, err := g.FindRelationships(a, NoNode)
 	if err != nil {
-		t.Fatalf("Children() returned error: %v", err)
+		t.Fatalf("FindRelationships() returned error: %v", err)
 	}
 
-	parents, err := g.Parents(a)
+	if len(relationships) != 0 {
+		t.Fatalf("expected no outgoing relationships, got %v", relationships)
+	}
+
+	relationships, err = g.FindRelationships(NoNode, a)
 	if err != nil {
-		t.Fatalf("Parents() returned error: %v", err)
+		t.Fatalf("FindRelationships() returned error: %v", err)
 	}
 
-	if len(children) != 0 {
-		t.Fatalf("expected no children, got %v", children)
-	}
-
-	if len(parents) != 0 {
-		t.Fatalf("expected no parents, got %v", parents)
+	if len(relationships) != 0 {
+		t.Fatalf("expected no incoming relationships, got %v", relationships)
 	}
 }
 
@@ -90,7 +90,10 @@ func TestRelationshipIsDirected(t *testing.T) {
 	}
 
 	if g.HasRelationship(b, a) {
-		t.Fatalf("(%d,%d) incorrectly exists merely because (%d,%d) exists", b, a, a, b)
+		t.Fatalf(
+			"(%d,%d) incorrectly exists merely because (%d,%d) exists",
+			b, a, a, b,
+		)
 	}
 }
 
@@ -125,14 +128,20 @@ func TestRelationshipIsUnique(t *testing.T) {
 		t.Fatal("second AddRelationship() reported that a new relationship was created")
 	}
 
-	children, err := g.Children(a)
+	relationships, err := g.FindRelationships(a, b)
 	if err != nil {
-		t.Fatalf("Children() returned error: %v", err)
+		t.Fatalf("FindRelationships(%d,%d) returned error: %v", a, b, err)
 	}
 
-	expected := []NodeID{b}
-	if !reflect.DeepEqual(children, expected) {
-		t.Fatalf("Children(%d) = %v, want %v", a, children, expected)
+	expected := []Relationship{
+		{From: a, To: b},
+	}
+
+	if !reflect.DeepEqual(relationships, expected) {
+		t.Fatalf(
+			"FindRelationships(%d,%d) = %v, want %v",
+			a, b, relationships, expected,
+		)
 	}
 }
 
@@ -157,28 +166,24 @@ func TestSelfRelationshipIsAllowed(t *testing.T) {
 		t.Fatalf("expected (%d,%d) to exist", a, a)
 	}
 
-	children, err := g.Children(a)
+	relationships, err := g.FindRelationships(a, a)
 	if err != nil {
-		t.Fatalf("Children() returned error: %v", err)
+		t.Fatalf("FindRelationships(%d,%d) returned error: %v", a, a, err)
 	}
 
-	parents, err := g.Parents(a)
-	if err != nil {
-		t.Fatalf("Parents() returned error: %v", err)
+	expected := []Relationship{
+		{From: a, To: a},
 	}
 
-	expected := []NodeID{a}
-
-	if !reflect.DeepEqual(children, expected) {
-		t.Fatalf("Children(%d) = %v, want %v", a, children, expected)
-	}
-
-	if !reflect.DeepEqual(parents, expected) {
-		t.Fatalf("Parents(%d) = %v, want %v", a, parents, expected)
+	if !reflect.DeepEqual(relationships, expected) {
+		t.Fatalf(
+			"FindRelationships(%d,%d) = %v, want %v",
+			a, a, relationships, expected,
+		)
 	}
 }
 
-func TestMultipleChildrenAndParents(t *testing.T) {
+func TestFindRelationshipsBySource(t *testing.T) {
 	var g Graph
 
 	a, err := g.CreateNode()
@@ -196,46 +201,33 @@ func TestMultipleChildrenAndParents(t *testing.T) {
 		t.Fatalf("CreateNode() returned error: %v", err)
 	}
 
-	d, err := g.CreateNode()
-	if err != nil {
-		t.Fatalf("CreateNode() returned error: %v", err)
-	}
-
 	if _, err := g.AddRelationship(a, b); err != nil {
 		t.Fatalf("AddRelationship(%d,%d): %v", a, b, err)
 	}
+
 	if _, err := g.AddRelationship(a, c); err != nil {
 		t.Fatalf("AddRelationship(%d,%d): %v", a, c, err)
 	}
-	if _, err := g.AddRelationship(d, b); err != nil {
-		t.Fatalf("AddRelationship(%d,%d): %v", d, b, err)
-	}
-	if _, err := g.AddRelationship(d, c); err != nil {
-		t.Fatalf("AddRelationship(%d,%d): %v", d, c, err)
-	}
 
-	childrenA, err := g.Children(a)
+	relationships, err := g.FindRelationships(a, NoNode)
 	if err != nil {
-		t.Fatalf("Children(%d): %v", a, err)
+		t.Fatalf("FindRelationships(%d,0): %v", a, err)
 	}
 
-	expectedChildrenA := []NodeID{b, c}
-	if !reflect.DeepEqual(childrenA, expectedChildrenA) {
-		t.Fatalf("Children(%d) = %v, want %v", a, childrenA, expectedChildrenA)
+	expected := []Relationship{
+		{From: a, To: b},
+		{From: a, To: c},
 	}
 
-	parentsB, err := g.Parents(b)
-	if err != nil {
-		t.Fatalf("Parents(%d): %v", b, err)
-	}
-
-	expectedParentsB := []NodeID{a, d}
-	if !reflect.DeepEqual(parentsB, expectedParentsB) {
-		t.Fatalf("Parents(%d) = %v, want %v", b, parentsB, expectedParentsB)
+	if !reflect.DeepEqual(relationships, expected) {
+		t.Fatalf(
+			"FindRelationships(%d,0) = %v, want %v",
+			a, relationships, expected,
+		)
 	}
 }
 
-func TestParentsAndChildrenAreConsistent(t *testing.T) {
+func TestFindRelationshipsByTarget(t *testing.T) {
 	var g Graph
 
 	a, err := g.CreateNode()
@@ -248,34 +240,83 @@ func TestParentsAndChildrenAreConsistent(t *testing.T) {
 		t.Fatalf("CreateNode() returned error: %v", err)
 	}
 
-	created, err := g.AddRelationship(a, b)
+	c, err := g.CreateNode()
 	if err != nil {
-		t.Fatalf("AddRelationship() returned error: %v", err)
-	}
-	if !created {
-		t.Fatal("relationship was not created")
+		t.Fatalf("CreateNode() returned error: %v", err)
 	}
 
-	children, err := g.Children(a)
+	if _, err := g.AddRelationship(a, c); err != nil {
+		t.Fatalf("AddRelationship(%d,%d): %v", a, c, err)
+	}
+
+	if _, err := g.AddRelationship(b, c); err != nil {
+		t.Fatalf("AddRelationship(%d,%d): %v", b, c, err)
+	}
+
+	relationships, err := g.FindRelationships(NoNode, c)
 	if err != nil {
-		t.Fatalf("Children() returned error: %v", err)
+		t.Fatalf("FindRelationships(0,%d): %v", c, err)
 	}
 
-	parents, err := g.Parents(b)
+	expected := []Relationship{
+		{From: a, To: c},
+		{From: b, To: c},
+	}
+
+	if !reflect.DeepEqual(relationships, expected) {
+		t.Fatalf(
+			"FindRelationships(0,%d) = %v, want %v",
+			c, relationships, expected,
+		)
+	}
+}
+
+func TestFindRelationshipsCanQueryAllFacts(t *testing.T) {
+	var g Graph
+
+	a, err := g.CreateNode()
 	if err != nil {
-		t.Fatalf("Parents() returned error: %v", err)
+		t.Fatalf("CreateNode() returned error: %v", err)
 	}
 
-	if !reflect.DeepEqual(children, []NodeID{b}) {
-		t.Fatalf("Children(%d) = %v, want [%d]", a, children, b)
+	b, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() returned error: %v", err)
 	}
 
-	if !reflect.DeepEqual(parents, []NodeID{a}) {
-		t.Fatalf("Parents(%d) = %v, want [%d]", b, parents, a)
+	c, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() returned error: %v", err)
 	}
 
-	if !g.HasRelationship(a, b) {
-		t.Fatal("relationship disappeared despite both directional views reporting it")
+	if _, err := g.AddRelationship(a, b); err != nil {
+		t.Fatalf("AddRelationship(%d,%d): %v", a, b, err)
+	}
+
+	if _, err := g.AddRelationship(a, c); err != nil {
+		t.Fatalf("AddRelationship(%d,%d): %v", a, c, err)
+	}
+
+	if _, err := g.AddRelationship(c, b); err != nil {
+		t.Fatalf("AddRelationship(%d,%d): %v", c, b, err)
+	}
+
+	relationships, err := g.FindRelationships(NoNode, NoNode)
+	if err != nil {
+		t.Fatalf("FindRelationships(0,0): %v", err)
+	}
+
+	expected := []Relationship{
+		{From: a, To: b},
+		{From: a, To: c},
+		{From: c, To: b},
+	}
+
+	if !reflect.DeepEqual(relationships, expected) {
+		t.Fatalf(
+			"FindRelationships(0,0) = %v, want %v",
+			relationships, expected,
+		)
 	}
 }
 
@@ -309,22 +350,22 @@ func TestRemoveRelationship(t *testing.T) {
 		t.Fatalf("relationship (%d,%d) still exists", a, b)
 	}
 
-	children, err := g.Children(a)
+	relationships, err := g.FindRelationships(a, NoNode)
 	if err != nil {
-		t.Fatalf("Children() returned error: %v", err)
+		t.Fatalf("FindRelationships() returned error: %v", err)
 	}
 
-	parents, err := g.Parents(b)
+	if len(relationships) != 0 {
+		t.Fatalf("expected no outgoing relationships, got %v", relationships)
+	}
+
+	relationships, err = g.FindRelationships(NoNode, b)
 	if err != nil {
-		t.Fatalf("Parents() returned error: %v", err)
+		t.Fatalf("FindRelationships() returned error: %v", err)
 	}
 
-	if len(children) != 0 {
-		t.Fatalf("expected no children after removal, got %v", children)
-	}
-
-	if len(parents) != 0 {
-		t.Fatalf("expected no parents after removal, got %v", parents)
+	if len(relationships) != 0 {
+		t.Fatalf("expected no incoming relationships, got %v", relationships)
 	}
 }
 
@@ -347,19 +388,29 @@ func TestDeleteNodeRequiresNoRelationships(t *testing.T) {
 
 	err = g.DeleteNode(a)
 	if !errors.Is(err, ErrNodeNotEmpty) {
-		t.Fatalf("DeleteNode(%d) error = %v, want %v", a, err, ErrNodeNotEmpty)
+		t.Fatalf(
+			"DeleteNode(%d) error = %v, want %v",
+			a, err, ErrNodeNotEmpty,
+		)
 	}
 
 	if !g.NodeExists(a) {
-		t.Fatalf("node %d disappeared even though deletion should have failed", a)
+		t.Fatalf(
+			"node %d disappeared even though deletion should have failed",
+			a,
+		)
 	}
 
-	if err := g.RemoveRelationship(a, b); err != nil {
+	_, err = g.RemoveRelationship(a, b)
+	if err != nil {
 		t.Fatalf("RemoveRelationship() returned error: %v", err)
 	}
 
 	if err := g.DeleteNode(a); err != nil {
-		t.Fatalf("DeleteNode(%d) after removing relationships returned error: %v", a, err)
+		t.Fatalf(
+			"DeleteNode(%d) after removing relationships returned error: %v",
+			a, err,
+		)
 	}
 
 	if g.NodeExists(a) {
@@ -386,11 +437,17 @@ func TestDeleteNodeWithIncomingRelationshipAlsoFails(t *testing.T) {
 
 	err = g.DeleteNode(b)
 	if !errors.Is(err, ErrNodeNotEmpty) {
-		t.Fatalf("DeleteNode(%d) error = %v, want %v", b, err, ErrNodeNotEmpty)
+		t.Fatalf(
+			"DeleteNode(%d) error = %v, want %v",
+			b, err, ErrNodeNotEmpty,
+		)
 	}
 
 	if !g.NodeExists(b) {
-		t.Fatalf("node %d disappeared even though deletion should have failed", b)
+		t.Fatalf(
+			"node %d disappeared even though deletion should have failed",
+			b,
+		)
 	}
 }
 
@@ -408,10 +465,7 @@ func TestRelationshipRequiresExistingNodes(t *testing.T) {
 	if !errors.Is(err, ErrNodeNotFound) {
 		t.Fatalf(
 			"AddRelationship(%d,%d) error = %v, want %v",
-			a,
-			nonexistent,
-			err,
-			ErrNodeNotFound,
+			a, nonexistent, err, ErrNodeNotFound,
 		)
 	}
 
@@ -420,17 +474,23 @@ func TestRelationshipRequiresExistingNodes(t *testing.T) {
 	}
 }
 
-func TestQueriesRequireExistingNode(t *testing.T) {
+func TestRelationshipQueriesRequireExistingFixedNodes(t *testing.T) {
 	var g Graph
 
 	const nonexistent NodeID = 999999
 
-	if _, err := g.Children(nonexistent); !errors.Is(err, ErrNodeNotFound) {
-		t.Fatalf("Children() error = %v, want %v", err, ErrNodeNotFound)
+	if _, err := g.FindRelationships(nonexistent, NoNode); !errors.Is(err, ErrNodeNotFound) {
+		t.Fatalf(
+			"FindRelationships(%d,0) error = %v, want %v",
+			nonexistent, err, ErrNodeNotFound,
+		)
 	}
 
-	if _, err := g.Parents(nonexistent); !errors.Is(err, ErrNodeNotFound) {
-		t.Fatalf("Parents() error = %v, want %v", err, ErrNodeNotFound)
+	if _, err := g.FindRelationships(NoNode, nonexistent); !errors.Is(err, ErrNodeNotFound) {
+		t.Fatalf(
+			"FindRelationships(0,%d) error = %v, want %v",
+			nonexistent, err, ErrNodeNotFound,
+		)
 	}
 }
 
