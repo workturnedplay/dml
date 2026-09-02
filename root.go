@@ -2,49 +2,113 @@ package wtw
 
 import "sort"
 
-// RootView provides the single-graph ROOT overlay.
+// RootGraph is the graph layer exposed above the primitive Graph.
 //
-// ROOT is an ordinary existing NodeID selected by this higher layer.
-// The relationships from ROOT to the other existing nodes are virtual:
-// they are not stored in Graph.
-type RootView struct {
+// ROOT is a real NodeID in the underlying Graph. Its relationship to every
+// other existing node is virtual: (ROOT, X) is visible through this layer
+// whenever X exists and X != ROOT, but is not physically stored in Graph.
+//
+// Ordinary relationships, including relationships pointing to ROOT, are
+// stored normally in Graph.
+type RootGraph struct {
 	graph *Graph
 	root  NodeID
 }
 
-// NewRootView creates a ROOT overlay for an existing node.
-//
-// The supplied root NodeID is not treated specially by the primitive Graph.
-// RootView gives it the higher-level ROOT semantics.
-func NewRootView(graph *Graph, root NodeID) (*RootView, error) {
+// NewRootView creates a ROOT layer around an existing primitive node.
+func NewRootView(graph *Graph, root NodeID) (*RootGraph, error) {
 	if !graph.NodeExists(root) {
 		return nil, ErrNodeNotFound
 	}
 
-	return &RootView{
+	return &RootGraph{
 		graph: graph,
 		root:  root,
 	}, nil
 }
 
-// Root returns the NodeID used as this view's ROOT.
-func (r *RootView) Root() NodeID {
+// Root returns the NodeID used as ROOT.
+func (r *RootGraph) Root() NodeID {
 	return r.root
 }
 
-// NodeExists reports whether id exists in the underlying graph.
+// CreateNode creates a node in the underlying graph.
 //
-// ROOT itself is an ordinary node and therefore is included.
-func (r *RootView) NodeExists(id NodeID) bool {
+// The newly created node is consequently visible as a virtual child of
+// ROOT through this layer.
+func (r *RootGraph) CreateNode() (NodeID, error) {
+	return r.graph.CreateNode()
+}
+
+// NodeExists reports whether id exists in the underlying graph.
+func (r *RootGraph) NodeExists(id NodeID) bool {
 	return r.graph.NodeExists(id)
 }
 
-// HasRelationship reports whether the relationship exists in the
-// ROOT view.
+// AddRelationship adds an ordinary relationship to the graph.
 //
-// For ROOT, every existing node other than ROOT is considered a child.
-// All other relationships come directly from the primitive graph.
-func (r *RootView) HasRelationship(from, to NodeID) bool {
+// A relationship from ROOT is virtual and therefore is not physically
+// stored. If the target exists, (ROOT, target) already exists in this
+// layer, so adding it is simply an idempotent no-op.
+//
+// Relationships pointing to ROOT are ordinary relationships and are stored.
+func (r *RootGraph) AddRelationship(from, to NodeID) (created bool, err error) {
+	if !r.graph.NodeExists(from) {
+		return false, ErrNodeNotFound
+	}
+
+	if !r.graph.NodeExists(to) {
+		return false, ErrNodeNotFound
+	}
+
+	if from == r.root {
+		if to == r.root {
+			return false, nil
+		}
+
+		// ROOT -> every other existing node is already represented
+		// virtually by this layer.
+		return false, nil
+	}
+
+	return r.graph.AddRelationship(from, to)
+}
+
+// RemoveRelationship removes an ordinary relationship from the graph.
+//
+// Virtual ROOT relationships cannot be removed because their existence is
+// derived from node existence. Therefore removing (ROOT, X) is a no-op
+// while X exists.
+//
+// Relationships pointing to ROOT are ordinary relationships and can be
+// removed normally.
+func (r *RootGraph) RemoveRelationship(from, to NodeID) (removed bool, err error) {
+	if !r.graph.NodeExists(from) {
+		return false, ErrNodeNotFound
+	}
+
+	if !r.graph.NodeExists(to) {
+		return false, ErrNodeNotFound
+	}
+
+	if from == r.root {
+		if to == r.root {
+			return false, nil
+		}
+
+		// ROOT -> X is virtual and cannot be removed independently of X.
+		return false, nil
+	}
+
+	return r.graph.RemoveRelationship(from, to)
+}
+
+// HasRelationship reports whether the relationship exists in the ROOT
+// layer.
+//
+// ROOT has a virtual relationship to every existing node other than itself.
+// All other relationships are taken from the primitive graph.
+func (r *RootGraph) HasRelationship(from, to NodeID) bool {
 	if !r.graph.NodeExists(from) || !r.graph.NodeExists(to) {
 		return false
 	}
@@ -56,12 +120,33 @@ func (r *RootView) HasRelationship(from, to NodeID) bool {
 	return r.graph.HasRelationship(from, to)
 }
 
-// FindOutgoing returns all relationships whose source is from in the
-// ROOT view.
+// FindRelationship reports whether the exact relationship exists in the
+// ROOT layer.
+func (r *RootGraph) FindRelationship(from, to NodeID) (Relationship, bool, error) {
+	if !r.graph.NodeExists(from) {
+		return Relationship{}, false, ErrNodeNotFound
+	}
+
+	if !r.graph.NodeExists(to) {
+		return Relationship{}, false, ErrNodeNotFound
+	}
+
+	if !r.HasRelationship(from, to) {
+		return Relationship{}, false, nil
+	}
+
+	return Relationship{
+		From: from,
+		To:   to,
+	}, true, nil
+}
+
+// FindOutgoing returns every relationship whose source is from in the
+// ROOT layer.
 //
-// For ROOT, this is the virtual relationship ROOT -> every other
-// existing node. For all other nodes, primitive relationships are returned.
-func (r *RootView) FindOutgoing(from NodeID) ([]Relationship, error) {
+// For ROOT, this means every existing node other than ROOT.
+// For every other node, it means the ordinary stored relationships.
+func (r *RootGraph) FindOutgoing(from NodeID) ([]Relationship, error) {
 	if !r.graph.NodeExists(from) {
 		return nil, ErrNodeNotFound
 	}
@@ -90,58 +175,57 @@ func (r *RootView) FindOutgoing(from NodeID) ([]Relationship, error) {
 	return relationships, nil
 }
 
-// FindIncoming returns all relationships whose target is to in the
-// ROOT view.
+// FindIncoming returns every relationship whose target is to in the ROOT
+// layer.
 //
-// ROOT has no parents in this overlay, so FindIncoming(ROOT) is empty.
-// For all other nodes, primitive incoming relationships are returned.
-func (r *RootView) FindIncoming(to NodeID) ([]Relationship, error) {
+// Unlike the previous implementation, ROOT is allowed to have parents.
+// Those relationships are ordinary primitive relationships and are therefore
+// returned normally.
+//
+// The only relationship excluded by the ROOT overlay is (ROOT, ROOT).
+func (r *RootGraph) FindIncoming(to NodeID) ([]Relationship, error) {
 	if !r.graph.NodeExists(to) {
 		return nil, ErrNodeNotFound
 	}
 
-	if to == r.root {
-		return []Relationship{}, nil
+	relationships, err := r.graph.FindIncoming(to)
+	if err != nil {
+		return nil, err
 	}
 
-	return r.graph.FindIncoming(to)
+	if to != r.root {
+		return relationships, nil
+	}
+
+	// (ROOT, ROOT) is not a valid relationship in the ROOT view because
+	// ROOT's virtual outgoing relationship excludes itself.
+	for i := range relationships {
+		if relationships[i].From == r.root {
+			relationships = append(relationships[:i], relationships[i+1:]...)
+			break
+		}
+	}
+
+	return relationships, nil
 }
 
-// FindRelationship looks up an exact relationship in the ROOT view.
-func (r *RootView) FindRelationship(from, to NodeID) (Relationship, bool, error) {
-	if !r.graph.NodeExists(from) {
-		return Relationship{}, false, ErrNodeNotFound
-	}
-
-	if !r.graph.NodeExists(to) {
-		return Relationship{}, false, ErrNodeNotFound
-	}
-
-	if r.HasRelationship(from, to) {
-		return Relationship{
-			From: from,
-			To:   to,
-		}, true, nil
-	}
-
-	return Relationship{}, false, nil
-}
-
-// FindRelationships returns all relationships visible through the ROOT
-// overlay.
+// FindRelationships returns every relationship visible through the ROOT
+// layer.
 //
-// Primitive relationships are included unchanged. Virtual ROOT
-// relationships are added for every existing node other than ROOT.
-func (r *RootView) FindRelationships() []Relationship {
+// This consists of all stored primitive relationships plus the virtual
+// ROOT -> X relationship for every existing X != ROOT.
+func (r *RootGraph) FindRelationships() []Relationship {
 	relationships := r.graph.FindRelationships()
-
-	relationships = append(
-		relationships,
-		// Virtual ROOT relationships.
-	)
 
 	for id := range r.graph.nodes {
 		if id == r.root {
+			continue
+		}
+
+		// If the primitive graph somehow contains ROOT -> id, it must not
+		// result in a duplicate relationship in this view. The relationship
+		// is already represented virtually.
+		if r.graph.HasRelationship(r.root, id) {
 			continue
 		}
 
@@ -155,8 +239,24 @@ func (r *RootView) FindRelationships() []Relationship {
 		if relationships[i].From != relationships[j].From {
 			return relationships[i].From < relationships[j].From
 		}
+
 		return relationships[i].To < relationships[j].To
 	})
 
 	return relationships
+}
+
+// DeleteNode deletes an ordinary node from the underlying graph.
+//
+// ROOT itself cannot be deleted through this layer.
+func (r *RootGraph) DeleteNode(id NodeID) error {
+	if !r.graph.NodeExists(id) {
+		return ErrNodeNotFound
+	}
+
+	if id == r.root {
+		return ErrNodeNotEmpty
+	}
+
+	return r.graph.DeleteNode(id)
 }
