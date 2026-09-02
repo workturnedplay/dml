@@ -1,88 +1,88 @@
 package wtw
 
-import (
-	"errors"
-	"sort"
-)
+import "errors"
 
 var (
-	ErrNameAlreadyBound = errors.New("name is already bound to a different node")
+	ErrNameAlreadyBound = errors.New("name is already bound")
+	ErrNodeAlreadyNamed = errors.New("node already has a name")
 	ErrNameNotFound     = errors.New("name not found")
-	ErrNodeAlreadyNamed = errors.New("node already has this name")
 )
 
-// NameRegistry maintains bootstrap associations between human-readable names
-// and NodeIDs.
+// NameRegistry maintains the one-to-one association between names and
+// existing NodeIDs.
 //
-// Names are not part of the primitive graph. They are external bootstrap
-// knowledge that allows the orchestrator to refer to particular NodeIDs by
-// stable names such as "ROOT" or "AllPointers".
-//
-// Multiple names may refer to the same NodeID.
+// Names are bootstrap metadata outside the primitive graph. The primitive
+// Graph does not know about names.
 type NameRegistry struct {
 	graph *Graph
 
 	byName map[string]NodeID
-	byID   map[NodeID]map[string]struct{}
+	byID   map[NodeID]string
 }
 
 // NewNameRegistry creates an empty name registry associated with graph.
 //
-// The registry does not create any nodes.
+// It does not create any nodes.
 func NewNameRegistry(graph *Graph) *NameRegistry {
 	return &NameRegistry{
 		graph:  graph,
 		byName: make(map[string]NodeID),
-		byID:   make(map[NodeID]map[string]struct{}),
+		byID:   make(map[NodeID]string),
 	}
 }
 
-// Lookup returns the NodeID currently associated with name.
+// Lookup returns the NodeID associated with name.
 //
-// The bool is false when the name has no association.
+// The bool is false when name has no association.
 func (r *NameRegistry) Lookup(name string) (NodeID, bool) {
 	id, ok := r.byName[name]
 	return id, ok
 }
 
-// Bind associates name with an existing NodeID.
+// NameForNode returns the name associated with id.
 //
-// A name may only have one NodeID at a time. Binding an already-bound name
-// to the same NodeID is treated as a successful no-op.
+// The bool is false when id has no name.
+func (r *NameRegistry) NameForNode(id NodeID) (string, bool) {
+	name, ok := r.byID[id]
+	return name, ok
+}
+
+// Bind associates name with an existing, currently unnamed NodeID.
 //
-// Multiple different names may refer to the same NodeID.
+// Both directions of the association are unique:
+//   - a name can identify only one NodeID
+//   - a NodeID can have only one name
+//
+// Binding the exact same name to the exact same NodeID is an idempotent
+// success.
 func (r *NameRegistry) Bind(name string, id NodeID) error {
 	if !r.graph.NodeExists(id) {
 		return ErrNodeNotFound
 	}
 
-	if existing, ok := r.byName[name]; ok {
-		if existing == id {
+	if existingID, ok := r.byName[name]; ok {
+		if existingID == id {
 			return nil
 		}
 
 		return ErrNameAlreadyBound
 	}
 
-	r.byName[name] = id
-
-	names := r.byID[id]
-	if names == nil {
-		names = make(map[string]struct{})
-		r.byID[id] = names
+	if _, ok := r.byID[id]; ok {
+		return ErrNodeAlreadyNamed
 	}
 
-	names[name] = struct{}{}
+	r.byName[name] = id
+	r.byID[id] = name
 
 	return nil
 }
 
-// CreateNamedNode creates a new primitive node and associates name with it.
+// CreateNamedNode creates a new primitive node and immediately gives it name.
 //
-// If name is already bound, no node is created and ErrNameAlreadyBound is
-// returned.
+// If name is already bound, no new node is created.
 func (r *NameRegistry) CreateNamedNode(name string) (NodeID, error) {
-	if _, exists := r.byName[name]; exists {
+	if _, ok := r.byName[name]; ok {
 		return 0, ErrNameAlreadyBound
 	}
 
@@ -98,48 +98,17 @@ func (r *NameRegistry) CreateNamedNode(name string) (NodeID, error) {
 	return id, nil
 }
 
-// Unbind removes the association for name.
+// Unbind removes the name association without deleting the NodeID.
 //
-// The NodeID itself is not deleted from the graph.
-//
-// The bool reports whether an association was actually removed.
+// The bool reports whether an association was removed.
 func (r *NameRegistry) Unbind(name string) (bool, error) {
 	id, ok := r.byName[name]
 	if !ok {
-		return false, nil
+		return false, ErrNameNotFound
 	}
 
 	delete(r.byName, name)
-
-	names := r.byID[id]
-	delete(names, name)
-
-	if len(names) == 0 {
-		delete(r.byID, id)
-	}
+	delete(r.byID, id)
 
 	return true, nil
-}
-
-// NamesForNode returns all names currently associated with id.
-//
-// The returned slice is sorted for deterministic results.
-//
-// An existing node with no names returns an empty slice.
-// A nonexistent node returns ErrNodeNotFound.
-func (r *NameRegistry) NamesForNode(id NodeID) ([]string, error) {
-	if !r.graph.NodeExists(id) {
-		return nil, ErrNodeNotFound
-	}
-
-	names := r.byID[id]
-
-	result := make([]string, 0, len(names))
-	for name := range names {
-		result = append(result, name)
-	}
-
-	sort.Strings(result)
-
-	return result, nil
 }

@@ -2,7 +2,6 @@ package wtw
 
 import (
 	"errors"
-	"reflect"
 	"testing"
 )
 
@@ -19,85 +18,35 @@ func TestNameRegistryCreateNamedNode(t *testing.T) {
 	var g Graph
 	names := NewNameRegistry(&g)
 
-	root, err := names.CreateNamedNode("ROOT")
+	id, err := names.CreateNamedNode("ROOT")
 	if err != nil {
 		t.Fatalf("CreateNamedNode() returned error: %v", err)
 	}
 
-	if !g.NodeExists(root) {
-		t.Fatalf("created node %d does not exist in graph", root)
+	if !g.NodeExists(id) {
+		t.Fatalf("created node %d does not exist", id)
 	}
 
 	found, ok := names.Lookup("ROOT")
 	if !ok {
-		t.Fatal("Lookup(\"ROOT\") did not find the newly created name")
+		t.Fatal("Lookup(\"ROOT\") did not find the name")
 	}
 
-	if found != root {
-		t.Fatalf(
-			"Lookup(\"ROOT\") = %d, want %d",
-			found, root,
-		)
-	}
-}
-
-func TestNameRegistryCreateNamedNodeDoesNotDuplicateName(t *testing.T) {
-	var g Graph
-	names := NewNameRegistry(&g)
-
-	first, err := names.CreateNamedNode("ROOT")
-	if err != nil {
-		t.Fatalf("first CreateNamedNode() returned error: %v", err)
+	if found != id {
+		t.Fatalf("Lookup(\"ROOT\") = %d, want %d", found, id)
 	}
 
-	_, err = names.CreateNamedNode("ROOT")
-	if !errors.Is(err, ErrNameAlreadyBound) {
-		t.Fatalf(
-			"second CreateNamedNode() error = %v, want %v",
-			err, ErrNameAlreadyBound,
-		)
-	}
-
-	other, err := g.CreateNode()
-	if err != nil {
-		t.Fatalf("CreateNode() returned error: %v", err)
-	}
-
-	if other == first {
-		t.Fatalf(
-			"second node unexpectedly reused first node ID %d",
-			first,
-		)
-	}
-}
-
-func TestNameRegistryBindExistingNode(t *testing.T) {
-	var g Graph
-	names := NewNameRegistry(&g)
-
-	a, err := g.CreateNode()
-	if err != nil {
-		t.Fatalf("CreateNode() returned error: %v", err)
-	}
-
-	if err := names.Bind("A", a); err != nil {
-		t.Fatalf("Bind() returned error: %v", err)
-	}
-
-	found, ok := names.Lookup("A")
+	name, ok := names.NameForNode(id)
 	if !ok {
-		t.Fatal("Lookup(\"A\") did not find bound name")
+		t.Fatalf("NameForNode(%d) did not find the name", id)
 	}
 
-	if found != a {
-		t.Fatalf(
-			"Lookup(\"A\") = %d, want %d",
-			found, a,
-		)
+	if name != "ROOT" {
+		t.Fatalf("NameForNode(%d) = %q, want %q", id, name, "ROOT")
 	}
 }
 
-func TestNameRegistryCannotBindNonexistentNode(t *testing.T) {
+func TestNameRegistryRequiresExistingNode(t *testing.T) {
 	var g Graph
 	names := NewNameRegistry(&g)
 
@@ -105,10 +54,7 @@ func TestNameRegistryCannotBindNonexistentNode(t *testing.T) {
 
 	err := names.Bind("A", nonexistent)
 	if !errors.Is(err, ErrNodeNotFound) {
-		t.Fatalf(
-			"Bind() error = %v, want %v",
-			err, ErrNodeNotFound,
-		)
+		t.Fatalf("Bind() error = %v, want %v", err, ErrNodeNotFound)
 	}
 
 	if _, ok := names.Lookup("A"); ok {
@@ -116,7 +62,7 @@ func TestNameRegistryCannotBindNonexistentNode(t *testing.T) {
 	}
 }
 
-func TestNameRegistryCannotRebindNameToDifferentNode(t *testing.T) {
+func TestNameRegistryNameIsUnique(t *testing.T) {
 	var g Graph
 	names := NewNameRegistry(&g)
 
@@ -136,22 +82,36 @@ func TestNameRegistryCannotRebindNameToDifferentNode(t *testing.T) {
 
 	err = names.Bind("A", b)
 	if !errors.Is(err, ErrNameAlreadyBound) {
-		t.Fatalf(
-			"second Bind() error = %v, want %v",
-			err, ErrNameAlreadyBound,
-		)
+		t.Fatalf("second Bind() error = %v, want %v", err, ErrNameAlreadyBound)
 	}
 
 	found, ok := names.Lookup("A")
-	if !ok {
-		t.Fatal("name disappeared after failed rebind")
+	if !ok || found != a {
+		t.Fatalf("failed rebind changed the existing association")
+	}
+}
+
+func TestNameRegistryNodeIDIsUnique(t *testing.T) {
+	var g Graph
+	names := NewNameRegistry(&g)
+
+	id, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() returned error: %v", err)
 	}
 
-	if found != a {
-		t.Fatalf(
-			"failed rebind changed name from %d to %d",
-			a, found,
-		)
+	if err := names.Bind("A", id); err != nil {
+		t.Fatalf("first Bind() returned error: %v", err)
+	}
+
+	err = names.Bind("B", id)
+	if !errors.Is(err, ErrNodeAlreadyNamed) {
+		t.Fatalf("second Bind() error = %v, want %v", err, ErrNodeAlreadyNamed)
+	}
+
+	name, ok := names.NameForNode(id)
+	if !ok || name != "A" {
+		t.Fatalf("failed second binding changed the existing association")
 	}
 }
 
@@ -159,49 +119,39 @@ func TestNameRegistrySameBindingIsIdempotent(t *testing.T) {
 	var g Graph
 	names := NewNameRegistry(&g)
 
-	a, err := g.CreateNode()
+	id, err := g.CreateNode()
 	if err != nil {
 		t.Fatalf("CreateNode() returned error: %v", err)
 	}
 
-	if err := names.Bind("A", a); err != nil {
+	if err := names.Bind("A", id); err != nil {
 		t.Fatalf("first Bind() returned error: %v", err)
 	}
 
-	if err := names.Bind("A", a); err != nil {
-		t.Fatalf("second identical Bind() returned error: %v", err)
+	if err := names.Bind("A", id); err != nil {
+		t.Fatalf("identical second Bind() returned error: %v", err)
 	}
 }
 
-func TestNameRegistryMultipleNamesCanReferToSameNode(t *testing.T) {
+func TestNameRegistryCreateNamedNodeDoesNotDuplicateName(t *testing.T) {
 	var g Graph
 	names := NewNameRegistry(&g)
 
-	a, err := g.CreateNode()
+	first, err := names.CreateNamedNode("A")
 	if err != nil {
-		t.Fatalf("CreateNode() returned error: %v", err)
+		t.Fatalf("first CreateNamedNode() returned error: %v", err)
 	}
 
-	if err := names.Bind("A", a); err != nil {
-		t.Fatalf("Bind(\"A\") returned error: %v", err)
-	}
-
-	if err := names.Bind("Alpha", a); err != nil {
-		t.Fatalf("Bind(\"Alpha\") returned error: %v", err)
-	}
-
-	got, err := names.NamesForNode(a)
-	if err != nil {
-		t.Fatalf("NamesForNode() returned error: %v", err)
-	}
-
-	want := []string{"A", "Alpha"}
-
-	if !reflect.DeepEqual(got, want) {
+	_, err = names.CreateNamedNode("A")
+	if !errors.Is(err, ErrNameAlreadyBound) {
 		t.Fatalf(
-			"NamesForNode(%d) = %v, want %v",
-			a, got, want,
+			"second CreateNamedNode() error = %v, want %v",
+			err, ErrNameAlreadyBound,
 		)
+	}
+
+	if !g.NodeExists(first) {
+		t.Fatalf("original named node %d disappeared", first)
 	}
 }
 
@@ -209,7 +159,7 @@ func TestNameRegistryUnbindDoesNotDeleteNode(t *testing.T) {
 	var g Graph
 	names := NewNameRegistry(&g)
 
-	a, err := names.CreateNamedNode("A")
+	id, err := names.CreateNamedNode("A")
 	if err != nil {
 		t.Fatalf("CreateNamedNode() returned error: %v", err)
 	}
@@ -227,63 +177,30 @@ func TestNameRegistryUnbindDoesNotDeleteNode(t *testing.T) {
 		t.Fatal("name still exists after Unbind()")
 	}
 
-	if !g.NodeExists(a) {
-		t.Fatalf(
-			"Unbind() incorrectly deleted NodeID %d from graph",
-			a,
-		)
+	if _, ok := names.NameForNode(id); ok {
+		t.Fatal("NodeID still has a name after Unbind()")
+	}
+
+	if !g.NodeExists(id) {
+		t.Fatalf("Unbind() incorrectly deleted NodeID %d", id)
 	}
 }
 
-func TestNameRegistryUnbindMissingName(t *testing.T) {
+func TestNameRegistryUnbindMissing(t *testing.T) {
 	var g Graph
 	names := NewNameRegistry(&g)
 
 	removed, err := names.Unbind("missing")
-	if err != nil {
-		t.Fatalf("Unbind() returned error: %v", err)
+	if !errors.Is(err, ErrNameNotFound) {
+		t.Fatalf("Unbind() error = %v, want %v", err, ErrNameNotFound)
 	}
 
 	if removed {
-		t.Fatal("Unbind() reported removal of a nonexistent name")
+		t.Fatal("Unbind() reported removal despite name not existing")
 	}
 }
 
-func TestNameRegistryNamesForNodeWithoutNames(t *testing.T) {
-	var g Graph
-	names := NewNameRegistry(&g)
-
-	a, err := g.CreateNode()
-	if err != nil {
-		t.Fatalf("CreateNode() returned error: %v", err)
-	}
-
-	got, err := names.NamesForNode(a)
-	if err != nil {
-		t.Fatalf("NamesForNode() returned error: %v", err)
-	}
-
-	if len(got) != 0 {
-		t.Fatalf("NamesForNode(%d) = %v, want empty", a, got)
-	}
-}
-
-func TestNameRegistryNamesForNonexistentNode(t *testing.T) {
-	var g Graph
-	names := NewNameRegistry(&g)
-
-	const nonexistent NodeID = 12345
-
-	_, err := names.NamesForNode(nonexistent)
-	if !errors.Is(err, ErrNodeNotFound) {
-		t.Fatalf(
-			"NamesForNode() error = %v, want %v",
-			err, ErrNodeNotFound,
-		)
-	}
-}
-
-func TestNameRegistryDoesNotCreateGraphRelationships(t *testing.T) {
+func TestNameRegistryDoesNotCreateRelationships(t *testing.T) {
 	var g Graph
 	names := NewNameRegistry(&g)
 
@@ -298,16 +215,10 @@ func TestNameRegistryDoesNotCreateGraphRelationships(t *testing.T) {
 	}
 
 	if g.HasRelationship(a, b) {
-		t.Fatalf(
-			"name registry unexpectedly created primitive relationship (%d,%d)",
-			a, b,
-		)
+		t.Fatalf("name registry created unexpected relationship (%d,%d)", a, b)
 	}
 
 	if g.HasRelationship(b, a) {
-		t.Fatalf(
-			"name registry unexpectedly created primitive relationship (%d,%d)",
-			b, a,
-		)
+		t.Fatalf("name registry created unexpected relationship (%d,%d)", b, a)
 	}
 }
