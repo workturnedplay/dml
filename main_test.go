@@ -951,6 +951,105 @@ func TestNameRegistryEnsureNamedNodeFindsExistingBinding(t *testing.T) {
 	}
 }
 
+func TestNameRegistryEnsureNamedNodeFailsOnStaleBinding(t *testing.T) {
+	var g Graph
+	names := NewNameRegistry(&g)
+
+	id, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode(): %v", err)
+	}
+
+	if err := names.Bind("A", id); err != nil {
+		t.Fatalf("Bind(): %v", err)
+	}
+
+	// Bypass NameRegistry.DeleteNode on purpose, simulating a caller bug
+	// that deletes the node without coordinating with the name registry.
+	if err := g.DeleteNode(id); err != nil {
+		t.Fatalf("DeleteNode(%d) via raw Graph: %v", id, err)
+	}
+
+	_, err = names.EnsureNamedNode("A")
+	if !errors.Is(err, ErrNameBoundToDeletedNode) {
+		t.Fatalf("EnsureNamedNode() error = %v, want %v", err, ErrNameBoundToDeletedNode)
+	}
+}
+
+func TestNameRegistryCreateNamedNodeFailsOnStaleBinding(t *testing.T) {
+	var g Graph
+	names := NewNameRegistry(&g)
+
+	id, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode(): %v", err)
+	}
+
+	if err := names.Bind("A", id); err != nil {
+		t.Fatalf("Bind(): %v", err)
+	}
+
+	if err := g.DeleteNode(id); err != nil {
+		t.Fatalf("DeleteNode(%d) via raw Graph: %v", id, err)
+	}
+
+	_, err = names.CreateNamedNode("A")
+	if !errors.Is(err, ErrNameBoundToDeletedNode) {
+		t.Fatalf("CreateNamedNode() error = %v, want %v", err, ErrNameBoundToDeletedNode)
+	}
+}
+
+func TestNameRegistryBindFailsOnStaleBindingToDifferentNode(t *testing.T) {
+	var g Graph
+	names := NewNameRegistry(&g)
+
+	stale, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for stale: %v", err)
+	}
+
+	if err := names.Bind("A", stale); err != nil {
+		t.Fatalf("Bind(): %v", err)
+	}
+
+	if err := g.DeleteNode(stale); err != nil {
+		t.Fatalf("DeleteNode(%d) via raw Graph: %v", stale, err)
+	}
+
+	replacement, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for replacement: %v", err)
+	}
+
+	err = names.Bind("A", replacement)
+	if !errors.Is(err, ErrNameBoundToDeletedNode) {
+		t.Fatalf("Bind() error = %v, want %v", err, ErrNameBoundToDeletedNode)
+	}
+}
+
+func TestBootstrapNamesFailsOnStaleBinding(t *testing.T) {
+	var g Graph
+	names := NewNameRegistry(&g)
+
+	id, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode(): %v", err)
+	}
+
+	if err := names.Bind("A", id); err != nil {
+		t.Fatalf("Bind(): %v", err)
+	}
+
+	if err := g.DeleteNode(id); err != nil {
+		t.Fatalf("DeleteNode(%d) via raw Graph: %v", id, err)
+	}
+
+	_, err = names.BootstrapNames([]string{"A", "B"})
+	if !errors.Is(err, ErrNameBoundToDeletedNode) {
+		t.Fatalf("BootstrapNames() error = %v, want %v", err, ErrNameBoundToDeletedNode)
+	}
+}
+
 func TestBootstrapNamesCreatesAllNames(t *testing.T) {
 	var g Graph
 	names := NewNameRegistry(&g)

@@ -268,6 +268,18 @@ var (
 	ErrNameAlreadyBound = errors.New("name is already bound")
 	ErrNodeAlreadyNamed = errors.New("node already has a name")
 	ErrNameNotFound     = errors.New("name not found")
+
+	// ErrNameBoundToDeletedNode is returned when a name's registry
+	// bookkeeping points at a NodeID that no longer exists in the
+	// underlying graph. This is never expected to happen through the
+	// registry's own API: it indicates that some caller deleted the node
+	// via the primitive Graph.DeleteNode directly instead of going
+	// through NameRegistry.DeleteNode, leaving the name -> NodeID
+	// association stale. It is deliberately surfaced as a distinct,
+	// loud failure rather than silently trusted (which would let further
+	// structure get built on a nonexistent node) or silently repaired
+	// (which would hide the upstream bug that caused it).
+	ErrNameBoundToDeletedNode = errors.New("name is bound to a node that no longer exists")
 )
 
 // NameRegistry maintains the one-to-one association between names and
@@ -309,6 +321,37 @@ func (r *NameRegistry) NameForNode(id NodeID) (string, bool) {
 	return name, ok
 }
 
+// lookupLive returns the NodeID currently bound to name in this
+// registry's bookkeeping, additionally confirming that the NodeID still
+// exists in the underlying graph.
+//
+// bound is true only when name has an association AND that association's
+// NodeID currently exists. If name has an association whose NodeID no
+// longer exists, lookupLive returns ErrNameBoundToDeletedNode instead of
+// a normal (id, bound) result: this is the shared fail-fast check used by
+// every registry operation that is about to trust or hand out a NodeID
+// (Bind, CreateNamedNode, EnsureNamedNode), so that a caller which deleted
+// a named node through the primitive Graph.DeleteNode directly (bypassing
+// NameRegistry.DeleteNode) gets a loud, immediate error the next time this
+// registry is used, rather than silently building further structure on a
+// nonexistent node.
+//
+// Lookup and NameForNode deliberately do NOT go through lookupLive: they
+// are raw, side-effect-free bookkeeping queries, not NodeID-issuing
+// operations, and keep their existing simple (value, bool) contract.
+func (r *NameRegistry) lookupLive(name string) (id NodeID, bound bool, err error) {
+	id, ok := r.byName[name]
+	if !ok {
+		return 0, false, nil
+	}
+
+	if !r.graph.NodeExists(id) {
+		return 0, false, ErrNameBoundToDeletedNode
+	}
+
+	return id, true, nil
+}
+
 // Bind associates name with an existing, currently unnamed NodeID.
 //
 // Both directions of the association are unique:
@@ -322,7 +365,12 @@ func (r *NameRegistry) Bind(name string, id NodeID) error {
 		return ErrNodeNotFound
 	}
 
-	if existingID, ok := r.byName[name]; ok {
+	existingID, bound, err := r.lookupLive(name)
+	if err != nil {
+		return err
+	}
+
+	if bound {
 		if existingID == id {
 			return nil
 		}
@@ -342,9 +390,15 @@ func (r *NameRegistry) Bind(name string, id NodeID) error {
 
 // CreateNamedNode creates a new primitive node and immediately gives it name.
 //
-// If name is already bound, no new node is created.
+// If name is already bound to a live node, no new node is created and
+// ErrNameAlreadyBound is returned. If name is bound to a NodeID that no
+// longer exists (see lookupLive), ErrNameBoundToDeletedNode is returned
+// instead, since that is a different, more serious problem than an
+// ordinary already-bound name.
 func (r *NameRegistry) CreateNamedNode(name string) (NodeID, error) {
-	if _, ok := r.byName[name]; ok {
+	if _, bound, err := r.lookupLive(name); err != nil {
+		return 0, err
+	} else if bound {
 		return 0, ErrNameAlreadyBound
 	}
 
@@ -370,8 +424,17 @@ func (r *NameRegistry) CreateNamedNode(name string) (NodeID, error) {
 // building block for bootstrapping foundational named nodes (ROOT-like
 // nodes such as AllPointers) that must exist exactly once no matter how
 // many times setup code runs.
+//
+// If name is bound to a NodeID that no longer exists, EnsureNamedNode
+// returns ErrNameBoundToDeletedNode (see lookupLive) rather than silently
+// trusting the stale association or silently creating a replacement.
 func (r *NameRegistry) EnsureNamedNode(name string) (NodeID, error) {
-	if id, ok := r.byName[name]; ok {
+	id, bound, err := r.lookupLive(name)
+	if err != nil {
+		return 0, err
+	}
+
+	if bound {
 		return id, nil
 	}
 
