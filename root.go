@@ -15,8 +15,8 @@ type RootGraph struct {
 	root  NodeID
 }
 
-// NewRootView creates a ROOT layer around an existing primitive node.
-func NewRootView(graph *Graph, root NodeID) (*RootGraph, error) {
+// NewRootGraph creates a ROOT layer around an existing primitive node.
+func NewRootGraph(graph *Graph, root NodeID) (*RootGraph, error) {
 	if !graph.NodeExists(root) {
 		return nil, ErrNodeNotFound
 	}
@@ -212,20 +212,27 @@ func (r *RootGraph) FindIncoming(to NodeID) ([]Relationship, error) {
 // FindRelationships returns every relationship visible through the ROOT
 // layer.
 //
-// This consists of all stored primitive relationships plus the virtual
-// ROOT -> X relationship for every existing X != ROOT.
+// This consists of all stored primitive relationships except relationships
+// whose source is ROOT, plus the virtual ROOT -> X relationship for every
+// existing X != ROOT.
+//
+// A primitive ROOT -> X relationship, if one exists, is ignored because the
+// ROOT layer represents that relationship virtually anyway.
+// The primitive (ROOT, ROOT) relationship is likewise hidden.
 func (r *RootGraph) FindRelationships() []Relationship {
-	relationships := r.graph.FindRelationships()
+	primitiveRelationships := r.graph.FindRelationships()
+	relationships := make([]Relationship, 0, len(primitiveRelationships)+len(r.graph.nodes)-1)
 
-	for id := range r.graph.nodes {
-		if id == r.root {
+	for _, relationship := range primitiveRelationships {
+		if relationship.From == r.root {
 			continue
 		}
 
-		// If the primitive graph somehow contains ROOT -> id, it must not
-		// result in a duplicate relationship in this view. The relationship
-		// is already represented virtually.
-		if r.graph.HasRelationship(r.root, id) {
+		relationships = append(relationships, relationship)
+	}
+
+	for id := range r.graph.nodes {
+		if id == r.root {
 			continue
 		}
 

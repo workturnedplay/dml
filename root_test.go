@@ -6,14 +6,14 @@ import (
 	"testing"
 )
 
-func TestNewRootViewRequiresExistingNode(t *testing.T) {
+func TestNewRootGraphRequiresExistingNode(t *testing.T) {
 	var g Graph
 
 	const root NodeID = 999
 
-	_, err := NewRootView(&g, root)
+	_, err := NewRootGraph(&g, root)
 	if !errors.Is(err, ErrNodeNotFound) {
-		t.Fatalf("NewRootView() error = %v, want %v", err, ErrNodeNotFound)
+		t.Fatalf("NewRootGraph() error = %v, want %v", err, ErrNodeNotFound)
 	}
 }
 
@@ -35,9 +35,9 @@ func TestRootExposesEveryOtherExistingNode(t *testing.T) {
 		t.Fatalf("CreateNode() for b: %v", err)
 	}
 
-	r, err := NewRootView(&g, root)
+	r, err := NewRootGraph(&g, root)
 	if err != nil {
-		t.Fatalf("NewRootView(): %v", err)
+		t.Fatalf("NewRootGraph(): %v", err)
 	}
 
 	got, err := r.FindOutgoing(root)
@@ -63,9 +63,9 @@ func TestRootDoesNotPointToItself(t *testing.T) {
 		t.Fatalf("CreateNode(): %v", err)
 	}
 
-	r, err := NewRootView(&g, root)
+	r, err := NewRootGraph(&g, root)
 	if err != nil {
-		t.Fatalf("NewRootView(): %v", err)
+		t.Fatalf("NewRootGraph(): %v", err)
 	}
 
 	if r.HasRelationship(root, root) {
@@ -99,9 +99,9 @@ func TestRootCanHaveParents(t *testing.T) {
 		t.Fatalf("AddRelationship(a, ROOT): %v", err)
 	}
 
-	r, err := NewRootView(&g, root)
+	r, err := NewRootGraph(&g, root)
 	if err != nil {
-		t.Fatalf("NewRootView(): %v", err)
+		t.Fatalf("NewRootGraph(): %v", err)
 	}
 
 	got, err := r.FindIncoming(root)
@@ -131,9 +131,9 @@ func TestRootCanBeTargetOfNormalRelationship(t *testing.T) {
 		t.Fatalf("CreateNode() for a: %v", err)
 	}
 
-	r, err := NewRootView(&g, root)
+	r, err := NewRootGraph(&g, root)
 	if err != nil {
-		t.Fatalf("NewRootView(): %v", err)
+		t.Fatalf("NewRootGraph(): %v", err)
 	}
 
 	created, err := r.AddRelationship(a, root)
@@ -171,9 +171,9 @@ func TestRootCreateNodeGoesThroughRootLayer(t *testing.T) {
 		t.Fatalf("CreateNode() for ROOT: %v", err)
 	}
 
-	r, err := NewRootView(&g, root)
+	r, err := NewRootGraph(&g, root)
 	if err != nil {
-		t.Fatalf("NewRootView(): %v", err)
+		t.Fatalf("NewRootGraph(): %v", err)
 	}
 
 	a, err := r.CreateNode()
@@ -203,9 +203,9 @@ func TestRootRelationshipIsVirtual(t *testing.T) {
 		t.Fatalf("CreateNode() for a: %v", err)
 	}
 
-	r, err := NewRootView(&g, root)
+	r, err := NewRootGraph(&g, root)
 	if err != nil {
-		t.Fatalf("NewRootView(): %v", err)
+		t.Fatalf("NewRootGraph(): %v", err)
 	}
 
 	if g.HasRelationship(root, a) {
@@ -230,9 +230,9 @@ func TestRootAddRelationshipDoesNotPhysicallyStoreVirtualRelationship(t *testing
 		t.Fatalf("CreateNode() for a: %v", err)
 	}
 
-	r, err := NewRootView(&g, root)
+	r, err := NewRootGraph(&g, root)
 	if err != nil {
-		t.Fatalf("NewRootView(): %v", err)
+		t.Fatalf("NewRootGraph(): %v", err)
 	}
 
 	created, err := r.AddRelationship(root, a)
@@ -266,9 +266,9 @@ func TestRootRemoveRelationshipCannotRemoveVirtualRelationship(t *testing.T) {
 		t.Fatalf("CreateNode() for a: %v", err)
 	}
 
-	r, err := NewRootView(&g, root)
+	r, err := NewRootGraph(&g, root)
 	if err != nil {
-		t.Fatalf("NewRootView(): %v", err)
+		t.Fatalf("NewRootGraph(): %v", err)
 	}
 
 	removed, err := r.RemoveRelationship(root, a)
@@ -303,9 +303,9 @@ func TestRootDelegatesNonRootRelationships(t *testing.T) {
 		t.Fatalf("CreateNode() for b: %v", err)
 	}
 
-	r, err := NewRootView(&g, root)
+	r, err := NewRootGraph(&g, root)
 	if err != nil {
-		t.Fatalf("NewRootView(): %v", err)
+		t.Fatalf("NewRootGraph(): %v", err)
 	}
 
 	if _, err := r.AddRelationship(a, b); err != nil {
@@ -348,9 +348,9 @@ func TestRootFindRelationshipsIncludesVirtualRelationships(t *testing.T) {
 		t.Fatalf("AddRelationship(a, b): %v", err)
 	}
 
-	r, err := NewRootView(&g, root)
+	r, err := NewRootGraph(&g, root)
 	if err != nil {
-		t.Fatalf("NewRootView(): %v", err)
+		t.Fatalf("NewRootGraph(): %v", err)
 	}
 
 	got := r.FindRelationships()
@@ -379,9 +379,9 @@ func TestRootDeleteNodeRemovesOrdinaryNode(t *testing.T) {
 		t.Fatalf("CreateNode() for a: %v", err)
 	}
 
-	r, err := NewRootView(&g, root)
+	r, err := NewRootGraph(&g, root)
 	if err != nil {
-		t.Fatalf("NewRootView(): %v", err)
+		t.Fatalf("NewRootGraph(): %v", err)
 	}
 
 	if err := r.DeleteNode(a); err != nil {
@@ -405,9 +405,9 @@ func TestRootCannotDeleteRoot(t *testing.T) {
 		t.Fatalf("CreateNode(): %v", err)
 	}
 
-	r, err := NewRootView(&g, root)
+	r, err := NewRootGraph(&g, root)
 	if err != nil {
-		t.Fatalf("NewRootView(): %v", err)
+		t.Fatalf("NewRootGraph(): %v", err)
 	}
 
 	err = r.DeleteNode(root)
@@ -417,5 +417,100 @@ func TestRootCannotDeleteRoot(t *testing.T) {
 
 	if !r.NodeExists(root) {
 		t.Fatal("ROOT disappeared after failed deletion")
+	}
+}
+
+func TestRootPhysicalRelationshipDoesNotDuplicateVirtualRelationship(t *testing.T) {
+	var g Graph
+
+	root, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for ROOT: %v", err)
+	}
+
+	a, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for a: %v", err)
+	}
+
+	if _, err := g.AddRelationship(root, a); err != nil {
+		t.Fatalf("AddRelationship(ROOT, a) in primitive graph: %v", err)
+	}
+
+	r, err := NewRootGraph(&g, root)
+	if err != nil {
+		t.Fatalf("NewRootGraph(): %v", err)
+	}
+
+	got, err := r.FindOutgoing(root)
+	if err != nil {
+		t.Fatalf("FindOutgoing(ROOT): %v", err)
+	}
+
+	want := []Relationship{
+		{From: root, To: a},
+	}
+
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("FindOutgoing(ROOT) = %v, want %v", got, want)
+	}
+
+	got = r.FindRelationships()
+
+	want = []Relationship{
+		{From: root, To: a},
+	}
+
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("FindRelationships() = %v, want %v", got, want)
+	}
+}
+func TestRootPhysicalSelfRelationshipIsHidden(t *testing.T) {
+	var g Graph
+
+	root, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for ROOT: %v", err)
+	}
+
+	if _, err := g.AddRelationship(root, root); err != nil {
+		t.Fatalf("AddRelationship(ROOT, ROOT) in primitive graph: %v", err)
+	}
+
+	if !g.HasRelationship(root, root) {
+		t.Fatal("primitive graph does not contain (ROOT, ROOT)")
+	}
+
+	r, err := NewRootGraph(&g, root)
+	if err != nil {
+		t.Fatalf("NewRootGraph(): %v", err)
+	}
+
+	if r.HasRelationship(root, root) {
+		t.Fatal("ROOT self-relationship is visible through RootGraph")
+	}
+
+	_, exists, err := r.FindRelationship(root, root)
+	if err != nil {
+		t.Fatalf("FindRelationship(ROOT, ROOT): %v", err)
+	}
+
+	if exists {
+		t.Fatal("FindRelationship(ROOT, ROOT) found a relationship")
+	}
+
+	got, err := r.FindIncoming(root)
+	if err != nil {
+		t.Fatalf("FindIncoming(ROOT): %v", err)
+	}
+
+	if len(got) != 0 {
+		t.Fatalf("FindIncoming(ROOT) = %v, want no relationships", got)
+	}
+
+	got = r.FindRelationships()
+
+	if len(got) != 0 {
+		t.Fatalf("FindRelationships() = %v, want no relationships", got)
 	}
 }
