@@ -360,6 +360,24 @@ func (r *NameRegistry) CreateNamedNode(name string) (NodeID, error) {
 	return id, nil
 }
 
+// EnsureNamedNode returns the NodeID currently associated with name,
+// creating and binding a fresh node exactly like CreateNamedNode if no
+// such association exists yet.
+//
+// Unlike CreateNamedNode, EnsureNamedNode is idempotent: calling it
+// repeatedly with the same name is always safe and always returns the
+// same NodeID once the name has first been bound. This is the primitive
+// building block for bootstrapping foundational named nodes (ROOT-like
+// nodes such as AllPointers) that must exist exactly once no matter how
+// many times setup code runs.
+func (r *NameRegistry) EnsureNamedNode(name string) (NodeID, error) {
+	if id, ok := r.byName[name]; ok {
+		return id, nil
+	}
+
+	return r.CreateNamedNode(name)
+}
+
 // Unbind removes the name association without deleting the NodeID.
 //
 // The bool reports whether an association was removed.
@@ -401,6 +419,57 @@ func (r *NameRegistry) DeleteNode(id NodeID) error {
 	}
 
 	return nil
+}
+
+// BootstrapNames ensures that every name in names has an associated
+// NodeID in this registry, creating any that do not yet exist.
+//
+// BootstrapNames is idempotent and resumable: because each individual
+// name is established through EnsureNamedNode, calling BootstrapNames
+// again — with the same list, a superset, or an overlapping list — never
+// disturbs names that were already bound, and safely picks up where a
+// previous partial call left off (for example, after a prior call failed
+// partway through with ErrNodeIDExhausted). There is deliberately no
+// transactional rollback: names successfully bound before a failure stay
+// bound, which is exactly what a resumable bootstrap should do.
+//
+// The returned map has one entry per distinct name in names; duplicate
+// entries in names collapse into a single map entry, as expected.
+func (r *NameRegistry) BootstrapNames(names []string) (map[string]NodeID, error) {
+	ids := make(map[string]NodeID, len(names))
+
+	for _, name := range names {
+		id, err := r.EnsureNamedNode(name)
+		if err != nil {
+			return nil, err
+		}
+
+		ids[name] = id
+	}
+
+	return ids, nil
+}
+
+// Foundational names are ordinary named nodes, exactly like ROOT, whose
+// special meaning comes entirely from higher-level relationships and
+// processors that interpret them — never from the primitive Graph or the
+// NameRegistry itself. See THEORY_NOTES_FROM_CONVERSATION.md and
+// theorystate_v0.6.md for the semantics each name is intended to support.
+const (
+	// NameAllPointers tags a node as Pointer-kind via the relationship
+	// (AllPointers, P). The primitive layer enforces nothing about P;
+	// invariants such as "P has at most one target" belong to a
+	// higher-level processor, not yet implemented.
+	NameAllPointers = "AllPointers"
+)
+
+// FoundationalNames lists every name that setup code should bootstrap via
+// NameRegistry.BootstrapNames. New foundational names should be appended
+// here — not bootstrapped ad hoc elsewhere — so there is a single, DRY
+// source of truth for what must exist, and only once the corresponding
+// representation is actually being implemented.
+var FoundationalNames = []string{
+	NameAllPointers,
 }
 
 // ErrCannotDeleteRoot is returned when deletion of ROOT is attempted

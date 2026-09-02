@@ -16,11 +16,18 @@ Completed milestones:
 5. Consolidation into main.go / main_test.go
 
 Current next task:
-- Set up AllPointers and related foundational names.
-- Each name gets its own newly allocated NodeID, like ROOT.
-- These are ordinary nodes; their special meaning comes from higher-level
-  relationships/processors.
-- Do not make them primitive Graph concepts.
+- AllPointers now exists as a foundational name (see Resolved this
+  session, item 3); the tagging relationship (AllPointers, P) is proven
+  end to end.
+- Decide, and only then implement, the smallest possible higher-level
+  Pointer processor that enforces "at most one target" for nodes tagged
+  (AllPointers, P) — per THEORY_NOTES_FROM_CONVERSATION.md section 9 and
+  theorystate_v0.6.md section 10, this invariant belongs above the
+  primitive Graph/NameRegistry layer, not inside it.
+- Add further foundational names (AllSubPointers, AllDomainPointers,
+  AllCapsules, allHEADs, allTAILs, ...) to FoundationalNames only when
+  actually starting the corresponding representation's implementation,
+  not preemptively.
 
 After that:
 - Continue building the generic tagging machinery.
@@ -62,6 +69,26 @@ Resolved this session:
  retrying; ErrCannotDeleteRoot cannot be resolved that way at all, since
  ROOT is structurally protected regardless of its relationship count.
  Covered by the updated TestRootCannotDeleteRoot.
+
+3. Name bootstrapping is now idempotent and resumable at the registry
+ level. NameRegistry.EnsureNamedNode(name) returns the existing NodeID if
+ name is already bound, or creates and binds a fresh node exactly like
+ CreateNamedNode if not. NameRegistry.BootstrapNames(names) applies
+ EnsureNamedNode across a list and returns map[string]NodeID; it is
+ naturally resumable because each step is independently idempotent, so a
+ partial failure (e.g. ErrNodeIDExhausted partway through) simply leaves
+ already-bound names untouched for a later retry to build on.
+ FoundationalNames is the single DRY source of truth for which names must
+ exist; it currently contains only NameAllPointers ("AllPointers"),
+ tagging a node as Pointer-kind via the relationship (AllPointers, P).
+ Covered by TestNameRegistryEnsureNamedNodeCreatesWhenMissing,
+ TestNameRegistryEnsureNamedNodeIsIdempotent,
+ TestNameRegistryEnsureNamedNodeFindsExistingBinding,
+ TestBootstrapNamesCreatesAllNames, TestBootstrapNamesIsIdempotent,
+ TestBootstrapNamesResumesAcrossOverlappingCalls,
+ TestBootstrapNamesHandlesDuplicateNamesInList,
+ TestFoundationalNamesIncludesAllPointers, and
+ TestAllPointersTagsPointerViaRelationship.
 
 Note for future external-metadata structures: this NameRegistry gap is one
 instance of a general pattern (external bookkeeping keyed by NodeID can

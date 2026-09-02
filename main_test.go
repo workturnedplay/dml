@@ -884,6 +884,209 @@ func TestNameRegistryDoesNotCreateRelationships(t *testing.T) {
 	}
 }
 
+func TestNameRegistryEnsureNamedNodeCreatesWhenMissing(t *testing.T) {
+	var g Graph
+	names := NewNameRegistry(&g)
+
+	id, err := names.EnsureNamedNode("A")
+	if err != nil {
+		t.Fatalf("EnsureNamedNode() returned error: %v", err)
+	}
+
+	if !g.NodeExists(id) {
+		t.Fatalf("EnsureNamedNode() returned NodeID %d that does not exist", id)
+	}
+
+	found, ok := names.Lookup("A")
+	if !ok || found != id {
+		t.Fatalf("Lookup(\"A\") = (%d, %v), want (%d, true)", found, ok, id)
+	}
+}
+
+func TestNameRegistryEnsureNamedNodeIsIdempotent(t *testing.T) {
+	var g Graph
+	names := NewNameRegistry(&g)
+
+	first, err := names.EnsureNamedNode("A")
+	if err != nil {
+		t.Fatalf("first EnsureNamedNode() returned error: %v", err)
+	}
+
+	second, err := names.EnsureNamedNode("A")
+	if err != nil {
+		t.Fatalf("second EnsureNamedNode() returned error: %v", err)
+	}
+
+	if first != second {
+		t.Fatalf(
+			"EnsureNamedNode() returned %d then %d, want the same NodeID both times",
+			first, second,
+		)
+	}
+}
+
+func TestNameRegistryEnsureNamedNodeFindsExistingBinding(t *testing.T) {
+	var g Graph
+	names := NewNameRegistry(&g)
+
+	id, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() returned error: %v", err)
+	}
+
+	if err := names.Bind("A", id); err != nil {
+		t.Fatalf("Bind() returned error: %v", err)
+	}
+
+	found, err := names.EnsureNamedNode("A")
+	if err != nil {
+		t.Fatalf("EnsureNamedNode() returned error: %v", err)
+	}
+
+	if found != id {
+		t.Fatalf(
+			"EnsureNamedNode(\"A\") = %d, want %d (the manually bound node)",
+			found, id,
+		)
+	}
+}
+
+func TestBootstrapNamesCreatesAllNames(t *testing.T) {
+	var g Graph
+	names := NewNameRegistry(&g)
+
+	ids, err := names.BootstrapNames([]string{"A", "B", "C"})
+	if err != nil {
+		t.Fatalf("BootstrapNames() returned error: %v", err)
+	}
+
+	if len(ids) != 3 {
+		t.Fatalf("BootstrapNames() returned %d entries, want 3", len(ids))
+	}
+
+	for _, name := range []string{"A", "B", "C"} {
+		id, ok := ids[name]
+		if !ok {
+			t.Fatalf("BootstrapNames() result missing entry for %q", name)
+		}
+
+		if !g.NodeExists(id) {
+			t.Fatalf("BootstrapNames() returned nonexistent NodeID %d for %q", id, name)
+		}
+
+		found, ok := names.Lookup(name)
+		if !ok || found != id {
+			t.Fatalf("Lookup(%q) = (%d, %v), want (%d, true)", name, found, ok, id)
+		}
+	}
+}
+
+func TestBootstrapNamesIsIdempotent(t *testing.T) {
+	var g Graph
+	names := NewNameRegistry(&g)
+
+	first, err := names.BootstrapNames([]string{"A", "B"})
+	if err != nil {
+		t.Fatalf("first BootstrapNames() returned error: %v", err)
+	}
+
+	second, err := names.BootstrapNames([]string{"A", "B"})
+	if err != nil {
+		t.Fatalf("second BootstrapNames() returned error: %v", err)
+	}
+
+	if !reflect.DeepEqual(first, second) {
+		t.Fatalf("BootstrapNames() = %v then %v, want identical results", first, second)
+	}
+}
+
+func TestBootstrapNamesResumesAcrossOverlappingCalls(t *testing.T) {
+	var g Graph
+	names := NewNameRegistry(&g)
+
+	first, err := names.BootstrapNames([]string{"A", "B"})
+	if err != nil {
+		t.Fatalf("first BootstrapNames() returned error: %v", err)
+	}
+
+	second, err := names.BootstrapNames([]string{"B", "C"})
+	if err != nil {
+		t.Fatalf("second BootstrapNames() returned error: %v", err)
+	}
+
+	if second["B"] != first["B"] {
+		t.Fatalf(
+			"BootstrapNames() rebound %q to %d, want unchanged %d",
+			"B", second["B"], first["B"],
+		)
+	}
+
+	if _, ok := names.Lookup("A"); !ok {
+		t.Fatal("\"A\" from the first call is no longer bound")
+	}
+
+	if _, ok := names.Lookup("C"); !ok {
+		t.Fatal("\"C\" from the second call was not bound")
+	}
+}
+
+func TestBootstrapNamesHandlesDuplicateNamesInList(t *testing.T) {
+	var g Graph
+	names := NewNameRegistry(&g)
+
+	ids, err := names.BootstrapNames([]string{"A", "A", "A"})
+	if err != nil {
+		t.Fatalf("BootstrapNames() returned error: %v", err)
+	}
+
+	if len(ids) != 1 {
+		t.Fatalf(
+			"BootstrapNames() with duplicate names returned %d entries, want 1",
+			len(ids),
+		)
+	}
+}
+
+func TestFoundationalNamesIncludesAllPointers(t *testing.T) {
+	for _, name := range FoundationalNames {
+		if name == NameAllPointers {
+			return
+		}
+	}
+
+	t.Fatalf("FoundationalNames %v does not include %q", FoundationalNames, NameAllPointers)
+}
+
+func TestAllPointersTagsPointerViaRelationship(t *testing.T) {
+	var g Graph
+	names := NewNameRegistry(&g)
+
+	ids, err := names.BootstrapNames(FoundationalNames)
+	if err != nil {
+		t.Fatalf("BootstrapNames() returned error: %v", err)
+	}
+
+	allPointers := ids[NameAllPointers]
+
+	p, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for p: %v", err)
+	}
+
+	created, err := g.AddRelationship(allPointers, p)
+	if err != nil {
+		t.Fatalf("AddRelationship(AllPointers, p): %v", err)
+	}
+
+	if !created {
+		t.Fatal("tagging relationship (AllPointers, p) was not created")
+	}
+
+	if !g.HasRelationship(allPointers, p) {
+		t.Fatal("p is not tagged as Pointer-kind via (AllPointers, p)")
+	}
+}
+
 func TestNewRootGraphRequiresExistingNode(t *testing.T) {
 	var g Graph
 
