@@ -784,6 +784,83 @@ func TestNameRegistryUnbindMissing(t *testing.T) {
 	}
 }
 
+func TestNameRegistryDeleteNodeRemovesNameAssociation(t *testing.T) {
+	var g Graph
+	names := NewNameRegistry(&g)
+
+	id, err := names.CreateNamedNode("A")
+	if err != nil {
+		t.Fatalf("CreateNamedNode(): %v", err)
+	}
+
+	if err := names.DeleteNode(id); err != nil {
+		t.Fatalf("DeleteNode(%d): %v", id, err)
+	}
+
+	if g.NodeExists(id) {
+		t.Fatalf("node %d still exists after DeleteNode()", id)
+	}
+
+	if _, ok := names.Lookup("A"); ok {
+		t.Fatal("name \"A\" still resolves after DeleteNode()")
+	}
+
+	if _, ok := names.NameForNode(id); ok {
+		t.Fatalf("NodeID %d still has a name after DeleteNode()", id)
+	}
+}
+
+func TestNameRegistryDeleteNodeFailsIfNotEmpty(t *testing.T) {
+	var g Graph
+	names := NewNameRegistry(&g)
+
+	a, err := names.CreateNamedNode("A")
+	if err != nil {
+		t.Fatalf("CreateNamedNode(): %v", err)
+	}
+
+	b, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode(): %v", err)
+	}
+
+	if _, err := g.AddRelationship(a, b); err != nil {
+		t.Fatalf("AddRelationship(): %v", err)
+	}
+
+	err = names.DeleteNode(a)
+	if !errors.Is(err, ErrNodeNotEmpty) {
+		t.Fatalf("DeleteNode(%d) error = %v, want %v", a, err, ErrNodeNotEmpty)
+	}
+
+	if !g.NodeExists(a) {
+		t.Fatalf("node %d disappeared even though deletion should have failed", a)
+	}
+
+	name, ok := names.NameForNode(a)
+	if !ok || name != "A" {
+		t.Fatalf("name association for %d was disturbed by failed DeleteNode()", a)
+	}
+}
+
+func TestNameRegistryDeleteNodeWithoutNameWorks(t *testing.T) {
+	var g Graph
+	names := NewNameRegistry(&g)
+
+	id, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode(): %v", err)
+	}
+
+	if err := names.DeleteNode(id); err != nil {
+		t.Fatalf("DeleteNode(%d): %v", id, err)
+	}
+
+	if g.NodeExists(id) {
+		t.Fatalf("node %d still exists after DeleteNode()", id)
+	}
+}
+
 func TestNameRegistryDoesNotCreateRelationships(t *testing.T) {
 	var g Graph
 	names := NewNameRegistry(&g)
@@ -1212,8 +1289,8 @@ func TestRootCannotDeleteRoot(t *testing.T) {
 	}
 
 	err = r.DeleteNode(root)
-	if !errors.Is(err, ErrNodeNotEmpty) {
-		t.Fatalf("DeleteNode(ROOT) error = %v, want %v", err, ErrNodeNotEmpty)
+	if !errors.Is(err, ErrCannotDeleteRoot) {
+		t.Fatalf("DeleteNode(ROOT) error = %v, want %v", err, ErrCannotDeleteRoot)
 	}
 
 	if !r.NodeExists(root) {

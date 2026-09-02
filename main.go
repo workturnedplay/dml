@@ -375,6 +375,44 @@ func (r *NameRegistry) Unbind(name string) (bool, error) {
 	return true, nil
 }
 
+// DeleteNode deletes id from the underlying graph and, only if that
+// succeeds, removes any name association for id from the registry.
+//
+// This exists because Graph and NameRegistry are deliberately separate
+// layers (Graph does not know about names). Deleting a named node directly
+// through Graph.DeleteNode would leave a stale name -> NodeID / NodeID ->
+// name association behind. Going through NameRegistry.DeleteNode instead
+// keeps both in sync.
+//
+// If id currently has relationships, the underlying Graph.DeleteNode call
+// fails with ErrNodeNotEmpty, and any existing name association is left
+// completely untouched, exactly as if DeleteNode had never been called.
+//
+// It is not an error for id to have no name association; this then simply
+// behaves like a plain Graph.DeleteNode.
+func (r *NameRegistry) DeleteNode(id NodeID) error {
+	if err := r.graph.DeleteNode(id); err != nil {
+		return err
+	}
+
+	if name, ok := r.byID[id]; ok {
+		delete(r.byName, name)
+		delete(r.byID, id)
+	}
+
+	return nil
+}
+
+// ErrCannotDeleteRoot is returned when deletion of ROOT is attempted
+// through a RootGraph layer.
+//
+// This is deliberately distinct from ErrNodeNotEmpty. ErrNodeNotEmpty
+// means "clear the relationships and try again." ErrCannotDeleteRoot means
+// deletion can never succeed through this layer regardless of ROOT's
+// relationship count, because ROOT's identity is structurally protected
+// here, not merely blocked by leftover relationships.
+var ErrCannotDeleteRoot = errors.New("cannot delete root node")
+
 // RootGraph is the graph layer exposed above the primitive Graph.
 //
 // ROOT is a real NodeID in the underlying Graph. Its relationship to every
@@ -628,14 +666,18 @@ func (r *RootGraph) FindRelationships() []Relationship {
 
 // DeleteNode deletes an ordinary node from the underlying graph.
 //
-// ROOT itself cannot be deleted through this layer.
+// ROOT itself cannot be deleted through this layer. This is reported as
+// ErrCannotDeleteRoot, not ErrNodeNotEmpty: ROOT's identity is
+// structurally protected by this layer regardless of whether it currently
+// has any relationships, so this failure cannot be resolved by clearing
+// relationships and retrying, unlike an ordinary ErrNodeNotEmpty failure.
 func (r *RootGraph) DeleteNode(id NodeID) error {
 	if !r.graph.NodeExists(id) {
 		return ErrNodeNotFound
 	}
 
 	if id == r.root {
-		return ErrNodeNotEmpty
+		return ErrCannotDeleteRoot
 	}
 
 	return r.graph.DeleteNode(id)

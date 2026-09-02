@@ -44,7 +44,30 @@ Editing convention:
   ...
   
   
+Resolved this session:
+1. Node deletion and the name registry now have a coordinated path.
+ NameRegistry.DeleteNode(id) deletes id from the underlying Graph and,
+ only if that succeeds, removes any name association for id from the
+ registry. Graph.DeleteNode itself remains unaware of NameRegistry, per
+ the existing layering rule — raw Graph.DeleteNode is still available and
+ still does not coordinate anything; callers who need the name registry
+ kept in sync must go through NameRegistry.DeleteNode instead. Covered by
+ TestNameRegistryDeleteNodeRemovesNameAssociation,
+ TestNameRegistryDeleteNodeFailsIfNotEmpty, and
+ TestNameRegistryDeleteNodeWithoutNameWorks.
+
+2. RootGraph.DeleteNode(ROOT) now returns a dedicated ErrCannotDeleteRoot
+ instead of reusing ErrNodeNotEmpty. The two failures are semantically
+ different: ErrNodeNotEmpty is resolved by clearing relationships and
+ retrying; ErrCannotDeleteRoot cannot be resolved that way at all, since
+ ROOT is structurally protected regardless of its relationship count.
+ Covered by the updated TestRootCannotDeleteRoot.
+
+Note for future external-metadata structures: this NameRegistry gap is one
+instance of a general pattern (external bookkeeping keyed by NodeID can
+outlive the NodeID once it's deleted, unless the owning layer coordinates
+its own delete). Expect the same shape of problem to recur for any future
+NodeID-keyed structure outside the primitive graph.
+
 Currently unaddressed yet:
-1. Node deletion and the name registry currently have no automatic interaction.
- NameRegistry can associate a name with a NodeID, while Graph.DeleteNode can subsequently delete that node once its relationships are gone. That leaves a stale name → NodeID / NodeID → name association pointing at a nonexistent node. The theory explicitly says the name registry is bootstrap metadata outside the primitive graph, so this is exactly the sort of boundary we should make explicit rather than accidentally letting it become inconsistent.
- I would not make Graph know about NameRegistry; that would violate the layering we've established. Instead, the next thing I'd implement is a higher-level operation on the registry/layer that performs the two pieces coherently, with tests for the failure and success cases.
+(none identified this session — flag anything new here as it comes up.)
