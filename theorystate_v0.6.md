@@ -778,9 +778,49 @@ relationship-object nodes (§8) are structurally the same move, applied to
 cross-graph identity and generic tagging respectively. Named once here so
 future structures can recognize the pattern rather than re-deriving it.
 
----
+## 76. Tag identity is bootstrapped, not hardcoded; interpreters are
+parameterized by tag, not branching on it
 
-## PART D — STATUS SUMMARY (consolidated)
+**DECIDED, validated by `wtw` as already-built, not proposed.** A question
+raised externally (session discussion with GPT-5.6 Luna) asked whether the
+system should take "the next step" of giving foundational tag names
+(`AllPointers`, `AllLists`, etc.) real NodeID identity via the same
+name→NodeID mechanism already used for ROOT, rather than treating tags as
+baked-in primitive concepts. This is not a future step: it is exactly what
+`FoundationalNames` + `NameRegistry.BootstrapNames` already do (§6, §25).
+Every foundational tag name is bootstrapped into an ordinary NodeID before
+any registry uses it; the primitive Graph never sees the string "AllPointers"
+at all, only the resulting NodeID participating in ordinary `(tag,node)`
+facts, identically to how ROOT's NodeID participates in `RootGraph`.
+
+**The stronger form actually implemented (worth stating explicitly, since a
+weaker form is easy to reach for).** A naive reading of "bootstrap the tag,
+then use it" still leaves room for an interpreter that hardcodes each
+bootstrapped ID and branches on it internally, e.g. `if tag == allPointersID
+{...} else if tag == allListsID {...}`. This is not what `wtw` does and is
+not the discipline this section decides. Instead, a single interpreter type
+is *parameterized by* whichever tag NodeID it's constructed with, and
+contains no branching on tag identity at all — see `PointerRegistry`, which
+implements both Representation A (§7A) and Representation B (§7B) as the
+same unmodified type and code path, distinguished only by which bootstrapped
+NodeID (`AllPointers` vs `AllSubPointers`) is passed to its constructor
+(validated by `TestSubPointerReusesPointerRegistryUnderDifferentTag`). This
+is a meaningfully stronger property than "tags have graph identity": it
+means adding a new tagged concept that fits an existing representation shape
+requires zero new branching logic anywhere, only a new bootstrapped name and
+a new constructor call.
+
+**What this does and does not decide.** This settles that (a) tag→NodeID
+bootstrapping via the existing `NameRegistry` machinery is sufficient and
+final for giving semantic names graph identity — no additional "generic
+classification framework" is needed on top of it (§7's construct-don't-add-
+primitives discipline already covers this case); and (b) the Go layer
+legitimately remains the place semantic interpretation lives for now.
+It does **not** decide or address: commit-time interception preventing a raw
+`Graph.AddRelationship` from bypassing a registry's invariant (§73, still
+open); whether Sets/Lists/Domains get analogous registry types (deferred
+per `implementation_state.md`'s "add foundational names only when starting
+the
 
 ### DECIDED
 - NodeID is the fundamental addressable object; uniqueness among existing
@@ -802,6 +842,10 @@ future structures can recognize the pattern rather than re-deriving it.
   self-delimiting subfields (§66a) — new this session.
 - Local ROOT (per-owner) is cheap/complete/current; global discovery is
   permanently best-effort only (§38).
+- Foundational tag names get graph identity via the same NameRegistry
+  bootstrap mechanism as ROOT, never hardcoded into the primitive graph;
+  interpreters are parameterized by the resulting tag NodeID rather than
+  branching on it internally (§76).
 
 ### TENTATIVE
 - Monotonically increasing NodeIDs; serialized first implementation.
