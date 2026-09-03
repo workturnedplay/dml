@@ -175,12 +175,21 @@ This permits the same underlying value to occur multiple times in a list using d
 
 ### Capsule relationships
 
-A capsule can be associated with:
-- previous capsule
-- actual element/value
-- next capsule
+A capsule's previous-capsule, element/value, and next-capsule roles are
+represented by three separate, freshly-minted intermediary nodes. The
+intermediary nodes are not identified by their position among the capsule's
+children; they are identified by their respective role tags.
 
-The old diagram used unique intermediary nodes for these roles.
+Conceptually:
+
+```text
+ElementCapsule -> UPrev
+ElementCapsule -> UValue
+ElementCapsule -> UNext
+
+allPrevElementCapsules -> UPrev
+"allElements of ElementCapsules" -> UValue
+allNextElementCapsules -> UNext
 
 ### Heads and tails
 

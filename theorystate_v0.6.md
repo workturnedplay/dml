@@ -118,8 +118,52 @@ higher layers should react to an overly restrictive lower layer (§73).
 
 ## 11. Ordered Lists
 
-Higher-level than Sets; needs explicit ordering structure (head/tail/
-next/previous, intermediary elements). Not decided. A Set-like index atop
+**TENTATIVE / explored representation.** Ordered Lists are higher-level than
+Sets and require explicit ordering structure (head/tail/next/previous plus
+intermediary element-occurrence nodes).
+
+An ElementCapsule is a freshly minted NodeID representing one particular
+element occurrence in the list, rather than necessarily the value NodeID
+itself. Thus the same value can occur multiple times in one list through
+different capsules.
+
+List membership must be identified by an explicit capsule-kind tag rather
+than by assuming that every direct child of a list is an ElementCapsule.
+Conceptually:
+
+```text
+(AllCapsules,Capsule)
+(list,Capsule)
+```
+
+The first relationship identifies the node as an ElementCapsule; the second
+associates that particular capsule with the list. Consequently, a list may
+have other direct children representing unrelated metadata or other
+structures without those children being mistaken for list elements.
+
+The three capsule roles — previous capsule, actual element/value, and next
+capsule — are likewise identified by explicit per-role tags rather than by
+child position. Each role has its own freshly minted intermediary slot node:
+
+```text
+ElementCapsule -> UPrev
+ElementCapsule -> UValue
+ElementCapsule -> UNext
+
+allPrevElementCapsules -> UPrev
+allElementsOfElementCapsules -> UValue
+allNextElementCapsules -> UNext
+```
+
+The role-slot nodes are therefore discovered by their respective tags, not by
+assuming that the first, second, or third child of an ElementCapsule has a
+particular meaning. The primitive graph has no semantic child ordering:
+outgoing relationships form a set, and storage/creation order carries no
+meaning (§5). This also allows additional unrelated children to be added to
+an ElementCapsule without invalidating discovery of the three defined roles.
+
+The exact final List representation and its invariants remain OPEN.
+A Set-like index atop
 a List may be added later for `doesElementExist(X)`.
 
 ## 12. ROOT and discoverability (single-graph)

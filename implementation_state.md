@@ -75,7 +75,12 @@ After that:
   (THEORY_NOTES_FROM_CONVERSATION.md section 11, theorystate section 11)
   are the two candidates on the table; Domains (theory section 6) likely
   wants Sets first, since it's framed as a constrained Set. Not yet
-  decided which to start with.
+  decided which to start with. If Ordered Lists are started, their
+  representation must preserve the established tagging discipline:
+  list -> ElementCapsule does not by itself make every list child a capsule;
+  capsules are identified through AllCapsules, and the capsule's previous,
+  value, and next intermediary slots are each discovered through their own
+  role tag rather than by child position.
 - Do not prematurely implement Set/List semantics in the primitive layer,
   regardless of which is chosen -- they remain higher-layer constructions,
   per the same discipline that kept Pointer semantics entirely out of
