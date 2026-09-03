@@ -725,10 +725,19 @@ const (
 	NameAllPointerMetadata = "AllPointerMetadata"
 
 	// NameAllPointerMetadataSubjectSlot tags a node as a subject-slot
-	// node used by PointerMetadataRegistry. See PointerMetadataRegistry
-	// for why the subject needs its own slot node rather than being
-	// pointed at directly.
+	// node used by PointerMetadataRegistry (Representation C) and
+	// PointerMetadataRegistryD (Representation D). See
+	// PointerMetadataRegistry for why the subject needs its own slot
+	// node rather than being pointed at directly.
 	NameAllPointerMetadataSubjectSlot = "AllPointerMetadataSubjectSlot"
+
+	// NameAllPointerMetadataTargetSlot tags a node as a target-slot node
+	// used by PointerMetadataRegistryD (Representation D). See
+	// PointerMetadataRegistryD for why the target, like the subject,
+	// needs its own dedicated slot node rather than being identified as
+	// "whichever child of M isn't tagged subject-slot" (Representation
+	// C's limitation).
+	NameAllPointerMetadataTargetSlot = "AllPointerMetadataTargetSlot"
 )
 
 // FoundationalNames lists every name that setup code should bootstrap via
@@ -741,6 +750,7 @@ var FoundationalNames = []string{
 	NameAllSubPointers,
 	NameAllPointerMetadata,
 	NameAllPointerMetadataSubjectSlot,
+	NameAllPointerMetadataTargetSlot,
 }
 
 // ErrCannotDeleteRoot is returned when deletion of ROOT is attempted
@@ -1024,15 +1034,16 @@ var (
 	ErrTooManyPointerTargets = errors.New("pointer node has more than one target; the pointer invariant has already been violated")
 
 	// ErrAmbiguousPointerMetadata is returned by PointerMetadataRegistry
-	// when a reverse lookup (subject -> subject-slot, or
-	// subject-slot -> metadata node) finds more than one tagged parent.
-	// This can only happen through an out-of-band Graph mutation that
-	// bypasses PointerMetadataRegistry -- e.g. two different metadata
-	// nodes both tagged (AllPointerMetadata, M) ending up pointed at the
-	// same subject-slot. Mirrors the fail-loud-not-silently-repair
-	// discipline used elsewhere in this file (ErrNameBoundToDeletedNode,
+	// and PointerMetadataRegistryD when a tagged-parent or tagged-child
+	// lookup (subject -> subject-slot, subject-slot -> metadata node, or,
+	// for Representation D, metadata -> target-slot) finds more than one
+	// match. This can only happen through an out-of-band Graph mutation
+	// that bypasses these registries -- e.g. two different metadata nodes
+	// both tagged (AllPointerMetadata, M) ending up pointed at the same
+	// subject-slot. Mirrors the fail-loud-not-silently-repair discipline
+	// used elsewhere in this file (ErrNameBoundToDeletedNode,
 	// ErrTooManyPointerTargets).
-	ErrAmbiguousPointerMetadata = errors.New("more than one node found during pointer-metadata reverse lookup; the uniqueness invariant has already been violated")
+	ErrAmbiguousPointerMetadata = errors.New("more than one node found during pointer-metadata lookup; the uniqueness invariant has already been violated")
 )
 
 // singleChildTarget returns the single relevant child of node in the
@@ -1366,6 +1377,110 @@ func findUniqueTaggedParent(g *Graph, node, tag NodeID) (parent NodeID, found bo
 	return parent, found, nil
 }
 
+// findUniqueTaggedChild returns the single child of node that is tagged
+// via (tag, child), i.e. for which g.HasRelationship(tag, child) holds.
+//
+// This is the forward-lookup counterpart to findUniqueTaggedParent: where
+// findUniqueTaggedParent scans node's *parents* for one tagged tag,
+// findUniqueTaggedChild scans node's *children* for one tagged tag. Used
+// by PointerMetadataRegistryD to find a specific slot child of M by tag,
+// rather than by exclusion/assumption about M's other children -- see the
+// PointerMetadataRegistryD doc comment for why this is the fix over
+// Representation C's exclusion-based approach.
+//
+// It requires node to exist. found is false if no tagged child exists. If
+// more than one tagged child exists -- only reachable through an
+// out-of-band Graph mutation -- ErrAmbiguousPointerMetadata is returned
+// instead of arbitrarily picking one.
+func findUniqueTaggedChild(g *Graph, node, tag NodeID) (child NodeID, found bool, err error) {
+	outgoing, err := g.FindOutgoing(node)
+	if err != nil {
+		return 0, false, err
+	}
+
+	for _, rel := range outgoing {
+		if g.HasRelationship(tag, rel.To) {
+			if found {
+				return 0, false, ErrAmbiguousPointerMetadata
+			}
+
+			child = rel.To
+			found = true
+		}
+	}
+
+	return child, found, nil
+}
+
+// locateBySubjectSlot finds node's metadata node and subject-slot node
+// via the two-hop subject -> subject-slot -> metadata reverse lookup
+// shared by both PointerMetadataRegistry (Representation C) and
+// PointerMetadataRegistryD (Representation D): both representations
+// identify the subject the same way, differing only in how they then
+// locate the target. node must exist.
+func locateBySubjectSlot(g *Graph, node, allPointerMetadata, allSubjectSlots NodeID) (metadata, subjectSlot NodeID, found bool, err error) {
+	subjectSlot, found, err = findUniqueTaggedParent(g, node, allSubjectSlots)
+	if err != nil || !found {
+		return 0, 0, found, err
+	}
+
+	metadata, found, err = findUniqueTaggedParent(g, subjectSlot, allPointerMetadata)
+	if err != nil || !found {
+		return 0, 0, found, err
+	}
+
+	return metadata, subjectSlot, true, nil
+}
+
+// ensureMetadataWithSubjectSlot returns subject's existing metadata/
+// subject-slot pair (via locateBySubjectSlot), creating a fresh, empty
+// one (M -> S -> subject, both tagged) if none exists yet. Shared by both
+// PointerMetadataRegistry and PointerMetadataRegistryD, which build
+// identical subject-side structure and differ only in how the target
+// side is represented. Callers are responsible for checking that subject
+// itself exists before calling this.
+func ensureMetadataWithSubjectSlot(g *Graph, subject, allPointerMetadata, allSubjectSlots NodeID) (metadata, subjectSlot NodeID, err error) {
+	var found bool
+	metadata, subjectSlot, found, err = locateBySubjectSlot(g, subject, allPointerMetadata, allSubjectSlots)
+	if err != nil {
+		return 0, 0, err
+	}
+	if found {
+		return metadata, subjectSlot, nil
+	}
+
+	err = g.Transact(func(tx *Txn) error {
+		var err error
+
+		subjectSlot, err = tx.CreateNode()
+		if err != nil {
+			return err
+		}
+		if _, err := tx.AddRelationship(allSubjectSlots, subjectSlot); err != nil {
+			return err
+		}
+		if _, err := tx.AddRelationship(subjectSlot, subject); err != nil {
+			return err
+		}
+
+		metadata, err = tx.CreateNode()
+		if err != nil {
+			return err
+		}
+		if _, err := tx.AddRelationship(allPointerMetadata, metadata); err != nil {
+			return err
+		}
+
+		_, err = tx.AddRelationship(metadata, subjectSlot)
+		return err
+	})
+	if err != nil {
+		return 0, 0, err
+	}
+
+	return metadata, subjectSlot, nil
+}
+
 // PointerMetadataRegistry implements Representation C (metadata
 // structure) of the Pointer processor,
 // THEORY_NOTES_FROM_CONVERSATION.md section 7C / theorystate_v0.6.md
@@ -1407,6 +1522,26 @@ func findUniqueTaggedParent(g *Graph, node, tag NodeID) (parent NodeID, found bo
 // (ErrAmbiguousPointerMetadata, ErrTooManyPointerTargets) rather than
 // silently repairing when an out-of-band mutation has violated an
 // invariant.
+//
+// Known limitation, kept deliberately rather than fixed here: M's target
+// is identified *by exclusion* -- "whichever of M's children isn't S must
+// be the target" -- via singleChildTarget(m.graph, metadata, slot). This
+// means M is implicitly assumed to have only these two children, ever;
+// any future unrelated child added to M (tagged or not) would make
+// target discovery fail loudly with ErrTooManyPointerTargets even though
+// nothing about the actual target changed. This is really the same
+// mistake as Representation A's "at most one child, period" -- just
+// shifted up one level -- and it also matches
+// THEORY_NOTES_FROM_CONVERSATION.md section 10's original "M -> P, M ->
+// I" sketch, which has an even sharper version of the same bug (those two
+// relationships collapse into one whenever target == subject, since
+// primitive relationships are unique pairs). PointerMetadataRegistryD
+// (Representation D) is the corrected construction -- see its doc
+// comment. This type is kept as-is, limitation and all, rather than
+// patched or deleted: it is useful as a deliberately stricter
+// representation for testing how higher-level code should react when a
+// lower layer refuses something Representation D would allow
+// (theorystate_v0.6.md section 73).
 type PointerMetadataRegistry struct {
 	graph              *Graph
 	allPointerMetadata NodeID
@@ -1436,17 +1571,7 @@ func NewPointerMetadataRegistry(graph *Graph, allPointerMetadata, allSubjectSlot
 // locate finds subject's metadata node and subject-slot node, if any.
 // found is false if subject has no metadata yet. subject must exist.
 func (m *PointerMetadataRegistry) locate(subject NodeID) (metadata, slot NodeID, found bool, err error) {
-	slot, found, err = findUniqueTaggedParent(m.graph, subject, m.allSubjectSlots)
-	if err != nil || !found {
-		return 0, 0, found, err
-	}
-
-	metadata, found, err = findUniqueTaggedParent(m.graph, slot, m.allPointerMetadata)
-	if err != nil || !found {
-		return 0, 0, found, err
-	}
-
-	return metadata, slot, true, nil
+	return locateBySubjectSlot(m.graph, subject, m.allPointerMetadata, m.allSubjectSlots)
 }
 
 // ensureMetadata returns subject's existing metadata/slot pair, creating
@@ -1456,45 +1581,7 @@ func (m *PointerMetadataRegistry) ensureMetadata(subject NodeID) (metadata, slot
 		return 0, 0, ErrNodeNotFound
 	}
 
-	var found bool
-	metadata, slot, found, err = m.locate(subject)
-	if err != nil {
-		return 0, 0, err
-	}
-	if found {
-		return metadata, slot, nil
-	}
-
-	err = m.graph.Transact(func(tx *Txn) error {
-		var err error
-
-		slot, err = tx.CreateNode()
-		if err != nil {
-			return err
-		}
-		if _, err := tx.AddRelationship(m.allSubjectSlots, slot); err != nil {
-			return err
-		}
-		if _, err := tx.AddRelationship(slot, subject); err != nil {
-			return err
-		}
-
-		metadata, err = tx.CreateNode()
-		if err != nil {
-			return err
-		}
-		if _, err := tx.AddRelationship(m.allPointerMetadata, metadata); err != nil {
-			return err
-		}
-
-		_, err = tx.AddRelationship(metadata, slot)
-		return err
-	})
-	if err != nil {
-		return 0, 0, err
-	}
-
-	return metadata, slot, nil
+	return ensureMetadataWithSubjectSlot(m.graph, subject, m.allPointerMetadata, m.allSubjectSlots)
 }
 
 // EnsureMetadata returns subject's metadata node, creating an empty one
@@ -1604,4 +1691,261 @@ func (m *PointerMetadataRegistry) RemoveTarget(subject NodeID) (removed bool, er
 	}
 
 	return m.graph.RemoveRelationship(metadata, target)
+}
+
+// PointerMetadataRegistryD implements Representation D, a corrected
+// generalization of Representation C (PointerMetadataRegistry) /
+// THEORY_NOTES_FROM_CONVERSATION.md section 10's original "M -> P, M ->
+// I" sketch.
+//
+// Representation C and section 10's original sketch share a real bug:
+// they each identify one of M's two children *by exclusion* -- "whichever
+// child isn't the subject/subject-slot must be the target/information
+// node" (or, in section 10's even earlier sketch, "M -> P" and "M -> I"
+// collapse into the same relationship whenever target == subject, since
+// primitive relationships are unique pairs -- THEORY_NOTES section 1).
+// Both are really the same underlying mistake as Representation A's "at
+// most one child, no room for anything else": M is implicitly assumed to
+// have *exactly* the relevant children and nothing more, which directly
+// contradicts section 10's own stated goal ("This is a general
+// construction, not merely a pointer trick" -- i.e. M should be free to
+// grow additional, unrelated children later without breaking discovery).
+//
+// Representation D fixes this by giving *both* roles their own dedicated,
+// freshly-minted, explicitly tagged slot node, exactly symmetric with
+// each other:
+//
+//	(AllPointerMetadata, M)
+//	M -> U1                                  M's subject-slot child
+//	(AllPointerMetadataSubjectSlot, U1)
+//	U1 -> subject                            U1 identifies the subject
+//	M -> U2                                  M's target-slot child (once set)
+//	(AllPointerMetadataTargetSlot, U2)
+//	U2 -> target                             U2 identifies the target
+//
+// Both U1 and U2 are discovered by their own tag, not by exclusion, so M
+// can carry any number of additional, unrelated children -- tagged or
+// not, now or added later -- without ever disturbing subject or target
+// discovery. This is the same occurrence/role-identity pattern already
+// named in theorystate_v0.6.md section 75, applied twice over instead of
+// once.
+//
+// Representation C (PointerMetadataRegistry) is kept, not deleted, even
+// though Representation D supersedes it as the *correct* general
+// construction: C's exclusion-based limitation is now understood and
+// named rather than accidental, and deliberately keeping the more
+// restrictive representation available is useful for testing how
+// higher-level code should react when a lower layer is stricter than
+// necessary (theorystate_v0.6.md section 73's commit-time interception
+// question -- should such a restriction be enforced, ignored, or merely
+// reported?). Do not add further logic to C to "fix" it; add it here to
+// D instead.
+//
+// As with every other registry in this file, every method here
+// re-derives current state fresh from the Graph on every call, and fails
+// loudly (ErrAmbiguousPointerMetadata, ErrTooManyPointerTargets) rather
+// than silently repairing an out-of-band invariant violation.
+type PointerMetadataRegistryD struct {
+	graph              *Graph
+	allPointerMetadata NodeID
+	allSubjectSlots    NodeID
+	allTargetSlots     NodeID
+}
+
+// NewPointerMetadataRegistryD creates a PointerMetadataRegistryD over
+// graph, using allPointerMetadata to tag metadata nodes, allSubjectSlots
+// to tag subject-slot nodes, and allTargetSlots to tag target-slot nodes.
+// All three must already exist -- typically via
+// NameRegistry.BootstrapNames(FoundationalNames).
+func NewPointerMetadataRegistryD(graph *Graph, allPointerMetadata, allSubjectSlots, allTargetSlots NodeID) (*PointerMetadataRegistryD, error) {
+	if !graph.NodeExists(allPointerMetadata) {
+		return nil, ErrNodeNotFound
+	}
+
+	if !graph.NodeExists(allSubjectSlots) {
+		return nil, ErrNodeNotFound
+	}
+
+	if !graph.NodeExists(allTargetSlots) {
+		return nil, ErrNodeNotFound
+	}
+
+	return &PointerMetadataRegistryD{
+		graph:              graph,
+		allPointerMetadata: allPointerMetadata,
+		allSubjectSlots:    allSubjectSlots,
+		allTargetSlots:     allTargetSlots,
+	}, nil
+}
+
+// locate finds subject's metadata node and subject-slot node, if any,
+// via the same subject-side lookup as PointerMetadataRegistry. subject
+// must exist.
+func (m *PointerMetadataRegistryD) locate(subject NodeID) (metadata, subjectSlot NodeID, found bool, err error) {
+	return locateBySubjectSlot(m.graph, subject, m.allPointerMetadata, m.allSubjectSlots)
+}
+
+// ensureMetadata returns subject's existing metadata/subject-slot pair,
+// creating a fresh, empty one (M -> U1 -> subject, both tagged) if none
+// exists yet.
+func (m *PointerMetadataRegistryD) ensureMetadata(subject NodeID) (metadata, subjectSlot NodeID, err error) {
+	if !m.graph.NodeExists(subject) {
+		return 0, 0, ErrNodeNotFound
+	}
+
+	return ensureMetadataWithSubjectSlot(m.graph, subject, m.allPointerMetadata, m.allSubjectSlots)
+}
+
+// EnsureMetadata returns subject's metadata node, creating an empty one
+// if none exists yet.
+func (m *PointerMetadataRegistryD) EnsureMetadata(subject NodeID) (NodeID, error) {
+	metadata, _, err := m.ensureMetadata(subject)
+	return metadata, err
+}
+
+// HasMetadata reports whether subject currently has an associated
+// metadata node, regardless of whether a target has been set.
+func (m *PointerMetadataRegistryD) HasMetadata(subject NodeID) (bool, error) {
+	if !m.graph.NodeExists(subject) {
+		return false, ErrNodeNotFound
+	}
+
+	_, _, found, err := m.locate(subject)
+	return found, err
+}
+
+// targetSlot returns metadata's current target-slot child (U2), if any,
+// found by tag rather than by exclusion -- see the PointerMetadataRegistryD
+// doc comment for why this is the fix over Representation C.
+func (m *PointerMetadataRegistryD) targetSlot(metadata NodeID) (slot NodeID, found bool, err error) {
+	return findUniqueTaggedChild(m.graph, metadata, m.allTargetSlots)
+}
+
+// Target returns subject's current target via its metadata/target-slot
+// nodes, if any.
+//
+// hasTarget is false when subject has no metadata node at all, when it
+// has one with no target-slot yet, or when it has a target-slot with no
+// target set yet -- callers that need to distinguish those cases should
+// use HasMetadata and EnsureMetadata directly.
+func (m *PointerMetadataRegistryD) Target(subject NodeID) (target NodeID, hasTarget bool, err error) {
+	if !m.graph.NodeExists(subject) {
+		return 0, false, ErrNodeNotFound
+	}
+
+	metadata, _, found, err := m.locate(subject)
+	if err != nil {
+		return 0, false, err
+	}
+	if !found {
+		return 0, false, nil
+	}
+
+	slot, found, err := m.targetSlot(metadata)
+	if err != nil {
+		return 0, false, err
+	}
+	if !found {
+		return 0, false, nil
+	}
+
+	return singleChildTarget(m.graph, slot)
+}
+
+// SetTarget sets subject's target to target, creating subject's metadata
+// node and/or target-slot node first if they do not exist yet.
+//
+// Self-targeting (SetTarget(subject, subject)) is supported: U2 (the
+// target-slot) is a freshly-minted node distinct from subject, U1, and M,
+// so U2 -> target can never collide with any other relationship no
+// matter what target equals.
+func (m *PointerMetadataRegistryD) SetTarget(subject, target NodeID) error {
+	if !m.graph.NodeExists(target) {
+		return ErrNodeNotFound
+	}
+
+	metadata, _, err := m.ensureMetadata(subject)
+	if err != nil {
+		return err
+	}
+
+	slot, found, err := m.targetSlot(metadata)
+	if err != nil {
+		return err
+	}
+
+	if !found {
+		return m.graph.Transact(func(tx *Txn) error {
+			var err error
+			slot, err = tx.CreateNode()
+			if err != nil {
+				return err
+			}
+			if _, err := tx.AddRelationship(m.allTargetSlots, slot); err != nil {
+				return err
+			}
+			if _, err := tx.AddRelationship(metadata, slot); err != nil {
+				return err
+			}
+			_, err = tx.AddRelationship(slot, target)
+			return err
+		})
+	}
+
+	current, hasTarget, err := singleChildTarget(m.graph, slot)
+	if err != nil {
+		return err
+	}
+
+	if hasTarget && current == target {
+		return nil
+	}
+
+	return m.graph.Transact(func(tx *Txn) error {
+		if hasTarget {
+			if _, err := tx.RemoveRelationship(slot, current); err != nil {
+				return err
+			}
+		}
+
+		_, err := tx.AddRelationship(slot, target)
+		return err
+	})
+}
+
+// RemoveTarget clears subject's target, if any. The metadata/subject-
+// slot/target-slot nodes themselves are left in place (no cascade
+// deletion, consistent with theorystate_v0.6.md section 18's rejection of
+// deleteNodeAndRelationships); an empty target-slot -- or no target-slot
+// at all -- is a valid, meaningful state.
+func (m *PointerMetadataRegistryD) RemoveTarget(subject NodeID) (removed bool, err error) {
+	if !m.graph.NodeExists(subject) {
+		return false, ErrNodeNotFound
+	}
+
+	metadata, _, found, err := m.locate(subject)
+	if err != nil {
+		return false, err
+	}
+	if !found {
+		return false, nil
+	}
+
+	slot, found, err := m.targetSlot(metadata)
+	if err != nil {
+		return false, err
+	}
+	if !found {
+		return false, nil
+	}
+
+	target, hasTarget, err := singleChildTarget(m.graph, slot)
+	if err != nil {
+		return false, err
+	}
+	if !hasTarget {
+		return false, nil
+	}
+
+	return m.graph.RemoveRelationship(slot, target)
 }

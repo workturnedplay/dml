@@ -114,6 +114,8 @@ U represents the particular pointer relationship/role. This costs another node/t
 
 P remains the identity of the pointer while target information is stored through a separate metadata structure associated with P. This allows P's direct children to remain unconstrained by the pointer representation.
 
+Note: the general metadata construction this representation builds on (section 10 below) originally had a real bug — identifying the subject and the information node as M's only two children, distinguished by exclusion, breaks when they collide or when M later needs to grow other children. See section 10's correction and theorystate_v0.6.md section 10a. The as-implemented Representation C (`PointerMetadataRegistry` in the Go code) still has this limitation, kept deliberately for now; Representation D (`PointerMetadataRegistryD`) corrects it.
+
 These three are possible representation techniques, not three different primitive graph mechanisms.
 
 ## 8. Domain Pointers
@@ -138,16 +140,20 @@ This means a node may have many primitive children while a particular processor 
 
 ## 10. Metadata without disturbing the primary structure
 
-A node P can be described without consuming P's direct-child representation. A separate fresh intermediary can associate P with an information node, with tags indicating that the intermediary is metadata and that P is the subject.
+A node P can be described without consuming P's direct-child representation. A separate fresh intermediary (M) can associate P with an information node (I), with tags indicating each intermediary's role.
 
-Conceptually:
+**Correction (supersedes the original diagram below):** the original sketch here was `M -> P, M -> I`, identifying P and I directly as M's two children. This is wrong, not merely simplified: primitive relationships are unique pairs (section 1), so `M -> P` and `M -> I` collapse into the *same* single relationship whenever `I == P` (self-reference), silently losing the distinction between "M has a subject" and "M has an information node." The same shape of bug also appears even when `P != I`: identifying "the subject" and "the information node" as literally *M's only two children* means M can never safely acquire any other child later without breaking whichever lookup assumed there'd be exactly one remaining/excluded child. This was found and corrected during work on Pointer Representation C (section 7C); see theorystate_v0.6.md section 10a and section 75 for the general role/occurrence-identity pattern this is an instance of.
+
+Corrected conceptually:
 
 ```text
-M -> P
-M -> I
+M -> U1
+U1 -> P
+M -> U2
+U2 -> I
 ```
 
-where M identifies the metadata relationship and I contains the information.
+where M identifies the metadata relationship, U1 and U2 are fresh, uniquely-tagged intermediary nodes carrying no meaning of their own, `U1 -> P` identifies the subject, and `U2 -> I` identifies the information/target. Because U1 and U2 are each freshly minted and distinct from P, I, and each other, `U1 -> P` and `U2 -> I` can never collide, even when `I == P`. Because U1 and U2 are each discovered *by their own tag* rather than by exclusion, M remains free to carry any number of additional, unrelated children — now or added later — without disturbing subject or information discovery.
 
 This is a general construction, not merely a pointer trick.
 

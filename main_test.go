@@ -2628,3 +2628,285 @@ func TestPointerMetadataRegistrySetTargetRequiresExistingTarget(t *testing.T) {
 		t.Fatalf("SetTarget() error = %v, want %v", err, ErrNodeNotFound)
 	}
 }
+
+func newPointerMetadataDTestFixture(t *testing.T) (*Graph, *PointerMetadataRegistryD) {
+	t.Helper()
+
+	var g Graph
+	names := NewNameRegistry(&g)
+
+	ids, err := names.BootstrapNames(FoundationalNames)
+	if err != nil {
+		t.Fatalf("BootstrapNames(): %v", err)
+	}
+
+	metadata, err := NewPointerMetadataRegistryD(&g, ids[NameAllPointerMetadata], ids[NameAllPointerMetadataSubjectSlot], ids[NameAllPointerMetadataTargetSlot])
+	if err != nil {
+		t.Fatalf("NewPointerMetadataRegistryD(): %v", err)
+	}
+
+	return &g, metadata
+}
+
+func TestFoundationalNamesIncludesAllPointerMetadataTargetSlot(t *testing.T) {
+	for _, name := range FoundationalNames {
+		if name == NameAllPointerMetadataTargetSlot {
+			return
+		}
+	}
+
+	t.Fatalf("FoundationalNames %v does not include %q", FoundationalNames, NameAllPointerMetadataTargetSlot)
+}
+
+func TestNewPointerMetadataRegistryDRequiresExistingTags(t *testing.T) {
+	var g Graph
+
+	existing, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode(): %v", err)
+	}
+
+	other, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode(): %v", err)
+	}
+
+	const nonexistent NodeID = 999999
+
+	if _, err := NewPointerMetadataRegistryD(&g, nonexistent, existing, other); !errors.Is(err, ErrNodeNotFound) {
+		t.Fatalf("NewPointerMetadataRegistryD() error = %v, want %v", err, ErrNodeNotFound)
+	}
+
+	if _, err := NewPointerMetadataRegistryD(&g, existing, nonexistent, other); !errors.Is(err, ErrNodeNotFound) {
+		t.Fatalf("NewPointerMetadataRegistryD() error = %v, want %v", err, ErrNodeNotFound)
+	}
+
+	if _, err := NewPointerMetadataRegistryD(&g, existing, other, nonexistent); !errors.Is(err, ErrNodeNotFound) {
+		t.Fatalf("NewPointerMetadataRegistryD() error = %v, want %v", err, ErrNodeNotFound)
+	}
+}
+
+func TestPointerMetadataRegistryDHasMetadataFalseInitially(t *testing.T) {
+	g, metadata := newPointerMetadataDTestFixture(t)
+
+	subject, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode(): %v", err)
+	}
+
+	has, err := metadata.HasMetadata(subject)
+	if err != nil {
+		t.Fatalf("HasMetadata(): %v", err)
+	}
+	if has {
+		t.Fatal("fresh subject unexpectedly already has metadata")
+	}
+
+	_, hasTarget, err := metadata.Target(subject)
+	if err != nil {
+		t.Fatalf("Target(): %v", err)
+	}
+	if hasTarget {
+		t.Fatal("fresh subject unexpectedly has a target")
+	}
+}
+
+func TestPointerMetadataRegistryDSetTargetLeavesSubjectChildrenUntouched(t *testing.T) {
+	g, metadata := newPointerMetadataDTestFixture(t)
+
+	subject, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for subject: %v", err)
+	}
+
+	preexisting, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for preexisting: %v", err)
+	}
+
+	if _, err := g.AddRelationship(subject, preexisting); err != nil {
+		t.Fatalf("AddRelationship(subject, preexisting): %v", err)
+	}
+
+	x, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for x: %v", err)
+	}
+
+	if err := metadata.SetTarget(subject, x); err != nil {
+		t.Fatalf("SetTarget(subject, x): %v", err)
+	}
+
+	outgoing, err := g.FindOutgoing(subject)
+	if err != nil {
+		t.Fatalf("FindOutgoing(subject): %v", err)
+	}
+
+	want := []Relationship{{From: subject, To: preexisting}}
+	if !reflect.DeepEqual(outgoing, want) {
+		t.Fatalf("FindOutgoing(subject) = %v, want %v (unchanged by the pointer representation)", outgoing, want)
+	}
+
+	target, hasTarget, err := metadata.Target(subject)
+	if err != nil {
+		t.Fatalf("Target(subject): %v", err)
+	}
+	if !hasTarget || target != x {
+		t.Fatalf("Target(subject) = (%d,%v), want (%d,true)", target, hasTarget, x)
+	}
+}
+
+func TestPointerMetadataRegistryDSetTargetAllowsSelfTarget(t *testing.T) {
+	g, metadata := newPointerMetadataDTestFixture(t)
+
+	subject, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode(): %v", err)
+	}
+
+	if err := metadata.SetTarget(subject, subject); err != nil {
+		t.Fatalf("SetTarget(subject, subject): %v", err)
+	}
+
+	target, hasTarget, err := metadata.Target(subject)
+	if err != nil {
+		t.Fatalf("Target(subject): %v", err)
+	}
+	if !hasTarget || target != subject {
+		t.Fatalf("Target(subject) = (%d,%v), want (%d,true)", target, hasTarget, subject)
+	}
+}
+
+func TestPointerMetadataRegistryDSetTargetReplacesExistingTarget(t *testing.T) {
+	g, metadata := newPointerMetadataDTestFixture(t)
+
+	subject, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for subject: %v", err)
+	}
+
+	x, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for x: %v", err)
+	}
+
+	y, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for y: %v", err)
+	}
+
+	if err := metadata.SetTarget(subject, x); err != nil {
+		t.Fatalf("SetTarget(subject, x): %v", err)
+	}
+
+	if err := metadata.SetTarget(subject, y); err != nil {
+		t.Fatalf("SetTarget(subject, y): %v", err)
+	}
+
+	target, hasTarget, err := metadata.Target(subject)
+	if err != nil {
+		t.Fatalf("Target(subject): %v", err)
+	}
+	if !hasTarget || target != y {
+		t.Fatalf("Target(subject) = (%d,%v), want (%d,true)", target, hasTarget, y)
+	}
+}
+
+func TestPointerMetadataRegistryDRemoveTargetRemovesExisting(t *testing.T) {
+	g, metadata := newPointerMetadataDTestFixture(t)
+
+	subject, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for subject: %v", err)
+	}
+
+	x, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for x: %v", err)
+	}
+
+	if err := metadata.SetTarget(subject, x); err != nil {
+		t.Fatalf("SetTarget(subject, x): %v", err)
+	}
+
+	removed, err := metadata.RemoveTarget(subject)
+	if err != nil {
+		t.Fatalf("RemoveTarget(subject): %v", err)
+	}
+	if !removed {
+		t.Fatal("RemoveTarget() reported that nothing was removed")
+	}
+
+	_, hasTarget, err := metadata.Target(subject)
+	if err != nil {
+		t.Fatalf("Target(subject): %v", err)
+	}
+	if hasTarget {
+		t.Fatal("subject still has a target after RemoveTarget()")
+	}
+}
+
+func TestPointerMetadataRegistryDSetTargetRequiresExistingTarget(t *testing.T) {
+	g, metadata := newPointerMetadataDTestFixture(t)
+
+	subject, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode(): %v", err)
+	}
+
+	const nonexistent NodeID = 999999
+
+	err = metadata.SetTarget(subject, nonexistent)
+	if !errors.Is(err, ErrNodeNotFound) {
+		t.Fatalf("SetTarget() error = %v, want %v", err, ErrNodeNotFound)
+	}
+}
+
+// TestPointerMetadataRegistryDAllowsUnrelatedMetadataChildren is the key
+// test distinguishing Representation D from Representation C: M can carry
+// an arbitrary, unrelated extra child without disturbing subject/target
+// discovery, because both are found by their own tag rather than by
+// exclusion. See the PointerMetadataRegistryD doc comment.
+func TestPointerMetadataRegistryDAllowsUnrelatedMetadataChildren(t *testing.T) {
+	g, metadata := newPointerMetadataDTestFixture(t)
+
+	subject, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for subject: %v", err)
+	}
+
+	x, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for x: %v", err)
+	}
+
+	if err := metadata.SetTarget(subject, x); err != nil {
+		t.Fatalf("SetTarget(subject, x): %v", err)
+	}
+
+	m, err := metadata.EnsureMetadata(subject)
+	if err != nil {
+		t.Fatalf("EnsureMetadata(subject): %v", err)
+	}
+
+	unrelated, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for unrelated: %v", err)
+	}
+
+	// Simulate a future extension adding an arbitrary, untagged child to
+	// M. Representation C's exclusion-based target lookup would break
+	// (ErrTooManyPointerTargets) if this were done to its metadata node;
+	// Representation D must not be affected at all.
+	if _, err := g.AddRelationship(m, unrelated); err != nil {
+		t.Fatalf("AddRelationship(m, unrelated): %v", err)
+	}
+
+	target, hasTarget, err := metadata.Target(subject)
+	if err != nil {
+		t.Fatalf("Target(subject) after adding an unrelated child to M: %v", err)
+	}
+	if !hasTarget || target != x {
+		t.Fatalf("Target(subject) = (%d,%v), want (%d,true) -- unrelated child to M should not affect target discovery", target, hasTarget, x)
+	}
+}

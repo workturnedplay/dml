@@ -23,27 +23,39 @@ Completed milestones:
 5. Consolidation into main.go / main_test.go
 
 Current next task:
-- The Pointer processor (PointerRegistry) is now implemented and tested
-  (see Resolved this session, item 4): it enforces "at most one target"
-  for nodes tagged (AllPointers, P), offers both NewPointer()
-  (mint-fresh-and-tag) and TagAsPointer() (tag-existing, rejecting nodes
-  that already have 2+ children), and re-derives the invariant fresh from
-  the Graph on every call rather than caching it, so out-of-band
-  violations via raw Graph mutation are always detected loudly
-  (ErrTooManyPointerTargets) rather than silently trusted or repaired.
-- Not yet implemented: Representation B (intermediary pointer node,
-  THEORY_NOTES_FROM_CONVERSATION.md section 7B) and Representation C
-  (metadata structure, section 7C). Only Representation A (direct child)
-  exists so far. Whether/when either alternative representation is
-  actually needed is still open.
-- Also still open: whether a commit-time interception mechanism
-  (theorystate_v0.6.md section 73) should eventually replace the
-  re-check-every-call approach; not needed yet since there is exactly one
-  processor (PointerRegistry) and no concurrent mutation.
-- Add further foundational names (AllSubPointers, AllDomainPointers,
-  AllCapsules, allHEADs, allTAILs, ...) to FoundationalNames only when
-  actually starting the corresponding representation's implementation,
-  not preemptively.
+- The Pointer processor is now implemented across all four
+  representations described in THEORY_NOTES_FROM_CONVERSATION.md section
+  7 / theorystate_v0.6.md section 10 (this bullet list replaces a
+  previously stale version of itself that still claimed only
+  Representation A existed after B and C had already been completed --
+  see Resolved this session, item 8):
+  - Representation A (direct child): PointerRegistry, tagged via
+    AllPointers.
+  - Representation B (intermediary pointer node): PointerRegistry reused
+    unmodified, tagged via AllSubPointers instead (item 7; see
+    TestSubPointerReusesPointerRegistryUnderDifferentTag).
+  - Representation C (metadata structure, exclusion-based target lookup):
+    PointerMetadataRegistry, tagged via AllPointerMetadata /
+    AllPointerMetadataSubjectSlot. Deliberately kept with its known
+    exclusion-based limitation -- see its doc comment and
+    theorystate_v0.6.md section 10a -- rather than patched, since a
+    stricter-than-necessary lower layer is useful for testing higher-layer
+    reactions (section 73).
+  - Representation D (corrected metadata structure, tag-based target
+    lookup): PointerMetadataRegistryD, adding
+    AllPointerMetadataTargetSlot. This is the construction
+    THEORY_NOTES_FROM_CONVERSATION.md section 10 should have described
+    from the start; see that section's correction and
+    theorystate_v0.6.md section 10a for why Representation C's
+    exclusion-based approach doesn't generalize safely (item 8).
+- Open: whether a commit-time interception mechanism (theorystate_v0.6.md
+  section 73) should eventually replace the re-check-every-call approach
+  used by every registry above; not needed yet since there is exactly one
+  writer and no concurrent mutation.
+- Add further foundational names (AllDomainPointers, AllCapsules,
+  allHEADs, allTAILs, ...) to FoundationalNames only when actually
+  starting the corresponding representation's implementation, not
+  preemptively.
 
 After that:
 - Continue building the generic tagging machinery.
@@ -200,6 +212,46 @@ NodeID-keyed structure outside the primitive graph.
  that pre-check reasoning staying true as this code evolves.
 
 7. PointerRegistry generalized (doc-only, no code change) to cover Representation B via a second instance tagged AllSubPointers; PointerMetadataRegistry added implementing Representation C, using a subject-slot indirection node discovered during design — a naive M->subject/M->target two-edge scheme cannot represent self-targeting since the two edges would collapse into one relationship; singleChildTarget extracted from PointerRegistry.currentTarget as shared DRY logic used by both registries.
+
+
+8. Fixed a real design bug in Representation C / theory section 10, found
+ during review: identifying "the target" as literally "whichever child
+ of M isn't the tagged subject-slot" (exclusion) silently assumes M can
+ never have any other child, ever -- contradicting the construction's
+ own stated purpose of letting M grow structure later without
+ disturbing what's already there. THEORY_NOTES_FROM_CONVERSATION.md
+ section 10 has been corrected (its original "M -> P, M -> I" sketch
+ had an even sharper version of the same bug: those two relationships
+ collapse into one whenever target == subject, since primitive
+ relationships are unique pairs). Added PointerMetadataRegistryD
+ (Representation D), which gives both the subject and the target their
+ own freshly-minted, independently-tagged slot node
+ (AllPointerMetadataSubjectSlot, reused from Representation C, and the
+ new AllPointerMetadataTargetSlot), each discovered by its own tag
+ rather than by exclusion. Representation C (PointerMetadataRegistry)
+ is kept exactly as-is rather than patched or removed -- see its doc
+ comment for why the limitation is now considered a deliberate, useful
+ restriction rather than an oversight. Shared subject-slot discovery/
+ creation logic (previously living only inside PointerMetadataRegistry)
+ was factored out into locateBySubjectSlot and
+ ensureMetadataWithSubjectSlot, now used by both PointerMetadataRegistry
+ and PointerMetadataRegistryD; a new findUniqueTaggedChild helper (the
+ forward-lookup counterpart to the existing findUniqueTaggedParent) was
+ added to support D's tag-based target-slot discovery. Also corrected
+ this file's own stale "Current next task" section below, which had not
+ been updated when Representations B and C were completed (item 7) and
+ still claimed only Representation A existed. Covered by
+ TestNewPointerMetadataRegistryDRequiresExistingTags,
+ TestPointerMetadataRegistryDHasMetadataFalseInitially,
+ TestPointerMetadataRegistryDSetTargetLeavesSubjectChildrenUntouched,
+ TestPointerMetadataRegistryDSetTargetAllowsSelfTarget,
+ TestPointerMetadataRegistryDSetTargetReplacesExistingTarget,
+ TestPointerMetadataRegistryDRemoveTargetRemovesExisting,
+ TestPointerMetadataRegistryDSetTargetRequiresExistingTarget, and
+ TestPointerMetadataRegistryDAllowsUnrelatedMetadataChildren (the last
+ of which directly demonstrates the fix: adding an unrelated child to M
+ does not break Representation D's target discovery, unlike
+ Representation C's).
 
 Currently unaddressed yet:
 - No commit-time interception exists to prevent a raw

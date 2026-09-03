@@ -94,6 +94,28 @@ Optionally `(AllSets,A)`. Not established as complete.
 enforcement is a higher-layer job. See §68 for the generalized mechanism
 this implies.
 
+**§10a — Metadata role-identification must use per-role tags, not
+exclusion (correction, validated by `wtw`).** THEORY_NOTES_FROM_
+CONVERSATION.md section 7C / this section's Pointer summary both rely on
+a metadata node M distinguishing "the subject" and "the target" among M's
+children. The original sketch identified them either directly (`M -> P`,
+`M -> I`) or via one tagged child plus "whichever child remains" (as
+implemented, Representation C / `PointerMetadataRegistry`). Both are
+wrong for the same reason: identifying a role by exclusion silently
+assumes M has *exactly* the expected children and no others, which
+contradicts the construction's own stated purpose (letting M carry
+additional structure later without disturbing what's already there —
+also true of the direct `M -> P` sketch, which additionally collapses
+outright when target == subject, since primitive relationships are
+unique pairs, §2.4/§2.6). The corrected form gives *every* role its own
+freshly-minted, tag-discovered slot node (`M -> U1` tagged subject-slot
+`-> P`, `M -> U2` tagged target-slot `-> I`) — the §75 occurrence/role-
+identity pattern applied to both roles instead of one. Implemented as
+`PointerMetadataRegistryD` (Representation D) alongside the original,
+deliberately-unfixed `PointerMetadataRegistry` (Representation C), the
+latter kept as a known-stricter representation useful for testing how
+higher layers should react to an overly restrictive lower layer (§73).
+
 ## 11. Ordered Lists
 
 Higher-level than Sets; needs explicit ordering structure (head/tail/
