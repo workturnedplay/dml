@@ -2131,3 +2131,215 @@ func TestPointerRegistryDetectsOutOfBandInvariantViolation(t *testing.T) {
 		t.Fatalf("FindOutgoing(%d) = %v, want the original 2 relationships untouched", p, outgoing)
 	}
 }
+
+func TestTransactCommitsMutationsOnSuccess(t *testing.T) {
+	var g Graph
+
+	var a, b NodeID
+	err := g.Transact(func(tx *Txn) error {
+		var err error
+		a, err = tx.CreateNode()
+		if err != nil {
+			return err
+		}
+
+		b, err = tx.CreateNode()
+		if err != nil {
+			return err
+		}
+
+		_, err = tx.AddRelationship(a, b)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("Transact() returned error: %v", err)
+	}
+
+	if !g.NodeExists(a) || !g.NodeExists(b) {
+		t.Fatalf("nodes %d, %d do not both exist after successful Transact()", a, b)
+	}
+
+	if !g.HasRelationship(a, b) {
+		t.Fatalf("relationship (%d,%d) missing after successful Transact()", a, b)
+	}
+}
+
+func TestTransactRollsBackCreateNodeOnLaterFailure(t *testing.T) {
+	var g Graph
+
+	const nonexistent NodeID = 999999
+
+	var id NodeID
+	err := g.Transact(func(tx *Txn) error {
+		var err error
+		id, err = tx.CreateNode()
+		if err != nil {
+			return err
+		}
+
+		_, err = tx.AddRelationship(id, nonexistent)
+		return err
+	})
+
+	if !errors.Is(err, ErrNodeNotFound) {
+		t.Fatalf("Transact() error = %v, want %v", err, ErrNodeNotFound)
+	}
+
+	if g.NodeExists(id) {
+		t.Fatalf("node %d still exists after its creating transaction rolled back", id)
+	}
+}
+
+func TestTransactRollsBackRelationshipsInLIFOOrder(t *testing.T) {
+	var g Graph
+
+	a, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for a: %v", err)
+	}
+
+	b, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for b: %v", err)
+	}
+
+	c, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for c: %v", err)
+	}
+
+	const nonexistent NodeID = 999999
+
+	err = g.Transact(func(tx *Txn) error {
+		if _, err := tx.AddRelationship(a, b); err != nil {
+			return err
+		}
+
+		if _, err := tx.AddRelationship(a, c); err != nil {
+			return err
+		}
+
+		_, err := tx.AddRelationship(a, nonexistent)
+		return err
+	})
+
+	if !errors.Is(err, ErrNodeNotFound) {
+		t.Fatalf("Transact() error = %v, want %v", err, ErrNodeNotFound)
+	}
+
+	if g.HasRelationship(a, b) {
+		t.Fatalf("relationship (%d,%d) survived a rolled-back transaction", a, b)
+	}
+
+	if g.HasRelationship(a, c) {
+		t.Fatalf("relationship (%d,%d) survived a rolled-back transaction", a, c)
+	}
+}
+
+func TestTransactRollsBackRemoveRelationshipOnLaterFailure(t *testing.T) {
+	var g Graph
+
+	a, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for a: %v", err)
+	}
+
+	b, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for b: %v", err)
+	}
+
+	if _, err := g.AddRelationship(a, b); err != nil {
+		t.Fatalf("AddRelationship(%d,%d): %v", a, b, err)
+	}
+
+	const nonexistent NodeID = 999999
+
+	err = g.Transact(func(tx *Txn) error {
+		if _, err := tx.RemoveRelationship(a, b); err != nil {
+			return err
+		}
+
+		_, err := tx.AddRelationship(a, nonexistent)
+		return err
+	})
+
+	if !errors.Is(err, ErrNodeNotFound) {
+		t.Fatalf("Transact() error = %v, want %v", err, ErrNodeNotFound)
+	}
+
+	if !g.HasRelationship(a, b) {
+		t.Fatalf("relationship (%d,%d) was not restored after rollback", a, b)
+	}
+}
+
+func TestTransactDoesNotUndoPreexistingRelationship(t *testing.T) {
+	var g Graph
+
+	a, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for a: %v", err)
+	}
+
+	b, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for b: %v", err)
+	}
+
+	if _, err := g.AddRelationship(a, b); err != nil {
+		t.Fatalf("AddRelationship(%d,%d): %v", a, b, err)
+	}
+
+	const nonexistent NodeID = 999999
+
+	err = g.Transact(func(tx *Txn) error {
+		// (a,b) already exists, so this call reports created == false and
+		// must not schedule an undo step for a relationship this
+		// transaction did not itself create.
+		created, err := tx.AddRelationship(a, b)
+		if err != nil {
+			return err
+		}
+		if created {
+			t.Fatal("AddRelationship() reported creating an already-existing relationship")
+		}
+
+		_, err = tx.AddRelationship(a, nonexistent)
+		return err
+	})
+
+	if !errors.Is(err, ErrNodeNotFound) {
+		t.Fatalf("Transact() error = %v, want %v", err, ErrNodeNotFound)
+	}
+
+	if !g.HasRelationship(a, b) {
+		t.Fatalf("preexisting relationship (%d,%d) was incorrectly removed by rollback", a, b)
+	}
+}
+
+func TestTransactRollsBackOnPanic(t *testing.T) {
+	var g Graph
+	var id NodeID
+
+	func() {
+		defer func() {
+			if r := recover(); r == nil {
+				t.Fatal("expected panic to propagate out of Transact()")
+			}
+		}()
+
+		_ = g.Transact(func(tx *Txn) error {
+			var err error
+			id, err = tx.CreateNode()
+			if err != nil {
+				t.Fatalf("CreateNode(): %v", err)
+			}
+
+			panic("boom")
+		})
+	}()
+
+	if g.NodeExists(id) {
+		t.Fatalf("node %d still exists after a panicking transaction", id)
+	}
+}

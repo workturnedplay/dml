@@ -4,12 +4,15 @@ Current implementation:
 - Toy implementation in Go 1.27.
 - Implementation consolidated into main.go and main_test.go.
 - Primitive Graph implemented and tested.
+- Graph.Transact / Txn implemented and tested, giving failure-atomicity
+  (not concurrency isolation) to multi-step primitive operations.
 - RootGraph implemented and tested.
 - PointerRegistry implemented and tested, enforcing the Pointer invariant
   (at most one target) for nodes tagged (AllPointers, P), per
   THEORY_NOTES_FROM_CONVERSATION.md section 7 / theorystate_v0.6.md
-  section 10.
-- Named nodes use an external name -> NodeID registry.
+  section 10. Its multi-step operations run inside Graph.Transact.
+- Named nodes use an external name -> NodeID registry. Its
+  CreateNamedNode also runs inside Graph.Transact.
 - ROOT is a real NodeID with special semantics only in RootGraph.
 
 Completed milestones:
@@ -125,11 +128,15 @@ NodeID-keyed structure outside the primitive graph.
  fails loudly with ErrTooManyPointerTargets and makes no changes, rather
  than silently repairing or silently trusting stale expectations. This
  mirrors the fail-loud-not-silently-repair discipline already used for
- ErrNameBoundToDeletedNode in NameRegistry. Multi-step operations
- (SetTarget's remove-then-add) are not atomic against interleaved external
- mutation; this is an accepted, pre-existing gap shared with
- NameRegistry.CreateNamedNode, not a new one — true transactional grouping
- is theorystate_v0.6.md section 14/45, both still OPEN. Covered by
+ ErrNameBoundToDeletedNode in NameRegistry. Multi-step operations (SetTarget's replace path, NewPointer's
+ create-then-tag) now run inside Graph.Transact (see item 6 below), so a
+ later step failing undoes an earlier step's mutation instead of leaving
+ orphaned or half-changed state; this closes what was originally an
+ accepted, pre-existing gap shared with NameRegistry.CreateNamedNode.
+ Graph.Transact provides failure-atomicity only, not concurrency
+ isolation -- true first-class multi-primitive-operation transactions as
+ a graph concept remain theorystate_v0.6.md section 14/45, both still
+ OPEN. Covered by
  TestNewPointerRegistryRequiresExistingAllPointers,
  TestPointerRegistryNewPointerStartsEmpty,
  TestPointerRegistrySetTargetAddsFirstTarget,
@@ -156,10 +163,53 @@ NodeID-keyed structure outside the primitive graph.
  TestRootDoesNotPointToItself, and others) still cover both the
  to == root and to != root cases and continue to pass.
 
+6. Added Graph.Transact(func(tx *Txn) error) error and the accompanying
+ Txn type, giving failure-atomicity to multi-step primitive operations:
+ if the function passed to Transact returns an error or panics, every
+ mutation performed through tx is undone, in reverse (LIFO) order,
+ before the error/panic propagates. This closes a real, previously
+ unaddressed gap: NameRegistry.CreateNamedNode's CreateNode-then-Bind
+ and PointerRegistry's CreateNode-then-tag / remove-then-add sequences
+ all used to commit each step immediately and unconditionally, so a
+ later step failing after an earlier one had already succeeded could
+ leave a node created-but-unnamed, or a Pointer left targetless because
+ its old target was removed before the new one could be added. Both
+ NameRegistry.CreateNamedNode and PointerRegistry.NewPointer/SetTarget
+ now run their multi-step sequences through Graph.Transact.
+ Txn deliberately provides failure-atomicity only, not isolation from
+ concurrent access -- nothing currently runs concurrently
+ (theorystate_v0.6.md section 19), so this was not attempted. Txn also
+ does not support undoing DeleteNode (would require resurrecting a
+ specific NodeID outside the normal monotonic counter -- deferred until
+ an actual caller needs it) and is not designed to nest
+ (theorystate_v0.6.md section 45, still OPEN). Covered by
+ TestTransactCommitsMutationsOnSuccess,
+ TestTransactRollsBackCreateNodeOnLaterFailure,
+ TestTransactRollsBackRelationshipsInLIFOOrder,
+ TestTransactRollsBackRemoveRelationshipOnLaterFailure,
+ TestTransactDoesNotUndoPreexistingRelationship, and
+ TestTransactRollsBackOnPanic. Note: through today's public API, the
+ specific failure points these tests protect against (Bind failing after
+ CreateNode; AddRelationship failing after RemoveRelationship or after
+ CreateNode) are not actually reachable by NameRegistry/PointerRegistry
+ callers, since each has its own pre-check that already guarantees the
+ later step will succeed -- so the direct proof of Txn's rollback
+ behavior lives in the Txn-level tests above, not in a forced-failure
+ integration test through NameRegistry or PointerRegistry. The
+ protection is still real and intentional: it removes the dependency on
+ that pre-check reasoning staying true as this code evolves.
+
 Currently unaddressed yet:
 - No commit-time interception exists to prevent a raw
   Graph.AddRelationship from creating a second child on an
   already-tagged Pointer node in the first place; PointerRegistry can
   only detect the violation after the fact, on its next call for that
-  node (see item 4 above and theorystate_v0.6.md section 73).
-  Whether/when a real interception mechanism is worth building is open.
+  node (see item 4 above and theorystate_v0.6.md section 73). This is a
+  different concern from item 6's Txn: Txn makes a registry's own
+  multi-step sequence atomic against its own later failure; it does
+  nothing to stop an unrelated caller from bypassing the registry
+  entirely via the raw Graph. Whether/when a real interception mechanism
+  (theorystate_v0.6.md section 73) is worth building is open.
+- Txn does not support transactional DeleteNode, and does not support
+  nesting one Graph.Transact call inside another. Neither is needed by
+  any current caller; add support if and when one actually needs it.

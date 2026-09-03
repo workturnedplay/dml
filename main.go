@@ -264,6 +264,174 @@ func (g *Graph) nodeExists(id NodeID) bool {
 	return exists
 }
 
+// Txn groups a sequence of primitive Graph mutations so that, if the
+// function passed to Graph.Transact returns a non-nil error or panics,
+// every mutation performed through tx during that call is undone, in
+// reverse order, before the error (or panic) propagates to the caller.
+//
+// Txn exists to close a real gap: several higher-level operations
+// elsewhere in this file are naturally multi-step (NameRegistry.
+// CreateNamedNode is CreateNode-then-Bind; PointerRegistry.SetTarget's
+// replace path is RemoveRelationship-then-AddRelationship;
+// PointerRegistry.NewPointer is CreateNode-then-AddRelationship). Before
+// Txn existed, each step committed immediately and unconditionally, so a
+// later step failing after an earlier step had already succeeded left
+// permanently orphaned or inconsistent state -- for example, a node
+// created but never named, or a Pointer left with no target at all
+// because its old target was removed before the new one could be added.
+// Txn's undo log makes each such sequence atomic with respect to failure.
+//
+// Txn deliberately does NOT provide isolation from concurrent access.
+// The toy implementation is single-threaded/serialized
+// (theorystate_v0.6.md section 19); nothing can observe a Txn's
+// intermediate state mid-sequence today because nothing else runs
+// between two statements in the same synchronous call. Should real
+// concurrency be introduced later, Txn as written here would need real
+// locking/isolation on top -- that is a separate, still-open problem
+// (theorystate_v0.6.md section 19), not one Txn tries to solve.
+//
+// Txn also does NOT provide durability/crash-atomicity: there is no
+// persistence layer yet, so a process crash mid-transaction is not a
+// concern this version needs to handle.
+//
+// Txn is intentionally not a staged/copy-on-write view of the graph
+// (theorystate_v0.6.md section 15's "transaction overlay" idea). Each Txn
+// method applies its mutation directly to the real underlying Graph and
+// simply records how to undo it; this is significantly simpler than a
+// full overlay and is sufficient because, per the isolation point above,
+// there is currently no concurrent reader that a staged view would need
+// to protect from seeing uncommitted state.
+//
+// Txn's mutating surface deliberately covers only what current callers
+// need: CreateNode, AddRelationship, and RemoveRelationship. Txn does not
+// offer a DeleteNode method: undoing a delete would require resurrecting
+// the exact same NodeID outside the normal monotonic counter, which is a
+// real design question of its own (see the never-reuse policy discussion
+// around ErrNodeIDExhausted) and is deferred until an actual caller needs
+// a transactional delete. Read operations are not wrapped either, since
+// every current caller already holds a reference to the underlying Graph
+// (or NameRegistry/PointerRegistry wrapping one) for reads; add
+// read-passthrough methods here if and when a caller actually needs them
+// (theorystate_v0.6.md section 7's construct-only-what's-needed
+// discipline).
+//
+// Nesting one Graph.Transact call inside another is not currently
+// supported or used by anything in this file: an inner Txn has its own
+// independent undo log and knows nothing about an enclosing one. Genuine
+// nested-transaction semantics are theorystate_v0.6.md section 45, still
+// OPEN; do not rely on nesting until that is deliberately designed.
+type Txn struct {
+	graph *Graph
+	undo  []func()
+}
+
+// Transact runs fn against a fresh Txn wrapping g. If fn returns a
+// non-nil error, every mutation fn performed through tx is undone, in
+// reverse order, and that same error is returned. If fn panics, the same
+// undo happens before the panic is re-raised, so a panicking caller does
+// not leave g in a partially mutated state either. If fn returns nil,
+// Transact simply returns nil; because every Txn method already applies
+// its mutation directly to g as it happens, there is no separate "commit"
+// step -- succeeding is simply not rolling back.
+func (g *Graph) Transact(fn func(tx *Txn) error) (err error) {
+	tx := &Txn{graph: g}
+
+	defer func() {
+		if r := recover(); r != nil {
+			tx.rollback()
+			panic(r)
+		}
+	}()
+
+	err = fn(tx)
+	if err != nil {
+		tx.rollback()
+	}
+
+	return err
+}
+
+// rollback undoes every mutation recorded on tx so far, in reverse
+// (LIFO) order. Reverse order matters: for example, if tx created a node
+// and then added a relationship from it, rolling back the relationship
+// first leaves the node empty, so rolling back the node's creation
+// (DeleteNode) afterward is guaranteed to satisfy DeleteNode's
+// no-relationships precondition (see the Graph.DeleteNode doc comment).
+// Undoing in the opposite order would risk DeleteNode failing with
+// ErrNodeNotEmpty.
+func (tx *Txn) rollback() {
+	for i := len(tx.undo) - 1; i >= 0; i-- {
+		tx.undo[i]()
+	}
+	tx.undo = nil
+}
+
+// CreateNode behaves exactly like Graph.CreateNode, additionally
+// recording an undo step that deletes the new node again if the
+// enclosing transaction rolls back.
+func (tx *Txn) CreateNode() (NodeID, error) {
+	id, err := tx.graph.CreateNode()
+	if err != nil {
+		return 0, err
+	}
+
+	tx.undo = append(tx.undo, func() {
+		// By the time this runs (see rollback's LIFO ordering), any
+		// relationships involving id that this same transaction added
+		// have already been undone, so id should be empty and this
+		// delete should succeed. If something outside this transaction
+		// mutated id in the meantime -- which nothing in this file
+		// currently does -- this best-effort delete may fail; that
+		// failure is deliberately swallowed here since Txn's rollback
+		// has no error return of its own to report it through, and a
+		// caller misusing Txn this way is a bug in the caller, not
+		// something Txn can prevent by construction.
+		_ = tx.graph.DeleteNode(id)
+	})
+
+	return id, nil
+}
+
+// AddRelationship behaves exactly like Graph.AddRelationship,
+// additionally recording an undo step that removes the relationship
+// again if the enclosing transaction rolls back -- but only if this call
+// actually created it. If (a,b) already existed before this call
+// (created == false), there is nothing for this call to undo: the
+// relationship was not this transaction's to remove.
+func (tx *Txn) AddRelationship(a, b NodeID) (created bool, err error) {
+	created, err = tx.graph.AddRelationship(a, b)
+	if err != nil {
+		return false, err
+	}
+
+	if created {
+		tx.undo = append(tx.undo, func() {
+			_, _ = tx.graph.RemoveRelationship(a, b)
+		})
+	}
+
+	return created, nil
+}
+
+// RemoveRelationship behaves exactly like Graph.RemoveRelationship,
+// additionally recording an undo step that re-adds the relationship
+// again if the enclosing transaction rolls back -- but only if this call
+// actually removed it, symmetric with AddRelationship above.
+func (tx *Txn) RemoveRelationship(a, b NodeID) (removed bool, err error) {
+	removed, err = tx.graph.RemoveRelationship(a, b)
+	if err != nil {
+		return false, err
+	}
+
+	if removed {
+		tx.undo = append(tx.undo, func() {
+			_, _ = tx.graph.AddRelationship(a, b)
+		})
+	}
+
+	return removed, nil
+}
+
 var (
 	ErrNameAlreadyBound = errors.New("name is already bound")
 	ErrNodeAlreadyNamed = errors.New("node already has a name")
@@ -395,6 +563,17 @@ func (r *NameRegistry) Bind(name string, id NodeID) error {
 // longer exists (see lookupLive), ErrNameBoundToDeletedNode is returned
 // instead, since that is a different, more serious problem than an
 // ordinary already-bound name.
+//
+// Node creation and binding happen inside a Graph.Transact call: if Bind
+// were ever to fail after CreateNode had already succeeded, the freshly
+// created node would otherwise be left permanently orphaned (existing in
+// the graph but never reachable through any name). Transact makes the two
+// steps atomic with respect to that failure. In today's implementation
+// this specific failure is not actually reachable through the public API
+// -- CreateNamedNode's own lookupLive check above already guarantees
+// Bind's checks will pass -- but wrapping it in Transact costs nothing
+// and removes the dependency on that reasoning staying true as this code
+// evolves.
 func (r *NameRegistry) CreateNamedNode(name string) (NodeID, error) {
 	if _, bound, err := r.lookupLive(name); err != nil {
 		return 0, err
@@ -402,12 +581,18 @@ func (r *NameRegistry) CreateNamedNode(name string) (NodeID, error) {
 		return 0, ErrNameAlreadyBound
 	}
 
-	id, err := r.graph.CreateNode()
-	if err != nil {
-		return 0, err
-	}
+	var id NodeID
 
-	if err := r.Bind(name, id); err != nil {
+	err := r.graph.Transact(func(tx *Txn) error {
+		var err error
+		id, err = tx.CreateNode()
+		if err != nil {
+			return err
+		}
+
+		return r.Bind(name, id)
+	})
+	if err != nil {
 		return 0, err
 	}
 
@@ -849,14 +1034,18 @@ var (
 // does, "always re-check, never cache" is the deliberate accepted
 // boundary of this registry.
 //
-// Multi-step PointerRegistry operations (SetTarget's remove-then-add) are
-// not atomic against concurrent or interleaved external Graph mutation.
-// This is an existing, already-accepted gap shared with
-// NameRegistry.CreateNamedNode (whose CreateNode-then-Bind is equally
-// non-atomic) -- true transactional grouping of multiple primitive
-// operations is theorystate_v0.6.md section 14/45, both still OPEN.
-// PointerRegistry does not attempt to solve that problem; it simply does
-// not make it worse.
+// Multi-step PointerRegistry operations (SetTarget's replace path,
+// NewPointer's create-then-tag) run inside Graph.Transact: if a later
+// step fails, an earlier step's mutation is undone rather than left
+// committed, so e.g. a failed SetTarget can never leave a Pointer looking
+// like it lost its old target without gaining the new one. See the Txn
+// doc comment for exactly what this does and does not guarantee -- in
+// particular, it is failure-atomicity, not isolation from concurrent
+// access; true multi-primitive-operation transactional grouping as a
+// first-class graph concept is still theorystate_v0.6.md section 14/45,
+// OPEN. What exists here is the minimum needed to stop PointerRegistry's
+// own multi-step operations from corrupting state on failure, not a
+// general transaction feature.
 type PointerRegistry struct {
 	graph       *Graph
 	allPointers NodeID
@@ -965,18 +1154,20 @@ func (p *PointerRegistry) SetTarget(id, target NodeID) error {
 		return ErrNodeNotFound
 	}
 
-	if hasTarget {
-		if current == target {
-			return nil
-		}
-
-		if _, err := p.graph.RemoveRelationship(id, current); err != nil {
-			return err
-		}
+	if hasTarget && current == target {
+		return nil
 	}
 
-	_, err = p.graph.AddRelationship(id, target)
-	return err
+	return p.graph.Transact(func(tx *Txn) error {
+		if hasTarget {
+			if _, err := tx.RemoveRelationship(id, current); err != nil {
+				return err
+			}
+		}
+
+		_, err := tx.AddRelationship(id, target)
+		return err
+	})
 }
 
 // RemoveTarget clears P's target, if any.
@@ -1005,13 +1196,26 @@ func (p *PointerRegistry) RemoveTarget(id NodeID) (removed bool, err error) {
 // Because the node is freshly created, it has zero relationships and
 // therefore trivially satisfies the Pointer invariant -- unlike
 // TagAsPointer, no invariant check is needed here.
+//
+// The create and tag steps run inside Graph.Transact: if tagging were
+// ever to fail after the node had already been created, the node would
+// otherwise be left orphaned -- it would exist but never be discoverable
+// as a Pointer. See the Txn doc comment and the PointerRegistry doc
+// comment above for what this atomicity does and does not cover.
 func (p *PointerRegistry) NewPointer() (NodeID, error) {
-	id, err := p.graph.CreateNode()
-	if err != nil {
-		return 0, err
-	}
+	var id NodeID
 
-	if _, err := p.graph.AddRelationship(p.allPointers, id); err != nil {
+	err := p.graph.Transact(func(tx *Txn) error {
+		var err error
+		id, err = tx.CreateNode()
+		if err != nil {
+			return err
+		}
+
+		_, err = tx.AddRelationship(p.allPointers, id)
+		return err
+	})
+	if err != nil {
 		return 0, err
 	}
 
