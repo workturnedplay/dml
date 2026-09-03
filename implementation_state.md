@@ -85,12 +85,11 @@ After that:
   intermediary slots are each discovered through their own role tag
   rather than by child position.
 
-  Not yet implemented: the list node itself (list membership tagging,
-  analogous to AllElementCapsules but one level up), head/tail
-  bookkeeping (AllHEADs/AllTAILs tags on capsules, per the discussion
-  recorded in item 10), and list-level operations (append, prepend,
-  insert-after, remove) that compose CapsuleRegistry's per-capsule
-  operations plus head/tail retagging into single atomic Transact calls.
+  The list node itself, head/tail bookkeeping (AllHeads/AllTails tags,
+  per the discussion recorded in item 10), and list-level append/
+  prepend/insert-after are now implemented as ListRegistry (item 11).
+  Not yet implemented: removing a capsule from a list, and deleting a
+  list itself.
 - Do not prematurely implement Set/List semantics in the primitive layer,
   regardless of which is chosen -- they remain higher-layer constructions,
   per the same discipline that kept Pointer semantics entirely out of
@@ -349,6 +348,54 @@ NodeID-keyed structure outside the primitive graph.
  Representation C/D's subject/target collision, since (AllHEADs, X) and
  (AllTAILs, X) are already two distinct relationships even when the same
  capsule X is currently both head and tail.
+
+11. Added ListRegistry, implementing Ordered Lists
+ (THEORY_NOTES_FROM_CONVERSATION.md section 11 / theorystate_v0.6.md
+ section 11) on top of CapsuleRegistry (item 10). A list is an ordinary
+ node tagged (AllLists, list). List membership is the ordinary
+ (list, capsule) containment edge combined with the capsule's own
+ (AllElementCapsules, capsule) tag -- a list's direct children are not
+ assumed to all be capsules, per the existing tagging discipline.
+
+ Head and tail are plain tags on a capsule -- (AllHeads, capsule) /
+ (AllTails, capsule) -- discovered via findUniqueTaggedChild, not a
+ further Pointer-style slot indirection: unlike Representation C/D's
+ subject/target, which share the same source node and can therefore
+ collide, AllHeads and AllTails are different sources and so can never
+ collide even when the same capsule is simultaneously both head and
+ tail (the normal state for a single-element list). Named AllHeads/
+ AllTails (PascalCase, consistent with every other tag name in this
+ file) rather than reproducing the theory docs' illustrative
+ allHEADs/allTAILs styling verbatim.
+
+ Append/Prepend/InsertAfter each run entirely inside one Graph.Transact
+ call. This required extending the txOps composability work from item
+ 10 one level further: CapsuleRegistry gained a tx-composable
+ newCapsuleTx (built on a new free function, buildCapsuleTx, since the
+ previous newCapsuleTx name was already a method) and setPrevTx/
+ setNextTx (built on a new singleChildTargetSetTx helper, the
+ tx-composable counterpart of PointerRegistry.SetTarget's read-current/
+ idempotency-check/replace sequence) -- so ListRegistry can mint a
+ capsule and rewire its slots as steps of its own enclosing transaction
+ without nesting Graph.Transact calls. CapsuleRegistry.NewCapsule itself
+ was refactored to call the new newCapsuleTx, with no behavior change.
+
+ Elements(list) is a read-only convenience traversing head-to-tail via
+ the existing Head/Next/Value methods; it adds no new graph structure.
+
+ Covered by TestFoundationalNamesIncludesListNames,
+ TestNewListRegistryRequiresExistingTags,
+ TestNewListTagsListAndStartsEmpty,
+ TestListAppendSingleElementIsHeadAndTail,
+ TestListAppendMultipleMaintainsOrder, TestListPrependAddsAtFront,
+ TestListInsertAfterMiddle, TestListInsertAfterTailUpdatesTail,
+ TestListInsertAfterRequiresCapsuleInList, and
+ TestListOperationsRequireListTag.
+
+ Not yet implemented: removing a capsule from a list (unlinking,
+ re-relinking neighbors, adjusting head/tail -- without cascading into
+ node deletion, per theorystate_v0.6.md section 18's rejection of
+ automatic cascade delete) and deleting a list itself.
 
 Currently unaddressed yet:
 - No commit-time interception exists to prevent a raw

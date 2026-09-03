@@ -3170,3 +3170,405 @@ func TestCapsuleOperationsRequireCapsuleTag(t *testing.T) {
 		t.Fatalf("Next() error = %v, want %v", err, ErrNotCapsule)
 	}
 }
+
+func newListTestFixture(t *testing.T) (*Graph, *CapsuleRegistry, *ListRegistry) {
+	t.Helper()
+
+	var g Graph
+	names := NewNameRegistry(&g)
+
+	ids, err := names.BootstrapNames(FoundationalNames)
+	if err != nil {
+		t.Fatalf("BootstrapNames(): %v", err)
+	}
+
+	capsules, err := NewCapsuleRegistry(
+		&g,
+		ids[NameAllElementCapsules],
+		ids[NameAllElementCapsulePrevSlot],
+		ids[NameAllElementCapsuleValueSlot],
+		ids[NameAllElementCapsuleNextSlot],
+	)
+	if err != nil {
+		t.Fatalf("NewCapsuleRegistry(): %v", err)
+	}
+
+	lists, err := NewListRegistry(&g, capsules, ids[NameAllLists], ids[NameAllHeads], ids[NameAllTails])
+	if err != nil {
+		t.Fatalf("NewListRegistry(): %v", err)
+	}
+
+	return &g, capsules, lists
+}
+
+func TestFoundationalNamesIncludesListNames(t *testing.T) {
+	want := []string{NameAllLists, NameAllHeads, NameAllTails}
+
+	for _, name := range want {
+		found := false
+		for _, got := range FoundationalNames {
+			if got == name {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("FoundationalNames %v does not include %q", FoundationalNames, name)
+		}
+	}
+}
+
+func TestNewListRegistryRequiresExistingTags(t *testing.T) {
+	var g Graph
+	names := NewNameRegistry(&g)
+
+	ids, err := names.BootstrapNames(FoundationalNames)
+	if err != nil {
+		t.Fatalf("BootstrapNames(): %v", err)
+	}
+
+	capsules, err := NewCapsuleRegistry(
+		&g,
+		ids[NameAllElementCapsules],
+		ids[NameAllElementCapsulePrevSlot],
+		ids[NameAllElementCapsuleValueSlot],
+		ids[NameAllElementCapsuleNextSlot],
+	)
+	if err != nil {
+		t.Fatalf("NewCapsuleRegistry(): %v", err)
+	}
+
+	const nonexistent NodeID = 999999
+	existing := ids[NameAllLists]
+
+	if _, err := NewListRegistry(&g, capsules, nonexistent, existing, existing); !errors.Is(err, ErrNodeNotFound) {
+		t.Fatalf("NewListRegistry() error = %v, want %v", err, ErrNodeNotFound)
+	}
+
+	if _, err := NewListRegistry(&g, capsules, existing, nonexistent, existing); !errors.Is(err, ErrNodeNotFound) {
+		t.Fatalf("NewListRegistry() error = %v, want %v", err, ErrNodeNotFound)
+	}
+
+	if _, err := NewListRegistry(&g, capsules, existing, existing, nonexistent); !errors.Is(err, ErrNodeNotFound) {
+		t.Fatalf("NewListRegistry() error = %v, want %v", err, ErrNodeNotFound)
+	}
+}
+
+func TestNewListTagsListAndStartsEmpty(t *testing.T) {
+	g, _, lists := newListTestFixture(t)
+
+	list, err := lists.NewList()
+	if err != nil {
+		t.Fatalf("NewList(): %v", err)
+	}
+
+	if !g.NodeExists(list) {
+		t.Fatalf("NewList() returned NodeID %d that does not exist", list)
+	}
+
+	if !lists.IsList(list) {
+		t.Fatalf("NewList() did not tag %d as a list", list)
+	}
+
+	if _, hasHead, err := lists.Head(list); err != nil {
+		t.Fatalf("Head(%d): %v", list, err)
+	} else if hasHead {
+		t.Fatalf("fresh list %d unexpectedly has a head", list)
+	}
+
+	if _, hasTail, err := lists.Tail(list); err != nil {
+		t.Fatalf("Tail(%d): %v", list, err)
+	} else if hasTail {
+		t.Fatalf("fresh list %d unexpectedly has a tail", list)
+	}
+
+	elements, err := lists.Elements(list)
+	if err != nil {
+		t.Fatalf("Elements(%d): %v", list, err)
+	}
+	if len(elements) != 0 {
+		t.Fatalf("Elements(%d) = %v, want empty", list, elements)
+	}
+}
+
+func TestListAppendSingleElementIsHeadAndTail(t *testing.T) {
+	g, _, lists := newListTestFixture(t)
+
+	list, err := lists.NewList()
+	if err != nil {
+		t.Fatalf("NewList(): %v", err)
+	}
+
+	value, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for value: %v", err)
+	}
+
+	capsule, err := lists.Append(list, value)
+	if err != nil {
+		t.Fatalf("Append(): %v", err)
+	}
+
+	head, hasHead, err := lists.Head(list)
+	if err != nil {
+		t.Fatalf("Head(%d): %v", list, err)
+	}
+	if !hasHead || head != capsule {
+		t.Fatalf("Head(%d) = (%d,%v), want (%d,true)", list, head, hasHead, capsule)
+	}
+
+	tail, hasTail, err := lists.Tail(list)
+	if err != nil {
+		t.Fatalf("Tail(%d): %v", list, err)
+	}
+	if !hasTail || tail != capsule {
+		t.Fatalf("Tail(%d) = (%d,%v), want (%d,true)", list, tail, hasTail, capsule)
+	}
+}
+
+func TestListAppendMultipleMaintainsOrder(t *testing.T) {
+	g, _, lists := newListTestFixture(t)
+
+	list, err := lists.NewList()
+	if err != nil {
+		t.Fatalf("NewList(): %v", err)
+	}
+
+	var values []NodeID
+	for i := 0; i < 3; i++ {
+		v, err := g.CreateNode()
+		if err != nil {
+			t.Fatalf("CreateNode() for value %d: %v", i, err)
+		}
+		values = append(values, v)
+
+		if _, err := lists.Append(list, v); err != nil {
+			t.Fatalf("Append(%d): %v", v, err)
+		}
+	}
+
+	got, err := lists.Elements(list)
+	if err != nil {
+		t.Fatalf("Elements(%d): %v", list, err)
+	}
+
+	if !reflect.DeepEqual(got, values) {
+		t.Fatalf("Elements(%d) = %v, want %v", list, got, values)
+	}
+
+	tail, hasTail, err := lists.Tail(list)
+	if err != nil {
+		t.Fatalf("Tail(%d): %v", list, err)
+	}
+	lastValue, _, err := lists.capsules.Value(tail)
+	if err != nil {
+		t.Fatalf("Value(tail): %v", err)
+	}
+	if !hasTail || lastValue != values[len(values)-1] {
+		t.Fatalf("tail capsule's value = %d, want %d", lastValue, values[len(values)-1])
+	}
+}
+
+func TestListPrependAddsAtFront(t *testing.T) {
+	g, _, lists := newListTestFixture(t)
+
+	list, err := lists.NewList()
+	if err != nil {
+		t.Fatalf("NewList(): %v", err)
+	}
+
+	a, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for a: %v", err)
+	}
+	b, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for b: %v", err)
+	}
+
+	if _, err := lists.Append(list, a); err != nil {
+		t.Fatalf("Append(a): %v", err)
+	}
+	if _, err := lists.Prepend(list, b); err != nil {
+		t.Fatalf("Prepend(b): %v", err)
+	}
+
+	got, err := lists.Elements(list)
+	if err != nil {
+		t.Fatalf("Elements(%d): %v", list, err)
+	}
+
+	want := []NodeID{b, a}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("Elements(%d) = %v, want %v", list, got, want)
+	}
+
+	head, hasHead, err := lists.Head(list)
+	if err != nil {
+		t.Fatalf("Head(%d): %v", list, err)
+	}
+	headValue, _, _ := lists.capsules.Value(head)
+	if !hasHead || headValue != b {
+		t.Fatalf("head value = %d, want %d", headValue, b)
+	}
+}
+
+func TestListInsertAfterMiddle(t *testing.T) {
+	g, _, lists := newListTestFixture(t)
+
+	list, err := lists.NewList()
+	if err != nil {
+		t.Fatalf("NewList(): %v", err)
+	}
+
+	a, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for a: %v", err)
+	}
+	c, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for c: %v", err)
+	}
+	b, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for b: %v", err)
+	}
+
+	capsuleA, err := lists.Append(list, a)
+	if err != nil {
+		t.Fatalf("Append(a): %v", err)
+	}
+	if _, err := lists.Append(list, c); err != nil {
+		t.Fatalf("Append(c): %v", err)
+	}
+
+	if _, err := lists.InsertAfter(list, capsuleA, b); err != nil {
+		t.Fatalf("InsertAfter(capsuleA, b): %v", err)
+	}
+
+	got, err := lists.Elements(list)
+	if err != nil {
+		t.Fatalf("Elements(%d): %v", list, err)
+	}
+
+	want := []NodeID{a, b, c}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("Elements(%d) = %v, want %v", list, got, want)
+	}
+
+	tail, hasTail, err := lists.Tail(list)
+	if err != nil {
+		t.Fatalf("Tail(%d): %v", list, err)
+	}
+	tailValue, _, _ := lists.capsules.Value(tail)
+	if !hasTail || tailValue != c {
+		t.Fatalf("tail value = %d, want %d (tail should be unaffected by a middle insert)", tailValue, c)
+	}
+}
+
+func TestListInsertAfterTailUpdatesTail(t *testing.T) {
+	g, _, lists := newListTestFixture(t)
+
+	list, err := lists.NewList()
+	if err != nil {
+		t.Fatalf("NewList(): %v", err)
+	}
+
+	a, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for a: %v", err)
+	}
+	b, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for b: %v", err)
+	}
+
+	capsuleA, err := lists.Append(list, a)
+	if err != nil {
+		t.Fatalf("Append(a): %v", err)
+	}
+
+	capsuleB, err := lists.InsertAfter(list, capsuleA, b)
+	if err != nil {
+		t.Fatalf("InsertAfter(capsuleA, b): %v", err)
+	}
+
+	tail, hasTail, err := lists.Tail(list)
+	if err != nil {
+		t.Fatalf("Tail(%d): %v", list, err)
+	}
+	if !hasTail || tail != capsuleB {
+		t.Fatalf("Tail(%d) = (%d,%v), want (%d,true)", list, tail, hasTail, capsuleB)
+	}
+
+	// The old tail (capsuleA) must have lost its AllTails tag.
+	if g.HasRelationship(lists.allTails, capsuleA) {
+		t.Fatalf("old tail capsule %d is still tagged AllTails after InsertAfter extended the list", capsuleA)
+	}
+
+	head, hasHead, err := lists.Head(list)
+	if err != nil {
+		t.Fatalf("Head(%d): %v", list, err)
+	}
+	if !hasHead || head != capsuleA {
+		t.Fatalf("Head(%d) = (%d,%v), want (%d,true) (head should be unaffected)", list, head, hasHead, capsuleA)
+	}
+}
+
+func TestListInsertAfterRequiresCapsuleInList(t *testing.T) {
+	g, _, lists := newListTestFixture(t)
+
+	list, err := lists.NewList()
+	if err != nil {
+		t.Fatalf("NewList(): %v", err)
+	}
+
+	other, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for other: %v", err)
+	}
+
+	value, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for value: %v", err)
+	}
+
+	_, err = lists.InsertAfter(list, other, value)
+	if !errors.Is(err, ErrCapsuleNotInList) {
+		t.Fatalf("InsertAfter() error = %v, want %v", err, ErrCapsuleNotInList)
+	}
+}
+
+func TestListOperationsRequireListTag(t *testing.T) {
+	g, _, lists := newListTestFixture(t)
+
+	notAList, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode(): %v", err)
+	}
+
+	value, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for value: %v", err)
+	}
+
+	if _, _, err := lists.Head(notAList); !errors.Is(err, ErrNotList) {
+		t.Fatalf("Head() error = %v, want %v", err, ErrNotList)
+	}
+
+	if _, _, err := lists.Tail(notAList); !errors.Is(err, ErrNotList) {
+		t.Fatalf("Tail() error = %v, want %v", err, ErrNotList)
+	}
+
+	if _, err := lists.Append(notAList, value); !errors.Is(err, ErrNotList) {
+		t.Fatalf("Append() error = %v, want %v", err, ErrNotList)
+	}
+
+	if _, err := lists.Prepend(notAList, value); !errors.Is(err, ErrNotList) {
+		t.Fatalf("Prepend() error = %v, want %v", err, ErrNotList)
+	}
+
+	if _, err := lists.Elements(notAList); !errors.Is(err, ErrNotList) {
+		t.Fatalf("Elements() error = %v, want %v", err, ErrNotList)
+	}
+}
