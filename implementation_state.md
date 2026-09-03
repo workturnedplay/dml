@@ -199,6 +199,8 @@ NodeID-keyed structure outside the primitive graph.
  protection is still real and intentional: it removes the dependency on
  that pre-check reasoning staying true as this code evolves.
 
+7. PointerRegistry generalized (doc-only, no code change) to cover Representation B via a second instance tagged AllSubPointers; PointerMetadataRegistry added implementing Representation C, using a subject-slot indirection node discovered during design — a naive M->subject/M->target two-edge scheme cannot represent self-targeting since the two edges would collapse into one relationship; singleChildTarget extracted from PointerRegistry.currentTarget as shared DRY logic used by both registries.
+
 Currently unaddressed yet:
 - No commit-time interception exists to prevent a raw
   Graph.AddRelationship from creating a second child on an
