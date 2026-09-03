@@ -1481,6 +1481,61 @@ func ensureMetadataWithSubjectSlot(g *Graph, subject, allPointerMetadata, allSub
 	return metadata, subjectSlot, nil
 }
 
+// subjectMetadataBase holds the graph/tag state and subject-side
+// operations -- locate, ensureMetadata, EnsureMetadata, HasMetadata --
+// shared identically by PointerMetadataRegistry (Representation C) and
+// PointerMetadataRegistryD (Representation D). Both representations
+// locate or create a subject's metadata node and subject-slot node in
+// exactly the same way (via locateBySubjectSlot /
+// ensureMetadataWithSubjectSlot); they differ only in how they then find
+// the target, which is why only the shared subject-side logic is
+// factored out here rather than merging the two types outright.
+//
+// PointerMetadataRegistry and PointerMetadataRegistryD each embed this
+// struct anonymously, so its fields (graph, allPointerMetadata,
+// allSubjectSlots) and methods are promoted and usable exactly as if
+// they were declared directly on the embedding type.
+type subjectMetadataBase struct {
+	graph              *Graph
+	allPointerMetadata NodeID
+	allSubjectSlots    NodeID
+}
+
+// locate finds subject's metadata node and subject-slot node, if any.
+// found is false if subject has no metadata yet. subject must exist.
+func (b *subjectMetadataBase) locate(subject NodeID) (metadata, subjectSlot NodeID, found bool, err error) {
+	return locateBySubjectSlot(b.graph, subject, b.allPointerMetadata, b.allSubjectSlots)
+}
+
+// ensureMetadata returns subject's existing metadata/subject-slot pair,
+// creating a fresh, empty one (M -> S -> subject, both tagged) if none
+// exists yet.
+func (b *subjectMetadataBase) ensureMetadata(subject NodeID) (metadata, subjectSlot NodeID, err error) {
+	if !b.graph.NodeExists(subject) {
+		return 0, 0, ErrNodeNotFound
+	}
+
+	return ensureMetadataWithSubjectSlot(b.graph, subject, b.allPointerMetadata, b.allSubjectSlots)
+}
+
+// EnsureMetadata returns subject's metadata node, creating an empty one
+// if none exists yet.
+func (b *subjectMetadataBase) EnsureMetadata(subject NodeID) (NodeID, error) {
+	metadata, _, err := b.ensureMetadata(subject)
+	return metadata, err
+}
+
+// HasMetadata reports whether subject currently has an associated
+// metadata node, regardless of whether a target has been set.
+func (b *subjectMetadataBase) HasMetadata(subject NodeID) (bool, error) {
+	if !b.graph.NodeExists(subject) {
+		return false, ErrNodeNotFound
+	}
+
+	_, _, found, err := b.locate(subject)
+	return found, err
+}
+
 // PointerMetadataRegistry implements Representation C (metadata
 // structure) of the Pointer processor,
 // THEORY_NOTES_FROM_CONVERSATION.md section 7C / theorystate_v0.6.md
@@ -1543,15 +1598,18 @@ func ensureMetadataWithSubjectSlot(g *Graph, subject, allPointerMetadata, allSub
 // lower layer refuses something Representation D would allow
 // (theorystate_v0.6.md section 73).
 type PointerMetadataRegistry struct {
-	graph              *Graph
-	allPointerMetadata NodeID
-	allSubjectSlots    NodeID
+	subjectMetadataBase
 }
 
 // NewPointerMetadataRegistry creates a PointerMetadataRegistry over
 // graph, using allPointerMetadata to tag metadata nodes and
 // allSubjectSlots to tag subject-slot nodes. Both must already exist --
 // typically via NameRegistry.BootstrapNames(FoundationalNames).
+//
+// locate, ensureMetadata, EnsureMetadata, and HasMetadata are inherited
+// unmodified from the embedded subjectMetadataBase, which is shared with
+// PointerMetadataRegistryD -- see subjectMetadataBase's doc comment for
+// why this subject-side logic is factored out rather than duplicated.
 func NewPointerMetadataRegistry(graph *Graph, allPointerMetadata, allSubjectSlots NodeID) (*PointerMetadataRegistry, error) {
 	if !graph.NodeExists(allPointerMetadata) {
 		return nil, ErrNodeNotFound
@@ -1562,47 +1620,12 @@ func NewPointerMetadataRegistry(graph *Graph, allPointerMetadata, allSubjectSlot
 	}
 
 	return &PointerMetadataRegistry{
-		graph:              graph,
-		allPointerMetadata: allPointerMetadata,
-		allSubjectSlots:    allSubjectSlots,
+		subjectMetadataBase: subjectMetadataBase{
+			graph:              graph,
+			allPointerMetadata: allPointerMetadata,
+			allSubjectSlots:    allSubjectSlots,
+		},
 	}, nil
-}
-
-// locate finds subject's metadata node and subject-slot node, if any.
-// found is false if subject has no metadata yet. subject must exist.
-func (m *PointerMetadataRegistry) locate(subject NodeID) (metadata, slot NodeID, found bool, err error) {
-	return locateBySubjectSlot(m.graph, subject, m.allPointerMetadata, m.allSubjectSlots)
-}
-
-// ensureMetadata returns subject's existing metadata/slot pair, creating
-// a fresh, empty one (M -> S -> subject, both tagged) if none exists yet.
-func (m *PointerMetadataRegistry) ensureMetadata(subject NodeID) (metadata, slot NodeID, err error) {
-	if !m.graph.NodeExists(subject) {
-		return 0, 0, ErrNodeNotFound
-	}
-
-	return ensureMetadataWithSubjectSlot(m.graph, subject, m.allPointerMetadata, m.allSubjectSlots)
-}
-
-// EnsureMetadata returns subject's metadata node, creating an empty one
-// if none exists yet. This is the Representation-C equivalent of
-// PointerRegistry.NewPointer / TagAsPointer -- there is no distinction
-// between the two here, since subject's own children are never inspected
-// or disturbed by this representation.
-func (m *PointerMetadataRegistry) EnsureMetadata(subject NodeID) (NodeID, error) {
-	metadata, _, err := m.ensureMetadata(subject)
-	return metadata, err
-}
-
-// HasMetadata reports whether subject currently has an associated
-// metadata node, regardless of whether a target has been set.
-func (m *PointerMetadataRegistry) HasMetadata(subject NodeID) (bool, error) {
-	if !m.graph.NodeExists(subject) {
-		return false, ErrNodeNotFound
-	}
-
-	_, _, found, err := m.locate(subject)
-	return found, err
 }
 
 // Target returns subject's current target via its metadata node, if any.
@@ -1746,10 +1769,8 @@ func (m *PointerMetadataRegistry) RemoveTarget(subject NodeID) (removed bool, er
 // loudly (ErrAmbiguousPointerMetadata, ErrTooManyPointerTargets) rather
 // than silently repairing an out-of-band invariant violation.
 type PointerMetadataRegistryD struct {
-	graph              *Graph
-	allPointerMetadata NodeID
-	allSubjectSlots    NodeID
-	allTargetSlots     NodeID
+	subjectMetadataBase
+	allTargetSlots NodeID
 }
 
 // NewPointerMetadataRegistryD creates a PointerMetadataRegistryD over
@@ -1757,6 +1778,11 @@ type PointerMetadataRegistryD struct {
 // to tag subject-slot nodes, and allTargetSlots to tag target-slot nodes.
 // All three must already exist -- typically via
 // NameRegistry.BootstrapNames(FoundationalNames).
+//
+// locate, ensureMetadata, EnsureMetadata, and HasMetadata are inherited
+// unmodified from the embedded subjectMetadataBase, which is shared with
+// PointerMetadataRegistry -- see subjectMetadataBase's doc comment for
+// why this subject-side logic is factored out rather than duplicated.
 func NewPointerMetadataRegistryD(graph *Graph, allPointerMetadata, allSubjectSlots, allTargetSlots NodeID) (*PointerMetadataRegistryD, error) {
 	if !graph.NodeExists(allPointerMetadata) {
 		return nil, ErrNodeNotFound
@@ -1771,47 +1797,13 @@ func NewPointerMetadataRegistryD(graph *Graph, allPointerMetadata, allSubjectSlo
 	}
 
 	return &PointerMetadataRegistryD{
-		graph:              graph,
-		allPointerMetadata: allPointerMetadata,
-		allSubjectSlots:    allSubjectSlots,
-		allTargetSlots:     allTargetSlots,
+		subjectMetadataBase: subjectMetadataBase{
+			graph:              graph,
+			allPointerMetadata: allPointerMetadata,
+			allSubjectSlots:    allSubjectSlots,
+		},
+		allTargetSlots: allTargetSlots,
 	}, nil
-}
-
-// locate finds subject's metadata node and subject-slot node, if any,
-// via the same subject-side lookup as PointerMetadataRegistry. subject
-// must exist.
-func (m *PointerMetadataRegistryD) locate(subject NodeID) (metadata, subjectSlot NodeID, found bool, err error) {
-	return locateBySubjectSlot(m.graph, subject, m.allPointerMetadata, m.allSubjectSlots)
-}
-
-// ensureMetadata returns subject's existing metadata/subject-slot pair,
-// creating a fresh, empty one (M -> U1 -> subject, both tagged) if none
-// exists yet.
-func (m *PointerMetadataRegistryD) ensureMetadata(subject NodeID) (metadata, subjectSlot NodeID, err error) {
-	if !m.graph.NodeExists(subject) {
-		return 0, 0, ErrNodeNotFound
-	}
-
-	return ensureMetadataWithSubjectSlot(m.graph, subject, m.allPointerMetadata, m.allSubjectSlots)
-}
-
-// EnsureMetadata returns subject's metadata node, creating an empty one
-// if none exists yet.
-func (m *PointerMetadataRegistryD) EnsureMetadata(subject NodeID) (NodeID, error) {
-	metadata, _, err := m.ensureMetadata(subject)
-	return metadata, err
-}
-
-// HasMetadata reports whether subject currently has an associated
-// metadata node, regardless of whether a target has been set.
-func (m *PointerMetadataRegistryD) HasMetadata(subject NodeID) (bool, error) {
-	if !m.graph.NodeExists(subject) {
-		return false, ErrNodeNotFound
-	}
-
-	_, _, found, err := m.locate(subject)
-	return found, err
 }
 
 // targetSlot returns metadata's current target-slot child (U2), if any,

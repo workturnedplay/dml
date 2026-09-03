@@ -277,6 +277,20 @@ NodeID-keyed structure outside the primitive graph.
  does not break Representation D's target discovery, unlike
  Representation C's).
 
+9. Removed duplication between PointerMetadataRegistry and
+ PointerMetadataRegistryD: both types had byte-for-byte identical
+ locate/ensureMetadata/EnsureMetadata/HasMetadata methods, since both
+ representations locate or create a subject's metadata/subject-slot pair
+ exactly the same way (via the already-shared locateBySubjectSlot /
+ ensureMetadataWithSubjectSlot helpers) and differ only in target
+ discovery. Factored the shared graph/tag fields and these four methods
+ into a new subjectMetadataBase struct, which both types now embed
+ anonymously; Go's field/method promotion means every existing call site
+ (m.graph, m.locate(...), m.ensureMetadata(...), and the exported
+ EnsureMetadata/HasMetadata called from outside the package) keeps
+ working unchanged. Pure refactor, no behavior change -- all existing
+ tests for both types continue to cover this without modification.
+
 Currently unaddressed yet:
 - No commit-time interception exists to prevent a raw
   Graph.AddRelationship from creating a second child on an
