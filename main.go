@@ -738,6 +738,25 @@ const (
 	// "whichever child of M isn't tagged subject-slot" (Representation
 	// C's limitation).
 	NameAllPointerMetadataTargetSlot = "AllPointerMetadataTargetSlot"
+
+	// NameAllElementCapsules tags a node as an ElementCapsule
+	// (THEORY_NOTES_FROM_CONVERSATION.md section 11 / theorystate_v0.6.md
+	// section 11): a freshly-minted NodeID representing one particular
+	// list-element occurrence, rather than the value itself. Named
+	// AllElementCapsules (not the theory docs' illustrative "AllCapsules")
+	// to avoid implying a more generic capsule concept. See
+	// CapsuleRegistry.
+	NameAllElementCapsules = "AllElementCapsules"
+
+	// NameAllElementCapsulePrevSlot, NameAllElementCapsuleValueSlot, and
+	// NameAllElementCapsuleNextSlot each tag a capsule's respective
+	// role-slot intermediary node. Each role is discovered by its own
+	// tag rather than by position, so a capsule may carry additional,
+	// unrelated children later without disturbing role discovery. See
+	// CapsuleRegistry.
+	NameAllElementCapsulePrevSlot  = "AllElementCapsulePrevSlot"
+	NameAllElementCapsuleValueSlot = "AllElementCapsuleValueSlot"
+	NameAllElementCapsuleNextSlot  = "AllElementCapsuleNextSlot"
 )
 
 // FoundationalNames lists every name that setup code should bootstrap via
@@ -751,6 +770,10 @@ var FoundationalNames = []string{
 	NameAllPointerMetadata,
 	NameAllPointerMetadataSubjectSlot,
 	NameAllPointerMetadataTargetSlot,
+	NameAllElementCapsules,
+	NameAllElementCapsulePrevSlot,
+	NameAllElementCapsuleValueSlot,
+	NameAllElementCapsuleNextSlot,
 }
 
 // ErrCannotDeleteRoot is returned when deletion of ROOT is attempted
@@ -1044,7 +1067,78 @@ var (
 	// used elsewhere in this file (ErrNameBoundToDeletedNode,
 	// ErrTooManyPointerTargets).
 	ErrAmbiguousPointerMetadata = errors.New("more than one node found during pointer-metadata lookup; the uniqueness invariant has already been violated")
+
+	// ErrNotCapsule is returned by CapsuleRegistry when asked to operate
+	// on a node that is not tagged (AllElementCapsules, node).
+	ErrNotCapsule = errors.New("node is not tagged as an element capsule")
 )
+
+// txOps is the minimal mutating surface needed to compose primitive
+// operations atomically, whether directly against a *Graph or inside an
+// existing *Txn. Both *Graph and *Txn satisfy it with their existing,
+// unmodified method sets.
+//
+// This exists so a registry's create/wire sequence can be reused both as
+// a standalone top-level Graph.Transact call and as one step composed
+// into a larger enclosing Transact call -- e.g. CapsuleRegistry.NewCapsule
+// composing PointerRegistry's create-and-tag sequence for each of a
+// capsule's three role slots -- without nesting one Graph.Transact call
+// inside another. Txn deliberately does not support nesting (see the Txn
+// doc comment); parameterizing over txOps instead of a concrete *Txn is
+// what lets the same sequence run either standalone or composed.
+type txOps interface {
+	CreateNode() (NodeID, error)
+	AddRelationship(a, b NodeID) (created bool, err error)
+	RemoveRelationship(a, b NodeID) (removed bool, err error)
+}
+
+// createTaggedNodeTx creates a fresh node and tags it via (tag, id),
+// against tx. This is the shared "mint a fresh, tag-identified node"
+// sequence used throughout this file: PointerRegistry.NewPointer's
+// Pointer-kind tagging (via newPointerTx below), and the subject-slot /
+// metadata / target-slot creation inside ensureMetadataWithSubjectSlot
+// and PointerMetadataRegistryD.SetTarget.
+func createTaggedNodeTx(tx txOps, tag NodeID) (NodeID, error) {
+	id, err := tx.CreateNode()
+	if err != nil {
+		return 0, err
+	}
+
+	if _, err := tx.AddRelationship(tag, id); err != nil {
+		return 0, err
+	}
+
+	return id, nil
+}
+
+// newPointerTx creates a fresh NodeID and tags it Pointer-kind via
+// (allPointers, id), against whatever txOps tx is given. This is the
+// create-and-tag sequence behind PointerRegistry.NewPointer, factored out
+// so a larger composite operation (e.g. CapsuleRegistry.NewCapsule) can
+// compose it into its own enclosing Graph.Transact call instead of
+// PointerRegistry opening a second, nested one.
+func newPointerTx(tx txOps, allPointers NodeID) (NodeID, error) {
+	return createTaggedNodeTx(tx, allPointers)
+}
+
+// setPointerTargetTx sets id's target to target within tx, given id's
+// current target state (current, hasCurrent) as already determined by the
+// caller. It performs the remove-old/add-new sequence directly against
+// tx, so it can be composed into a larger enclosing transaction (e.g. a
+// future list operation rewiring an existing capsule slot's target)
+// without nesting Graph.Transact calls. Callers are responsible for the
+// "already has this target -> no-op" idempotency check before calling
+// this, exactly as PointerRegistry.SetTarget already does.
+func setPointerTargetTx(tx txOps, id, current NodeID, hasCurrent bool, target NodeID) error {
+	if hasCurrent {
+		if _, err := tx.RemoveRelationship(id, current); err != nil {
+			return err
+		}
+	}
+
+	_, err := tx.AddRelationship(id, target)
+	return err
+}
 
 // singleChildTarget returns the single relevant child of node in the
 // underlying Graph, after excluding any NodeIDs listed in exclude.
@@ -1257,14 +1351,7 @@ func (p *PointerRegistry) SetTarget(id, target NodeID) error {
 	}
 
 	return p.graph.Transact(func(tx *Txn) error {
-		if hasTarget {
-			if _, err := tx.RemoveRelationship(id, current); err != nil {
-				return err
-			}
-		}
-
-		_, err := tx.AddRelationship(id, target)
-		return err
+		return setPointerTargetTx(tx, id, current, hasTarget, target)
 	})
 }
 
@@ -1305,12 +1392,7 @@ func (p *PointerRegistry) NewPointer() (NodeID, error) {
 
 	err := p.graph.Transact(func(tx *Txn) error {
 		var err error
-		id, err = tx.CreateNode()
-		if err != nil {
-			return err
-		}
-
-		_, err = tx.AddRelationship(p.allPointers, id)
+		id, err = newPointerTx(tx, p.allPointers)
 		return err
 	})
 	if err != nil {
@@ -1452,22 +1534,16 @@ func ensureMetadataWithSubjectSlot(g *Graph, subject, allPointerMetadata, allSub
 	err = g.Transact(func(tx *Txn) error {
 		var err error
 
-		subjectSlot, err = tx.CreateNode()
+		subjectSlot, err = createTaggedNodeTx(tx, allSubjectSlots)
 		if err != nil {
-			return err
-		}
-		if _, err := tx.AddRelationship(allSubjectSlots, subjectSlot); err != nil {
 			return err
 		}
 		if _, err := tx.AddRelationship(subjectSlot, subject); err != nil {
 			return err
 		}
 
-		metadata, err = tx.CreateNode()
+		metadata, err = createTaggedNodeTx(tx, allPointerMetadata)
 		if err != nil {
-			return err
-		}
-		if _, err := tx.AddRelationship(allPointerMetadata, metadata); err != nil {
 			return err
 		}
 
@@ -1676,14 +1752,7 @@ func (m *PointerMetadataRegistry) SetTarget(subject, target NodeID) error {
 	}
 
 	return m.graph.Transact(func(tx *Txn) error {
-		if hasTarget {
-			if _, err := tx.RemoveRelationship(metadata, current); err != nil {
-				return err
-			}
-		}
-
-		_, err := tx.AddRelationship(metadata, target)
-		return err
+		return setPointerTargetTx(tx, metadata, current, hasTarget, target)
 	})
 }
 
@@ -1869,11 +1938,8 @@ func (m *PointerMetadataRegistryD) SetTarget(subject, target NodeID) error {
 	if !found {
 		return m.graph.Transact(func(tx *Txn) error {
 			var err error
-			slot, err = tx.CreateNode()
+			slot, err = createTaggedNodeTx(tx, m.allTargetSlots)
 			if err != nil {
-				return err
-			}
-			if _, err := tx.AddRelationship(m.allTargetSlots, slot); err != nil {
 				return err
 			}
 			if _, err := tx.AddRelationship(metadata, slot); err != nil {
@@ -1894,14 +1960,7 @@ func (m *PointerMetadataRegistryD) SetTarget(subject, target NodeID) error {
 	}
 
 	return m.graph.Transact(func(tx *Txn) error {
-		if hasTarget {
-			if _, err := tx.RemoveRelationship(slot, current); err != nil {
-				return err
-			}
-		}
-
-		_, err := tx.AddRelationship(slot, target)
-		return err
+		return setPointerTargetTx(tx, slot, current, hasTarget, target)
 	})
 }
 
@@ -1940,4 +1999,286 @@ func (m *PointerMetadataRegistryD) RemoveTarget(subject NodeID) (removed bool, e
 	}
 
 	return m.graph.RemoveRelationship(slot, target)
+}
+
+// CapsuleRegistry implements the ElementCapsule primitive of Ordered
+// Lists (THEORY_NOTES_FROM_CONVERSATION.md section 11 / theorystate_v0.6.md
+// section 11): each list-element *occurrence* gets its own freshly-minted
+// NodeID (the capsule) rather than reusing the value's own NodeID, so the
+// same value can occur multiple times in a list through different
+// capsules (theorystate_v0.6.md section 75's occurrence/role-identity
+// pattern).
+//
+// A capsule's previous, value, and next roles are each represented by a
+// dedicated intermediary slot node -- exactly Pointer Representation B
+// (THEORY_NOTES_FROM_CONVERSATION.md section 7B / theorystate_v0.6.md
+// section 10), applied three times under three different tags:
+//
+//	(AllElementCapsules, capsule)
+//	capsule -> Uprev    (AllElementCapsulePrevSlot, Uprev)   Uprev -> prevCapsule
+//	capsule -> Uvalue   (AllElementCapsuleValueSlot, Uvalue) Uvalue -> value
+//	capsule -> Unext    (AllElementCapsuleNextSlot, Unext)   Unext -> nextCapsule
+//
+// Each slot's own target is enforced to be at most one using the exact
+// same PointerRegistry type already used for Representations A and B;
+// CapsuleRegistry embeds three PointerRegistry instances -- one per role,
+// distinguished only by tag, per theorystate_v0.6.md section 76's
+// tag-parameterization discipline -- rather than reimplementing "at most
+// one target" a third time.
+//
+// The three slot roles are discovered by their own tag
+// (findUniqueTaggedChild), never by position or by exclusion, so a
+// capsule remains free to carry additional, unrelated children later
+// without disturbing role discovery -- the same discipline established
+// for PointerMetadataRegistryD.
+//
+// CapsuleRegistry does not itself know about lists, heads, or tails, and
+// does not itself decide when a capsule is linked into or unlinked from a
+// list -- it only mints and wires individual capsules and their three
+// roles. List-level operations (append/prepend/insert, head/tail
+// bookkeeping) are a separate, higher layer to be built on top of this
+// one; not implemented yet. Per discussion, head/tail is expected to be a
+// plain (AllHEADs, capsule) / (AllTAILs, capsule) tag pair discovered via
+// findUniqueTaggedChild, not a further Pointer-style indirection: unlike
+// Representation C/D's subject/target collision risk, (AllHEADs, X) and
+// (AllTAILs, X) are already two distinct relationships even when the same
+// capsule X is simultaneously both head and tail (a single-element list).
+type CapsuleRegistry struct {
+	graph              *Graph
+	allElementCapsules NodeID
+	prevSlots          *PointerRegistry
+	valueSlots         *PointerRegistry
+	nextSlots          *PointerRegistry
+}
+
+// NewCapsuleRegistry creates a CapsuleRegistry over graph.
+// allElementCapsules tags capsule-kind nodes; allPrevSlot, allValueSlot,
+// and allNextSlot each tag a capsule's respective role-slot node. All
+// four must already exist -- typically via
+// NameRegistry.BootstrapNames(FoundationalNames). allPrevSlot,
+// allValueSlot, and allNextSlot's existence is checked by the embedded
+// NewPointerRegistry calls; allElementCapsules is checked here.
+func NewCapsuleRegistry(graph *Graph, allElementCapsules, allPrevSlot, allValueSlot, allNextSlot NodeID) (*CapsuleRegistry, error) {
+	if !graph.NodeExists(allElementCapsules) {
+		return nil, ErrNodeNotFound
+	}
+
+	prevSlots, err := NewPointerRegistry(graph, allPrevSlot)
+	if err != nil {
+		return nil, err
+	}
+
+	valueSlots, err := NewPointerRegistry(graph, allValueSlot)
+	if err != nil {
+		return nil, err
+	}
+
+	nextSlots, err := NewPointerRegistry(graph, allNextSlot)
+	if err != nil {
+		return nil, err
+	}
+
+	return &CapsuleRegistry{
+		graph:              graph,
+		allElementCapsules: allElementCapsules,
+		prevSlots:          prevSlots,
+		valueSlots:         valueSlots,
+		nextSlots:          nextSlots,
+	}, nil
+}
+
+// IsCapsule reports whether id is currently tagged
+// (AllElementCapsules, id).
+func (c *CapsuleRegistry) IsCapsule(id NodeID) bool {
+	return c.graph.HasRelationship(c.allElementCapsules, id)
+}
+
+// slotFor returns capsule's role-slot child tagged via (tag, slot) --
+// e.g. its prev, value, or next slot -- found by tag rather than by
+// position, so a capsule may carry additional, unrelated children later
+// without disturbing role discovery. found is false if capsule has no
+// such slot yet, which for a capsule created via NewCapsule should only
+// happen due to an out-of-band mutation, since NewCapsule always creates
+// all three slots up front. capsule's existence is checked implicitly by
+// the underlying FindOutgoing call (via findUniqueTaggedChild), which
+// returns ErrNodeNotFound if capsule does not exist.
+func (c *CapsuleRegistry) slotFor(capsule, tag NodeID) (slot NodeID, found bool, err error) {
+	return findUniqueTaggedChild(c.graph, capsule, tag)
+}
+
+// NewCapsule creates a fresh capsule NodeID, tags it
+// (AllElementCapsules, capsule), and wires all three of its role slots
+// (prev, value, next) -- each via the shared newPointerTx create-and-tag
+// sequence -- entirely inside one Graph.Transact call. This composes
+// PointerRegistry's create-and-tag logic four times (once for the
+// capsule's own tag, once per slot) without nesting Graph.Transact calls,
+// via the txOps-parameterized helpers above.
+//
+// The value slot's target is set to value immediately, since a freshly
+// created slot trivially satisfies the Pointer invariant (it starts
+// childless), exactly like PointerRegistry.NewPointer. The prev and next
+// slots are left empty: a capsule with no preceding or following
+// neighbor is a normal, valid state -- e.g. a single-element list's sole
+// capsule is simultaneously head and tail, with both slots empty.
+//
+// value must already exist.
+func (c *CapsuleRegistry) NewCapsule(value NodeID) (NodeID, error) {
+	if !c.graph.NodeExists(value) {
+		return 0, ErrNodeNotFound
+	}
+
+	var capsule NodeID
+
+	err := c.graph.Transact(func(tx *Txn) error {
+		var err error
+
+		capsule, err = createTaggedNodeTx(tx, c.allElementCapsules)
+		if err != nil {
+			return err
+		}
+
+		prevSlot, err := newPointerTx(tx, c.prevSlots.allPointers)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.AddRelationship(capsule, prevSlot); err != nil {
+			return err
+		}
+
+		valueSlot, err := newPointerTx(tx, c.valueSlots.allPointers)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.AddRelationship(capsule, valueSlot); err != nil {
+			return err
+		}
+		if _, err := tx.AddRelationship(valueSlot, value); err != nil {
+			return err
+		}
+
+		nextSlot, err := newPointerTx(tx, c.nextSlots.allPointers)
+		if err != nil {
+			return err
+		}
+
+		_, err = tx.AddRelationship(capsule, nextSlot)
+		return err
+	})
+	if err != nil {
+		return 0, err
+	}
+
+	return capsule, nil
+}
+
+// Value returns capsule's current value, i.e. its value slot's target.
+//
+// hasValue is false only if capsule's value slot has no target set --
+// which should not occur for any capsule created via NewCapsule, since
+// NewCapsule always sets the value slot's target immediately. It can
+// only arise from an out-of-band mutation (e.g. RemoveTarget called
+// directly through the underlying value PointerRegistry).
+func (c *CapsuleRegistry) Value(capsule NodeID) (value NodeID, hasValue bool, err error) {
+	slot, found, err := c.slotFor(capsule, c.valueSlots.allPointers)
+	if err != nil {
+		return 0, false, err
+	}
+	if !found {
+		return 0, false, ErrNotCapsule
+	}
+
+	return c.valueSlots.Target(slot)
+}
+
+// SetValue replaces capsule's value.
+func (c *CapsuleRegistry) SetValue(capsule, value NodeID) error {
+	slot, found, err := c.slotFor(capsule, c.valueSlots.allPointers)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return ErrNotCapsule
+	}
+
+	return c.valueSlots.SetTarget(slot, value)
+}
+
+// Prev returns capsule's previous-capsule link, if any. hasPrev is false
+// for a capsule currently at the head of its list.
+func (c *CapsuleRegistry) Prev(capsule NodeID) (prev NodeID, hasPrev bool, err error) {
+	slot, found, err := c.slotFor(capsule, c.prevSlots.allPointers)
+	if err != nil {
+		return 0, false, err
+	}
+	if !found {
+		return 0, false, ErrNotCapsule
+	}
+
+	return c.prevSlots.Target(slot)
+}
+
+// SetPrev sets capsule's previous-capsule link.
+func (c *CapsuleRegistry) SetPrev(capsule, prev NodeID) error {
+	slot, found, err := c.slotFor(capsule, c.prevSlots.allPointers)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return ErrNotCapsule
+	}
+
+	return c.prevSlots.SetTarget(slot, prev)
+}
+
+// RemovePrev clears capsule's previous-capsule link, if any.
+func (c *CapsuleRegistry) RemovePrev(capsule NodeID) (removed bool, err error) {
+	slot, found, err := c.slotFor(capsule, c.prevSlots.allPointers)
+	if err != nil {
+		return false, err
+	}
+	if !found {
+		return false, ErrNotCapsule
+	}
+
+	return c.prevSlots.RemoveTarget(slot)
+}
+
+// Next returns capsule's next-capsule link, if any. hasNext is false for
+// a capsule currently at the tail of its list.
+func (c *CapsuleRegistry) Next(capsule NodeID) (next NodeID, hasNext bool, err error) {
+	slot, found, err := c.slotFor(capsule, c.nextSlots.allPointers)
+	if err != nil {
+		return 0, false, err
+	}
+	if !found {
+		return 0, false, ErrNotCapsule
+	}
+
+	return c.nextSlots.Target(slot)
+}
+
+// SetNext sets capsule's next-capsule link.
+func (c *CapsuleRegistry) SetNext(capsule, next NodeID) error {
+	slot, found, err := c.slotFor(capsule, c.nextSlots.allPointers)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return ErrNotCapsule
+	}
+
+	return c.nextSlots.SetTarget(slot, next)
+}
+
+// RemoveNext clears capsule's next-capsule link, if any.
+func (c *CapsuleRegistry) RemoveNext(capsule NodeID) (removed bool, err error) {
+	slot, found, err := c.slotFor(capsule, c.nextSlots.allPointers)
+	if err != nil {
+		return false, err
+	}
+	if !found {
+		return false, ErrNotCapsule
+	}
+
+	return c.nextSlots.RemoveTarget(slot)
 }

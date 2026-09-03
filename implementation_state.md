@@ -69,18 +69,28 @@ After that:
   this. See theorystate_v0.6.md section 76 for the formal writeup. This
   bullet is corrected here because it had gone stale without being
   updated when that work landed.
-- The actual open question now is which higher-level semantic structure
-  to implement and test next -- Sets (theory section 9 / theorystate
-  section 32's open definitional questions) and Ordered Lists
-  (THEORY_NOTES_FROM_CONVERSATION.md section 11, theorystate section 11)
-  are the two candidates on the table; Domains (theory section 6) likely
-  wants Sets first, since it's framed as a constrained Set. Not yet
-  decided which to start with. If Ordered Lists are started, their
-  representation must preserve the established tagging discipline:
-  list -> ElementCapsule does not by itself make every list child a capsule;
-  capsules are identified through AllCapsules, and the capsule's previous,
-  value, and next intermediary slots are each discovered through their own
-  role tag rather than by child position.
+- Ordered Lists (THEORY_NOTES_FROM_CONVERSATION.md section 11,
+  theorystate section 11) has been chosen as the next higher-level
+  structure over Sets (theory section 9 / theorystate section 32's open
+  definitional questions are still genuinely unresolved design forks,
+  whereas the List representation is already largely settled); Domains
+  (theory section 6) and Sets remain for later, Domains likely wanting
+  Sets first since it's framed as a constrained Set.
+
+  The ElementCapsule primitive (CapsuleRegistry, see item 10 above) is
+  now implemented: list -> ElementCapsule does not by itself make every
+  list child a capsule; capsules are identified through
+  AllElementCapsules (renamed from the theory docs' illustrative
+  "AllCapsules"), and the capsule's previous, value, and next
+  intermediary slots are each discovered through their own role tag
+  rather than by child position.
+
+  Not yet implemented: the list node itself (list membership tagging,
+  analogous to AllElementCapsules but one level up), head/tail
+  bookkeeping (AllHEADs/AllTAILs tags on capsules, per the discussion
+  recorded in item 10), and list-level operations (append, prepend,
+  insert-after, remove) that compose CapsuleRegistry's per-capsule
+  operations plus head/tail retagging into single atomic Transact calls.
 - Do not prematurely implement Set/List semantics in the primitive layer,
   regardless of which is chosen -- they remain higher-layer constructions,
   per the same discipline that kept Pointer semantics entirely out of
@@ -290,6 +300,55 @@ NodeID-keyed structure outside the primitive graph.
  EnsureMetadata/HasMetadata called from outside the package) keeps
  working unchanged. Pure refactor, no behavior change -- all existing
  tests for both types continue to cover this without modification.
+
+10. Added the txOps interface, satisfied unmodified by both *Graph and
+ *Txn, plus three small helpers built on it: createTaggedNodeTx (create
+ a node and tag it via (tag, id)), newPointerTx (thin wrapper for
+ Pointer-kind tagging), and setPointerTargetTx (the shared remove-old/
+ add-new replace sequence). PointerRegistry.NewPointer/SetTarget,
+ ensureMetadataWithSubjectSlot, and PointerMetadataRegistryD.SetTarget
+ were refactored to call these instead of repeating the same
+ CreateNode-then-AddRelationship / RemoveRelationship-then-
+ AddRelationship sequences inline; behavior and test coverage are
+ unchanged. This exists to support composing multiple registries'
+ create/wire sequences into one atomic operation without nesting
+ Graph.Transact calls, which Txn does not support (see the Txn doc
+ comment) -- the first consumer of this is CapsuleRegistry.NewCapsule
+ below, which composes three separate Pointer-style slot creations plus
+ its own tagging into a single Transact call.
+
+ Added CapsuleRegistry, implementing the ElementCapsule primitive of
+ Ordered Lists (THEORY_NOTES_FROM_CONVERSATION.md section 11 /
+ theorystate_v0.6.md section 11): AllElementCapsules tags capsule-kind
+ nodes (renamed from the theory docs' illustrative "AllCapsules" to
+ avoid implying a more generic capsule concept); each capsule's prev,
+ value, and next roles are represented by a dedicated PointerRegistry
+ instance under its own tag (AllElementCapsulePrevSlot /
+ AllElementCapsuleValueSlot / AllElementCapsuleNextSlot) -- Pointer
+ Representation B applied three times, reusing PointerRegistry
+ unmodified rather than reimplementing "at most one target" a third
+ time (theorystate_v0.6.md section 76). Roles are discovered by tag via
+ findUniqueTaggedChild, not by position or exclusion, matching the
+ discipline established for PointerMetadataRegistryD. NewCapsule wires
+ the capsule's own tag and all three slots inside one Graph.Transact
+ call via the new txOps helpers. Covered by
+ TestFoundationalNamesIncludesElementCapsuleNames,
+ TestNewCapsuleRegistryRequiresExistingTags,
+ TestNewCapsuleRequiresExistingValue, TestNewCapsuleTagsAndSetsValue,
+ TestNewCapsuleStartsWithNoPrevOrNext,
+ TestCapsuleSetPrevAndNextLinkCapsules, TestCapsuleRemovePrevAndNext,
+ and TestCapsuleOperationsRequireCapsuleTag.
+
+ CapsuleRegistry does not yet implement list-level concepts (head/tail
+ bookkeeping, append/prepend/insert-after, or list membership itself,
+ i.e. AllLists-style tagging) -- only individual capsule creation and
+ prev/value/next wiring. That higher layer is deliberately deferred, per
+ the discussion that head/tail should be plain tags (AllHEADs/AllTAILs)
+ on capsules discovered via findUniqueTaggedChild, not a further
+ Pointer-style indirection -- there is no collision risk analogous to
+ Representation C/D's subject/target collision, since (AllHEADs, X) and
+ (AllTAILs, X) are already two distinct relationships even when the same
+ capsule X is currently both head and tail.
 
 Currently unaddressed yet:
 - No commit-time interception exists to prevent a raw

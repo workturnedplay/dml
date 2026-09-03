@@ -2910,3 +2910,263 @@ func TestPointerMetadataRegistryDAllowsUnrelatedMetadataChildren(t *testing.T) {
 		t.Fatalf("Target(subject) = (%d,%v), want (%d,true) -- unrelated child to M should not affect target discovery", target, hasTarget, x)
 	}
 }
+
+func newCapsuleTestFixture(t *testing.T) (*Graph, *CapsuleRegistry) {
+	t.Helper()
+
+	var g Graph
+	names := NewNameRegistry(&g)
+
+	ids, err := names.BootstrapNames(FoundationalNames)
+	if err != nil {
+		t.Fatalf("BootstrapNames(): %v", err)
+	}
+
+	capsules, err := NewCapsuleRegistry(
+		&g,
+		ids[NameAllElementCapsules],
+		ids[NameAllElementCapsulePrevSlot],
+		ids[NameAllElementCapsuleValueSlot],
+		ids[NameAllElementCapsuleNextSlot],
+	)
+	if err != nil {
+		t.Fatalf("NewCapsuleRegistry(): %v", err)
+	}
+
+	return &g, capsules
+}
+
+func TestFoundationalNamesIncludesElementCapsuleNames(t *testing.T) {
+	want := []string{
+		NameAllElementCapsules,
+		NameAllElementCapsulePrevSlot,
+		NameAllElementCapsuleValueSlot,
+		NameAllElementCapsuleNextSlot,
+	}
+
+	for _, name := range want {
+		found := false
+		for _, got := range FoundationalNames {
+			if got == name {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("FoundationalNames %v does not include %q", FoundationalNames, name)
+		}
+	}
+}
+
+func TestNewCapsuleRegistryRequiresExistingTags(t *testing.T) {
+	var g Graph
+
+	existing, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode(): %v", err)
+	}
+
+	const nonexistent NodeID = 999999
+
+	if _, err := NewCapsuleRegistry(&g, nonexistent, existing, existing, existing); !errors.Is(err, ErrNodeNotFound) {
+		t.Fatalf("NewCapsuleRegistry() error = %v, want %v", err, ErrNodeNotFound)
+	}
+
+	if _, err := NewCapsuleRegistry(&g, existing, nonexistent, existing, existing); !errors.Is(err, ErrNodeNotFound) {
+		t.Fatalf("NewCapsuleRegistry() error = %v, want %v", err, ErrNodeNotFound)
+	}
+
+	if _, err := NewCapsuleRegistry(&g, existing, existing, nonexistent, existing); !errors.Is(err, ErrNodeNotFound) {
+		t.Fatalf("NewCapsuleRegistry() error = %v, want %v", err, ErrNodeNotFound)
+	}
+
+	if _, err := NewCapsuleRegistry(&g, existing, existing, existing, nonexistent); !errors.Is(err, ErrNodeNotFound) {
+		t.Fatalf("NewCapsuleRegistry() error = %v, want %v", err, ErrNodeNotFound)
+	}
+}
+
+func TestNewCapsuleRequiresExistingValue(t *testing.T) {
+	_, capsules := newCapsuleTestFixture(t)
+
+	const nonexistent NodeID = 999999
+
+	if _, err := capsules.NewCapsule(nonexistent); !errors.Is(err, ErrNodeNotFound) {
+		t.Fatalf("NewCapsule() error = %v, want %v", err, ErrNodeNotFound)
+	}
+}
+
+func TestNewCapsuleTagsAndSetsValue(t *testing.T) {
+	g, capsules := newCapsuleTestFixture(t)
+
+	value, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for value: %v", err)
+	}
+
+	capsule, err := capsules.NewCapsule(value)
+	if err != nil {
+		t.Fatalf("NewCapsule(): %v", err)
+	}
+
+	if !g.NodeExists(capsule) {
+		t.Fatalf("NewCapsule() returned NodeID %d that does not exist", capsule)
+	}
+
+	if !capsules.IsCapsule(capsule) {
+		t.Fatalf("NewCapsule() did not tag %d as an ElementCapsule", capsule)
+	}
+
+	got, hasValue, err := capsules.Value(capsule)
+	if err != nil {
+		t.Fatalf("Value(%d): %v", capsule, err)
+	}
+	if !hasValue || got != value {
+		t.Fatalf("Value(%d) = (%d,%v), want (%d,true)", capsule, got, hasValue, value)
+	}
+}
+
+func TestNewCapsuleStartsWithNoPrevOrNext(t *testing.T) {
+	g, capsules := newCapsuleTestFixture(t)
+
+	value, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for value: %v", err)
+	}
+
+	capsule, err := capsules.NewCapsule(value)
+	if err != nil {
+		t.Fatalf("NewCapsule(): %v", err)
+	}
+
+	if _, hasPrev, err := capsules.Prev(capsule); err != nil {
+		t.Fatalf("Prev(%d): %v", capsule, err)
+	} else if hasPrev {
+		t.Fatalf("freshly created capsule %d unexpectedly has a prev", capsule)
+	}
+
+	if _, hasNext, err := capsules.Next(capsule); err != nil {
+		t.Fatalf("Next(%d): %v", capsule, err)
+	} else if hasNext {
+		t.Fatalf("freshly created capsule %d unexpectedly has a next", capsule)
+	}
+}
+
+func TestCapsuleSetPrevAndNextLinkCapsules(t *testing.T) {
+	g, capsules := newCapsuleTestFixture(t)
+
+	v1, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for v1: %v", err)
+	}
+
+	v2, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for v2: %v", err)
+	}
+
+	c1, err := capsules.NewCapsule(v1)
+	if err != nil {
+		t.Fatalf("NewCapsule(v1): %v", err)
+	}
+
+	c2, err := capsules.NewCapsule(v2)
+	if err != nil {
+		t.Fatalf("NewCapsule(v2): %v", err)
+	}
+
+	if err := capsules.SetNext(c1, c2); err != nil {
+		t.Fatalf("SetNext(c1, c2): %v", err)
+	}
+
+	if err := capsules.SetPrev(c2, c1); err != nil {
+		t.Fatalf("SetPrev(c2, c1): %v", err)
+	}
+
+	next, hasNext, err := capsules.Next(c1)
+	if err != nil {
+		t.Fatalf("Next(c1): %v", err)
+	}
+	if !hasNext || next != c2 {
+		t.Fatalf("Next(c1) = (%d,%v), want (%d,true)", next, hasNext, c2)
+	}
+
+	prev, hasPrev, err := capsules.Prev(c2)
+	if err != nil {
+		t.Fatalf("Prev(c2): %v", err)
+	}
+	if !hasPrev || prev != c1 {
+		t.Fatalf("Prev(c2) = (%d,%v), want (%d,true)", prev, hasPrev, c1)
+	}
+}
+
+func TestCapsuleRemovePrevAndNext(t *testing.T) {
+	g, capsules := newCapsuleTestFixture(t)
+
+	v1, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for v1: %v", err)
+	}
+
+	v2, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for v2: %v", err)
+	}
+
+	c1, err := capsules.NewCapsule(v1)
+	if err != nil {
+		t.Fatalf("NewCapsule(v1): %v", err)
+	}
+
+	c2, err := capsules.NewCapsule(v2)
+	if err != nil {
+		t.Fatalf("NewCapsule(v2): %v", err)
+	}
+
+	if err := capsules.SetNext(c1, c2); err != nil {
+		t.Fatalf("SetNext(c1, c2): %v", err)
+	}
+
+	removed, err := capsules.RemoveNext(c1)
+	if err != nil {
+		t.Fatalf("RemoveNext(c1): %v", err)
+	}
+	if !removed {
+		t.Fatal("RemoveNext() reported that nothing was removed")
+	}
+
+	if _, hasNext, err := capsules.Next(c1); err != nil {
+		t.Fatalf("Next(c1): %v", err)
+	} else if hasNext {
+		t.Fatal("c1 still has a next after RemoveNext()")
+	}
+}
+
+func TestCapsuleOperationsRequireCapsuleTag(t *testing.T) {
+	g, capsules := newCapsuleTestFixture(t)
+
+	id, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode(): %v", err)
+	}
+
+	x, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for x: %v", err)
+	}
+
+	if _, _, err := capsules.Value(id); !errors.Is(err, ErrNotCapsule) {
+		t.Fatalf("Value() error = %v, want %v", err, ErrNotCapsule)
+	}
+
+	if err := capsules.SetValue(id, x); !errors.Is(err, ErrNotCapsule) {
+		t.Fatalf("SetValue() error = %v, want %v", err, ErrNotCapsule)
+	}
+
+	if _, _, err := capsules.Prev(id); !errors.Is(err, ErrNotCapsule) {
+		t.Fatalf("Prev() error = %v, want %v", err, ErrNotCapsule)
+	}
+
+	if _, _, err := capsules.Next(id); !errors.Is(err, ErrNotCapsule) {
+		t.Fatalf("Next() error = %v, want %v", err, ErrNotCapsule)
+	}
+}
