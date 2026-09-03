@@ -7,5 +7,5 @@ setlocal enabledelayedexpansion
 ::if running as admin must get back to current dir:
 cd /d %~dp0
 
-go test ./...
+go test -race ./...
 pause
