@@ -820,7 +820,13 @@ It does **not** decide or address: commit-time interception preventing a raw
 `Graph.AddRelationship` from bypassing a registry's invariant (§73, still
 open); whether Sets/Lists/Domains get analogous registry types (deferred
 per `implementation_state.md`'s "add foundational names only when starting
-the
+the corresponding representation" discipline, itself an instance of §7); or
+whether interpretation logic itself ever becomes graph-resident (§16/§27,
+still a later, unaddressed bootstrapping question).
+
+---
+
+## PART D — STATUS SUMMARY (consolidated)
 
 ### DECIDED
 - NodeID is the fundamental addressable object; uniqueness among existing
