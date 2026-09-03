@@ -880,6 +880,98 @@ one." Per §7's discipline, this should stay unbuilt until repeated call-site
 usage demonstrates an actual recurring pattern worth naming, not merely
 because the underlying primitive call is used more than once.
 
+## 77. Changeset-level commit-time validation (extends §73) — OPEN
+
+**OPEN, proposed, not decided.** §73 already establishes that a
+higher-level checker may hook into the transaction-commit boundary and
+reject a transaction that violates its invariant. As written, §73 leaves
+open at what granularity such a checker is consulted. This section
+proposes and examines a specific answer: **checkers should be asked to
+approve or decline an entire grouped changeset, not each primitive
+operation individually** — and records the real design tension this
+creates with `Txn`'s current implementation, rather than resolving it.
+
+**Motivation — single-operation validation is provably too strict already.**
+`ensureMetadataWithSubjectSlot` in the current `wtw` code performs a
+sequence — create a slot node, tag it, create a metadata node, tag it,
+link them — as several separate `AddRelationship`/`CreateNode` calls. A
+hypothetical checker enforcing "every node tagged
+`AllPointerMetadataSubjectSlot` must have exactly one parent tagged
+`AllPointerMetadata`" would reject the *first* op in that sequence (the
+slot exists with no metadata parent yet), even though the completed
+sequence is entirely valid. This is not a hypothetical edge case; it is
+the shape of every multi-step operation already in the codebase
+(`NameRegistry.CreateNamedNode`, `PointerRegistry.SetTarget`'s replace
+path, `PointerRegistry.NewPointer`). Any commit-time checker operating at
+per-operation granularity would need to specially exempt every existing
+multi-step registry operation, which suggests per-operation is the wrong
+granularity rather than that each operation needs a carve-out.
+
+**What "grouped" requires that per-operation checking doesn't: a proposed
+overlay.** For a checker to answer "does this changeset, once fully
+applied, keep my invariant" it generally needs to run its ordinary query
+methods (`FindOutgoing`, `HasRelationship`, etc.) against *the graph as it
+would look if the changeset landed* — not against a raw list of operations
+it must interpret itself. That is a staged/overlay view: base graph plus
+pending changeset, queryable as a merged whole, with the real `Graph`
+untouched until (and unless) every relevant checker approves.
+
+**Direct tension with `Txn`'s current design (not yet resolved).** `Txn`'s
+doc comment explicitly states it is deliberately *not* a staged/
+copy-on-write view (§15's "transaction overlay" idea), on the grounds that
+"nothing can observe a Txn's intermediate state mid-sequence today because
+nothing else runs between two statements in the same synchronous call"
+(§19). A commit-time checker consulted mid-changeset *is* such an
+observer — synchronous and single-threaded, not concurrent, so §19's
+no-concurrent-mutation guarantee still holds, but the specific premise
+that let `Txn` skip staging no longer does. Supporting changeset-level
+checkers therefore means `Txn` (or something built alongside it) must gain
+an optional staged mode: accumulate the changeset without touching the
+real `Graph`, let checkers query the overlay, and only flush to the real
+`Graph` on approval — otherwise cleanly reproducing §15's overlay, whose
+only prior treatment (§63) rejected it specifically for cross-graph
+pending state under network partition, a concern that does not apply to
+this purely local, synchronous use. This would be that idea's first
+legitimate use case, not a repeat of the rejected one.
+
+**A cheap answer to "which nodes belong to the changeset."** No new
+bookkeeping appears to be needed for this part: `Txn.undo` already records,
+in order, exactly what a transaction has created or changed, currently
+used only for rollback-on-error. The same log doubles as the overlay's
+pending-delta for merged reads, and as the answer to "is this specific
+node/edge part of the changeset or the pre-existing graph" — trivially,
+by whether it appears in the log.
+
+**Relevance filtering is a real scaling concern, with a candidate answer.**
+Invoking every registered checker (Pointer, PointerMetadata, and any
+future Set/List/Domain checkers) on every changeset regardless of
+relevance does not scale as the number of higher-level structures grows.
+§76's tag-parameterization discipline suggests a cheap filter: since every
+registry already knows its own tag NodeID (`allPointers`,
+`allPointerMetadata`, etc.), a commit-time hook can check, per registered
+checker and in time proportional to changeset size, whether the changeset
+touches any node tagged with that checker's tag or adds/removes an edge
+to/from one — and only invoke checkers that could plausibly care. This
+reuses the same "parameterized by tag, not branching on identity"
+principle §76 formalized for interpreters, applied here to checker
+dispatch instead.
+
+**Declines should be attributable, not generic.** Following the existing
+fail-loud-with-specifics discipline (`ErrTooManyPointerTargets`,
+`ErrAmbiguousPointerMetadata`, `ErrNameBoundToDeletedNode`), a declined
+changeset should identify which checker declined it and why, not just
+that some checker did — a changeset can plausibly touch structure governed
+by several checkers at once, and the caller needs to know which specific
+invariant broke.
+
+**What this section does not decide.** Whether this is worth building at
+all yet (no current caller needs it — same "not needed yet, single
+writer, no concurrent mutation" reasoning `Txn`'s doc comment already
+gives for deferring true isolation); the concrete API shape for staged
+`Txn` or checker registration; whether staged and non-staged `Txn` should
+be the same type or two; and how (or whether) this interacts with nested
+transactions, themselves still OPEN per §45.
+
 ---
 
 ## PART D — STATUS SUMMARY (consolidated)
@@ -938,6 +1030,10 @@ because the underlying primitive call is used more than once.
   question only now (§61).
 - Nested transaction semantics (§45); exact cross-graph teardown protocol
   (§43); rebase algorithm (§24); processor execution semantics.
+- Whether commit-time validation should operate on grouped changesets
+  rather than single operations, requiring `Txn` to gain a staged/overlay
+  mode in tension with its current deliberately-non-staged design (§77,
+  extends §73).
 
 ### REJECTED FOR NOW
 - Giving primitive relationships their own NodeIDs.
