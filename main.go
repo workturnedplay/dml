@@ -605,12 +605,10 @@ func (r *RootGraph) AddRelationship(from, to NodeID) (created bool, err error) {
 	}
 
 	if from == r.root {
-		if to == r.root {
-			return false, nil
-		}
-
-		// ROOT -> every other existing node is already represented
-		// virtually by this layer.
+		// Whether to == root (the self-loop case, hidden by the ROOT
+		// overlay's irreflexivity) or to != root (already represented
+		// virtually by this layer), there is nothing to physically add
+		// either way.
 		return false, nil
 	}
 
@@ -635,11 +633,9 @@ func (r *RootGraph) RemoveRelationship(from, to NodeID) (removed bool, err error
 	}
 
 	if from == r.root {
-		if to == r.root {
-			return false, nil
-		}
-
-		// ROOT -> X is virtual and cannot be removed independently of X.
+		// Symmetric with AddRelationship above: whether to == root or
+		// not, there is no physical relationship for this layer to
+		// remove.
 		return false, nil
 	}
 
@@ -813,4 +809,239 @@ func (r *RootGraph) DeleteNode(id NodeID) error {
 	}
 
 	return r.graph.DeleteNode(id)
+}
+
+var (
+	ErrNotPointer            = errors.New("node is not tagged as a pointer")
+	ErrTooManyPointerTargets = errors.New("pointer node has more than one target; the pointer invariant has already been violated")
+)
+
+// PointerRegistry enforces the Pointer invariant -- "at most one target"
+// -- for nodes tagged Pointer-kind via the relationship (AllPointers, P).
+//
+// This implements Representation A from
+// THEORY_NOTES_FROM_CONVERSATION.md section 7 / theorystate_v0.6.md
+// section 10: a Pointer's target, if any, is simply P's single direct
+// child in the underlying Graph. The tag itself -- (AllPointers, P) -- is
+// ordinary graph structure, exactly like any other name-style tag. Like
+// NameRegistry and RootGraph, PointerRegistry adds nothing to the
+// primitive Graph; it is purely an interpretation/enforcement layer above
+// it (theorystate_v0.6.md sections 10 and 73).
+//
+// PointerRegistry does not, and structurally cannot, prevent every path
+// to invariant violation: a caller can always bypass this layer and call
+// Graph.AddRelationship(P, Y) directly, giving a tagged node two or more
+// children. PointerRegistry does not try to intercept arbitrary Graph
+// mutations -- Graph must stay unaware of Pointer semantics, per the same
+// layering discipline already established elsewhere in this file.
+// Instead, every method here re-derives P's current target set fresh from
+// the Graph on every call rather than caching it, and fails loudly with
+// ErrTooManyPointerTargets if that set already has more than one member,
+// rather than silently repairing or silently trusting stale expectations.
+// This mirrors the fail-loud-not-silently-repair discipline already used
+// for ErrNameBoundToDeletedNode in NameRegistry, and is the practical
+// mitigation for the general gap recorded in theorystate_v0.6.md section
+// 74: external structure built on top of the primitive Graph can go
+// stale the instant a primitive mutation happens elsewhere, and nothing
+// below this layer will ever notify it. A durable commit-time
+// interception mechanism that could reject such a mutation before it
+// lands (theorystate_v0.6.md section 73) does not exist yet; until it
+// does, "always re-check, never cache" is the deliberate accepted
+// boundary of this registry.
+//
+// Multi-step PointerRegistry operations (SetTarget's remove-then-add) are
+// not atomic against concurrent or interleaved external Graph mutation.
+// This is an existing, already-accepted gap shared with
+// NameRegistry.CreateNamedNode (whose CreateNode-then-Bind is equally
+// non-atomic) -- true transactional grouping of multiple primitive
+// operations is theorystate_v0.6.md section 14/45, both still OPEN.
+// PointerRegistry does not attempt to solve that problem; it simply does
+// not make it worse.
+type PointerRegistry struct {
+	graph       *Graph
+	allPointers NodeID
+}
+
+// NewPointerRegistry creates a PointerRegistry over graph, using
+// allPointers as the tagging node for the (AllPointers, P) relationship.
+//
+// allPointers must already exist. It is the caller's responsibility to
+// have bootstrapped it first, typically via
+// NameRegistry.EnsureNamedNode(NameAllPointers) or
+// NameRegistry.BootstrapNames(FoundationalNames). PointerRegistry itself
+// has no dependency on NameRegistry or on names at all -- exactly like
+// RootGraph takes its root as a plain NodeID rather than a name, keeping
+// this layer decoupled from the bootstrap-naming concern.
+func NewPointerRegistry(graph *Graph, allPointers NodeID) (*PointerRegistry, error) {
+	if !graph.NodeExists(allPointers) {
+		return nil, ErrNodeNotFound
+	}
+
+	return &PointerRegistry{
+		graph:       graph,
+		allPointers: allPointers,
+	}, nil
+}
+
+// IsPointer reports whether id is currently tagged Pointer-kind via
+// (AllPointers, id).
+func (p *PointerRegistry) IsPointer(id NodeID) bool {
+	return p.graph.HasRelationship(p.allPointers, id)
+}
+
+// currentTarget returns P's current single target, re-derived fresh from
+// the underlying Graph on every call (see the PointerRegistry doc comment
+// for why this is never cached).
+//
+// It requires P to exist and to be tagged Pointer-kind; otherwise it
+// returns ErrNodeNotFound or ErrNotPointer respectively, without
+// inspecting P's relationships at all. If P is tagged but currently has
+// more than one outgoing relationship -- meaning some caller bypassed
+// this registry and violated the Pointer invariant directly through the
+// primitive Graph -- currentTarget returns ErrTooManyPointerTargets
+// rather than silently picking one of them.
+func (p *PointerRegistry) currentTarget(id NodeID) (target NodeID, hasTarget bool, err error) {
+	if !p.graph.NodeExists(id) {
+		return 0, false, ErrNodeNotFound
+	}
+
+	if !p.IsPointer(id) {
+		return 0, false, ErrNotPointer
+	}
+
+	outgoing, err := p.graph.FindOutgoing(id)
+	if err != nil {
+		return 0, false, err
+	}
+
+	switch len(outgoing) {
+	case 0:
+		return 0, false, nil
+	case 1:
+		return outgoing[0].To, true, nil
+	default:
+		return 0, false, ErrTooManyPointerTargets
+	}
+}
+
+// Target returns P's current target.
+//
+// hasTarget is false when P is a valid, currently-empty Pointer. See
+// currentTarget for the error cases: P missing, P not tagged Pointer-kind,
+// or P's invariant already violated by an out-of-band Graph mutation.
+func (p *PointerRegistry) Target(id NodeID) (target NodeID, hasTarget bool, err error) {
+	return p.currentTarget(id)
+}
+
+// SetTarget sets P's target to X, enforcing that P has at most one target
+// both before and after the call.
+//
+// Both P and X must already exist, and P must already be tagged
+// Pointer-kind (see NewPointer and TagAsPointer). Target's existence is
+// checked before any mutation happens: if X did not exist and this check
+// were skipped, a stale target could be removed before the new one failed
+// to be added, losing data on a failed call. If P currently has no
+// target, (P, X) is simply added. If P currently has exactly one target
+// and it already equals X, this is an idempotent no-op. If P currently
+// has exactly one different target, that relationship is removed and
+// (P, X) is added in its place. If P currently has more than one target
+// -- meaning the invariant was already violated by something outside
+// this registry -- SetTarget makes no changes at all and returns
+// ErrTooManyPointerTargets: it deliberately does not attempt to repair
+// the violation by picking one existing target to keep or by clearing
+// all of them, since either choice would be a silent, unrequested
+// decision about data this registry did not create.
+//
+// Self-targeting, i.e. SetTarget(P, P), is allowed: self-relationships
+// are permitted at the primitive layer (THEORY_NOTES_FROM_CONVERSATION.md
+// section 1) and nothing about the Pointer invariant rules it out.
+func (p *PointerRegistry) SetTarget(id, target NodeID) error {
+	current, hasTarget, err := p.currentTarget(id)
+	if err != nil {
+		return err
+	}
+
+	if !p.graph.NodeExists(target) {
+		return ErrNodeNotFound
+	}
+
+	if hasTarget {
+		if current == target {
+			return nil
+		}
+
+		if _, err := p.graph.RemoveRelationship(id, current); err != nil {
+			return err
+		}
+	}
+
+	_, err = p.graph.AddRelationship(id, target)
+	return err
+}
+
+// RemoveTarget clears P's target, if any.
+//
+// The returned bool reports whether a target was actually removed. If P
+// currently has no target, this is a no-op returning (false, nil). If P
+// currently has more than one target -- an already-violated invariant --
+// RemoveTarget makes no changes and returns ErrTooManyPointerTargets, for
+// the same reason given in SetTarget: this registry does not silently
+// repair violations it did not create.
+func (p *PointerRegistry) RemoveTarget(id NodeID) (removed bool, err error) {
+	current, hasTarget, err := p.currentTarget(id)
+	if err != nil {
+		return false, err
+	}
+
+	if !hasTarget {
+		return false, nil
+	}
+
+	return p.graph.RemoveRelationship(id, current)
+}
+
+// NewPointer creates a fresh NodeID and immediately tags it Pointer-kind.
+//
+// Because the node is freshly created, it has zero relationships and
+// therefore trivially satisfies the Pointer invariant -- unlike
+// TagAsPointer, no invariant check is needed here.
+func (p *PointerRegistry) NewPointer() (NodeID, error) {
+	id, err := p.graph.CreateNode()
+	if err != nil {
+		return 0, err
+	}
+
+	if _, err := p.graph.AddRelationship(p.allPointers, id); err != nil {
+		return 0, err
+	}
+
+	return id, nil
+}
+
+// TagAsPointer tags an existing node id as Pointer-kind.
+//
+// Unlike NewPointer, id may already have relationships from before it
+// became a Pointer, so TagAsPointer checks that id currently has at most
+// one outgoing relationship before tagging it -- tagging a node that
+// already has two or more outgoing relationships would immediately
+// create an already-violated Pointer, which TagAsPointer refuses to do,
+// returning ErrTooManyPointerTargets and leaving id untagged. id's
+// existence is implicitly checked by the underlying FindOutgoing call,
+// which returns ErrNodeNotFound if id does not exist.
+//
+// Tagging an id that is already tagged Pointer-kind is an idempotent
+// success, exactly like the underlying Graph.AddRelationship being
+// idempotent for an already-existing relationship.
+func (p *PointerRegistry) TagAsPointer(id NodeID) error {
+	outgoing, err := p.graph.FindOutgoing(id)
+	if err != nil {
+		return err
+	}
+
+	if len(outgoing) > 1 {
+		return ErrTooManyPointerTargets
+	}
+
+	_, err = p.graph.AddRelationship(p.allPointers, id)
+	return err
 }

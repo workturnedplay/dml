@@ -1694,3 +1694,440 @@ func TestRootPhysicalSelfRelationshipIsHidden(t *testing.T) {
 		t.Fatalf("FindRelationships() = %v, want no relationships", got)
 	}
 }
+
+// newPointerTestFixture creates a fresh Graph and PointerRegistry with
+// AllPointers already bootstrapped, for use by PointerRegistry tests.
+func newPointerTestFixture(t *testing.T) (*Graph, *PointerRegistry) {
+	t.Helper()
+
+	var g Graph
+	names := NewNameRegistry(&g)
+
+	allPointers, err := names.EnsureNamedNode(NameAllPointers)
+	if err != nil {
+		t.Fatalf("EnsureNamedNode(%q): %v", NameAllPointers, err)
+	}
+
+	pointers, err := NewPointerRegistry(&g, allPointers)
+	if err != nil {
+		t.Fatalf("NewPointerRegistry(): %v", err)
+	}
+
+	return &g, pointers
+}
+
+func TestNewPointerRegistryRequiresExistingAllPointers(t *testing.T) {
+	var g Graph
+
+	const nonexistent NodeID = 999999
+
+	_, err := NewPointerRegistry(&g, nonexistent)
+	if !errors.Is(err, ErrNodeNotFound) {
+		t.Fatalf("NewPointerRegistry() error = %v, want %v", err, ErrNodeNotFound)
+	}
+}
+
+func TestPointerRegistryNewPointerStartsEmpty(t *testing.T) {
+	g, pointers := newPointerTestFixture(t)
+
+	p, err := pointers.NewPointer()
+	if err != nil {
+		t.Fatalf("NewPointer(): %v", err)
+	}
+
+	if !g.NodeExists(p) {
+		t.Fatalf("NewPointer() returned NodeID %d that does not exist", p)
+	}
+
+	if !pointers.IsPointer(p) {
+		t.Fatalf("NewPointer() did not tag %d as Pointer-kind", p)
+	}
+
+	_, hasTarget, err := pointers.Target(p)
+	if err != nil {
+		t.Fatalf("Target(%d): %v", p, err)
+	}
+
+	if hasTarget {
+		t.Fatalf("freshly created pointer %d unexpectedly has a target", p)
+	}
+}
+
+func TestPointerRegistrySetTargetAddsFirstTarget(t *testing.T) {
+	g, pointers := newPointerTestFixture(t)
+
+	p, err := pointers.NewPointer()
+	if err != nil {
+		t.Fatalf("NewPointer(): %v", err)
+	}
+
+	x, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for x: %v", err)
+	}
+
+	if err := pointers.SetTarget(p, x); err != nil {
+		t.Fatalf("SetTarget(%d,%d): %v", p, x, err)
+	}
+
+	target, hasTarget, err := pointers.Target(p)
+	if err != nil {
+		t.Fatalf("Target(%d): %v", p, err)
+	}
+
+	if !hasTarget || target != x {
+		t.Fatalf("Target(%d) = (%d,%v), want (%d,true)", p, target, hasTarget, x)
+	}
+}
+
+func TestPointerRegistrySetTargetIsIdempotentForSameTarget(t *testing.T) {
+	g, pointers := newPointerTestFixture(t)
+
+	p, err := pointers.NewPointer()
+	if err != nil {
+		t.Fatalf("NewPointer(): %v", err)
+	}
+
+	x, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for x: %v", err)
+	}
+
+	if err := pointers.SetTarget(p, x); err != nil {
+		t.Fatalf("first SetTarget(%d,%d): %v", p, x, err)
+	}
+
+	if err := pointers.SetTarget(p, x); err != nil {
+		t.Fatalf("second SetTarget(%d,%d): %v", p, x, err)
+	}
+
+	outgoing, err := g.FindOutgoing(p)
+	if err != nil {
+		t.Fatalf("FindOutgoing(%d): %v", p, err)
+	}
+
+	if len(outgoing) != 1 {
+		t.Fatalf("FindOutgoing(%d) = %v, want exactly one relationship", p, outgoing)
+	}
+}
+
+func TestPointerRegistrySetTargetReplacesExistingTarget(t *testing.T) {
+	g, pointers := newPointerTestFixture(t)
+
+	p, err := pointers.NewPointer()
+	if err != nil {
+		t.Fatalf("NewPointer(): %v", err)
+	}
+
+	x, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for x: %v", err)
+	}
+
+	y, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for y: %v", err)
+	}
+
+	if err := pointers.SetTarget(p, x); err != nil {
+		t.Fatalf("SetTarget(%d,%d): %v", p, x, err)
+	}
+
+	if err := pointers.SetTarget(p, y); err != nil {
+		t.Fatalf("SetTarget(%d,%d): %v", p, y, err)
+	}
+
+	target, hasTarget, err := pointers.Target(p)
+	if err != nil {
+		t.Fatalf("Target(%d): %v", p, err)
+	}
+
+	if !hasTarget || target != y {
+		t.Fatalf("Target(%d) = (%d,%v), want (%d,true)", p, target, hasTarget, y)
+	}
+
+	if g.HasRelationship(p, x) {
+		t.Fatalf("old target relationship (%d,%d) was not removed", p, x)
+	}
+
+	outgoing, err := g.FindOutgoing(p)
+	if err != nil {
+		t.Fatalf("FindOutgoing(%d): %v", p, err)
+	}
+
+	if len(outgoing) != 1 {
+		t.Fatalf("FindOutgoing(%d) = %v, want exactly one relationship after replacement", p, outgoing)
+	}
+}
+
+func TestPointerRegistrySetTargetAllowsSelfTarget(t *testing.T) {
+	_, pointers := newPointerTestFixture(t)
+
+	p, err := pointers.NewPointer()
+	if err != nil {
+		t.Fatalf("NewPointer(): %v", err)
+	}
+
+	if err := pointers.SetTarget(p, p); err != nil {
+		t.Fatalf("SetTarget(%d,%d) self-target: %v", p, p, err)
+	}
+
+	target, hasTarget, err := pointers.Target(p)
+	if err != nil {
+		t.Fatalf("Target(%d): %v", p, err)
+	}
+
+	if !hasTarget || target != p {
+		t.Fatalf("Target(%d) = (%d,%v), want (%d,true)", p, target, hasTarget, p)
+	}
+}
+
+func TestPointerRegistrySetTargetRequiresExistingTarget(t *testing.T) {
+	_, pointers := newPointerTestFixture(t)
+
+	p, err := pointers.NewPointer()
+	if err != nil {
+		t.Fatalf("NewPointer(): %v", err)
+	}
+
+	const nonexistent NodeID = 999999
+
+	err = pointers.SetTarget(p, nonexistent)
+	if !errors.Is(err, ErrNodeNotFound) {
+		t.Fatalf("SetTarget() error = %v, want %v", err, ErrNodeNotFound)
+	}
+}
+
+func TestPointerRegistrySetTargetRequiresPointerTag(t *testing.T) {
+	g, pointers := newPointerTestFixture(t)
+
+	id, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode(): %v", err)
+	}
+
+	x, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for x: %v", err)
+	}
+
+	err = pointers.SetTarget(id, x)
+	if !errors.Is(err, ErrNotPointer) {
+		t.Fatalf("SetTarget() error = %v, want %v", err, ErrNotPointer)
+	}
+}
+
+func TestPointerRegistryRemoveTargetRemovesExisting(t *testing.T) {
+	g, pointers := newPointerTestFixture(t)
+
+	p, err := pointers.NewPointer()
+	if err != nil {
+		t.Fatalf("NewPointer(): %v", err)
+	}
+
+	x, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for x: %v", err)
+	}
+
+	if err := pointers.SetTarget(p, x); err != nil {
+		t.Fatalf("SetTarget(%d,%d): %v", p, x, err)
+	}
+
+	removed, err := pointers.RemoveTarget(p)
+	if err != nil {
+		t.Fatalf("RemoveTarget(%d): %v", p, err)
+	}
+
+	if !removed {
+		t.Fatal("RemoveTarget() reported that nothing was removed")
+	}
+
+	_, hasTarget, err := pointers.Target(p)
+	if err != nil {
+		t.Fatalf("Target(%d): %v", p, err)
+	}
+
+	if hasTarget {
+		t.Fatalf("pointer %d still has a target after RemoveTarget()", p)
+	}
+}
+
+func TestPointerRegistryRemoveTargetNoOpWhenEmpty(t *testing.T) {
+	_, pointers := newPointerTestFixture(t)
+
+	p, err := pointers.NewPointer()
+	if err != nil {
+		t.Fatalf("NewPointer(): %v", err)
+	}
+
+	removed, err := pointers.RemoveTarget(p)
+	if err != nil {
+		t.Fatalf("RemoveTarget(%d): %v", p, err)
+	}
+
+	if removed {
+		t.Fatal("RemoveTarget() reported removal of a nonexistent target")
+	}
+}
+
+func TestPointerRegistryTagAsPointerTagsFreshNode(t *testing.T) {
+	g, pointers := newPointerTestFixture(t)
+
+	id, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode(): %v", err)
+	}
+
+	if pointers.IsPointer(id) {
+		t.Fatalf("node %d is unexpectedly already tagged Pointer-kind", id)
+	}
+
+	if err := pointers.TagAsPointer(id); err != nil {
+		t.Fatalf("TagAsPointer(%d): %v", id, err)
+	}
+
+	if !pointers.IsPointer(id) {
+		t.Fatalf("TagAsPointer(%d) did not tag the node", id)
+	}
+}
+
+func TestPointerRegistryTagAsPointerAllowsExistingSingleChild(t *testing.T) {
+	g, pointers := newPointerTestFixture(t)
+
+	id, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode(): %v", err)
+	}
+
+	x, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for x: %v", err)
+	}
+
+	if _, err := g.AddRelationship(id, x); err != nil {
+		t.Fatalf("AddRelationship(%d,%d): %v", id, x, err)
+	}
+
+	if err := pointers.TagAsPointer(id); err != nil {
+		t.Fatalf("TagAsPointer(%d): %v", id, err)
+	}
+
+	target, hasTarget, err := pointers.Target(id)
+	if err != nil {
+		t.Fatalf("Target(%d): %v", id, err)
+	}
+
+	if !hasTarget || target != x {
+		t.Fatalf("Target(%d) = (%d,%v), want (%d,true)", id, target, hasTarget, x)
+	}
+}
+
+func TestPointerRegistryTagAsPointerRejectsMultipleExistingChildren(t *testing.T) {
+	g, pointers := newPointerTestFixture(t)
+
+	id, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode(): %v", err)
+	}
+
+	x, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for x: %v", err)
+	}
+
+	y, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for y: %v", err)
+	}
+
+	if _, err := g.AddRelationship(id, x); err != nil {
+		t.Fatalf("AddRelationship(%d,%d): %v", id, x, err)
+	}
+
+	if _, err := g.AddRelationship(id, y); err != nil {
+		t.Fatalf("AddRelationship(%d,%d): %v", id, y, err)
+	}
+
+	err = pointers.TagAsPointer(id)
+	if !errors.Is(err, ErrTooManyPointerTargets) {
+		t.Fatalf("TagAsPointer() error = %v, want %v", err, ErrTooManyPointerTargets)
+	}
+
+	if pointers.IsPointer(id) {
+		t.Fatalf("node %d was tagged despite violating the Pointer invariant", id)
+	}
+}
+
+func TestPointerRegistryTagAsPointerIsIdempotent(t *testing.T) {
+	g, pointers := newPointerTestFixture(t)
+
+	id, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode(): %v", err)
+	}
+
+	if err := pointers.TagAsPointer(id); err != nil {
+		t.Fatalf("first TagAsPointer(%d): %v", id, err)
+	}
+
+	if err := pointers.TagAsPointer(id); err != nil {
+		t.Fatalf("second TagAsPointer(%d): %v", id, err)
+	}
+}
+
+func TestPointerRegistryDetectsOutOfBandInvariantViolation(t *testing.T) {
+	g, pointers := newPointerTestFixture(t)
+
+	p, err := pointers.NewPointer()
+	if err != nil {
+		t.Fatalf("NewPointer(): %v", err)
+	}
+
+	x, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for x: %v", err)
+	}
+
+	y, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for y: %v", err)
+	}
+
+	// Bypass PointerRegistry entirely, simulating a caller bug that
+	// mutates a tagged Pointer node directly through the primitive Graph.
+	if _, err := g.AddRelationship(p, x); err != nil {
+		t.Fatalf("AddRelationship(%d,%d) via raw Graph: %v", p, x, err)
+	}
+
+	if _, err := g.AddRelationship(p, y); err != nil {
+		t.Fatalf("AddRelationship(%d,%d) via raw Graph: %v", p, y, err)
+	}
+
+	if _, _, err := pointers.Target(p); !errors.Is(err, ErrTooManyPointerTargets) {
+		t.Fatalf("Target() error = %v, want %v", err, ErrTooManyPointerTargets)
+	}
+
+	z, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for z: %v", err)
+	}
+
+	if err := pointers.SetTarget(p, z); !errors.Is(err, ErrTooManyPointerTargets) {
+		t.Fatalf("SetTarget() error = %v, want %v", err, ErrTooManyPointerTargets)
+	}
+
+	if _, err := pointers.RemoveTarget(p); !errors.Is(err, ErrTooManyPointerTargets) {
+		t.Fatalf("RemoveTarget() error = %v, want %v", err, ErrTooManyPointerTargets)
+	}
+
+	// Confirm none of the failed calls above mutated anything.
+	outgoing, err := g.FindOutgoing(p)
+	if err != nil {
+		t.Fatalf("FindOutgoing(%d): %v", p, err)
+	}
+
+	if len(outgoing) != 2 {
+		t.Fatalf("FindOutgoing(%d) = %v, want the original 2 relationships untouched", p, outgoing)
+	}
+}
