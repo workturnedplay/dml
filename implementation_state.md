@@ -58,9 +58,28 @@ Current next task:
   preemptively.
 
 After that:
-- Continue building the generic tagging machinery.
-- Use relationships such as (AllPointers, P) to express tags.
-- Do not prematurely implement Set/List semantics in the primitive layer.
+- The generic tagging machinery this bullet used to point at as future
+  work is already built and validated: FoundationalNames + BootstrapNames
+  gives tags real NodeID identity (no hardcoded strings reach the
+  primitive Graph), PointerRegistry is reused unmodified across
+  Representations A and B by parameterizing on which tag NodeID it's
+  constructed with (no branching on tag identity), and generic
+  (Tag,X) membership querying is already covered by the existing
+  Graph.FindOutgoing(tag) -- no further abstraction is needed for any of
+  this. See theorystate_v0.6.md section 76 for the formal writeup. This
+  bullet is corrected here because it had gone stale without being
+  updated when that work landed.
+- The actual open question now is which higher-level semantic structure
+  to implement and test next -- Sets (theory section 9 / theorystate
+  section 32's open definitional questions) and Ordered Lists
+  (THEORY_NOTES_FROM_CONVERSATION.md section 11, theorystate section 11)
+  are the two candidates on the table; Domains (theory section 6) likely
+  wants Sets first, since it's framed as a constrained Set. Not yet
+  decided which to start with.
+- Do not prematurely implement Set/List semantics in the primitive layer,
+  regardless of which is chosen -- they remain higher-layer constructions,
+  per the same discipline that kept Pointer semantics entirely out of
+  Graph.
 
 Important constraints:
 - Primitive Graph must remain unaware of ROOT and higher-level tags.

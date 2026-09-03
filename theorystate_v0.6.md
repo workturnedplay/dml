@@ -824,6 +824,18 @@ the corresponding representation" discipline, itself an instance of §7); or
 whether interpretation logic itself ever becomes graph-resident (§16/§27,
 still a later, unaddressed bootstrapping question).
 
+**Generic tag membership query is also already present, not pending.** A
+question adjacent to §76's main point: does a generic `(Tag,X)` membership
+query need its own abstraction (e.g. a `TagRegistry.Members(tag)` method)?
+No — `Graph.FindOutgoing(tag)` already returns exactly that set, and no
+registry built so far (`PointerRegistry`, `PointerMetadataRegistry(D)`)
+needs anything beyond it. A named wrapper would be a pure renaming
+convenience with no invariant of its own to enforce — unlike, say,
+`PointerRegistry.Target`, which earns its existence by enforcing "at most
+one." Per §7's discipline, this should stay unbuilt until repeated call-site
+usage demonstrates an actual recurring pattern worth naming, not merely
+because the underlying primitive call is used more than once.
+
 ---
 
 ## PART D — STATUS SUMMARY (consolidated)
