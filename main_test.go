@@ -3572,3 +3572,401 @@ func TestListOperationsRequireListTag(t *testing.T) {
 		t.Fatalf("Elements() error = %v, want %v", err, ErrNotList)
 	}
 }
+
+func TestListRemoveMiddleElement(t *testing.T) {
+	g, _, lists := newListTestFixture(t)
+
+	list, err := lists.NewList()
+	if err != nil {
+		t.Fatalf("NewList(): %v", err)
+	}
+
+	a, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for a: %v", err)
+	}
+	b, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for b: %v", err)
+	}
+	c, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for c: %v", err)
+	}
+
+	capsuleA, err := lists.Append(list, a)
+	if err != nil {
+		t.Fatalf("Append(a): %v", err)
+	}
+	capsuleB, err := lists.Append(list, b)
+	if err != nil {
+		t.Fatalf("Append(b): %v", err)
+	}
+	if _, err := lists.Append(list, c); err != nil {
+		t.Fatalf("Append(c): %v", err)
+	}
+
+	if err := lists.Remove(list, capsuleB); err != nil {
+		t.Fatalf("Remove(capsuleB): %v", err)
+	}
+
+	got, err := lists.Elements(list)
+	if err != nil {
+		t.Fatalf("Elements(%d): %v", list, err)
+	}
+
+	want := []NodeID{a, c}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("Elements(%d) = %v, want %v", list, got, want)
+	}
+
+	next, hasNext, err := lists.capsules.Next(capsuleA)
+	if err != nil {
+		t.Fatalf("Next(capsuleA): %v", err)
+	}
+	if !hasNext {
+		t.Fatal("capsuleA lost its next link after an unrelated middle removal")
+	}
+	nextValue, _, _ := lists.capsules.Value(next)
+	if nextValue != c {
+		t.Fatalf("capsuleA's next value = %d, want %d", nextValue, c)
+	}
+}
+
+func TestListRemoveHeadUpdatesHead(t *testing.T) {
+	g, _, lists := newListTestFixture(t)
+
+	list, err := lists.NewList()
+	if err != nil {
+		t.Fatalf("NewList(): %v", err)
+	}
+
+	a, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for a: %v", err)
+	}
+	b, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for b: %v", err)
+	}
+
+	capsuleA, err := lists.Append(list, a)
+	if err != nil {
+		t.Fatalf("Append(a): %v", err)
+	}
+	capsuleB, err := lists.Append(list, b)
+	if err != nil {
+		t.Fatalf("Append(b): %v", err)
+	}
+
+	if err := lists.Remove(list, capsuleA); err != nil {
+		t.Fatalf("Remove(capsuleA): %v", err)
+	}
+
+	head, hasHead, err := lists.Head(list)
+	if err != nil {
+		t.Fatalf("Head(%d): %v", list, err)
+	}
+	if !hasHead || head != capsuleB {
+		t.Fatalf("Head(%d) = (%d,%v), want (%d,true)", list, head, hasHead, capsuleB)
+	}
+
+	if _, hasPrev, err := lists.capsules.Prev(capsuleB); err != nil {
+		t.Fatalf("Prev(capsuleB): %v", err)
+	} else if hasPrev {
+		t.Fatal("new head capsuleB unexpectedly still has a prev")
+	}
+}
+
+func TestListRemoveTailUpdatesTail(t *testing.T) {
+	g, _, lists := newListTestFixture(t)
+
+	list, err := lists.NewList()
+	if err != nil {
+		t.Fatalf("NewList(): %v", err)
+	}
+
+	a, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for a: %v", err)
+	}
+	b, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for b: %v", err)
+	}
+
+	capsuleA, err := lists.Append(list, a)
+	if err != nil {
+		t.Fatalf("Append(a): %v", err)
+	}
+	capsuleB, err := lists.Append(list, b)
+	if err != nil {
+		t.Fatalf("Append(b): %v", err)
+	}
+
+	if err := lists.Remove(list, capsuleB); err != nil {
+		t.Fatalf("Remove(capsuleB): %v", err)
+	}
+
+	tail, hasTail, err := lists.Tail(list)
+	if err != nil {
+		t.Fatalf("Tail(%d): %v", list, err)
+	}
+	if !hasTail || tail != capsuleA {
+		t.Fatalf("Tail(%d) = (%d,%v), want (%d,true)", list, tail, hasTail, capsuleA)
+	}
+
+	if _, hasNext, err := lists.capsules.Next(capsuleA); err != nil {
+		t.Fatalf("Next(capsuleA): %v", err)
+	} else if hasNext {
+		t.Fatal("new tail capsuleA unexpectedly still has a next")
+	}
+}
+
+func TestListRemoveSoleElementEmptiesList(t *testing.T) {
+	g, _, lists := newListTestFixture(t)
+
+	list, err := lists.NewList()
+	if err != nil {
+		t.Fatalf("NewList(): %v", err)
+	}
+
+	a, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for a: %v", err)
+	}
+
+	capsuleA, err := lists.Append(list, a)
+	if err != nil {
+		t.Fatalf("Append(a): %v", err)
+	}
+
+	if err := lists.Remove(list, capsuleA); err != nil {
+		t.Fatalf("Remove(capsuleA): %v", err)
+	}
+
+	if _, hasHead, err := lists.Head(list); err != nil {
+		t.Fatalf("Head(%d): %v", list, err)
+	} else if hasHead {
+		t.Fatal("list unexpectedly still has a head after removing its sole element")
+	}
+
+	if _, hasTail, err := lists.Tail(list); err != nil {
+		t.Fatalf("Tail(%d): %v", list, err)
+	} else if hasTail {
+		t.Fatal("list unexpectedly still has a tail after removing its sole element")
+	}
+
+	elements, err := lists.Elements(list)
+	if err != nil {
+		t.Fatalf("Elements(%d): %v", list, err)
+	}
+	if len(elements) != 0 {
+		t.Fatalf("Elements(%d) = %v, want empty", list, elements)
+	}
+}
+
+func TestListRemoveClearsCapsuleOwnLinks(t *testing.T) {
+	g, _, lists := newListTestFixture(t)
+
+	list, err := lists.NewList()
+	if err != nil {
+		t.Fatalf("NewList(): %v", err)
+	}
+
+	a, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for a: %v", err)
+	}
+	b, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for b: %v", err)
+	}
+	c, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for c: %v", err)
+	}
+
+	if _, err := lists.Append(list, a); err != nil {
+		t.Fatalf("Append(a): %v", err)
+	}
+	capsuleB, err := lists.Append(list, b)
+	if err != nil {
+		t.Fatalf("Append(b): %v", err)
+	}
+	if _, err := lists.Append(list, c); err != nil {
+		t.Fatalf("Append(c): %v", err)
+	}
+
+	if err := lists.Remove(list, capsuleB); err != nil {
+		t.Fatalf("Remove(capsuleB): %v", err)
+	}
+
+	if _, hasPrev, err := lists.capsules.Prev(capsuleB); err != nil {
+		t.Fatalf("Prev(capsuleB): %v", err)
+	} else if hasPrev {
+		t.Fatal("removed capsuleB still has a prev link into its old list")
+	}
+
+	if _, hasNext, err := lists.capsules.Next(capsuleB); err != nil {
+		t.Fatalf("Next(capsuleB): %v", err)
+	} else if hasNext {
+		t.Fatal("removed capsuleB still has a next link into its old list")
+	}
+
+	// The capsule itself remains a valid, addressable ElementCapsule --
+	// removal from a list does not delete or untag it.
+	if !lists.capsules.IsCapsule(capsuleB) {
+		t.Fatal("removed capsuleB lost its AllElementCapsules tag")
+	}
+
+	value, hasValue, err := lists.capsules.Value(capsuleB)
+	if err != nil {
+		t.Fatalf("Value(capsuleB): %v", err)
+	}
+	if !hasValue || value != b {
+		t.Fatalf("Value(capsuleB) = (%d,%v), want (%d,true)", value, hasValue, b)
+	}
+}
+
+func TestListRemoveRequiresCapsuleInList(t *testing.T) {
+	g, capsules, lists := newListTestFixture(t)
+
+	list, err := lists.NewList()
+	if err != nil {
+		t.Fatalf("NewList(): %v", err)
+	}
+
+	value, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for value: %v", err)
+	}
+
+	// A capsule that exists but was never linked into this list.
+	unrelated, err := capsules.NewCapsule(value)
+	if err != nil {
+		t.Fatalf("NewCapsule(): %v", err)
+	}
+
+	err = lists.Remove(list, unrelated)
+	if !errors.Is(err, ErrCapsuleNotInList) {
+		t.Fatalf("Remove() error = %v, want %v", err, ErrCapsuleNotInList)
+	}
+}
+
+func TestListRemoveRequiresListTag(t *testing.T) {
+	g, capsules, lists := newListTestFixture(t)
+
+	notAList, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode(): %v", err)
+	}
+
+	value, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for value: %v", err)
+	}
+
+	capsule, err := capsules.NewCapsule(value)
+	if err != nil {
+		t.Fatalf("NewCapsule(): %v", err)
+	}
+
+	err = lists.Remove(notAList, capsule)
+	if !errors.Is(err, ErrNotList) {
+		t.Fatalf("Remove() error = %v, want %v", err, ErrNotList)
+	}
+}
+
+func TestListDeleteListRequiresListTag(t *testing.T) {
+	g, _, lists := newListTestFixture(t)
+
+	notAList, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode(): %v", err)
+	}
+
+	err = lists.DeleteList(notAList)
+	if !errors.Is(err, ErrNotList) {
+		t.Fatalf("DeleteList() error = %v, want %v", err, ErrNotList)
+	}
+}
+
+func TestListDeleteListFailsIfNotEmpty(t *testing.T) {
+	g, _, lists := newListTestFixture(t)
+
+	list, err := lists.NewList()
+	if err != nil {
+		t.Fatalf("NewList(): %v", err)
+	}
+
+	value, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for value: %v", err)
+	}
+
+	if _, err := lists.Append(list, value); err != nil {
+		t.Fatalf("Append(): %v", err)
+	}
+
+	err = lists.DeleteList(list)
+	if !errors.Is(err, ErrNodeNotEmpty) {
+		t.Fatalf("DeleteList() error = %v, want %v", err, ErrNodeNotEmpty)
+	}
+
+	if !g.NodeExists(list) {
+		t.Fatalf("list %d disappeared even though deletion should have failed", list)
+	}
+
+	if !lists.IsList(list) {
+		t.Fatal("AllLists tag was not restored after a failed DeleteList()")
+	}
+}
+
+func TestListDeleteListSucceedsWhenEmpty(t *testing.T) {
+	g, _, lists := newListTestFixture(t)
+
+	list, err := lists.NewList()
+	if err != nil {
+		t.Fatalf("NewList(): %v", err)
+	}
+
+	if err := lists.DeleteList(list); err != nil {
+		t.Fatalf("DeleteList(): %v", err)
+	}
+
+	if g.NodeExists(list) {
+		t.Fatalf("list %d still exists after successful DeleteList()", list)
+	}
+}
+
+func TestListRemoveThenDeleteListSucceeds(t *testing.T) {
+	g, _, lists := newListTestFixture(t)
+
+	list, err := lists.NewList()
+	if err != nil {
+		t.Fatalf("NewList(): %v", err)
+	}
+
+	value, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for value: %v", err)
+	}
+
+	capsule, err := lists.Append(list, value)
+	if err != nil {
+		t.Fatalf("Append(): %v", err)
+	}
+
+	if err := lists.Remove(list, capsule); err != nil {
+		t.Fatalf("Remove(): %v", err)
+	}
+
+	if err := lists.DeleteList(list); err != nil {
+		t.Fatalf("DeleteList() after Remove(): %v", err)
+	}
+
+	if g.NodeExists(list) {
+		t.Fatalf("list %d still exists after successful DeleteList()", list)
+	}
+}

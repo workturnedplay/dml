@@ -392,10 +392,51 @@ NodeID-keyed structure outside the primitive graph.
  TestListInsertAfterRequiresCapsuleInList, and
  TestListOperationsRequireListTag.
 
- Not yet implemented: removing a capsule from a list (unlinking,
- re-relinking neighbors, adjusting head/tail -- without cascading into
- node deletion, per theorystate_v0.6.md section 18's rejection of
- automatic cascade delete) and deleting a list itself.
+12. Added ListRegistry.Remove and ListRegistry.DeleteList, closing the
+ two gaps item 11 deliberately deferred.
+
+ Remove(list, capsule) unlinks capsule from list: relinks capsule's
+ neighbors around the gap (or updates head/tail if capsule was an
+ endpoint, or clears both if capsule was the sole element), and clears
+ capsule's own prev/next slots, entirely inside one Graph.Transact call.
+ This needed the txOps composability chain extended one more level:
+ singleChildTargetRemoveTx (the tx-composable counterpart of
+ PointerRegistry.RemoveTarget -- a plain, non-transactional
+ RemoveRelationship call is not safe to reuse here, since it would not
+ be recorded in the enclosing transaction's undo log) and
+ CapsuleRegistry.removeSlotTargetTx/removePrevTx/removeNextTx built on
+ it, mirroring the existing setSlotTargetTx/setPrevTx/setNextTx. Remove
+ does not delete or untag capsule -- list membership is a separate
+ concern from capsule-kind/value identity, per theory section 8.
+
+ DeleteList(list) deletes list from the underlying graph and its
+ (AllLists, list) tag together, inside one Graph.Transact call. This is
+ a different shape of coordinated delete than
+ NameRegistry.DeleteNode's: the AllLists tag is itself an ordinary
+ primitive relationship *into* list, so it must be removed *before*
+ Graph.DeleteNode can succeed (not after, the way NameRegistry cleans up
+ its purely-external bookkeeping) -- Transact's rollback is what makes
+ this safe if DeleteNode then fails with ErrNodeNotEmpty. Per
+ theorystate_v0.6.md section 18, this is deliberately "delete only if
+ empty," not cascade; callers must Remove every element first.
+
+ Covered by TestListRemoveMiddleElement, TestListRemoveHeadUpdatesHead,
+ TestListRemoveTailUpdatesTail, TestListRemoveSoleElementEmptiesList,
+ TestListRemoveClearsCapsuleOwnLinks, TestListRemoveRequiresCapsuleInList,
+ TestListRemoveRequiresListTag, TestListDeleteListRequiresListTag,
+ TestListDeleteListFailsIfNotEmpty, TestListDeleteListSucceedsWhenEmpty,
+ and TestListRemoveThenDeleteListSucceeds.
+
+ Ordered Lists are now feature-complete for the primitives currently
+ scoped: creation, append/prepend/insert-after/remove, head/tail/
+ traversal, and list deletion. Not yet addressed: a Set-like membership
+ index for O(1) doesEqual/contains checks (theory section 11 notes this
+ as a possible later addition on top of the existing traversal), and
+ deleting a capsule node itself once fully detached (ordinary
+ Graph.DeleteNode already covers this once its remaining relationships
+ -- AllElementCapsules tag, three slot-tag edges -- are cleared, so no
+ new registry method is obviously needed here, but hasn't been exercised
+ by a test yet).
 
 Currently unaddressed yet:
 - No commit-time interception exists to prevent a raw

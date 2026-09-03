@@ -1199,6 +1199,33 @@ func singleChildTargetSetTx(tx txOps, graph *Graph, node, target NodeID) error {
 	return setPointerTargetTx(tx, node, current, hasCurrent, target)
 }
 
+// singleChildTargetRemoveTx clears node's single "target" child, if any,
+// composed into an existing tx rather than opening a new Graph.Transact.
+// It is the tx-composable counterpart of PointerRegistry.RemoveTarget's
+// read-current/remove sequence: PointerRegistry.RemoveTarget itself
+// removes directly against the underlying Graph, which is correct for
+// standalone use (a single RemoveRelationship call needs no atomicity of
+// its own) but wrong to reuse where the removal must be one step of a
+// larger enclosing transaction -- it would not be recorded in that
+// transaction's undo log, and so would survive a later step's rollback
+// instead of being undone with it. ListRegistry.Remove is exactly such a
+// caller: clearing a capsule's own prev/next slots must roll back
+// together with the neighbor-relinking steps around it.
+//
+// removed reports whether a target actually existed and was removed.
+func singleChildTargetRemoveTx(tx txOps, graph *Graph, node NodeID) (removed bool, err error) {
+	current, hasCurrent, err := singleChildTarget(graph, node)
+	if err != nil {
+		return false, err
+	}
+
+	if !hasCurrent {
+		return false, nil
+	}
+
+	return tx.RemoveRelationship(node, current)
+}
+
 // singleChildTarget returns the single relevant child of node in the
 // underlying Graph, after excluding any NodeIDs listed in exclude.
 //
@@ -2259,6 +2286,37 @@ func (c *CapsuleRegistry) setNextTx(tx txOps, capsule, target NodeID) error {
 	return c.setSlotTargetTx(tx, capsule, c.nextSlots.allPointers, target)
 }
 
+// removeSlotTargetTx clears capsule's role slot -- found via slotTag --
+// composed into an existing tx. capsule must already have the given role
+// slot. This is the tx-composable counterpart of the exported
+// RemovePrev/RemoveNext (see singleChildTargetRemoveTx for why a
+// separate tx-composable path is needed rather than reusing those
+// directly), used by ListRegistry.Remove so a capsule's own links can be
+// cleared as part of the same transaction that relinks its neighbors.
+func (c *CapsuleRegistry) removeSlotTargetTx(tx txOps, capsule, slotTag NodeID) (removed bool, err error) {
+	slot, found, err := findUniqueTaggedChild(c.graph, capsule, slotTag)
+	if err != nil {
+		return false, err
+	}
+	if !found {
+		return false, ErrNotCapsule
+	}
+
+	return singleChildTargetRemoveTx(tx, c.graph, slot)
+}
+
+// removePrevTx clears capsule's prev-slot, composed into an existing tx.
+// See removeSlotTargetTx.
+func (c *CapsuleRegistry) removePrevTx(tx txOps, capsule NodeID) (bool, error) {
+	return c.removeSlotTargetTx(tx, capsule, c.prevSlots.allPointers)
+}
+
+// removeNextTx clears capsule's next-slot, composed into an existing tx.
+// See removeSlotTargetTx.
+func (c *CapsuleRegistry) removeNextTx(tx txOps, capsule NodeID) (bool, error) {
+	return c.removeSlotTargetTx(tx, capsule, c.nextSlots.allPointers)
+}
+
 // NewCapsule creates a fresh capsule NodeID, tags it
 // (AllElementCapsules, capsule), and wires all three of its role slots
 // (prev, value, next), entirely inside one Graph.Transact call, via
@@ -2764,4 +2822,158 @@ func (l *ListRegistry) Elements(list NodeID) ([]NodeID, error) {
 	}
 
 	return values, nil
+}
+
+// Remove unlinks capsule from list, relinking capsule's neighbors (if
+// any) around the gap and updating head/tail tagging as needed, entirely
+// inside one Graph.Transact call. capsule's own prev/next slots are
+// cleared as part of the same transaction, since they described its
+// position within the list it is now leaving -- this leaves capsule as a
+// standalone, valid, empty-linked capsule rather than one carrying stale
+// links into a list it is no longer part of.
+//
+// This does not delete capsule itself, or its role-slot nodes -- no
+// cascade deletion, consistent with theorystate_v0.6.md section 18's
+// rejection of deleteNodeAndRelationships. capsule keeps its
+// AllElementCapsules tag and its value: list membership is a separate
+// concern from capsule-kind or value identity (theory section 8 -- the
+// same node identity can participate in multiple interpretations without
+// changing its primitive facts). A caller wanting to delete capsule
+// afterward must still clear its own remaining relationships first (its
+// AllElementCapsules tag, its three slot-tag edges), per the ordinary
+// Graph.DeleteNode "delete only if empty" rule.
+//
+// list must already be tagged (AllLists, list); capsule must currently
+// be an element of list (checked via the (list, capsule) containment
+// edge, returning ErrCapsuleNotInList otherwise).
+func (l *ListRegistry) Remove(list, capsule NodeID) error {
+	if !l.graph.NodeExists(list) {
+		return ErrNodeNotFound
+	}
+
+	if !l.IsList(list) {
+		return ErrNotList
+	}
+
+	if !l.graph.HasRelationship(list, capsule) {
+		return ErrCapsuleNotInList
+	}
+
+	return l.graph.Transact(func(tx *Txn) error {
+		prev, hasPrev, err := l.capsules.Prev(capsule)
+		if err != nil {
+			return err
+		}
+
+		next, hasNext, err := l.capsules.Next(capsule)
+		if err != nil {
+			return err
+		}
+
+		switch {
+		case hasPrev && hasNext:
+			// Removing a middle element: splice prev and next together
+			// directly. Head/tail are unaffected.
+			if err := l.capsules.setNextTx(tx, prev, next); err != nil {
+				return err
+			}
+			if err := l.capsules.setPrevTx(tx, next, prev); err != nil {
+				return err
+			}
+
+		case hasPrev:
+			// capsule was the tail: prev becomes the new tail.
+			if _, err := l.capsules.removeNextTx(tx, prev); err != nil {
+				return err
+			}
+			if _, err := tx.RemoveRelationship(l.allTails, capsule); err != nil {
+				return err
+			}
+			if _, err := tx.AddRelationship(l.allTails, prev); err != nil {
+				return err
+			}
+
+		case hasNext:
+			// capsule was the head: next becomes the new head.
+			if _, err := l.capsules.removePrevTx(tx, next); err != nil {
+				return err
+			}
+			if _, err := tx.RemoveRelationship(l.allHeads, capsule); err != nil {
+				return err
+			}
+			if _, err := tx.AddRelationship(l.allHeads, next); err != nil {
+				return err
+			}
+
+		default:
+			// capsule was the sole element: the list becomes empty.
+			if _, err := tx.RemoveRelationship(l.allHeads, capsule); err != nil {
+				return err
+			}
+			if _, err := tx.RemoveRelationship(l.allTails, capsule); err != nil {
+				return err
+			}
+		}
+
+		if _, err := l.capsules.removePrevTx(tx, capsule); err != nil {
+			return err
+		}
+		if _, err := l.capsules.removeNextTx(tx, capsule); err != nil {
+			return err
+		}
+
+		_, err = tx.RemoveRelationship(list, capsule)
+		return err
+	})
+}
+
+// DeleteList deletes list from the underlying graph, additionally
+// removing its (AllLists, list) tag as part of the same transaction.
+//
+// Unlike NameRegistry.DeleteNode's coordinated delete -- which deletes
+// the primitive node first and only then cleans up name bookkeeping that
+// lives entirely outside the graph -- the (AllLists, list) tag is itself
+// an ordinary primitive relationship *into* list, and therefore itself
+// counts toward list's relationship count. It must be removed *before*
+// Graph.DeleteNode can succeed, not after. This method's own
+// Graph.Transact call is what makes that safe: if list turns out not to
+// be empty and the underlying DeleteNode call fails with
+// ErrNodeNotEmpty, the tag removal that already happened is rolled back
+// automatically, leaving list exactly as tagged and populated as before
+// this call -- rather than leaving a list untagged but still present
+// with orphaned element capsules.
+//
+// Per theorystate_v0.6.md section 18, deletion is deliberately "delete
+// only if empty," not cascade: DeleteList refuses (ErrNodeNotEmpty,
+// resolvable by clearing and retrying -- unlike RootGraph's
+// ErrCannotDeleteRoot, this is not structurally permanent) if list
+// currently has any element capsules or any other relationship at all.
+// Callers wanting to delete a non-empty list must first Remove every
+// element capsule; DeleteList does not touch those now-detached capsule
+// nodes at all.
+//
+// list must currently be tagged (AllLists, list).
+func (l *ListRegistry) DeleteList(list NodeID) error {
+	if !l.graph.NodeExists(list) {
+		return ErrNodeNotFound
+	}
+
+	if !l.IsList(list) {
+		return ErrNotList
+	}
+
+	return l.graph.Transact(func(tx *Txn) error {
+		if _, err := tx.RemoveRelationship(l.allLists, list); err != nil {
+			return err
+		}
+
+		// Graph.DeleteNode is called directly rather than through tx --
+		// Txn deliberately has no transactional DeleteNode (see the Txn
+		// doc comment) -- but that is fine here: DeleteNode either
+		// succeeds outright (nothing left for rollback to undo) or fails
+		// without mutating anything, in which case returning its error
+		// from this closure triggers Transact's normal rollback of the
+		// tag-removal step above.
+		return l.graph.DeleteNode(list)
+	})
 }
