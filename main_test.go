@@ -4240,7 +4240,7 @@ func TestListContainsRequiresExistingValue(t *testing.T) {
 	}
 }
 
-func TestListRemoveMiddleElement(t *testing.T) {
+func TestListRemoveWithoutDeletingCapsuleMiddleElement(t *testing.T) {
 	g, _, lists := newListTestFixture(t)
 
 	list, err := lists.NewList()
@@ -4273,8 +4273,8 @@ func TestListRemoveMiddleElement(t *testing.T) {
 		t.Fatalf("Append(c): %v", err)
 	}
 
-	if err := lists.Remove(list, capsuleB); err != nil {
-		t.Fatalf("Remove(capsuleB): %v", err)
+	if err := lists.RemoveWithoutDeletingCapsule(list, capsuleB); err != nil {
+		t.Fatalf("RemoveWithoutDeletingCapsule(capsuleB): %v", err)
 	}
 
 	got, err := lists.Elements(list)
@@ -4300,7 +4300,7 @@ func TestListRemoveMiddleElement(t *testing.T) {
 	}
 }
 
-func TestListRemoveHeadUpdatesHead(t *testing.T) {
+func TestListRemoveWithoutDeletingCapsuleHeadUpdatesHead(t *testing.T) {
 	g, _, lists := newListTestFixture(t)
 
 	list, err := lists.NewList()
@@ -4326,8 +4326,8 @@ func TestListRemoveHeadUpdatesHead(t *testing.T) {
 		t.Fatalf("Append(b): %v", err)
 	}
 
-	if err := lists.Remove(list, capsuleA); err != nil {
-		t.Fatalf("Remove(capsuleA): %v", err)
+	if err := lists.RemoveWithoutDeletingCapsule(list, capsuleA); err != nil {
+		t.Fatalf("RemoveWithoutDeletingCapsule(capsuleA): %v", err)
 	}
 
 	head, hasHead, err := lists.Head(list)
@@ -4345,7 +4345,7 @@ func TestListRemoveHeadUpdatesHead(t *testing.T) {
 	}
 }
 
-func TestListRemoveTailUpdatesTail(t *testing.T) {
+func TestListRemoveWithoutDeletingCapsuleTailUpdatesTail(t *testing.T) {
 	g, _, lists := newListTestFixture(t)
 
 	list, err := lists.NewList()
@@ -4371,8 +4371,8 @@ func TestListRemoveTailUpdatesTail(t *testing.T) {
 		t.Fatalf("Append(b): %v", err)
 	}
 
-	if err := lists.Remove(list, capsuleB); err != nil {
-		t.Fatalf("Remove(capsuleB): %v", err)
+	if err := lists.RemoveWithoutDeletingCapsule(list, capsuleB); err != nil {
+		t.Fatalf("RemoveWithoutDeletingCapsule(capsuleB): %v", err)
 	}
 
 	tail, hasTail, err := lists.Tail(list)
@@ -4390,7 +4390,7 @@ func TestListRemoveTailUpdatesTail(t *testing.T) {
 	}
 }
 
-func TestListRemoveSoleElementEmptiesList(t *testing.T) {
+func TestListRemoveWithoutDeletingCapsuleSoleElementEmptiesList(t *testing.T) {
 	g, _, lists := newListTestFixture(t)
 
 	list, err := lists.NewList()
@@ -4408,8 +4408,8 @@ func TestListRemoveSoleElementEmptiesList(t *testing.T) {
 		t.Fatalf("Append(a): %v", err)
 	}
 
-	if err := lists.Remove(list, capsuleA); err != nil {
-		t.Fatalf("Remove(capsuleA): %v", err)
+	if err := lists.RemoveWithoutDeletingCapsule(list, capsuleA); err != nil {
+		t.Fatalf("RemoveWithoutDeletingCapsule(capsuleA): %v", err)
 	}
 
 	if _, hasHead, err := lists.Head(list); err != nil {
@@ -4433,7 +4433,7 @@ func TestListRemoveSoleElementEmptiesList(t *testing.T) {
 	}
 }
 
-func TestListRemoveClearsCapsuleOwnLinks(t *testing.T) {
+func TestListRemoveWithoutDeletingCapsuleClearsCapsuleOwnLinks(t *testing.T) {
 	g, _, lists := newListTestFixture(t)
 
 	list, err := lists.NewList()
@@ -4465,8 +4465,8 @@ func TestListRemoveClearsCapsuleOwnLinks(t *testing.T) {
 		t.Fatalf("Append(c): %v", err)
 	}
 
-	if err := lists.Remove(list, capsuleB); err != nil {
-		t.Fatalf("Remove(capsuleB): %v", err)
+	if err := lists.RemoveWithoutDeletingCapsule(list, capsuleB); err != nil {
+		t.Fatalf("RemoveWithoutDeletingCapsule(capsuleB): %v", err)
 	}
 
 	if _, hasPrev, err := lists.capsules.Prev(capsuleB); err != nil {
@@ -4496,7 +4496,7 @@ func TestListRemoveClearsCapsuleOwnLinks(t *testing.T) {
 	}
 }
 
-func TestListRemoveRequiresCapsuleInList(t *testing.T) {
+func TestListRemoveWithoutDeletingCapsuleRequiresCapsuleInList(t *testing.T) {
 	g, capsules, lists := newListTestFixture(t)
 
 	list, err := lists.NewList()
@@ -4515,13 +4515,13 @@ func TestListRemoveRequiresCapsuleInList(t *testing.T) {
 		t.Fatalf("NewCapsule(): %v", err)
 	}
 
-	err = lists.Remove(list, unrelated)
+	err = lists.RemoveWithoutDeletingCapsule(list, unrelated)
 	if !errors.Is(err, ErrCapsuleNotInList) {
-		t.Fatalf("Remove() error = %v, want %v", err, ErrCapsuleNotInList)
+		t.Fatalf("RemoveWithoutDeletingCapsule() error = %v, want %v", err, ErrCapsuleNotInList)
 	}
 }
 
-func TestListRemoveRequiresListTag(t *testing.T) {
+func TestListRemoveWithoutDeletingCapsuleRequiresListTag(t *testing.T) {
 	g, capsules, lists := newListTestFixture(t)
 
 	notAList, err := g.CreateNode()
@@ -4539,9 +4539,9 @@ func TestListRemoveRequiresListTag(t *testing.T) {
 		t.Fatalf("NewCapsule(): %v", err)
 	}
 
-	err = lists.Remove(notAList, capsule)
+	err = lists.RemoveWithoutDeletingCapsule(notAList, capsule)
 	if !errors.Is(err, ErrNotList) {
-		t.Fatalf("Remove() error = %v, want %v", err, ErrNotList)
+		t.Fatalf("RemoveWithoutDeletingCapsule() error = %v, want %v", err, ErrNotList)
 	}
 }
 
@@ -4607,7 +4607,7 @@ func TestListDeleteListSucceedsWhenEmpty(t *testing.T) {
 	}
 }
 
-func TestListRemoveThenDeleteListSucceeds(t *testing.T) {
+func TestListRemoveWithoutDeletingCapsuleThenDeleteListSucceeds(t *testing.T) {
 	g, _, lists := newListTestFixture(t)
 
 	list, err := lists.NewList()
@@ -4625,12 +4625,12 @@ func TestListRemoveThenDeleteListSucceeds(t *testing.T) {
 		t.Fatalf("Append(): %v", err)
 	}
 
-	if err := lists.Remove(list, capsule); err != nil {
-		t.Fatalf("Remove(): %v", err)
+	if err := lists.RemoveWithoutDeletingCapsule(list, capsule); err != nil {
+		t.Fatalf("RemoveWithoutDeletingCapsule(): %v", err)
 	}
 
 	if err := lists.DeleteList(list); err != nil {
-		t.Fatalf("DeleteList() after Remove(): %v", err)
+		t.Fatalf("DeleteList() after RemoveWithoutDeletingCapsule(): %v", err)
 	}
 
 	if g.NodeExists(list) {
@@ -4638,7 +4638,7 @@ func TestListRemoveThenDeleteListSucceeds(t *testing.T) {
 	}
 }
 
-func TestListRemoveAndDeleteDeletesUnreferencedCapsule(t *testing.T) {
+func TestListRemoveDeletesUnreferencedCapsule(t *testing.T) {
 	g, _, lists := newListTestFixture(t)
 
 	list, err := lists.NewList()
@@ -4656,20 +4656,20 @@ func TestListRemoveAndDeleteDeletesUnreferencedCapsule(t *testing.T) {
 		t.Fatalf("Append(): %v", err)
 	}
 
-	deleted, err := lists.RemoveAndDelete(list, capsule)
+	deleted, err := lists.Remove(list, capsule)
 	if err != nil {
-		t.Fatalf("RemoveAndDelete(): %v", err)
+		t.Fatalf("Remove(): %v", err)
 	}
 	if !deleted {
-		t.Fatal("RemoveAndDelete() reported deleted=false for an unreferenced capsule")
+		t.Fatal("Remove() reported deleted=false for an unreferenced capsule")
 	}
 
 	if g.NodeExists(capsule) {
-		t.Fatalf("capsule %d still exists after RemoveAndDelete()", capsule)
+		t.Fatalf("capsule %d still exists after Remove()", capsule)
 	}
 
 	if g.HasRelationship(list, capsule) {
-		t.Fatal("capsule is still linked into list after RemoveAndDelete()")
+		t.Fatal("capsule is still linked into list after Remove()")
 	}
 
 	elements, err := lists.Elements(list)
@@ -4677,11 +4677,11 @@ func TestListRemoveAndDeleteDeletesUnreferencedCapsule(t *testing.T) {
 		t.Fatalf("Elements(list): %v", err)
 	}
 	if len(elements) != 0 {
-		t.Fatalf("Elements(list) = %v, want empty after RemoveAndDelete()", elements)
+		t.Fatalf("Elements(list) = %v, want empty after Remove()", elements)
 	}
 }
 
-func TestListRemoveAndDeleteKeepsCapsuleIfStillReferencedElsewhere(t *testing.T) {
+func TestListRemoveKeepsCapsuleIfStillReferencedElsewhere(t *testing.T) {
 	g, capsules, lists := newListTestFixture(t)
 
 	list, err := lists.NewList()
@@ -4716,24 +4716,24 @@ func TestListRemoveAndDeleteKeepsCapsuleIfStillReferencedElsewhere(t *testing.T)
 		t.Fatalf("AddRelationship(metadata, valueSlot): %v", err)
 	}
 
-	deleted, err := lists.RemoveAndDelete(list, capsule)
+	deleted, err := lists.Remove(list, capsule)
 	if err != nil {
-		t.Fatalf("RemoveAndDelete(): %v", err)
+		t.Fatalf("Remove(): %v", err)
 	}
 	if deleted {
-		t.Fatal("RemoveAndDelete() reported deleted=true for a capsule still referenced elsewhere")
+		t.Fatal("Remove() reported deleted=true for a capsule still referenced elsewhere")
 	}
 
 	// The removal half must still have fully succeeded.
 	if g.HasRelationship(list, capsule) {
-		t.Fatal("capsule is still linked into list after RemoveAndDelete()")
+		t.Fatal("capsule is still linked into list after Remove()")
 	}
 	elements, err := lists.Elements(list)
 	if err != nil {
 		t.Fatalf("Elements(list): %v", err)
 	}
 	if len(elements) != 0 {
-		t.Fatalf("Elements(list) = %v, want empty after RemoveAndDelete()", elements)
+		t.Fatalf("Elements(list) = %v, want empty after Remove()", elements)
 	}
 
 	// But the capsule itself, being undeletable, must remain intact.
@@ -4745,7 +4745,7 @@ func TestListRemoveAndDeleteKeepsCapsuleIfStillReferencedElsewhere(t *testing.T)
 	}
 }
 
-func TestListRemoveAndDeleteRequiresCapsuleInList(t *testing.T) {
+func TestListRemoveRequiresCapsuleInList(t *testing.T) {
 	g, capsules, lists := newListTestFixture(t)
 
 	list, err := lists.NewList()
@@ -4763,13 +4763,13 @@ func TestListRemoveAndDeleteRequiresCapsuleInList(t *testing.T) {
 		t.Fatalf("NewCapsule(): %v", err)
 	}
 
-	_, err = lists.RemoveAndDelete(list, unrelated)
+	_, err = lists.Remove(list, unrelated)
 	if !errors.Is(err, ErrCapsuleNotInList) {
-		t.Fatalf("RemoveAndDelete() error = %v, want %v", err, ErrCapsuleNotInList)
+		t.Fatalf("Remove() error = %v, want %v", err, ErrCapsuleNotInList)
 	}
 }
 
-func TestListRemoveAndDeleteRequiresListTag(t *testing.T) {
+func TestListRemoveRequiresListTag(t *testing.T) {
 	g, capsules, lists := newListTestFixture(t)
 
 	notAList, err := g.CreateNode()
@@ -4787,8 +4787,8 @@ func TestListRemoveAndDeleteRequiresListTag(t *testing.T) {
 		t.Fatalf("NewCapsule(): %v", err)
 	}
 
-	_, err = lists.RemoveAndDelete(notAList, capsule)
+	_, err = lists.Remove(notAList, capsule)
 	if !errors.Is(err, ErrNotList) {
-		t.Fatalf("RemoveAndDelete() error = %v, want %v", err, ErrNotList)
+		t.Fatalf("Remove() error = %v, want %v", err, ErrNotList)
 	}
 }

@@ -537,6 +537,62 @@ NodeID-keyed structure outside the primitive graph.
  TestListRemoveAndDeleteRequiresListTag, and
  TestCapsuleRoleSlotsAreNotTaggedWithGenericAllPointers.
 
+14. Added CapsuleRegistry.DeleteCapsule and ListRegistry.RemoveAndDelete
+ (see item 15 for the RemoveAndDelete rename), resolving item 13's "not
+ yet addressed" note about deleting a fully detached capsule.
+
+15. Corrected a wrong premise found during review: Txn was believed
+ unable to undo a Graph.DeleteNode call once it succeeded, and item 14's
+ DeleteCapsule was built around that belief (a nodeIsEmpty read-only
+ pre-verification pass over all four nodes before deleting any of
+ them). That belief was wrong, not merely cautious -- Graph.DeleteNode
+ only ever succeeds when a node already has zero relationships in both
+ directions, and NodeIDs are never reused once handed out (the counter
+ only increases), so undoing a delete only ever needs to restore
+ "exists, with empty relationship maps," which can never collide with
+ an unrelated node. Added Graph.resurrectNode (internal) and
+ Txn.DeleteNode, which records a resurrection undo step exactly like
+ every other Txn method already records its own. txOps was extended to
+ include DeleteNode accordingly.
+
+ DeleteCapsule was simplified to match: the nodeIsEmpty helper and its
+ separate pre-verification pass are gone entirely. Each of the four
+ nodes is now deleted via tx.DeleteNode in sequence after the known
+ relationships are cleared; if a later delete in the sequence fails
+ (ErrNodeNotEmpty, mapped to ErrCapsuleNotEmpty), Transact's ordinary
+ rollback undoes every earlier step in the same call, including any
+ DeleteNode calls that had already succeeded earlier in that sequence.
+ All existing DeleteCapsule tests continue to pass unmodified against
+ this simplified implementation. See theorystate_v0.6.md section 78
+ (corrected this session) for the full writeup, including the specific
+ caveat that this safety is tied to the current toy allocator's
+ never-reuse property and would not automatically transfer to a NodeID
+ scheme that permits reuse.
+
+ Separately, per discussion: ListRegistry.Remove is now the primary/
+ default removal operation -- unlink capsule from its list and reclaim
+ it via DeleteCapsule whenever nothing else still references it, since a
+ capsule exists only to represent one list-element occurrence and has no
+ reason to be left behind once unreferenced. The previous Remove
+ (unlink only, capsule always survives) is renamed ListRegistry.
+ RemoveWithoutDeletingCapsule and kept available for callers that need
+ capsule to unconditionally survive removal. Tests previously named
+ TestListRemove* for the unlink-only behavior are renamed
+ TestListRemoveWithoutDeletingCapsule* accordingly; no test behavior
+ changed, only names, to track the renamed method they exercise.
+
+ Covered by TestListRemoveWithoutDeletingCapsuleMiddleElement,
+ TestListRemoveWithoutDeletingCapsuleHeadUpdatesHead,
+ TestListRemoveWithoutDeletingCapsuleTailUpdatesTail,
+ TestListRemoveWithoutDeletingCapsuleSoleElementEmptiesList,
+ TestListRemoveWithoutDeletingCapsuleClearsCapsuleOwnLinks,
+ TestListRemoveWithoutDeletingCapsuleRequiresCapsuleInList,
+ TestListRemoveWithoutDeletingCapsuleRequiresListTag,
+ TestListRemoveWithoutDeletingCapsuleThenDeleteListSucceeds,
+ TestListRemoveDeletesUnreferencedCapsule,
+ TestListRemoveKeepsCapsuleIfStillReferencedElsewhere,
+ TestListRemoveRequiresCapsuleInList, and TestListRemoveRequiresListTag.
+
 Currently unaddressed yet:
 - No commit-time interception exists to prevent a raw
   Graph.AddRelationship from creating a second child on an
@@ -548,6 +604,6 @@ Currently unaddressed yet:
   nothing to stop an unrelated caller from bypassing the registry
   entirely via the raw Graph. Whether/when a real interception mechanism
   (theorystate_v0.6.md section 73) is worth building is open.
-- Txn does not support transactional DeleteNode, and does not support
-  nesting one Graph.Transact call inside another. Neither is needed by
+- Txn does not support nesting one Graph.Transact call inside another
+  (Txn.DeleteNode is supported -- see item 15). Nesting is not needed by
   any current caller; add support if and when one actually needs it.

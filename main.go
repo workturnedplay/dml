@@ -262,6 +262,28 @@ func (g *Graph) DeleteNode(id NodeID) error {
 	return nil
 }
 
+// resurrectNode re-inserts id into the graph with no relationships,
+// without consuming a new ID from the monotonic counter.
+//
+// This is an internal, low-level helper used only by Txn.DeleteNode's
+// rollback path. It is safe -- not merely convenient -- because of two
+// facts holding together: (1) Graph.DeleteNode only ever succeeds when
+// id already has zero relationships in both directions, so "existing,
+// with empty outgoing/incoming maps" is a *complete* restoration of id's
+// prior state, not merely a partial one; and (2) NodeIDs are never
+// reused once handed out by CreateNode (the counter only increases, and
+// a deleted id is never returned to any pool of ids available for
+// reuse), so resurrecting id can never collide with some unrelated node
+// that might have taken over the same id in the meantime -- no such
+// takeover is possible. Do not call this for any purpose other than
+// undoing a Txn-recorded DeleteNode.
+func (g *Graph) resurrectNode(id NodeID) {
+	g.ensureInitialized()
+	g.nodes[id] = struct{}{}
+	g.outgoing[id] = make(map[NodeID]struct{})
+	g.incoming[id] = make(map[NodeID]struct{})
+}
+
 func (g *Graph) ensureInitialized() {
 	if g.nodes == nil {
 		g.nodes = make(map[NodeID]struct{})
@@ -317,18 +339,28 @@ func (g *Graph) nodeExists(id NodeID) bool {
 // there is currently no concurrent reader that a staged view would need
 // to protect from seeing uncommitted state.
 //
-// Txn's mutating surface deliberately covers only what current callers
-// need: CreateNode, AddRelationship, and RemoveRelationship. Txn does not
-// offer a DeleteNode method: undoing a delete would require resurrecting
-// the exact same NodeID outside the normal monotonic counter, which is a
-// real design question of its own (see the never-reuse policy discussion
-// around ErrNodeIDExhausted) and is deferred until an actual caller needs
-// a transactional delete. Read operations are not wrapped either, since
-// every current caller already holds a reference to the underlying Graph
-// (or NameRegistry/PointerRegistry wrapping one) for reads; add
-// read-passthrough methods here if and when a caller actually needs them
-// (theorystate_v0.6.md section 7's construct-only-what's-needed
-// discipline).
+// Txn's mutating surface covers CreateNode, AddRelationship,
+// RemoveRelationship, and DeleteNode. An earlier version of this comment
+// claimed DeleteNode could not be supported transactionally because
+// undoing it would require "resurrecting the exact same NodeID outside
+// the normal monotonic counter" -- that claim was wrong, not merely
+// cautious: NodeIDs in this implementation are never reused once handed
+// out by CreateNode (the counter only ever increases; a deleted id is
+// never returned to a pool of ids available for reuse), and
+// Graph.DeleteNode only ever succeeds when the node already has zero
+// relationships in both directions. Put together, undoing a DeleteNode
+// never needs to reconstruct any relationship state at all -- it only
+// ever needs to restore "id exists, with empty relationship maps",
+// which is a complete and exact restoration of id's state immediately
+// before the delete, and can never collide with some other node having
+// taken over id in the meantime, since that can't happen. See
+// Graph.resurrectNode and Txn.DeleteNode below.
+//
+// Read operations are not wrapped, since every current caller already
+// holds a reference to the underlying Graph (or NameRegistry/
+// PointerRegistry wrapping one) for reads; add read-passthrough methods
+// here if and when a caller actually needs them (theorystate_v0.6.md
+// section 7's construct-only-what's-needed discipline).
 //
 // Nesting one Graph.Transact call inside another is not currently
 // supported or used by anything in this file: an inner Txn has its own
@@ -445,6 +477,37 @@ func (tx *Txn) RemoveRelationship(a, b NodeID) (removed bool, err error) {
 	}
 
 	return removed, nil
+}
+
+// DeleteNode behaves exactly like Graph.DeleteNode, additionally
+// recording an undo step that resurrects id -- exactly as it was
+// immediately before this call -- if the enclosing transaction rolls
+// back. See Graph.resurrectNode and the Txn doc comment above for why
+// this is a safe, complete restoration and not a workaround: id had
+// zero relationships in both directions immediately before this call
+// (that is Graph.DeleteNode's own precondition for succeeding), and
+// NodeIDs are never reused, so there is nothing more to restore and no
+// possibility of id having been claimed by an unrelated node in the
+// meantime.
+//
+// This is what lets a caller compose several DeleteNode calls into one
+// logical multi-node teardown inside a single Graph.Transact call (see
+// CapsuleRegistry.DeleteCapsule) without first having to prove every
+// node's emptiness ahead of time: if a later DeleteNode call in the
+// sequence fails, Transact's normal LIFO rollback undoes every earlier
+// step, including any DeleteNode calls that had already succeeded
+// earlier in that same sequence, exactly like it already does for
+// AddRelationship/RemoveRelationship/CreateNode.
+func (tx *Txn) DeleteNode(id NodeID) error {
+	if err := tx.graph.DeleteNode(id); err != nil {
+		return err
+	}
+
+	tx.undo = append(tx.undo, func() {
+		tx.graph.resurrectNode(id)
+	})
+
+	return nil
 }
 
 var (
@@ -1133,8 +1196,11 @@ var (
 
 // txOps is the minimal mutating surface needed to compose primitive
 // operations atomically, whether directly against a *Graph or inside an
-// existing *Txn. Both *Graph and *Txn satisfy it with their existing,
-// unmodified method sets.
+// existing *Txn. Both *Graph and *Txn satisfy it with their existing
+// method sets, including DeleteNode -- Txn.DeleteNode is itself fully
+// undoable (see its doc comment), so a caller composing several deletes
+// into one logical teardown does not need any special pre-verification
+// step of its own; an ordinary Transact rollback already covers it.
 //
 // This exists so a registry's create/wire sequence can be reused both as
 // a standalone top-level Graph.Transact call and as one step composed
@@ -1148,6 +1214,7 @@ type txOps interface {
 	CreateNode() (NodeID, error)
 	AddRelationship(a, b NodeID) (created bool, err error)
 	RemoveRelationship(a, b NodeID) (removed bool, err error)
+	DeleteNode(id NodeID) error
 }
 
 // createTaggedNodeTx creates a fresh node and tags it via (tag, id),
@@ -1252,35 +1319,6 @@ func singleChildTargetRemoveTx(tx txOps, graph *Graph, node NodeID) (removed boo
 	}
 
 	return tx.RemoveRelationship(node, current)
-}
-
-// nodeIsEmpty reports whether id currently has no relationships at all,
-// in either direction -- the same condition Graph.DeleteNode itself
-// requires before it will delete a node, checked here ahead of time,
-// read-only, with no mutation. This exists so a caller composing several
-// Graph.DeleteNode calls into one logical operation
-// (CapsuleRegistry.DeleteCapsule deletes four nodes together) can
-// confirm every one of them is already safe to delete before actually
-// deleting any of them, since Txn cannot undo a DeleteNode call once it
-// succeeds (see the Txn doc comment) -- so the safe pattern is to prove
-// every deletion will succeed first, then perform them, rather than
-// discovering a failure partway through a sequence of otherwise
-// non-undoable deletes.
-func nodeIsEmpty(g *Graph, id NodeID) (bool, error) {
-	outgoing, err := g.FindOutgoing(id)
-	if err != nil {
-		return false, err
-	}
-	if len(outgoing) != 0 {
-		return false, nil
-	}
-
-	incoming, err := g.FindIncoming(id)
-	if err != nil {
-		return false, err
-	}
-
-	return len(incoming) == 0, nil
 }
 
 // singleChildTarget returns the single relevant child of node in the
@@ -2629,41 +2667,42 @@ func (c *CapsuleRegistry) RemoveNext(capsule NodeID) (removed bool, err error) {
 // A capsule minted via NewCapsule/newCapsuleTx has a fixed, known shape:
 // its own AllElementCapsules tag, exactly three outgoing edges to its
 // role slots, each slot's own role tag, and (usually) a target already
-// set on the value slot. DeleteCapsule is only willing to proceed if
-// every one of these four nodes -- capsule, prevSlot, valueSlot,
-// nextSlot -- has *exactly* that fixed shape and nothing else: no list
-// membership or head/tail tag on the capsule, no target currently set on
-// prevSlot or nextSlot, and no unrelated parent or child added to any of
-// the four by something else. If even one of them carries any
-// additional relationship -- ListRegistry still linking capsule into a
-// list, a caller having called SetPrev/SetNext without a matching
-// Remove, or some future structure referencing a slot node for its own
-// reasons -- DeleteCapsule changes nothing at all and returns
-// ErrCapsuleNotEmpty, rather than deleting only the parts that happen to
-// be clean and leaving a broken, partially-torn-down capsule behind.
-// This is deliberately all-or-nothing.
+// set on the value slot. DeleteCapsule removes every relationship
+// CapsuleRegistry itself is aware of through tx first (capsule's own
+// three slot-edges and its AllElementCapsules tag, the value slot's
+// target edge if set, and each slot's own role-tag edge), then deletes
+// each of the four nodes via tx.DeleteNode. If capsule or any of its
+// three slots still carries something beyond that fixed shape --
+// ListRegistry still linking capsule into a list, a caller having
+// called SetPrev/SetNext without a matching removal, or some future
+// structure referencing a slot node for its own reasons -- the
+// corresponding tx.DeleteNode call fails with the underlying Graph's own
+// ErrNodeNotEmpty, which this method maps to the more specific
+// ErrCapsuleNotEmpty.
+//
+// This is deliberately all-or-nothing, and getting that right requires
+// no special care: tx.DeleteNode is itself fully undoable (see the Txn
+// doc comment), so if a later delete in the sequence below fails,
+// Graph.Transact's ordinary LIFO rollback automatically undoes every
+// earlier step in this same call -- including any DeleteNode calls that
+// had already succeeded earlier in the sequence -- exactly like it
+// already does for every other multi-step operation in this file. No
+// separate pre-verification pass is needed before deleting anything;
+// see theorystate_v0.6.md section 78 for why an earlier version of this
+// method needed one; and why it no longer does.
 //
 // Every relationship this removes is one CapsuleRegistry itself is
 // certain it created (via buildCapsuleTx). value itself is never
 // deleted -- only the valueSlot -> value edge is removed -- since value
 // is caller-owned data that may still be referenced elsewhere (e.g. by
-// another capsule's own value slot).
-//
-// Safety under Txn's documented limitation that it cannot undo a
-// DeleteNode call once it succeeds (see the Txn doc comment): every
-// relationship removal below runs through tx first (fully undoable),
-// then nodeIsEmpty re-derives, read-only, whether each of the four nodes
-// genuinely has zero relationships left -- if not, this returns
-// ErrCapsuleNotEmpty before any node is deleted, and Transact rolls back
-// every relationship removed above, leaving capsule exactly as it was.
-// Only once all four nodes are confirmed empty are the four
-// Graph.DeleteNode calls made, directly against the graph rather than
-// through tx (Txn does not support transactional DeleteNode), grouped
-// last and in sequence -- by that point every one of them is guaranteed
-// to succeed under this codebase's single-threaded, serialized execution
-// model (theorystate_v0.6.md section 19), since nothing else can mutate
-// the graph between the nodeIsEmpty checks and these deletes within the
-// same synchronous call.
+// another capsule's own value slot). prevSlot and nextSlot's own target
+// edges, if set, are deliberately never force-cleared here: doing so
+// would risk leaving a *neighboring* capsule (whatever prevSlot/nextSlot
+// currently points at) with a dangling reference into a node this call
+// is about to delete. Refusing to delete when a prev/next target is
+// still set (surfaced as ErrCapsuleNotEmpty via the corresponding slot's
+// failed tx.DeleteNode) is the correct behavior, not a missing feature;
+// see TestCapsuleRegistryDeleteCapsuleFailsIfPrevOrNextSet.
 //
 // capsule must currently be tagged (AllElementCapsules, capsule); a
 // capsule somehow missing one of its three role slots -- only reachable
@@ -2734,25 +2773,15 @@ func (c *CapsuleRegistry) DeleteCapsule(capsule NodeID) error {
 		}
 
 		for _, node := range []NodeID{prevSlot, valueSlot, nextSlot, capsule} {
-			empty, err := nodeIsEmpty(c.graph, node)
-			if err != nil {
+			if err := tx.DeleteNode(node); err != nil {
+				if errors.Is(err, ErrNodeNotEmpty) {
+					return ErrCapsuleNotEmpty
+				}
 				return err
-			}
-			if !empty {
-				return ErrCapsuleNotEmpty
 			}
 		}
 
-		if err := c.graph.DeleteNode(prevSlot); err != nil {
-			return err
-		}
-		if err := c.graph.DeleteNode(valueSlot); err != nil {
-			return err
-		}
-		if err := c.graph.DeleteNode(nextSlot); err != nil {
-			return err
-		}
-		return c.graph.DeleteNode(capsule)
+		return nil
 	})
 }
 
@@ -2791,11 +2820,13 @@ func (c *CapsuleRegistry) DeleteCapsule(capsule NodeID) error {
 // As with every other registry in this file, list structure is
 // re-derived fresh from the Graph on every call rather than cached.
 //
-// Not yet implemented: removing a capsule from a list (unlinking and
-// re-relinking neighbors, adjusting head/tail, without cascading into
-// node deletion -- see theorystate_v0.6.md section 18's rejection of
-// automatic cascade delete) and deleting a list itself. Both are
-// deferred to a future change, not overlooked.
+// Two removal paths are available: RemoveWithoutDeletingCapsule unlinks
+// capsule from list only, leaving it standalone and intact (no cascading
+// node deletion, consistent with theorystate_v0.6.md section 18's
+// rejection of automatic cascade delete); Remove does the same unlinking
+// and then additionally reclaims capsule via CapsuleRegistry.DeleteCapsule
+// whenever nothing else still references it. DeleteList removes a list
+// itself once empty.
 type ListRegistry struct {
 	graph    *Graph
 	capsules *CapsuleRegistry
@@ -3195,13 +3226,13 @@ func (l *ListRegistry) Contains(list, value NodeID) (capsule NodeID, found bool,
 	return occurrences[0], true, nil
 }
 
-// Remove unlinks capsule from list, relinking capsule's neighbors (if
-// any) around the gap and updating head/tail tagging as needed, entirely
-// inside one Graph.Transact call. capsule's own prev/next slots are
-// cleared as part of the same transaction, since they described its
-// position within the list it is now leaving -- this leaves capsule as a
-// standalone, valid, empty-linked capsule rather than one carrying stale
-// links into a list it is no longer part of.
+// RemoveWithoutDeletingCapsule unlinks capsule from list, relinking
+// capsule's neighbors (if any) around the gap and updating head/tail
+// tagging as needed, entirely inside one Graph.Transact call. capsule's
+// own prev/next slots are cleared as part of the same transaction, since
+// they described its position within the list it is now leaving -- this
+// leaves capsule as a standalone, valid, empty-linked capsule rather
+// than one carrying stale links into a list it is no longer part of.
 //
 // This does not delete capsule itself, or its role-slot nodes -- no
 // cascade deletion, consistent with theorystate_v0.6.md section 18's
@@ -3209,15 +3240,20 @@ func (l *ListRegistry) Contains(list, value NodeID) (capsule NodeID, found bool,
 // AllElementCapsules tag and its value: list membership is a separate
 // concern from capsule-kind or value identity (theory section 8 -- the
 // same node identity can participate in multiple interpretations without
-// changing its primitive facts). A caller wanting to delete capsule
-// afterward must still clear its own remaining relationships first (its
-// AllElementCapsules tag, its three slot-tag edges), per the ordinary
-// Graph.DeleteNode "delete only if empty" rule.
+// changing its primitive facts).
+//
+// This is the lower-level primitive Remove (below) builds on: Remove
+// calls this method first and then attempts CapsuleRegistry.DeleteCapsule
+// as a second, separate step. Call this method directly instead of
+// Remove when capsule must unconditionally survive removal regardless of
+// whether it happens to be otherwise unreferenced -- e.g. a caller
+// planning to immediately re-link capsule into a different list or
+// position.
 //
 // list must already be tagged (AllLists, list); capsule must currently
 // be an element of list (checked via the (list, capsule) containment
 // edge, returning ErrCapsuleNotInList otherwise).
-func (l *ListRegistry) Remove(list, capsule NodeID) error {
+func (l *ListRegistry) RemoveWithoutDeletingCapsule(list, capsule NodeID) error {
 	if !l.graph.NodeExists(list) {
 		return ErrNodeNotFound
 	}
@@ -3298,46 +3334,45 @@ func (l *ListRegistry) Remove(list, capsule NodeID) error {
 	})
 }
 
-// RemoveAndDelete unlinks capsule from list, exactly as Remove does, and
+// Remove unlinks capsule from list via RemoveWithoutDeletingCapsule, and
 // then additionally attempts to delete capsule and its three role-slot
-// nodes via CapsuleRegistry.DeleteCapsule.
+// nodes via CapsuleRegistry.DeleteCapsule -- this is the list structure
+// cleaning up after itself: a capsule exists only to represent one
+// occurrence of a value within a list (theory section 12 / section 75),
+// so once it is removed from its (only) list and nothing else has taken
+// an interest in it, there is no reason to leave it behind as an orphan.
 //
 // deleted reports whether the capsule was actually deleted. Deletion is
 // best-effort and deliberately not the same atomic step as removal:
-// Remove's own step always fully commits on its own terms, exactly as
-// calling Remove directly would, and DeleteCapsule is then attempted
-// separately immediately afterward. If capsule turns out not to be
-// safely deletable -- some further reference to it or one of its role
-// slots exists beyond what Remove itself cleared -- deleted is false
-// and err is nil: this is not a failure of RemoveAndDelete, it simply
+// RemoveWithoutDeletingCapsule's own step always fully commits on its
+// own terms, exactly as calling it directly would, and DeleteCapsule is
+// then attempted separately immediately afterward. If capsule turns out
+// not to be safely deletable -- some further reference to it or one of
+// its role slots exists beyond what removal itself cleared, e.g. it was
+// also (unusually) referenced by something outside this list -- deleted
+// is false and err is nil: this is not a failure of Remove, it simply
 // means capsule was left in place, standalone and still valid, exactly
-// as plain Remove already leaves it (see Remove's own doc comment and
-// TestListRemoveClearsCapsuleOwnLinks). err is reserved for genuine
-// failures: list not tagged, capsule not currently an element of list,
-// or an unexpected error from either underlying call.
+// as RemoveWithoutDeletingCapsule already leaves it (see
+// TestListRemoveWithoutDeletingCapsuleClearsCapsuleOwnLinks). err is
+// reserved for genuine failures: list not tagged, capsule not currently
+// an element of list, or an unexpected error from either underlying
+// call.
 //
 // These are deliberately two separate Graph.Transact calls (one inside
-// Remove, one inside DeleteCapsule), not a single joint transaction
-// spanning both. Under this codebase's current single-threaded,
-// serialized execution model (theorystate_v0.6.md section 19), nothing
-// can run between them, so there is no observable intermediate state to
-// protect against -- and keeping them separate is what lets a capsule
-// that legitimately cannot be deleted still be fully, successfully
-// removed from list, rather than the entire operation rolling back and
-// leaving capsule stuck in list merely because it turned out to still be
-// referenced elsewhere.
-//
-// This is a new, separate method rather than a change to Remove's own
-// behavior: Remove's existing guarantee that it never deletes or untags
-// capsule (theory section 8's "list membership is a separate concern
-// from capsule-kind/value identity") is preserved unchanged for existing
-// callers. Callers who instead want removal to also reclaim the capsule
-// whenever that is safe should call RemoveAndDelete instead of Remove.
+// RemoveWithoutDeletingCapsule, one inside DeleteCapsule), not a single
+// joint transaction spanning both. Under this codebase's current
+// single-threaded, serialized execution model (theorystate_v0.6.md
+// section 19), nothing can run between them, so there is no observable
+// intermediate state to protect against -- and keeping them separate is
+// what lets a capsule that legitimately cannot be deleted still be
+// fully, successfully removed from list, rather than the entire
+// operation rolling back and leaving capsule stuck in list merely
+// because it turned out to still be referenced elsewhere.
 //
 // list must already be tagged (AllLists, list); capsule must currently
-// be an element of list, exactly like Remove.
-func (l *ListRegistry) RemoveAndDelete(list, capsule NodeID) (deleted bool, err error) {
-	if err := l.Remove(list, capsule); err != nil {
+// be an element of list, exactly like RemoveWithoutDeletingCapsule.
+func (l *ListRegistry) Remove(list, capsule NodeID) (deleted bool, err error) {
+	if err := l.RemoveWithoutDeletingCapsule(list, capsule); err != nil {
 		return false, err
 	}
 

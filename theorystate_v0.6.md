@@ -992,39 +992,60 @@ transactions, themselves still OPEN per §45.
 
 ---
 
-## 78. Deleting a multi-node composite structure requires proving global
-emptiness before any single delete, not merely local emptiness at each
-step
+## 78. Txn supports transactional DeleteNode; deleting a multi-node
+composite structure needs no special pre-verification beyond ordinary
+rollback
 
-**Resolved (session finding, validated by `wtw`), extends §74's teardown
-discipline to teardown that spans several NodeIDs.** §18/§18a establish
-that a single node's deletion must be all-or-nothing based on its own
-emptiness. A composite structure built from several related nodes -- an
-ElementCapsule and its three role-slot nodes, in the `wtw` implementation
--- raises a sharper version of the same question: deleting the whole
-structure means deleting *several* nodes together, but `Txn` cannot undo
-a `Graph.DeleteNode` call once it succeeds. Checking each node's
-emptiness immediately before deleting it, one at a time, is therefore
-unsafe: if an early delete in the sequence succeeds and a later one then
-fails (because some node deeper in the sequence turns out to carry an
-unexpected relationship), the already-deleted node cannot be resurrected
-by rollback, leaving the composite structure permanently, partially torn
-down.
+**Corrected this session (the paragraph below records what was
+initially believed and why it was wrong, rather than silently
+disappearing).** An earlier pass at this section claimed `Txn` could not
+undo a `Graph.DeleteNode` call once it succeeded, and on that basis
+required any multi-node composite delete (an ElementCapsule and its
+three role-slot nodes, in the `wtw` implementation) to prove -- read-only,
+ahead of time -- that every node involved was already fully empty before
+deleting any of them.
 
-**Resolution pattern.** Perform every relationship removal the teardown
-itself is responsible for first, through the transaction's undo-capable
-mutation methods (so all of it remains fully reversible); then, and only
-then, verify -- read-only, no mutation -- that every node about to be
-deleted now has zero relationships at all; only once every one of them is
-confirmed empty does the sequence of raw `DeleteNode` calls happen. Under
-this codebase's single-threaded, serialized execution model (§19),
-nothing can invalidate that proof between the check and the deletes
-within the same synchronous call, so by the time the first `DeleteNode`
-call runs, every subsequent one in the sequence is already guaranteed to
-succeed. This is a stronger requirement than what a single-node
-coordinated delete (§74) needs, precisely because §74's pattern only ever
-performs one `DeleteNode` call per coordinating operation. See
-`CapsuleRegistry.DeleteCapsule` / `nodeIsEmpty` in the Go implementation.
+That premise was wrong, not merely cautious, and the underlying
+implementation has been corrected rather than worked around. Two facts
+already true of this implementation, once put together, make transactional
+`DeleteNode` fully safe: (1) `Graph.DeleteNode` only ever succeeds when
+the node already has zero relationships in both directions (§18), so
+"the node exists, with empty relationship maps" is a *complete*
+restoration of its exact prior state, not a partial one requiring
+relationship data to be reconstructed; and (2) NodeIDs in this
+implementation are never reused once handed out (§2.2's counter only
+increases), so resurrecting a deleted id can never collide with an
+unrelated node having since taken over that same id. `Txn.DeleteNode`
+therefore records a resurrection undo step exactly like every other
+`Txn` method already records its own, and ordinary `Graph.Transact`
+rollback covers it without any special handling.
+
+**Consequence for composite-structure teardown.** A caller deleting
+several related nodes together (`CapsuleRegistry.DeleteCapsule` deleting
+a capsule and its three role-slot nodes) needs no pre-verification pass
+at all: each node can simply be deleted via `tx.DeleteNode` in sequence,
+after clearing whatever relationships the coordinating operation itself
+is responsible for. If a later delete in the sequence fails (some node
+still carries an unexpected relationship), `Transact`'s ordinary LIFO
+rollback automatically undoes every earlier step in the same call,
+*including any `DeleteNode` calls that had already succeeded earlier in
+that same sequence* -- exactly the case the original, incorrect premise
+assumed was unrecoverable. This removes the extra `nodeIsEmpty`-based
+proof step this section originally required; §74's single-node
+coordinated-delete pattern and this section's multi-node pattern are now
+the same mechanism at different scale, not two different disciplines.
+
+**What remains genuinely true and unaffected by this correction:** this
+never-reuse-based safety is specific to *this implementation's* NodeID
+allocator (a durably-never-decrementing counter, §2.2). It is not a
+general property of every conceivable NodeID scheme this project might
+adopt later -- e.g. a scheme permitting reuse of deleted IDs (§2.3,
+amended for exported IDs in the distributed case, §40) would reopen
+exactly the ABA-style hazard (§41) this section originally worried
+about, and would need its own, different resolution (generation tagging
+or an explicit reuse-safety proof) before transactional `DeleteNode`
+could be trusted again. This correction applies to the current toy
+allocator as built, not to NodeID schemes in general.
 
 ---
 
@@ -1054,6 +1075,11 @@ performs one `DeleteNode` call per coordinating operation. See
   bootstrap mechanism as ROOT, never hardcoded into the primitive graph;
   interpreters are parameterized by the resulting tag NodeID rather than
   branching on it internally (§76).
+- Transactional DeleteNode is fully supported by Txn for the current
+  toy NodeID allocator: undoing it only ever needs to restore "exists,
+  with empty relationship maps" (§18's own precondition for DeleteNode
+  succeeding), and NodeIDs are never reused (§2.2), so no collision with
+  an unrelated node can occur (§78, corrected).
 
 ### TENTATIVE
 - Monotonically increasing NodeIDs; serialized first implementation.
