@@ -1116,6 +1116,19 @@ var (
 	// the given capsule is not currently an element of the given list
 	// (i.e. (list, capsule) does not exist).
 	ErrCapsuleNotInList = errors.New("capsule is not an element of this list")
+
+	// ErrCapsuleNotEmpty is returned by CapsuleRegistry.DeleteCapsule
+	// when capsule, or one of its three role-slot nodes, currently
+	// carries any relationship beyond the fixed shape buildCapsuleTx
+	// itself establishes -- e.g. capsule is still an element of some
+	// list, still tagged head/tail, a slot still has its target set, or
+	// a slot has picked up some unrelated parent of its own. This is the
+	// CapsuleRegistry-level analogue of ErrNodeNotEmpty, one layer up:
+	// DeleteCapsule makes no changes at all when this is returned, and a
+	// caller must first undo whatever is holding the capsule or one of
+	// its slots open (e.g. via ListRegistry.Remove) before deletion can
+	// succeed.
+	ErrCapsuleNotEmpty = errors.New("capsule or one of its role slots has relationships beyond its own fixed structure; the capsule cannot be safely deleted")
 )
 
 // txOps is the minimal mutating surface needed to compose primitive
@@ -1239,6 +1252,35 @@ func singleChildTargetRemoveTx(tx txOps, graph *Graph, node NodeID) (removed boo
 	}
 
 	return tx.RemoveRelationship(node, current)
+}
+
+// nodeIsEmpty reports whether id currently has no relationships at all,
+// in either direction -- the same condition Graph.DeleteNode itself
+// requires before it will delete a node, checked here ahead of time,
+// read-only, with no mutation. This exists so a caller composing several
+// Graph.DeleteNode calls into one logical operation
+// (CapsuleRegistry.DeleteCapsule deletes four nodes together) can
+// confirm every one of them is already safe to delete before actually
+// deleting any of them, since Txn cannot undo a DeleteNode call once it
+// succeeds (see the Txn doc comment) -- so the safe pattern is to prove
+// every deletion will succeed first, then perform them, rather than
+// discovering a failure partway through a sequence of otherwise
+// non-undoable deletes.
+func nodeIsEmpty(g *Graph, id NodeID) (bool, error) {
+	outgoing, err := g.FindOutgoing(id)
+	if err != nil {
+		return false, err
+	}
+	if len(outgoing) != 0 {
+		return false, nil
+	}
+
+	incoming, err := g.FindIncoming(id)
+	if err != nil {
+		return false, err
+	}
+
+	return len(incoming) == 0, nil
 }
 
 // singleChildTarget returns the single relevant child of node in the
@@ -2418,6 +2460,24 @@ func (c *CapsuleRegistry) SetValue(capsule, value NodeID) error {
 // PointerMetadata target, etc.), which are silently skipped rather than
 // mistaken for capsule occurrences.
 //
+// Naming note worth being explicit about, raised in review: valueSlots
+// is a *PointerRegistry constructed with allValueSlot (i.e.
+// AllElementCapsuleValueSlot) as its own tag -- not with the separate,
+// generic AllPointers tag; see NewCapsuleRegistry. So
+// c.valueSlots.IsPointer(slot) here checks exactly one relationship,
+// (AllElementCapsuleValueSlot, slot), never a second, independent
+// (AllPointers, slot) fact -- a value slot is never tagged both ways.
+// IsPointer is still the method's name, inherited unmodified from
+// PointerRegistry per theorystate_v0.6.md section 76's
+// tag-parameterization discipline (one type, no branching on which tag
+// it holds), which makes it easy to misread this call as depending on
+// two independent tags when only one ever exists.
+// TestCapsuleRoleSlotsAreNotTaggedWithGenericAllPointers pins this down
+// directly, so that constructing CapsuleRegistry's three slot registries
+// against the shared generic AllPointers tag instead of their own
+// distinct role tags -- which would silently break slotFor's per-role
+// discovery -- would be caught immediately.
+//
 // Each qualifying slot's owning capsule is then found via
 // findUniqueTaggedParent(slot, allElementCapsules) -- deliberately a
 // *tagged* parent lookup, not a "the slot has exactly one parent, full
@@ -2559,6 +2619,141 @@ func (c *CapsuleRegistry) RemoveNext(capsule NodeID) (removed bool, err error) {
 	}
 
 	return c.nextSlots.RemoveTarget(slot)
+}
+
+// DeleteCapsule deletes capsule and all three of its role-slot nodes
+// (prev, value, next) from the underlying graph, entirely inside one
+// Graph.Transact call, but only if doing so cannot leave anything
+// orphaned or partially torn down.
+//
+// A capsule minted via NewCapsule/newCapsuleTx has a fixed, known shape:
+// its own AllElementCapsules tag, exactly three outgoing edges to its
+// role slots, each slot's own role tag, and (usually) a target already
+// set on the value slot. DeleteCapsule is only willing to proceed if
+// every one of these four nodes -- capsule, prevSlot, valueSlot,
+// nextSlot -- has *exactly* that fixed shape and nothing else: no list
+// membership or head/tail tag on the capsule, no target currently set on
+// prevSlot or nextSlot, and no unrelated parent or child added to any of
+// the four by something else. If even one of them carries any
+// additional relationship -- ListRegistry still linking capsule into a
+// list, a caller having called SetPrev/SetNext without a matching
+// Remove, or some future structure referencing a slot node for its own
+// reasons -- DeleteCapsule changes nothing at all and returns
+// ErrCapsuleNotEmpty, rather than deleting only the parts that happen to
+// be clean and leaving a broken, partially-torn-down capsule behind.
+// This is deliberately all-or-nothing.
+//
+// Every relationship this removes is one CapsuleRegistry itself is
+// certain it created (via buildCapsuleTx). value itself is never
+// deleted -- only the valueSlot -> value edge is removed -- since value
+// is caller-owned data that may still be referenced elsewhere (e.g. by
+// another capsule's own value slot).
+//
+// Safety under Txn's documented limitation that it cannot undo a
+// DeleteNode call once it succeeds (see the Txn doc comment): every
+// relationship removal below runs through tx first (fully undoable),
+// then nodeIsEmpty re-derives, read-only, whether each of the four nodes
+// genuinely has zero relationships left -- if not, this returns
+// ErrCapsuleNotEmpty before any node is deleted, and Transact rolls back
+// every relationship removed above, leaving capsule exactly as it was.
+// Only once all four nodes are confirmed empty are the four
+// Graph.DeleteNode calls made, directly against the graph rather than
+// through tx (Txn does not support transactional DeleteNode), grouped
+// last and in sequence -- by that point every one of them is guaranteed
+// to succeed under this codebase's single-threaded, serialized execution
+// model (theorystate_v0.6.md section 19), since nothing else can mutate
+// the graph between the nodeIsEmpty checks and these deletes within the
+// same synchronous call.
+//
+// capsule must currently be tagged (AllElementCapsules, capsule); a
+// capsule somehow missing one of its three role slots -- only reachable
+// through an out-of-band Graph mutation -- is treated the same as
+// ErrCapsuleNotEmpty rather than guessed about.
+func (c *CapsuleRegistry) DeleteCapsule(capsule NodeID) error {
+	if !c.graph.NodeExists(capsule) {
+		return ErrNodeNotFound
+	}
+
+	if !c.IsCapsule(capsule) {
+		return ErrNotCapsule
+	}
+
+	return c.graph.Transact(func(tx *Txn) error {
+		prevSlot, hasPrevSlot, err := c.slotFor(capsule, c.prevSlots.allPointers)
+		if err != nil {
+			return err
+		}
+
+		valueSlot, hasValueSlot, err := c.slotFor(capsule, c.valueSlots.allPointers)
+		if err != nil {
+			return err
+		}
+
+		nextSlot, hasNextSlot, err := c.slotFor(capsule, c.nextSlots.allPointers)
+		if err != nil {
+			return err
+		}
+
+		if !hasPrevSlot || !hasValueSlot || !hasNextSlot {
+			return ErrCapsuleNotEmpty
+		}
+
+		value, hasValue, err := c.valueSlots.Target(valueSlot)
+		if err != nil {
+			return err
+		}
+
+		if _, err := tx.RemoveRelationship(capsule, prevSlot); err != nil {
+			return err
+		}
+		if _, err := tx.RemoveRelationship(c.prevSlots.allPointers, prevSlot); err != nil {
+			return err
+		}
+
+		if hasValue {
+			if _, err := tx.RemoveRelationship(valueSlot, value); err != nil {
+				return err
+			}
+		}
+		if _, err := tx.RemoveRelationship(capsule, valueSlot); err != nil {
+			return err
+		}
+		if _, err := tx.RemoveRelationship(c.valueSlots.allPointers, valueSlot); err != nil {
+			return err
+		}
+
+		if _, err := tx.RemoveRelationship(capsule, nextSlot); err != nil {
+			return err
+		}
+		if _, err := tx.RemoveRelationship(c.nextSlots.allPointers, nextSlot); err != nil {
+			return err
+		}
+
+		if _, err := tx.RemoveRelationship(c.allElementCapsules, capsule); err != nil {
+			return err
+		}
+
+		for _, node := range []NodeID{prevSlot, valueSlot, nextSlot, capsule} {
+			empty, err := nodeIsEmpty(c.graph, node)
+			if err != nil {
+				return err
+			}
+			if !empty {
+				return ErrCapsuleNotEmpty
+			}
+		}
+
+		if err := c.graph.DeleteNode(prevSlot); err != nil {
+			return err
+		}
+		if err := c.graph.DeleteNode(valueSlot); err != nil {
+			return err
+		}
+		if err := c.graph.DeleteNode(nextSlot); err != nil {
+			return err
+		}
+		return c.graph.DeleteNode(capsule)
+	})
 }
 
 // ListRegistry implements Ordered Lists (THEORY_NOTES_FROM_CONVERSATION.md
@@ -3101,6 +3296,59 @@ func (l *ListRegistry) Remove(list, capsule NodeID) error {
 		_, err = tx.RemoveRelationship(list, capsule)
 		return err
 	})
+}
+
+// RemoveAndDelete unlinks capsule from list, exactly as Remove does, and
+// then additionally attempts to delete capsule and its three role-slot
+// nodes via CapsuleRegistry.DeleteCapsule.
+//
+// deleted reports whether the capsule was actually deleted. Deletion is
+// best-effort and deliberately not the same atomic step as removal:
+// Remove's own step always fully commits on its own terms, exactly as
+// calling Remove directly would, and DeleteCapsule is then attempted
+// separately immediately afterward. If capsule turns out not to be
+// safely deletable -- some further reference to it or one of its role
+// slots exists beyond what Remove itself cleared -- deleted is false
+// and err is nil: this is not a failure of RemoveAndDelete, it simply
+// means capsule was left in place, standalone and still valid, exactly
+// as plain Remove already leaves it (see Remove's own doc comment and
+// TestListRemoveClearsCapsuleOwnLinks). err is reserved for genuine
+// failures: list not tagged, capsule not currently an element of list,
+// or an unexpected error from either underlying call.
+//
+// These are deliberately two separate Graph.Transact calls (one inside
+// Remove, one inside DeleteCapsule), not a single joint transaction
+// spanning both. Under this codebase's current single-threaded,
+// serialized execution model (theorystate_v0.6.md section 19), nothing
+// can run between them, so there is no observable intermediate state to
+// protect against -- and keeping them separate is what lets a capsule
+// that legitimately cannot be deleted still be fully, successfully
+// removed from list, rather than the entire operation rolling back and
+// leaving capsule stuck in list merely because it turned out to still be
+// referenced elsewhere.
+//
+// This is a new, separate method rather than a change to Remove's own
+// behavior: Remove's existing guarantee that it never deletes or untags
+// capsule (theory section 8's "list membership is a separate concern
+// from capsule-kind/value identity") is preserved unchanged for existing
+// callers. Callers who instead want removal to also reclaim the capsule
+// whenever that is safe should call RemoveAndDelete instead of Remove.
+//
+// list must already be tagged (AllLists, list); capsule must currently
+// be an element of list, exactly like Remove.
+func (l *ListRegistry) RemoveAndDelete(list, capsule NodeID) (deleted bool, err error) {
+	if err := l.Remove(list, capsule); err != nil {
+		return false, err
+	}
+
+	if err := l.capsules.DeleteCapsule(capsule); err != nil {
+		if errors.Is(err, ErrCapsuleNotEmpty) {
+			return false, nil
+		}
+		return false, err
+	}
+
+	return true, nil
 }
 
 // DeleteList deletes list from the underlying graph, additionally

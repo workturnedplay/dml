@@ -992,6 +992,42 @@ transactions, themselves still OPEN per §45.
 
 ---
 
+## 78. Deleting a multi-node composite structure requires proving global
+emptiness before any single delete, not merely local emptiness at each
+step
+
+**Resolved (session finding, validated by `wtw`), extends §74's teardown
+discipline to teardown that spans several NodeIDs.** §18/§18a establish
+that a single node's deletion must be all-or-nothing based on its own
+emptiness. A composite structure built from several related nodes -- an
+ElementCapsule and its three role-slot nodes, in the `wtw` implementation
+-- raises a sharper version of the same question: deleting the whole
+structure means deleting *several* nodes together, but `Txn` cannot undo
+a `Graph.DeleteNode` call once it succeeds. Checking each node's
+emptiness immediately before deleting it, one at a time, is therefore
+unsafe: if an early delete in the sequence succeeds and a later one then
+fails (because some node deeper in the sequence turns out to carry an
+unexpected relationship), the already-deleted node cannot be resurrected
+by rollback, leaving the composite structure permanently, partially torn
+down.
+
+**Resolution pattern.** Perform every relationship removal the teardown
+itself is responsible for first, through the transaction's undo-capable
+mutation methods (so all of it remains fully reversible); then, and only
+then, verify -- read-only, no mutation -- that every node about to be
+deleted now has zero relationships at all; only once every one of them is
+confirmed empty does the sequence of raw `DeleteNode` calls happen. Under
+this codebase's single-threaded, serialized execution model (§19),
+nothing can invalidate that proof between the check and the deletes
+within the same synchronous call, so by the time the first `DeleteNode`
+call runs, every subsequent one in the sequence is already guaranteed to
+succeed. This is a stronger requirement than what a single-node
+coordinated delete (§74) needs, precisely because §74's pattern only ever
+performs one `DeleteNode` call per coordinating operation. See
+`CapsuleRegistry.DeleteCapsule` / `nodeIsEmpty` in the Go implementation.
+
+---
+
 ## PART D — STATUS SUMMARY (consolidated)
 
 ### DECIDED

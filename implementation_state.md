@@ -471,11 +471,71 @@ NodeID-keyed structure outside the primitive graph.
  TestListOccurrencesOfFindsDuplicates, TestListContainsRequiresListTag,
  and TestListContainsRequiresExistingValue.
 
- Not yet addressed: deleting a capsule node itself once fully detached
- (ordinary Graph.DeleteNode already covers this once its remaining
- relationships -- AllElementCapsules tag, three slot-tag edges -- are
- cleared, so no new registry method is obviously needed here, but hasn't
- been exercised by a test yet).
+14. Added CapsuleRegistry.DeleteCapsule and ListRegistry.RemoveAndDelete,
+ resolving item 13's "not yet addressed" note about deleting a fully
+ detached capsule.
+
+ DeleteCapsule deletes a capsule and all three of its role-slot nodes
+ together, inside one Graph.Transact call, but only if every one of
+ those four nodes currently has *exactly* the fixed shape buildCapsuleTx
+ itself establishes and nothing more -- no list membership or head/tail
+ tag on the capsule, no target still set on the prev/next slots, and no
+ unrelated parent added to any slot by something else. This is
+ deliberately all-or-nothing: if any of the four nodes has so much as
+ one relationship beyond its own fixed structure, DeleteCapsule changes
+ nothing and returns the new ErrCapsuleNotEmpty (the CapsuleRegistry-
+ level analogue of ErrNodeNotEmpty), rather than deleting whichever
+ parts happen to be clean and leaving a broken, partially-torn-down
+ capsule behind.
+
+ Getting this right required a new shared helper, nodeIsEmpty, and a
+ specific ordering discipline: Txn cannot undo a Graph.DeleteNode call
+ once it succeeds, so deleting four related nodes inside one transaction
+ is only safe if every one of them is first *proven* -- read-only, via
+ nodeIsEmpty, after all of this operation's own relationship removals
+ have gone through tx (and are therefore still fully undoable) -- to
+ already have zero relationships left, before any Graph.DeleteNode call
+ is made at all. Only once all four are confirmed empty are the four
+ deletes performed, grouped last and in sequence -- see
+ theorystate_v0.6.md section 78 for the generalized principle.
+
+ ListRegistry.RemoveAndDelete composes Remove and DeleteCapsule as two
+ separate, sequential Graph.Transact calls, not one joint transaction:
+ Remove's own step always fully commits on its own terms, and
+ DeleteCapsule is then attempted as a best-effort second step. If
+ capsule turns out not to be safely deletable, RemoveAndDelete reports
+ deleted=false with no error, rather than rolling back the removal too
+ -- a capsule that legitimately cannot be deleted still ends up fully,
+ successfully removed from the list. This is a new, separate method, not
+ a change to Remove's existing behavior: Remove's own guarantee that it
+ never deletes or untags capsule (item 12, theory section 8) is
+ unchanged for existing callers.
+
+ Also clarified and pinned by a new test
+ (TestCapsuleRoleSlotsAreNotTaggedWithGenericAllPointers), following a
+ review finding: CapsulesWithValue's c.valueSlots.IsPointer(slot) filter
+ depends on exactly one tag relationship, not two. CapsuleRegistry
+ constructs its three slot PointerRegistry instances with their own
+ distinct role tags (AllElementCapsulePrevSlot /
+ AllElementCapsuleValueSlot / AllElementCapsuleNextSlot), never with the
+ separate, generic AllPointers tag -- so IsPointer here checks precisely
+ the role tag itself, inherited unmodified from PointerRegistry
+ (theorystate_v0.6.md section 76). Worth naming and testing directly,
+ since PointerRegistry's generic naming (allPointers field, IsPointer
+ method) makes it easy to assume a second, independent generic tag is
+ also involved when it never is.
+
+ Covered by TestCapsuleRegistryDeleteCapsuleDeletesCleanCapsule,
+ TestCapsuleRegistryDeleteCapsuleFailsIfStillListed,
+ TestCapsuleRegistryDeleteCapsuleFailsIfPrevOrNextSet,
+ TestCapsuleRegistryDeleteCapsuleFailsIfSlotHasExtraParent,
+ TestCapsuleRegistryDeleteCapsuleRequiresCapsuleTag,
+ TestCapsuleRegistryDeleteCapsuleRequiresExistingNode,
+ TestListRemoveAndDeleteDeletesUnreferencedCapsule,
+ TestListRemoveAndDeleteKeepsCapsuleIfStillReferencedElsewhere,
+ TestListRemoveAndDeleteRequiresCapsuleInList,
+ TestListRemoveAndDeleteRequiresListTag, and
+ TestCapsuleRoleSlotsAreNotTaggedWithGenericAllPointers.
 
 Currently unaddressed yet:
 - No commit-time interception exists to prevent a raw

@@ -3196,6 +3196,279 @@ func TestCapsuleOperationsRequireCapsuleTag(t *testing.T) {
 	}
 }
 
+func TestCapsuleRegistryDeleteCapsuleDeletesCleanCapsule(t *testing.T) {
+	g, capsules := newCapsuleTestFixture(t)
+
+	value, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for value: %v", err)
+	}
+
+	capsule, err := capsules.NewCapsule(value)
+	if err != nil {
+		t.Fatalf("NewCapsule(): %v", err)
+	}
+
+	prevSlot, found, err := capsules.slotFor(capsule, capsules.prevSlots.allPointers)
+	if err != nil || !found {
+		t.Fatalf("slotFor(prev): found=%v err=%v", found, err)
+	}
+	valueSlot, found, err := capsules.slotFor(capsule, capsules.valueSlots.allPointers)
+	if err != nil || !found {
+		t.Fatalf("slotFor(value): found=%v err=%v", found, err)
+	}
+	nextSlot, found, err := capsules.slotFor(capsule, capsules.nextSlots.allPointers)
+	if err != nil || !found {
+		t.Fatalf("slotFor(next): found=%v err=%v", found, err)
+	}
+
+	if err := capsules.DeleteCapsule(capsule); err != nil {
+		t.Fatalf("DeleteCapsule(): %v", err)
+	}
+
+	if g.NodeExists(capsule) {
+		t.Fatalf("capsule %d still exists after DeleteCapsule()", capsule)
+	}
+	if g.NodeExists(prevSlot) {
+		t.Fatalf("prevSlot %d still exists after DeleteCapsule()", prevSlot)
+	}
+	if g.NodeExists(valueSlot) {
+		t.Fatalf("valueSlot %d still exists after DeleteCapsule()", valueSlot)
+	}
+	if g.NodeExists(nextSlot) {
+		t.Fatalf("nextSlot %d still exists after DeleteCapsule()", nextSlot)
+	}
+
+	if !g.NodeExists(value) {
+		t.Fatal("DeleteCapsule() incorrectly deleted the capsule's value")
+	}
+}
+
+func TestCapsuleRegistryDeleteCapsuleFailsIfStillListed(t *testing.T) {
+	g, capsules, lists := newListTestFixture(t)
+
+	list, err := lists.NewList()
+	if err != nil {
+		t.Fatalf("NewList(): %v", err)
+	}
+
+	value, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for value: %v", err)
+	}
+
+	capsule, err := lists.Append(list, value)
+	if err != nil {
+		t.Fatalf("Append(): %v", err)
+	}
+
+	err = capsules.DeleteCapsule(capsule)
+	if !errors.Is(err, ErrCapsuleNotEmpty) {
+		t.Fatalf("DeleteCapsule() error = %v, want %v", err, ErrCapsuleNotEmpty)
+	}
+
+	if !g.NodeExists(capsule) {
+		t.Fatal("capsule disappeared despite a failed DeleteCapsule()")
+	}
+	if !capsules.IsCapsule(capsule) {
+		t.Fatal("capsule lost its AllElementCapsules tag despite a failed DeleteCapsule()")
+	}
+	if !g.HasRelationship(list, capsule) {
+		t.Fatal("capsule lost its list membership despite a failed DeleteCapsule()")
+	}
+
+	got, hasValue, err := capsules.Value(capsule)
+	if err != nil {
+		t.Fatalf("Value(capsule): %v", err)
+	}
+	if !hasValue || got != value {
+		t.Fatalf("Value(capsule) = (%d,%v), want (%d,true) -- unaffected by a failed DeleteCapsule()", got, hasValue, value)
+	}
+}
+
+func TestCapsuleRegistryDeleteCapsuleFailsIfPrevOrNextSet(t *testing.T) {
+	g, capsules := newCapsuleTestFixture(t)
+
+	v1, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for v1: %v", err)
+	}
+	v2, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for v2: %v", err)
+	}
+
+	c1, err := capsules.NewCapsule(v1)
+	if err != nil {
+		t.Fatalf("NewCapsule(v1): %v", err)
+	}
+	c2, err := capsules.NewCapsule(v2)
+	if err != nil {
+		t.Fatalf("NewCapsule(v2): %v", err)
+	}
+
+	if err := capsules.SetNext(c1, c2); err != nil {
+		t.Fatalf("SetNext(c1, c2): %v", err)
+	}
+
+	err = capsules.DeleteCapsule(c1)
+	if !errors.Is(err, ErrCapsuleNotEmpty) {
+		t.Fatalf("DeleteCapsule(c1) error = %v, want %v", err, ErrCapsuleNotEmpty)
+	}
+
+	if !g.NodeExists(c1) {
+		t.Fatal("c1 disappeared despite a failed DeleteCapsule()")
+	}
+
+	next, hasNext, err := capsules.Next(c1)
+	if err != nil {
+		t.Fatalf("Next(c1): %v", err)
+	}
+	if !hasNext || next != c2 {
+		t.Fatalf("Next(c1) = (%d,%v), want (%d,true) -- unaffected by a failed DeleteCapsule()", next, hasNext, c2)
+	}
+}
+
+func TestCapsuleRegistryDeleteCapsuleFailsIfSlotHasExtraParent(t *testing.T) {
+	g, capsules := newCapsuleTestFixture(t)
+
+	value, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for value: %v", err)
+	}
+
+	capsule, err := capsules.NewCapsule(value)
+	if err != nil {
+		t.Fatalf("NewCapsule(): %v", err)
+	}
+
+	valueSlot, found, err := capsules.slotFor(capsule, capsules.valueSlots.allPointers)
+	if err != nil || !found {
+		t.Fatalf("slotFor(value): found=%v err=%v", found, err)
+	}
+
+	metadata, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for metadata: %v", err)
+	}
+
+	// An unrelated node referencing the value slot for its own reasons
+	// -- ordinary permitted graph structure (a node may have any number
+	// of parents, THEORY_NOTES_FROM_CONVERSATION.md section 1) that
+	// DeleteCapsule must not silently delete out from under.
+	if _, err := g.AddRelationship(metadata, valueSlot); err != nil {
+		t.Fatalf("AddRelationship(metadata, valueSlot): %v", err)
+	}
+
+	err = capsules.DeleteCapsule(capsule)
+	if !errors.Is(err, ErrCapsuleNotEmpty) {
+		t.Fatalf("DeleteCapsule() error = %v, want %v", err, ErrCapsuleNotEmpty)
+	}
+
+	if !g.NodeExists(capsule) || !g.NodeExists(valueSlot) {
+		t.Fatal("capsule or valueSlot disappeared despite a failed DeleteCapsule()")
+	}
+	if !g.HasRelationship(metadata, valueSlot) {
+		t.Fatal("unrelated metadata relationship was disturbed by a failed DeleteCapsule()")
+	}
+}
+
+func TestCapsuleRegistryDeleteCapsuleRequiresCapsuleTag(t *testing.T) {
+	g, capsules := newCapsuleTestFixture(t)
+
+	id, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode(): %v", err)
+	}
+
+	err = capsules.DeleteCapsule(id)
+	if !errors.Is(err, ErrNotCapsule) {
+		t.Fatalf("DeleteCapsule() error = %v, want %v", err, ErrNotCapsule)
+	}
+}
+
+func TestCapsuleRegistryDeleteCapsuleRequiresExistingNode(t *testing.T) {
+	_, capsules := newCapsuleTestFixture(t)
+
+	const nonexistent NodeID = 999999
+
+	err := capsules.DeleteCapsule(nonexistent)
+	if !errors.Is(err, ErrNodeNotFound) {
+		t.Fatalf("DeleteCapsule() error = %v, want %v", err, ErrNodeNotFound)
+	}
+}
+
+// TestCapsuleRoleSlotsAreNotTaggedWithGenericAllPointers pins down a
+// point raised in review: each of a capsule's three role slots is
+// tagged only with its own specific role tag (AllElementCapsulePrevSlot
+// / AllElementCapsuleValueSlot / AllElementCapsuleNextSlot), never with
+// the separate, generic AllPointers tag, even though the underlying
+// PointerRegistry type is literally named for that concept. If
+// CapsuleRegistry were ever changed to construct its three slot
+// registries against the shared generic AllPointers tag instead of
+// their own distinct tags, slotFor's per-role, tag-based discovery
+// (findUniqueTaggedChild) would no longer be able to tell a capsule's
+// prev slot from its value slot from its next slot -- this test exists
+// to catch exactly that regression.
+func TestCapsuleRoleSlotsAreNotTaggedWithGenericAllPointers(t *testing.T) {
+	var g Graph
+	names := NewNameRegistry(&g)
+
+	ids, err := names.BootstrapNames(FoundationalNames)
+	if err != nil {
+		t.Fatalf("BootstrapNames(): %v", err)
+	}
+
+	capsules, err := NewCapsuleRegistry(
+		&g,
+		ids[NameAllElementCapsules],
+		ids[NameAllElementCapsulePrevSlot],
+		ids[NameAllElementCapsuleValueSlot],
+		ids[NameAllElementCapsuleNextSlot],
+	)
+	if err != nil {
+		t.Fatalf("NewCapsuleRegistry(): %v", err)
+	}
+
+	value, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for value: %v", err)
+	}
+
+	capsule, err := capsules.NewCapsule(value)
+	if err != nil {
+		t.Fatalf("NewCapsule(): %v", err)
+	}
+
+	allPointers := ids[NameAllPointers]
+
+	for _, tc := range []struct {
+		name string
+		tag  NodeID
+	}{
+		{"prev", capsules.prevSlots.allPointers},
+		{"value", capsules.valueSlots.allPointers},
+		{"next", capsules.nextSlots.allPointers},
+	} {
+		slot, found, err := capsules.slotFor(capsule, tc.tag)
+		if err != nil || !found {
+			t.Fatalf("slotFor(%s): found=%v err=%v", tc.name, found, err)
+		}
+
+		if g.HasRelationship(allPointers, slot) {
+			t.Fatalf("%s slot %d is tagged with the generic AllPointers tag; it should only carry its own role tag", tc.name, slot)
+		}
+
+		incoming, err := g.FindIncoming(slot)
+		if err != nil {
+			t.Fatalf("FindIncoming(%s slot): %v", tc.name, err)
+		}
+		if len(incoming) != 2 {
+			t.Fatalf("%s slot %d has %d incoming relationships, want exactly 2 (its owning capsule and its own role tag)", tc.name, slot, len(incoming))
+		}
+	}
+}
+
 func TestCapsulesWithValueFindsAllOccurrences(t *testing.T) {
 	g, capsules := newCapsuleTestFixture(t)
 
@@ -4362,5 +4635,160 @@ func TestListRemoveThenDeleteListSucceeds(t *testing.T) {
 
 	if g.NodeExists(list) {
 		t.Fatalf("list %d still exists after successful DeleteList()", list)
+	}
+}
+
+func TestListRemoveAndDeleteDeletesUnreferencedCapsule(t *testing.T) {
+	g, _, lists := newListTestFixture(t)
+
+	list, err := lists.NewList()
+	if err != nil {
+		t.Fatalf("NewList(): %v", err)
+	}
+
+	value, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for value: %v", err)
+	}
+
+	capsule, err := lists.Append(list, value)
+	if err != nil {
+		t.Fatalf("Append(): %v", err)
+	}
+
+	deleted, err := lists.RemoveAndDelete(list, capsule)
+	if err != nil {
+		t.Fatalf("RemoveAndDelete(): %v", err)
+	}
+	if !deleted {
+		t.Fatal("RemoveAndDelete() reported deleted=false for an unreferenced capsule")
+	}
+
+	if g.NodeExists(capsule) {
+		t.Fatalf("capsule %d still exists after RemoveAndDelete()", capsule)
+	}
+
+	if g.HasRelationship(list, capsule) {
+		t.Fatal("capsule is still linked into list after RemoveAndDelete()")
+	}
+
+	elements, err := lists.Elements(list)
+	if err != nil {
+		t.Fatalf("Elements(list): %v", err)
+	}
+	if len(elements) != 0 {
+		t.Fatalf("Elements(list) = %v, want empty after RemoveAndDelete()", elements)
+	}
+}
+
+func TestListRemoveAndDeleteKeepsCapsuleIfStillReferencedElsewhere(t *testing.T) {
+	g, capsules, lists := newListTestFixture(t)
+
+	list, err := lists.NewList()
+	if err != nil {
+		t.Fatalf("NewList(): %v", err)
+	}
+
+	value, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for value: %v", err)
+	}
+
+	capsule, err := lists.Append(list, value)
+	if err != nil {
+		t.Fatalf("Append(): %v", err)
+	}
+
+	valueSlot, found, err := capsules.slotFor(capsule, capsules.valueSlots.allPointers)
+	if err != nil || !found {
+		t.Fatalf("slotFor(value): found=%v err=%v", found, err)
+	}
+
+	metadata, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for metadata: %v", err)
+	}
+
+	// Something unrelated referencing one of the capsule's slots -- this
+	// alone must be enough to make deletion unsafe, even though Remove
+	// itself does not care about it.
+	if _, err := g.AddRelationship(metadata, valueSlot); err != nil {
+		t.Fatalf("AddRelationship(metadata, valueSlot): %v", err)
+	}
+
+	deleted, err := lists.RemoveAndDelete(list, capsule)
+	if err != nil {
+		t.Fatalf("RemoveAndDelete(): %v", err)
+	}
+	if deleted {
+		t.Fatal("RemoveAndDelete() reported deleted=true for a capsule still referenced elsewhere")
+	}
+
+	// The removal half must still have fully succeeded.
+	if g.HasRelationship(list, capsule) {
+		t.Fatal("capsule is still linked into list after RemoveAndDelete()")
+	}
+	elements, err := lists.Elements(list)
+	if err != nil {
+		t.Fatalf("Elements(list): %v", err)
+	}
+	if len(elements) != 0 {
+		t.Fatalf("Elements(list) = %v, want empty after RemoveAndDelete()", elements)
+	}
+
+	// But the capsule itself, being undeletable, must remain intact.
+	if !g.NodeExists(capsule) {
+		t.Fatal("capsule was deleted despite still being referenced elsewhere")
+	}
+	if !capsules.IsCapsule(capsule) {
+		t.Fatal("capsule lost its AllElementCapsules tag despite deletion being refused")
+	}
+}
+
+func TestListRemoveAndDeleteRequiresCapsuleInList(t *testing.T) {
+	g, capsules, lists := newListTestFixture(t)
+
+	list, err := lists.NewList()
+	if err != nil {
+		t.Fatalf("NewList(): %v", err)
+	}
+
+	value, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for value: %v", err)
+	}
+
+	unrelated, err := capsules.NewCapsule(value)
+	if err != nil {
+		t.Fatalf("NewCapsule(): %v", err)
+	}
+
+	_, err = lists.RemoveAndDelete(list, unrelated)
+	if !errors.Is(err, ErrCapsuleNotInList) {
+		t.Fatalf("RemoveAndDelete() error = %v, want %v", err, ErrCapsuleNotInList)
+	}
+}
+
+func TestListRemoveAndDeleteRequiresListTag(t *testing.T) {
+	g, capsules, lists := newListTestFixture(t)
+
+	notAList, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode(): %v", err)
+	}
+
+	value, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for value: %v", err)
+	}
+
+	capsule, err := capsules.NewCapsule(value)
+	if err != nil {
+		t.Fatalf("NewCapsule(): %v", err)
+	}
+
+	_, err = lists.RemoveAndDelete(notAList, capsule)
+	if !errors.Is(err, ErrNotList) {
+		t.Fatalf("RemoveAndDelete() error = %v, want %v", err, ErrNotList)
 	}
 }
