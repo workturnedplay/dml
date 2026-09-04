@@ -438,20 +438,34 @@ NodeID-keyed structure outside the primitive graph.
  out to be needed: CapsulesWithValue is a pure reverse lookup from a
  value's own Graph.FindIncoming, filtered to genuine value-slot parents
  (via the existing valueSlots PointerRegistry's IsPointer) and resolved
- to an owning capsule via the new findUniqueParent helper (the untagged
- counterpart of findUniqueTaggedParent, for slot nodes expected to have
- exactly one parent full stop rather than one parent additionally
- satisfying some tag) -- failing loudly with the new
- ErrAmbiguousSlotOwner if an out-of-band mutation has given a slot more
- than one parent. ListRegistry.OccurrencesOf filters those candidates
- down to the ones satisfying the existing (list,capsule) containment
- edge -- the same O(1) check InsertAfter/Remove already use -- and
- Contains is a thin wrapper reporting whether any occurrence was found.
- Running time is proportional to how many places a value is referenced
- anywhere in the graph, not to the length of any particular list.
+ to an owning capsule via the existing findUniqueTaggedParent, tagged
+ AllElementCapsules.
+
+ An earlier draft of this used a new, untagged findUniqueParent helper
+ instead, requiring a slot to have exactly one parent full stop -- caught
+ in review as wrong, not merely stricter than necessary: a role-slot node
+ is ordinary graph structure, and nothing prevents some future unrelated
+ construct from also pointing at it (a node may have any number of
+ parents, THEORY_NOTES_FROM_CONVERSATION.md section 1), which must not be
+ confused with a second owning capsule or make the lookup fail.
+ findUniqueTaggedParent already has exactly the right semantics -- ignore
+ any number of non-capsule-tagged parents, only object if two distinct
+ capsule-tagged parents both claim the same slot -- so no new helper or
+ error type was needed; ambiguity surfaces via the existing
+ ErrAmbiguousPointerMetadata, exactly as it already does for
+ findUniqueTaggedChild's other callers elsewhere in this file.
+
+ ListRegistry.OccurrencesOf filters CapsulesWithValue's candidates down
+ to the ones satisfying the existing (list,capsule) containment edge --
+ the same O(1) check InsertAfter/Remove already use -- and Contains is a
+ thin wrapper reporting whether any occurrence was found. Running time is
+ proportional to how many places a value is referenced anywhere in the
+ graph, not to the length of any particular list.
+
  Covered by TestCapsulesWithValueFindsAllOccurrences,
  TestCapsulesWithValueIgnoresUnrelatedEdges,
- TestCapsulesWithValueDetectsAmbiguousSlotOwner,
+ TestCapsulesWithValueIgnoresUnrelatedParentsOfSlot,
+ TestCapsulesWithValueDetectsAmbiguousCapsuleOwnership,
  TestListContainsFindsValue, TestListContainsFalseForAbsentValue,
  TestListContainsScopedToOwningList,
  TestListOccurrencesOfFindsDuplicates, TestListContainsRequiresListTag,

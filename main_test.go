@@ -3272,7 +3272,14 @@ func TestCapsulesWithValueIgnoresUnrelatedEdges(t *testing.T) {
 	}
 }
 
-func TestCapsulesWithValueDetectsAmbiguousSlotOwner(t *testing.T) {
+// TestCapsulesWithValueIgnoresUnrelatedParentsOfSlot is the regression
+// test for the bug caught in review: a role-slot node acquiring an
+// unrelated extra parent (e.g. some future metadata structure
+// referencing the slot itself, for its own reasons) must not be confused
+// with a second owning capsule, and must not make CapsulesWithValue
+// fail. Only a parent that is itself tagged AllElementCapsules counts as
+// an owner.
+func TestCapsulesWithValueIgnoresUnrelatedParentsOfSlot(t *testing.T) {
 	g, capsules := newCapsuleTestFixture(t)
 
 	value, err := g.CreateNode()
@@ -3293,20 +3300,76 @@ func TestCapsulesWithValueDetectsAmbiguousSlotOwner(t *testing.T) {
 		t.Fatalf("capsule %d unexpectedly has no value slot", capsule)
 	}
 
-	other, err := g.CreateNode()
+	metadata, err := g.CreateNode()
 	if err != nil {
-		t.Fatalf("CreateNode() for other: %v", err)
+		t.Fatalf("CreateNode() for metadata: %v", err)
+	}
+
+	// An unrelated node pointing at the slot itself, not tagged as a
+	// capsule -- ordinary permitted graph structure that ownership
+	// discovery must ignore rather than error on or mistake for the
+	// owner.
+	if _, err := g.AddRelationship(metadata, slot); err != nil {
+		t.Fatalf("AddRelationship(metadata, slot): %v", err)
+	}
+
+	got, err := capsules.CapsulesWithValue(value)
+	if err != nil {
+		t.Fatalf("CapsulesWithValue(value): %v", err)
+	}
+
+	want := []NodeID{capsule}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("CapsulesWithValue(value) = %v, want %v -- an unrelated non-capsule parent of the value slot must not affect ownership discovery", got, want)
+	}
+}
+
+// TestCapsulesWithValueDetectsAmbiguousCapsuleOwnership covers the
+// genuine invariant violation that TestCapsulesWithValueIgnoresUnrelatedParentsOfSlot
+// is deliberately distinguished from: two distinct capsule-tagged nodes
+// both wired to the same value slot, which can only happen through an
+// out-of-band mutation, since buildCapsuleTx wires each slot to exactly
+// one owning capsule at creation.
+func TestCapsulesWithValueDetectsAmbiguousCapsuleOwnership(t *testing.T) {
+	g, capsules := newCapsuleTestFixture(t)
+
+	value, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for value: %v", err)
+	}
+
+	capsule, err := capsules.NewCapsule(value)
+	if err != nil {
+		t.Fatalf("NewCapsule(value): %v", err)
+	}
+
+	slot, found, err := capsules.slotFor(capsule, capsules.valueSlots.allPointers)
+	if err != nil {
+		t.Fatalf("slotFor(capsule, valueSlot tag): %v", err)
+	}
+	if !found {
+		t.Fatalf("capsule %d unexpectedly has no value slot", capsule)
+	}
+
+	otherValue, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for otherValue: %v", err)
+	}
+
+	otherCapsule, err := capsules.NewCapsule(otherValue)
+	if err != nil {
+		t.Fatalf("NewCapsule(otherValue): %v", err)
 	}
 
 	// Bypass CapsuleRegistry entirely, simulating an out-of-band mutation
-	// that gives the value slot a second parent.
-	if _, err := g.AddRelationship(other, slot); err != nil {
-		t.Fatalf("AddRelationship(other, slot): %v", err)
+	// that wires a second, distinct capsule to the same value slot.
+	if _, err := g.AddRelationship(otherCapsule, slot); err != nil {
+		t.Fatalf("AddRelationship(otherCapsule, slot): %v", err)
 	}
 
 	_, err = capsules.CapsulesWithValue(value)
-	if !errors.Is(err, ErrAmbiguousSlotOwner) {
-		t.Fatalf("CapsulesWithValue(value) error = %v, want %v", err, ErrAmbiguousSlotOwner)
+	if !errors.Is(err, ErrAmbiguousPointerMetadata) {
+		t.Fatalf("CapsulesWithValue(value) error = %v, want %v", err, ErrAmbiguousPointerMetadata)
 	}
 }
 

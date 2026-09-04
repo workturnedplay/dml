@@ -1116,17 +1116,6 @@ var (
 	// the given capsule is not currently an element of the given list
 	// (i.e. (list, capsule) does not exist).
 	ErrCapsuleNotInList = errors.New("capsule is not an element of this list")
-
-	// ErrAmbiguousSlotOwner is returned by findUniqueParent when a
-	// role-slot node (e.g. an ElementCapsule's value slot) is found to
-	// have more than one parent in the underlying Graph. This can only
-	// happen through an out-of-band Graph mutation, since every slot
-	// node created via buildCapsuleTx is freshly minted and wired to
-	// exactly one owning capsule in the same transaction that mints it.
-	// Mirrors the fail-loud-not-silently-repair discipline used
-	// elsewhere in this file (ErrAmbiguousPointerMetadata,
-	// ErrTooManyPointerTargets, ErrNameBoundToDeletedNode).
-	ErrAmbiguousSlotOwner = errors.New("more than one parent found for a role-slot node; the uniqueness invariant has already been violated")
 )
 
 // txOps is the minimal mutating surface needed to compose primitive
@@ -1604,38 +1593,6 @@ func findUniqueTaggedChild(g *Graph, node, tag NodeID) (child NodeID, found bool
 	}
 
 	return child, found, nil
-}
-
-// findUniqueParent returns the single parent of node in the underlying
-// Graph, i.e. the only X for which (X, node) exists -- with no tag
-// filtering, unlike findUniqueTaggedParent. This is the correct lookup
-// for a role-slot node such as an ElementCapsule's prev/value/next slot:
-// each such slot is freshly minted by buildCapsuleTx and wired to its
-// one owning capsule in the very same transaction that creates it, and
-// is never intended to be pointed at by anything else. Such a slot is
-// therefore expected to have exactly one parent, full stop -- not merely
-// one parent that additionally satisfies some tag, which is what
-// findUniqueTaggedParent checks instead.
-//
-// It requires node to exist. found is false if node currently has no
-// parent at all. If node has more than one parent -- only reachable
-// through an out-of-band Graph mutation -- ErrAmbiguousSlotOwner is
-// returned instead of arbitrarily picking one, per the same fail-loud
-// discipline used throughout this file.
-func findUniqueParent(g *Graph, node NodeID) (parent NodeID, found bool, err error) {
-	incoming, err := g.FindIncoming(node)
-	if err != nil {
-		return 0, false, err
-	}
-
-	switch len(incoming) {
-	case 0:
-		return 0, false, nil
-	case 1:
-		return incoming[0].From, true, nil
-	default:
-		return 0, false, ErrAmbiguousSlotOwner
-	}
 }
 
 // locateBySubjectSlot finds node's metadata node and subject-slot node
@@ -2459,16 +2416,29 @@ func (c *CapsuleRegistry) SetValue(capsule, value NodeID) error {
 // value-slot tag) -- value may well have other, unrelated incoming
 // relationships elsewhere in the graph (a Pointer target, a
 // PointerMetadata target, etc.), which are silently skipped rather than
-// mistaken for capsule occurrences. Each qualifying slot's owning
-// capsule is then found via findUniqueParent, which fails loudly with
-// ErrAmbiguousSlotOwner if some out-of-band mutation has given a slot
-// more than one parent, and is silently skipped (not fabricated) if a
-// slot somehow has no parent at all. Like slotFor's other callers
-// (Value, Prev, Next, ...), this does not separately verify
-// IsCapsule(capsule) for each candidate found this way -- a well-formed
-// graph only ever wires a value-slot's single parent to be its true,
-// correctly-tagged owning capsule, matching the level of defensiveness
-// already used elsewhere in this file.
+// mistaken for capsule occurrences.
+//
+// Each qualifying slot's owning capsule is then found via
+// findUniqueTaggedParent(slot, allElementCapsules) -- deliberately a
+// *tagged* parent lookup, not a "the slot has exactly one parent, full
+// stop" lookup. A role-slot node is free to acquire any number of
+// additional, unrelated parents over time (some future metadata
+// structure referencing the slot node itself, for its own reasons --
+// nothing in this file prevents that, since a node may have any number
+// of parents, THEORY_NOTES_FROM_CONVERSATION.md section 1) without that
+// being confused for a second owning capsule. ErrAmbiguousPointerMetadata
+// (the same error findUniqueTaggedParent/findUniqueTaggedChild already
+// return elsewhere in this file for an analogous ambiguity) is returned
+// only if two distinct *capsule-tagged* nodes both claim the same slot --
+// a genuine invariant violation, since buildCapsuleTx wires each slot to
+// exactly one owning capsule at creation and nothing legitimate ever
+// adds a second one. A slot with no capsule-tagged parent at all (found
+// == false, e.g. after some out-of-band edit removed the owning edge) is
+// silently skipped rather than fabricated. Like slotFor's other callers
+// (Value, Prev, Next, ...), this does not separately re-verify that the
+// discovered capsule's own value slot (via slotFor) is this exact slot --
+// a well-formed graph only ever wires that edge to match, the same level
+// of defensiveness already used elsewhere in this file.
 //
 // Running time is proportional to the number of incoming relationships
 // value happens to have across the whole graph -- typically small and
@@ -2497,7 +2467,7 @@ func (c *CapsuleRegistry) CapsulesWithValue(value NodeID) ([]NodeID, error) {
 			continue
 		}
 
-		capsule, found, err := findUniqueParent(c.graph, slot)
+		capsule, found, err := findUniqueTaggedParent(c.graph, slot, c.allElementCapsules)
 		if err != nil {
 			return nil, err
 		}
