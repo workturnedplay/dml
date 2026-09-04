@@ -17,8 +17,19 @@ package dml
 import (
 	"errors"
 	"reflect"
+	"sort"
 	"testing"
 )
+
+// sortedNodeIDs returns a sorted copy of ids, for comparing test results
+// against results whose order is documented as unspecified (e.g.
+// CapsuleRegistry.CapsulesWithValue, ListRegistry.OccurrencesOf).
+func sortedNodeIDs(ids []NodeID) []NodeID {
+	sorted := make([]NodeID, len(ids))
+	copy(sorted, ids)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+	return sorted
+}
 
 func TestCreateNode(t *testing.T) {
 	var g Graph
@@ -3185,6 +3196,120 @@ func TestCapsuleOperationsRequireCapsuleTag(t *testing.T) {
 	}
 }
 
+func TestCapsulesWithValueFindsAllOccurrences(t *testing.T) {
+	g, capsules := newCapsuleTestFixture(t)
+
+	value, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for value: %v", err)
+	}
+
+	other, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for other: %v", err)
+	}
+
+	c1, err := capsules.NewCapsule(value)
+	if err != nil {
+		t.Fatalf("NewCapsule(value) for c1: %v", err)
+	}
+
+	c2, err := capsules.NewCapsule(value)
+	if err != nil {
+		t.Fatalf("NewCapsule(value) for c2: %v", err)
+	}
+
+	// A capsule holding an unrelated value must not show up.
+	if _, err := capsules.NewCapsule(other); err != nil {
+		t.Fatalf("NewCapsule(other): %v", err)
+	}
+
+	got, err := capsules.CapsulesWithValue(value)
+	if err != nil {
+		t.Fatalf("CapsulesWithValue(value): %v", err)
+	}
+
+	want := sortedNodeIDs([]NodeID{c1, c2})
+	got = sortedNodeIDs(got)
+
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("CapsulesWithValue(value) = %v, want %v", got, want)
+	}
+}
+
+func TestCapsulesWithValueIgnoresUnrelatedEdges(t *testing.T) {
+	g, capsules := newCapsuleTestFixture(t)
+
+	value, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for value: %v", err)
+	}
+
+	capsule, err := capsules.NewCapsule(value)
+	if err != nil {
+		t.Fatalf("NewCapsule(value): %v", err)
+	}
+
+	unrelated, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for unrelated: %v", err)
+	}
+
+	// A plain, non-value-slot relationship pointing at value from
+	// elsewhere in the graph (e.g. some other structure's target).
+	if _, err := g.AddRelationship(unrelated, value); err != nil {
+		t.Fatalf("AddRelationship(unrelated, value): %v", err)
+	}
+
+	got, err := capsules.CapsulesWithValue(value)
+	if err != nil {
+		t.Fatalf("CapsulesWithValue(value): %v", err)
+	}
+
+	want := []NodeID{capsule}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("CapsulesWithValue(value) = %v, want %v", got, want)
+	}
+}
+
+func TestCapsulesWithValueDetectsAmbiguousSlotOwner(t *testing.T) {
+	g, capsules := newCapsuleTestFixture(t)
+
+	value, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for value: %v", err)
+	}
+
+	capsule, err := capsules.NewCapsule(value)
+	if err != nil {
+		t.Fatalf("NewCapsule(value): %v", err)
+	}
+
+	slot, found, err := capsules.slotFor(capsule, capsules.valueSlots.allPointers)
+	if err != nil {
+		t.Fatalf("slotFor(capsule, valueSlot tag): %v", err)
+	}
+	if !found {
+		t.Fatalf("capsule %d unexpectedly has no value slot", capsule)
+	}
+
+	other, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for other: %v", err)
+	}
+
+	// Bypass CapsuleRegistry entirely, simulating an out-of-band mutation
+	// that gives the value slot a second parent.
+	if _, err := g.AddRelationship(other, slot); err != nil {
+		t.Fatalf("AddRelationship(other, slot): %v", err)
+	}
+
+	_, err = capsules.CapsulesWithValue(value)
+	if !errors.Is(err, ErrAmbiguousSlotOwner) {
+		t.Fatalf("CapsulesWithValue(value) error = %v, want %v", err, ErrAmbiguousSlotOwner)
+	}
+}
+
 func newListTestFixture(t *testing.T) (*Graph, *CapsuleRegistry, *ListRegistry) {
 	t.Helper()
 
@@ -3584,6 +3709,198 @@ func TestListOperationsRequireListTag(t *testing.T) {
 
 	if _, err := lists.Elements(notAList); !errors.Is(err, ErrNotList) {
 		t.Fatalf("Elements() error = %v, want %v", err, ErrNotList)
+	}
+}
+
+func TestListContainsFindsValue(t *testing.T) {
+	g, _, lists := newListTestFixture(t)
+
+	list, err := lists.NewList()
+	if err != nil {
+		t.Fatalf("NewList(): %v", err)
+	}
+
+	a, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for a: %v", err)
+	}
+	b, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for b: %v", err)
+	}
+	c, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for c: %v", err)
+	}
+
+	if _, err := lists.Append(list, a); err != nil {
+		t.Fatalf("Append(a): %v", err)
+	}
+	capsuleB, err := lists.Append(list, b)
+	if err != nil {
+		t.Fatalf("Append(b): %v", err)
+	}
+	if _, err := lists.Append(list, c); err != nil {
+		t.Fatalf("Append(c): %v", err)
+	}
+
+	got, found, err := lists.Contains(list, b)
+	if err != nil {
+		t.Fatalf("Contains(list, b): %v", err)
+	}
+	if !found || got != capsuleB {
+		t.Fatalf("Contains(list, b) = (%d,%v), want (%d,true)", got, found, capsuleB)
+	}
+}
+
+func TestListContainsFalseForAbsentValue(t *testing.T) {
+	g, _, lists := newListTestFixture(t)
+
+	list, err := lists.NewList()
+	if err != nil {
+		t.Fatalf("NewList(): %v", err)
+	}
+
+	a, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for a: %v", err)
+	}
+
+	absent, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for absent: %v", err)
+	}
+
+	if _, err := lists.Append(list, a); err != nil {
+		t.Fatalf("Append(a): %v", err)
+	}
+
+	_, found, err := lists.Contains(list, absent)
+	if err != nil {
+		t.Fatalf("Contains(list, absent): %v", err)
+	}
+	if found {
+		t.Fatal("Contains() reported a value that was never appended")
+	}
+}
+
+func TestListContainsScopedToOwningList(t *testing.T) {
+	g, _, lists := newListTestFixture(t)
+
+	listA, err := lists.NewList()
+	if err != nil {
+		t.Fatalf("NewList() for listA: %v", err)
+	}
+
+	listB, err := lists.NewList()
+	if err != nil {
+		t.Fatalf("NewList() for listB: %v", err)
+	}
+
+	value, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for value: %v", err)
+	}
+
+	if _, err := lists.Append(listB, value); err != nil {
+		t.Fatalf("Append(listB, value): %v", err)
+	}
+
+	_, found, err := lists.Contains(listA, value)
+	if err != nil {
+		t.Fatalf("Contains(listA, value): %v", err)
+	}
+	if found {
+		t.Fatal("Contains(listA, value) incorrectly found a value that only exists in listB")
+	}
+
+	_, found, err = lists.Contains(listB, value)
+	if err != nil {
+		t.Fatalf("Contains(listB, value): %v", err)
+	}
+	if !found {
+		t.Fatal("Contains(listB, value) did not find a value that was appended to listB")
+	}
+}
+
+func TestListOccurrencesOfFindsDuplicates(t *testing.T) {
+	g, _, lists := newListTestFixture(t)
+
+	list, err := lists.NewList()
+	if err != nil {
+		t.Fatalf("NewList(): %v", err)
+	}
+
+	value, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for value: %v", err)
+	}
+
+	c1, err := lists.Append(list, value)
+	if err != nil {
+		t.Fatalf("first Append(value): %v", err)
+	}
+
+	c2, err := lists.Append(list, value)
+	if err != nil {
+		t.Fatalf("second Append(value): %v", err)
+	}
+
+	got, err := lists.OccurrencesOf(list, value)
+	if err != nil {
+		t.Fatalf("OccurrencesOf(list, value): %v", err)
+	}
+
+	want := sortedNodeIDs([]NodeID{c1, c2})
+	got = sortedNodeIDs(got)
+
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("OccurrencesOf(list, value) = %v, want %v", got, want)
+	}
+
+	_, found, err := lists.Contains(list, value)
+	if err != nil {
+		t.Fatalf("Contains(list, value): %v", err)
+	}
+	if !found {
+		t.Fatal("Contains() did not find a value with duplicate occurrences")
+	}
+}
+
+func TestListContainsRequiresListTag(t *testing.T) {
+	g, _, lists := newListTestFixture(t)
+
+	notAList, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode(): %v", err)
+	}
+
+	value, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for value: %v", err)
+	}
+
+	if _, _, err := lists.Contains(notAList, value); !errors.Is(err, ErrNotList) {
+		t.Fatalf("Contains() error = %v, want %v", err, ErrNotList)
+	}
+
+	if _, err := lists.OccurrencesOf(notAList, value); !errors.Is(err, ErrNotList) {
+		t.Fatalf("OccurrencesOf() error = %v, want %v", err, ErrNotList)
+	}
+}
+
+func TestListContainsRequiresExistingValue(t *testing.T) {
+	_, _, lists := newListTestFixture(t)
+
+	list, err := lists.NewList()
+	if err != nil {
+		t.Fatalf("NewList(): %v", err)
+	}
+
+	const nonexistent NodeID = 999999
+
+	if _, _, err := lists.Contains(list, nonexistent); !errors.Is(err, ErrNodeNotFound) {
+		t.Fatalf("Contains() error = %v, want %v", err, ErrNodeNotFound)
 	}
 }
 

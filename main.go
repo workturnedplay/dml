@@ -1116,6 +1116,17 @@ var (
 	// the given capsule is not currently an element of the given list
 	// (i.e. (list, capsule) does not exist).
 	ErrCapsuleNotInList = errors.New("capsule is not an element of this list")
+
+	// ErrAmbiguousSlotOwner is returned by findUniqueParent when a
+	// role-slot node (e.g. an ElementCapsule's value slot) is found to
+	// have more than one parent in the underlying Graph. This can only
+	// happen through an out-of-band Graph mutation, since every slot
+	// node created via buildCapsuleTx is freshly minted and wired to
+	// exactly one owning capsule in the same transaction that mints it.
+	// Mirrors the fail-loud-not-silently-repair discipline used
+	// elsewhere in this file (ErrAmbiguousPointerMetadata,
+	// ErrTooManyPointerTargets, ErrNameBoundToDeletedNode).
+	ErrAmbiguousSlotOwner = errors.New("more than one parent found for a role-slot node; the uniqueness invariant has already been violated")
 )
 
 // txOps is the minimal mutating surface needed to compose primitive
@@ -1593,6 +1604,38 @@ func findUniqueTaggedChild(g *Graph, node, tag NodeID) (child NodeID, found bool
 	}
 
 	return child, found, nil
+}
+
+// findUniqueParent returns the single parent of node in the underlying
+// Graph, i.e. the only X for which (X, node) exists -- with no tag
+// filtering, unlike findUniqueTaggedParent. This is the correct lookup
+// for a role-slot node such as an ElementCapsule's prev/value/next slot:
+// each such slot is freshly minted by buildCapsuleTx and wired to its
+// one owning capsule in the very same transaction that creates it, and
+// is never intended to be pointed at by anything else. Such a slot is
+// therefore expected to have exactly one parent, full stop -- not merely
+// one parent that additionally satisfies some tag, which is what
+// findUniqueTaggedParent checks instead.
+//
+// It requires node to exist. found is false if node currently has no
+// parent at all. If node has more than one parent -- only reachable
+// through an out-of-band Graph mutation -- ErrAmbiguousSlotOwner is
+// returned instead of arbitrarily picking one, per the same fail-loud
+// discipline used throughout this file.
+func findUniqueParent(g *Graph, node NodeID) (parent NodeID, found bool, err error) {
+	incoming, err := g.FindIncoming(node)
+	if err != nil {
+		return 0, false, err
+	}
+
+	switch len(incoming) {
+	case 0:
+		return 0, false, nil
+	case 1:
+		return incoming[0].From, true, nil
+	default:
+		return 0, false, ErrAmbiguousSlotOwner
+	}
 }
 
 // locateBySubjectSlot finds node's metadata node and subject-slot node
@@ -2389,6 +2432,85 @@ func (c *CapsuleRegistry) SetValue(capsule, value NodeID) error {
 	return c.valueSlots.SetTarget(slot, value)
 }
 
+// CapsulesWithValue returns every capsule, anywhere in the graph, whose
+// value slot currently targets value -- not scoped to any particular
+// list.
+//
+// This is the reverse-lookup counterpart to Value(capsule): Value walks
+// capsule -> valueSlot -> value forward; CapsulesWithValue walks
+// value -> valueSlot -> capsule backward, starting from
+// Graph.FindIncoming(value) (an indexed map lookup, not a scan of any
+// list). This is the realization behind ListRegistry.Contains/
+// OccurrencesOf below: theorystate_v0.6.md section 11's open question
+// about adding "a Set-like index atop a List... for doesElementExist(X)"
+// turns out not to need any new node, tag, or index structure at all --
+// the ElementCapsule/value-slot wiring already built for ordinary list
+// traversal already has everything a reverse lookup needs, exactly
+// because each list-element occurrence already has its own
+// freshly-minted, uniquely-tagged identity (theorystate_v0.6.md section
+// 75). The only thing missing was asking the question from the value's
+// side instead of the list's side -- the same realization already
+// implicit in how InsertAfter/Remove check list membership via a direct
+// (list, capsule) relationship lookup instead of walking the list to
+// find afterCapsule/capsule.
+//
+// Candidates are found via value's incoming relationships, filtered to
+// those actually tagged as value-slots (IsPointer under this registry's
+// value-slot tag) -- value may well have other, unrelated incoming
+// relationships elsewhere in the graph (a Pointer target, a
+// PointerMetadata target, etc.), which are silently skipped rather than
+// mistaken for capsule occurrences. Each qualifying slot's owning
+// capsule is then found via findUniqueParent, which fails loudly with
+// ErrAmbiguousSlotOwner if some out-of-band mutation has given a slot
+// more than one parent, and is silently skipped (not fabricated) if a
+// slot somehow has no parent at all. Like slotFor's other callers
+// (Value, Prev, Next, ...), this does not separately verify
+// IsCapsule(capsule) for each candidate found this way -- a well-formed
+// graph only ever wires a value-slot's single parent to be its true,
+// correctly-tagged owning capsule, matching the level of defensiveness
+// already used elsewhere in this file.
+//
+// Running time is proportional to the number of incoming relationships
+// value happens to have across the whole graph -- typically small and
+// unrelated to the length of any list value occurs in -- not to the
+// length of any particular list.
+//
+// value need not currently be tagged or used as a capsule value at all.
+// If value does not exist, this fails with ErrNodeNotFound, via the
+// underlying Graph.FindIncoming(value) call.
+//
+// The returned capsules are in no particular semantic order (they follow
+// Graph.FindIncoming's own deterministic sort by slot NodeID, which does
+// not necessarily correspond to capsule creation order).
+func (c *CapsuleRegistry) CapsulesWithValue(value NodeID) ([]NodeID, error) {
+	incoming, err := c.graph.FindIncoming(value)
+	if err != nil {
+		return nil, err
+	}
+
+	var capsules []NodeID
+
+	for _, rel := range incoming {
+		slot := rel.From
+
+		if !c.valueSlots.IsPointer(slot) {
+			continue
+		}
+
+		capsule, found, err := findUniqueParent(c.graph, slot)
+		if err != nil {
+			return nil, err
+		}
+		if !found {
+			continue
+		}
+
+		capsules = append(capsules, capsule)
+	}
+
+	return capsules, nil
+}
+
 // Prev returns capsule's previous-capsule link, if any. hasPrev is false
 // for a capsule currently at the head of its list.
 func (c *CapsuleRegistry) Prev(capsule NodeID) (prev NodeID, hasPrev bool, err error) {
@@ -2837,6 +2959,75 @@ func (l *ListRegistry) Elements(list NodeID) ([]NodeID, error) {
 	}
 
 	return values, nil
+}
+
+// OccurrencesOf returns every capsule within list whose value equals
+// value, in no particular semantic order (see the ordering note on
+// CapsuleRegistry.CapsulesWithValue, which this is built directly on
+// top of).
+//
+// This exists because a value may legitimately occur more than once in
+// the same list, each occurrence via its own capsule
+// (THEORY_NOTES_FROM_CONVERSATION.md section 12 / theorystate_v0.6.md
+// section 75's occurrence-identity distinction) -- Contains below only
+// needs to know whether at least one occurrence exists, but some callers
+// legitimately need all of them (e.g. removing every occurrence of a
+// value, or counting duplicates).
+//
+// list must already be tagged (AllLists, list). If value does not
+// exist, this fails with ErrNodeNotFound, via
+// CapsuleRegistry.CapsulesWithValue.
+func (l *ListRegistry) OccurrencesOf(list, value NodeID) ([]NodeID, error) {
+	if !l.graph.NodeExists(list) {
+		return nil, ErrNodeNotFound
+	}
+
+	if !l.IsList(list) {
+		return nil, ErrNotList
+	}
+
+	candidates, err := l.capsules.CapsulesWithValue(value)
+	if err != nil {
+		return nil, err
+	}
+
+	var occurrences []NodeID
+
+	for _, capsule := range candidates {
+		if l.graph.HasRelationship(list, capsule) {
+			occurrences = append(occurrences, capsule)
+		}
+	}
+
+	return occurrences, nil
+}
+
+// Contains reports whether value currently occurs at least once in
+// list, returning one such capsule if so. If value occurs more than
+// once, which capsule is returned is unspecified -- see OccurrencesOf
+// to find every occurrence.
+//
+// Built directly on OccurrencesOf: per theorystate_v0.6.md section 11's
+// note that a Set-like membership index "may be added later" for this
+// exact query, no new node, tag, or index structure turned out to be
+// necessary -- see the CapsuleRegistry.CapsulesWithValue doc comment for
+// why the existing list/capsule/value-slot structure already supports
+// this query in time proportional to how many places value is
+// referenced, not to list's length.
+//
+// list must already be tagged (AllLists, list). If value does not
+// exist, this fails with ErrNodeNotFound.
+func (l *ListRegistry) Contains(list, value NodeID) (capsule NodeID, found bool, err error) {
+	occurrences, err := l.OccurrencesOf(list, value)
+	if err != nil {
+		return 0, false, err
+	}
+
+	if len(occurrences) == 0 {
+		return 0, false, nil
+	}
+
+	return occurrences[0], true, nil
 }
 
 // Remove unlinks capsule from list, relinking capsule's neighbors (if

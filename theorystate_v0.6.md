@@ -163,8 +163,26 @@ meaning (§5). This also allows additional unrelated children to be added to
 an ElementCapsule without invalidating discovery of the three defined roles.
 
 The exact final List representation and its invariants remain OPEN.
-A Set-like index atop
-a List may be added later for `doesElementExist(X)`.
+
+**Resolved (session finding, validated by `wtw`): no separate Set-like
+index structure is needed for `doesElementExist(X)`-style membership
+queries.** The original framing above assumed a value-membership query
+would need new index structure layered atop the list. It doesn't. Every
+list-element occurrence already has its own freshly-minted,
+uniquely-tagged value-slot node (this section, above); running
+Graph.FindIncoming against a *value* rather than against the list
+already yields every capsule holding that value, in time proportional to
+how many places the value is referenced anywhere in the graph -- not to
+the length of any list it occurs in. List membership of a specific
+capsule is likewise already an existing O(1) primitive-relationship
+check ((list,capsule) -- see this section's list->ElementCapsule edges),
+the exact same check InsertAfter/Remove already use to validate their
+own capsule arguments. Combining the two -- reverse-lookup from the
+value, then filter by the (list,capsule) edge -- answers
+`doesElementExist(X)` (and, generalized, "every occurrence of X") without
+adding any new node, tag, or index structure at all. See
+`CapsuleRegistry.CapsulesWithValue` / `ListRegistry.Contains` /
+`ListRegistry.OccurrencesOf` in the Go implementation.
 
 ## 12. ROOT and discoverability (single-graph)
 

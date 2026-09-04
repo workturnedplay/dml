@@ -429,14 +429,39 @@ NodeID-keyed structure outside the primitive graph.
 
  Ordered Lists are now feature-complete for the primitives currently
  scoped: creation, append/prepend/insert-after/remove, head/tail/
- traversal, and list deletion. Not yet addressed: a Set-like membership
- index for O(1) doesEqual/contains checks (theory section 11 notes this
- as a possible later addition on top of the existing traversal), and
- deleting a capsule node itself once fully detached (ordinary
- Graph.DeleteNode already covers this once its remaining relationships
- -- AllElementCapsules tag, three slot-tag edges -- are cleared, so no
- new registry method is obviously needed here, but hasn't been exercised
- by a test yet).
+ traversal, and list deletion.
+
+13. Added value-membership queries -- CapsuleRegistry.CapsulesWithValue,
+ ListRegistry.OccurrencesOf, and ListRegistry.Contains -- resolving what
+ item 12 above and theory section 11 had flagged as a possible later
+ "Set-like index" addition. No new node, tag, or index structure turned
+ out to be needed: CapsulesWithValue is a pure reverse lookup from a
+ value's own Graph.FindIncoming, filtered to genuine value-slot parents
+ (via the existing valueSlots PointerRegistry's IsPointer) and resolved
+ to an owning capsule via the new findUniqueParent helper (the untagged
+ counterpart of findUniqueTaggedParent, for slot nodes expected to have
+ exactly one parent full stop rather than one parent additionally
+ satisfying some tag) -- failing loudly with the new
+ ErrAmbiguousSlotOwner if an out-of-band mutation has given a slot more
+ than one parent. ListRegistry.OccurrencesOf filters those candidates
+ down to the ones satisfying the existing (list,capsule) containment
+ edge -- the same O(1) check InsertAfter/Remove already use -- and
+ Contains is a thin wrapper reporting whether any occurrence was found.
+ Running time is proportional to how many places a value is referenced
+ anywhere in the graph, not to the length of any particular list.
+ Covered by TestCapsulesWithValueFindsAllOccurrences,
+ TestCapsulesWithValueIgnoresUnrelatedEdges,
+ TestCapsulesWithValueDetectsAmbiguousSlotOwner,
+ TestListContainsFindsValue, TestListContainsFalseForAbsentValue,
+ TestListContainsScopedToOwningList,
+ TestListOccurrencesOfFindsDuplicates, TestListContainsRequiresListTag,
+ and TestListContainsRequiresExistingValue.
+
+ Not yet addressed: deleting a capsule node itself once fully detached
+ (ordinary Graph.DeleteNode already covers this once its remaining
+ relationships -- AllElementCapsules tag, three slot-tag edges -- are
+ cleared, so no new registry method is obviously needed here, but hasn't
+ been exercised by a test yet).
 
 Currently unaddressed yet:
 - No commit-time interception exists to prevent a raw

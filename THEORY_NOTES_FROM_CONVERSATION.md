@@ -220,9 +220,9 @@ The list processor simply ignores children that are not relevant capsules.
 
 ### Doubly linked list
 
-The intended structure is a doubly linked ordered list. It does not inherently provide fast membership lookup. A simple implementation can traverse from head to tail.
+The intended structure is a doubly linked ordered list. A naive implementation traverses from head to tail to answer membership questions, which is the right default access pattern for *positional* queries (visit every element in order).
 
-A separate Set/index can later provide faster membership checks and can itself be built on top of the existing list representation.
+**Correction (supersedes the paragraph below in the original writeup):** value *membership* -- "does X occur in this list" -- does not need a separate Set/index structure built on top of the list at all, and does not need list traversal either. Because each occurrence already has its own freshly-minted, tagged value-slot node (see "Element identity versus value identity" below), asking the question from the *value's* side -- which nodes currently point at X, and are any of them a value-slot belonging to a capsule that is a member of this particular list -- answers it directly via the existing reverse-relationship index, in time proportional to how many places X is referenced, not to list length. This is the same kind of reverse-lookup already used to verify list membership of a specific capsule (a direct (list,capsule) relationship check), just applied one hop further back, from value to its owning capsule. No new node, tag, or index structure was actually needed.
 
 ### Multiple structures over one list
 
