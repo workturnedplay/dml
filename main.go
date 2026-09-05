@@ -3590,13 +3590,17 @@ func (l *ListRegistry) DeleteList(list NodeID) error {
 			return err
 		}
 
-		// Graph.DeleteNode is called directly rather than through tx --
-		// Txn deliberately has no transactional DeleteNode (see the Txn
-		// doc comment) -- but that is fine here: DeleteNode either
-		// succeeds outright (nothing left for rollback to undo) or fails
+		// tx.DeleteNode is used here (not a direct l.graph.DeleteNode
+		// call) purely for consistency with every other multi-step
+		// registry operation's txOps discipline in this file, now that
+		// Txn.DeleteNode exists (theorystate_v0.6.md section 78). This
+		// is the last step in the sequence, so behavior is unchanged
+		// either way: DeleteNode either succeeds outright or fails
 		// without mutating anything, in which case returning its error
 		// from this closure triggers Transact's normal rollback of the
-		// tag-removal step above.
-		return l.graph.DeleteNode(list)
+		// tag-removal step above -- but going through tx means this
+		// method no longer needs its own special-cased exception to a
+		// pattern the rest of the file follows uniformly.
+		return tx.DeleteNode(list)
 	})
 }
