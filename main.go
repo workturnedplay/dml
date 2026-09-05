@@ -1192,6 +1192,18 @@ var (
 	// its slots open (e.g. via ListRegistry.Remove) before deletion can
 	// succeed.
 	ErrCapsuleNotEmpty = errors.New("capsule or one of its role slots has relationships beyond its own fixed structure; the capsule cannot be safely deleted")
+
+	// ErrInvalidListStructure is returned when ListRegistry discovers that
+	// the graph no longer satisfies the structural invariants of an ordered
+	// list. This is intended for out-of-band Graph mutations: normal list
+	// operations maintain these relationships transactionally.
+	ErrInvalidListStructure = errors.New("list structure is invalid")
+
+	// ErrListCycle is returned by ListRegistry.Elements when the head-to-tail
+	// traversal encounters the same ElementCapsule more than once. A cycle
+	// can only arise through an out-of-band graph mutation because the
+	// normal list operations maintain an acyclic chain.
+	ErrListCycle = errors.New("list next-chain contains a cycle")
 )
 
 // txOps is the minimal mutating surface needed to compose primitive
@@ -2278,11 +2290,30 @@ func (c *CapsuleRegistry) IsCapsule(id NodeID) bool {
 // without disturbing role discovery. found is false if capsule has no
 // such slot yet, which for a capsule created via NewCapsule should only
 // happen due to an out-of-band mutation, since NewCapsule always creates
-// all three slots up front. capsule's existence is checked implicitly by
-// the underlying FindOutgoing call (via findUniqueTaggedChild), which
-// returns ErrNodeNotFound if capsule does not exist.
+// all three slots up front.
+//
+// The discovered slot must also have capsule as its unique
+// AllElementCapsules-tagged parent. This second check is important because
+// the primitive Graph permits arbitrary additional parents: a raw mutation
+// could otherwise make one capsule point at another capsule's role slot and
+// silently alias that role. Unrelated non-capsule parents remain permitted;
+// two distinct capsule-tagged parents produce ErrAmbiguousPointerMetadata.
+// capsule's existence is checked implicitly by the underlying lookups.
 func (c *CapsuleRegistry) slotFor(capsule, tag NodeID) (slot NodeID, found bool, err error) {
-	return findUniqueTaggedChild(c.graph, capsule, tag)
+	slot, found, err = findUniqueTaggedChild(c.graph, capsule, tag)
+	if err != nil || !found {
+		return slot, found, err
+	}
+
+	owner, foundOwner, err := findUniqueTaggedParent(c.graph, slot, c.allElementCapsules)
+	if err != nil {
+		return 0, false, err
+	}
+	if !foundOwner || owner != capsule {
+		return 0, false, ErrAmbiguousPointerMetadata
+	}
+
+	return slot, true, nil
 }
 
 // buildCapsuleTx creates a fresh capsule NodeID, tags it via
@@ -2894,7 +2925,14 @@ func (l *ListRegistry) Head(list NodeID) (head NodeID, hasHead bool, err error) 
 		return 0, false, ErrNotList
 	}
 
-	return findUniqueTaggedChild(l.graph, list, l.allHeads)
+	head, found, err := findUniqueTaggedChild(l.graph, list, l.allHeads)
+	if err != nil || !found {
+		return head, found, err
+	}
+	if !l.capsules.IsCapsule(head) || !l.graph.HasRelationship(list, head) {
+		return 0, false, ErrInvalidListStructure
+	}
+	return head, true, nil
 }
 
 // Tail returns list's current tail capsule, if any. hasTail is false for
@@ -2908,7 +2946,14 @@ func (l *ListRegistry) Tail(list NodeID) (tail NodeID, hasTail bool, err error) 
 		return 0, false, ErrNotList
 	}
 
-	return findUniqueTaggedChild(l.graph, list, l.allTails)
+	tail, found, err := findUniqueTaggedChild(l.graph, list, l.allTails)
+	if err != nil || !found {
+		return tail, found, err
+	}
+	if !l.capsules.IsCapsule(tail) || !l.graph.HasRelationship(list, tail) {
+		return 0, false, ErrInvalidListStructure
+	}
+	return tail, true, nil
 }
 
 // Append creates a fresh capsule holding value and links it as the new
@@ -3115,12 +3160,118 @@ func (l *ListRegistry) InsertAfter(list, afterCapsule, value NodeID) (NodeID, er
 	return capsule, nil
 }
 
-// Elements returns list's current values, in head-to-tail order, by
-// traversing the capsule chain via CapsuleRegistry.Next.
+// validateStructure checks the ordered-list invariants that are meaningful
+// at this layer without imposing any restriction on unrelated primitive
+// graph relationships. In particular, direct list children only count as
+// elements when they are tagged AllElementCapsules; arbitrary non-capsule
+// children remain permitted.
 //
-// This is a plain read-only convenience built entirely on existing
-// registry methods (Head, then repeated Next/Value) -- it adds no new
-// graph structure or discovery mechanism of its own.
+// The check deliberately walks the Next chain with a visited set. The
+// primitive Graph permits cycles, but an ordered list is interpreted as a
+// finite head-to-tail sequence. The same pass also checks list membership,
+// reciprocal Prev/Next links, and that every capsule-tagged list member is
+// actually reachable from the head. Thus a corrupted graph is rejected
+// rather than silently producing a plausible partial sequence.
+func (l *ListRegistry) validateStructure(list NodeID) error {
+	head, hasHead, err := findUniqueTaggedChild(l.graph, list, l.allHeads)
+	if err != nil {
+		return err
+	}
+	tail, hasTail, err := findUniqueTaggedChild(l.graph, list, l.allTails)
+	if err != nil {
+		return err
+	}
+
+	outgoing, err := l.graph.FindOutgoing(list)
+	if err != nil {
+		return err
+	}
+
+	members := make(map[NodeID]struct{})
+	for _, rel := range outgoing {
+		if l.capsules.IsCapsule(rel.To) {
+			members[rel.To] = struct{}{}
+		}
+	}
+
+	if !hasHead || !hasTail {
+		if hasHead || hasTail || len(members) != 0 {
+			return ErrInvalidListStructure
+		}
+		return nil
+	}
+
+	if !l.capsules.IsCapsule(head) || !l.capsules.IsCapsule(tail) {
+		return ErrInvalidListStructure
+	}
+	if _, ok := members[head]; !ok {
+		return ErrInvalidListStructure
+	}
+	if _, ok := members[tail]; !ok {
+		return ErrInvalidListStructure
+	}
+
+	visited := make(map[NodeID]struct{}, len(members))
+	current := head
+	for {
+		if _, seen := visited[current]; seen {
+			return ErrListCycle
+		}
+		visited[current] = struct{}{}
+
+		if !l.capsules.IsCapsule(current) {
+			return ErrInvalidListStructure
+		}
+		if !l.graph.HasRelationship(list, current) {
+			return ErrInvalidListStructure
+		}
+		if _, hasValue, err := l.capsules.Value(current); err != nil {
+			return err
+		} else if !hasValue {
+			return ErrInvalidListStructure
+		}
+
+		next, hasNext, err := l.capsules.Next(current)
+		if err != nil {
+			return err
+		}
+		if !hasNext {
+			if current != tail {
+				return ErrInvalidListStructure
+			}
+			break
+		}
+
+		if !l.capsules.IsCapsule(next) || !l.graph.HasRelationship(list, next) {
+			return ErrInvalidListStructure
+		}
+		prev, hasPrev, err := l.capsules.Prev(next)
+		if err != nil {
+			return err
+		}
+		if !hasPrev || prev != current {
+			return ErrInvalidListStructure
+		}
+
+		current = next
+	}
+
+	if _, hasPrev, err := l.capsules.Prev(head); err != nil {
+		return err
+	} else if hasPrev {
+		return ErrInvalidListStructure
+	}
+
+	if len(visited) != len(members) {
+		return ErrInvalidListStructure
+	}
+	return nil
+}
+
+// Elements returns list's current values, in head-to-tail order, by
+// traversing the capsule chain via CapsuleRegistry.Next. It first validates
+// the list structure so out-of-band mutations cannot turn a corrupted
+// chain into a silently accepted partial or cross-list traversal.
 func (l *ListRegistry) Elements(list NodeID) ([]NodeID, error) {
 	if !l.graph.NodeExists(list) {
 		return nil, ErrNodeNotFound
@@ -3130,7 +3281,17 @@ func (l *ListRegistry) Elements(list NodeID) ([]NodeID, error) {
 		return nil, ErrNotList
 	}
 
+	if err := l.validateStructure(list); err != nil {
+		return nil, err
+	}
+
 	var values []NodeID
+
+	// The primitive Graph intentionally permits arbitrary cycles. The list
+	// layer, however, interprets Next as a finite ordered chain, so traversal
+	// must detect a repeated capsule rather than relying on a timeout or
+	// assuming that well-formed construction is the only possible state.
+	visited := make(map[NodeID]struct{})
 
 	current, hasCurrent, err := findUniqueTaggedChild(l.graph, list, l.allHeads)
 	if err != nil {
@@ -3138,6 +3299,11 @@ func (l *ListRegistry) Elements(list NodeID) ([]NodeID, error) {
 	}
 
 	for hasCurrent {
+		if _, seen := visited[current]; seen {
+			return nil, ErrListCycle
+		}
+		visited[current] = struct{}{}
+
 		value, hasValue, err := l.capsules.Value(current)
 		if err != nil {
 			return nil, err
