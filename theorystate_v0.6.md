@@ -1,6 +1,6 @@
 # Theory State v0.6 (Coalesced)
 
-**Status:** Exploratory / pre-implementation
+**Status:** Exploratory / theory state linked to an active implementation
 **Purpose:** Single source of truth, merging v0.1–v0.5 and subsequent session
 findings. Sections 1–19 and 26–35 (single-graph foundation) are stable.
 Sections 36+ (distributed/cross-graph) contain genuine unresolved forks —
@@ -377,7 +377,10 @@ outgoing relationships form a set, and storage/creation order carries no
 meaning (§5). This also allows additional unrelated children to be added to
 an ElementCapsule without invalidating discovery of the three defined roles.
 
-The exact final List representation and its invariants remain OPEN.
+The exact final *semantic* List definition remains OPEN. The current Go
+implementation nevertheless has a concrete explored representation and
+implementation-level validation rules; those rules are recorded separately
+below and must not be mistaken for a final semantic commitment.
 
 **Resolved (session finding, validated by `wtw`): no separate Set-like
 index structure is needed for `doesElementExist(X)`-style membership
@@ -440,6 +443,39 @@ stated above, value *membership* needs neither traversal nor a separate
 index: it is answered by reverse-lookup from the value's own
 `FindIncoming`, one hop further back than the existing `(list,capsule)`
 membership check.
+
+**§11b — Current implementation-level List validation (not a semantic
+decision).** The current `ListRegistry` implementation validates the ordered
+List interpretation when traversing with `Elements`. This is deliberately
+above the primitive Graph: raw graph relationships remain possible, while a
+higher-level consumer refuses to interpret corrupted structure as a valid
+List.
+
+The current validation requires coherent head/tail boundary metadata and a
+finite head-to-tail `Next` chain. Every traversed node must be a genuine
+`AllElementCapsules` member of the list and must have a value. `Prev` and
+`Next` relationships must be reciprocal, and every capsule tagged as a
+member of the list must be reachable from the head. A repeated capsule is a
+cycle and is detected using a visited set keyed by `NodeID`, not a timeout.
+Malformed structure is rejected with `ErrListCycle`, `ErrInvalidListStructure`,
+or the more specific underlying registry/graph error as appropriate.
+
+Role-slot discovery has a corresponding ownership check. After a capsule's
+previous, value, or next slot is found through its specific role tag, the
+current implementation requires that slot to have the requesting capsule as
+its unique `AllElementCapsules`-tagged owner. Arbitrary unrelated parents of
+a role slot remain permitted because role slots are ordinary graph nodes; two
+distinct capsule owners are ambiguous and are rejected rather than guessed.
+
+These rules are implementation-level validation for the currently explored
+representation, not a claim that the primitive Graph should enforce them or
+that they define the final semantics of Lists. They follow §7a's separation
+between primitive storage and higher-level interpretation.
+
+The adversarial test suite deliberately exercises these boundaries, including
+cycles, broken `Prev`/`Next` reciprocity, cross-list contamination,
+disconnected members, malformed head/tail metadata, missing/invalid role data,
+and out-of-band graph mutations.
 
 ## 12. ROOT and discoverability (single-graph)
 

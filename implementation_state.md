@@ -68,31 +68,36 @@ After that:
   this. See theorystate_v0.6.md section 76 for the formal writeup. This
   bullet is corrected here because it had gone stale without being
   updated when that work landed.
-- Ordered Lists (theorystate_v0.6.md section 11 / 11a)
-  has been chosen as the next higher-level
-  structure over Sets (theorystate_v0.6.md section 9 / section 32's open
-  definitional questions are still genuinely unresolved design forks,
-  whereas the List representation is already largely settled); Domains
-  (theorystate_v0.6.md section 9c) and Sets remain for later, Domains
-  likely wanting Sets first since it's framed as a constrained Set.
+- Ordered Lists (theorystate_v0.6.md section 11 / 11a) are the current
+  higher-level structure being implemented over the still-open Set
+  semantics (theorystate_v0.6.md section 9 / section 32). Domains remain
+  later and likely still want Sets first, since the theory frames a Domain
+  as a constrained Set.
 
-  The ElementCapsule primitive (CapsuleRegistry, see item 10 above) is
-  now implemented: list -> ElementCapsule does not by itself make every
-  list child a capsule; capsules are identified through
-  AllElementCapsules (renamed from the theory docs' illustrative
-  "AllCapsules"), and the capsule's previous, value, and next
-  intermediary slots are each discovered through their own role tag
-  rather than by child position.
+  The ElementCapsule primitive (CapsuleRegistry, item 10) is implemented:
+  list -> ElementCapsule does not by itself make every list child a capsule;
+  capsules are identified through AllElementCapsules, and the capsule's
+  previous, value, and next intermediary slots are discovered through their
+  own role tags rather than by child position.
 
-  The list node itself, head/tail bookkeeping (AllHeads/AllTails tags,
-  per the discussion recorded in item 10), and list-level append/
-  prepend/insert-after are now implemented as ListRegistry (item 11).
-  Not yet implemented: removing a capsule from a list, and deleting a
-  list itself.
-- Do not prematurely implement Set/List semantics in the primitive layer,
-  regardless of which is chosen -- they remain higher-layer constructions,
-  per the same discipline that kept Pointer semantics entirely out of
-  Graph.
+  ListRegistry is implemented through creation, append/prepend/insert-after,
+  both removal forms, head/tail/traversal, value-membership queries, and
+  deletion. The current implementation also validates the ordered-list
+  interpretation defensively after raw Graph mutations: traversal uses a
+  visited NodeID set to detect cycles deterministically, verifies list
+  membership and capsule/value validity, checks reciprocal Prev/Next links,
+  checks head/tail consistency and reachability, and rejects malformed
+  structure with the appropriate registry error rather than timing out or
+  returning a partial sequence. Capsule role-slot discovery likewise verifies
+  that the discovered slot is owned by the requesting capsule through its
+  AllElementCapsules-tagged parent, while unrelated non-capsule parents remain
+  permitted.
+
+  Ordered Lists are therefore feature-complete for the primitives currently
+  scoped, but their final semantic contract remains OPEN in theorystate_v0.6.md.
+- Do not prematurely implement Set/List semantics in the primitive layer;
+  they remain higher-layer constructions, per the same discipline that kept
+  Pointer semantics entirely out of Graph.
 
 Important constraints:
 - Primitive Graph must remain unaware of ROOT and higher-level tags.
@@ -446,7 +451,7 @@ NodeID-keyed structure outside the primitive graph.
  in review as wrong, not merely stricter than necessary: a role-slot node
  is ordinary graph structure, and nothing prevents some future unrelated
  construct from also pointing at it (a node may have any number of
- parents, THEORY_NOTES_FROM_CONVERSATION.md section 1), which must not be
+ parents, theorystate_v0.6.md section 2.5/3), which must not be
  confused with a second owning capsule or make the lookup fail.
  findUniqueTaggedParent already has exactly the right semantics -- ignore
  any number of non-capsule-tagged parents, only object if two distinct
@@ -588,6 +593,30 @@ NodeID-keyed structure outside the primitive graph.
  TestListRemoveDeletesUnreferencedCapsule,
  TestListRemoveKeepsCapsuleIfStillReferencedElsewhere,
  TestListRemoveRequiresCapsuleInList, and TestListRemoveRequiresListTag.
+
+16. Added adversarial structural validation for Ordered Lists and
+ ElementCapsule role discovery. This is an implementation-level hardening
+ of the current ListRegistry/CapsuleRegistry interpretation, not a new
+ primitive-Graph invariant and not a final semantic commitment about Lists.
+
+ ListRegistry.Elements now detects Next-chain cycles with a visited set keyed
+ by ElementCapsule NodeID rather than using a timeout. It also rejects
+ malformed head/tail metadata, capsules that are not members of the list,
+ missing values, broken reciprocal Prev/Next links, and list members that are
+ unreachable from the head. This keeps malformed raw graph mutations from
+ becoming silently truncated or cross-list traversals.
+
+ CapsuleRegistry.slotFor now verifies that a discovered role slot has the
+ requesting capsule as its unique AllElementCapsules-tagged owner. Arbitrary
+ unrelated parents of the role-slot node remain allowed; only competing
+ capsule ownership is ambiguous and rejected.
+
+ The adversarial tests appended to main_test.go cover cycles, broken
+ Prev/Next reciprocity, cross-list contamination, disconnected members,
+ malformed head/tail metadata, missing/invalid role data, duplicate role
+ metadata, and related out-of-band graph mutations. The full suite, race
+ detector, and go vet were run against the resulting source with an older
+ local Go toolchain, while the project's go.mod remains at Go 1.27.
 
 Currently unaddressed yet:
 - No commit-time interception exists to prevent a raw
