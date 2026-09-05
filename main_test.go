@@ -4792,3 +4792,231 @@ func TestListRemoveRequiresListTag(t *testing.T) {
 		t.Fatalf("Remove() error = %v, want %v", err, ErrNotList)
 	}
 }
+
+// These tests deliberately exploit freedoms that the primitive Graph permits.
+// They are not tests of "normal" construction; they ask whether higher-level
+// discovery depends on accidental child/parent cardinality or child ordering.
+
+func TestAdversarialListIgnoresUnrelatedListChild(t *testing.T) {
+	g, _, lists := newListTestFixture(t)
+	list, err := lists.NewList()
+	if err != nil {
+		t.Fatalf("NewList(): %v", err)
+	}
+	a, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode(a): %v", err)
+	}
+	b, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode(b): %v", err)
+	}
+	if _, err := lists.Append(list, a); err != nil {
+		t.Fatalf("Append(a): %v", err)
+	}
+	if _, err := lists.Append(list, b); err != nil {
+		t.Fatalf("Append(b): %v", err)
+	}
+
+	unrelated, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode(unrelated): %v", err)
+	}
+	if _, err := g.AddRelationship(list, unrelated); err != nil {
+		t.Fatalf("AddRelationship(list, unrelated): %v", err)
+	}
+
+	got, err := lists.Elements(list)
+	if err != nil {
+		t.Fatalf("Elements(): %v", err)
+	}
+	if want := []NodeID{a, b}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("Elements() = %v, want %v", got, want)
+	}
+	if _, _, err := lists.Head(list); err != nil {
+		t.Fatalf("Head(): %v", err)
+	}
+	if _, _, err := lists.Tail(list); err != nil {
+		t.Fatalf("Tail(): %v", err)
+	}
+}
+
+func TestAdversarialCapsuleIgnoresUnrelatedChild(t *testing.T) {
+	g, capsules := newCapsuleTestFixture(t)
+	value, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode(value): %v", err)
+	}
+	capsule, err := capsules.NewCapsule(value)
+	if err != nil {
+		t.Fatalf("NewCapsule(): %v", err)
+	}
+
+	unrelated, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode(unrelated): %v", err)
+	}
+	if _, err := g.AddRelationship(capsule, unrelated); err != nil {
+		t.Fatalf("AddRelationship(capsule, unrelated): %v", err)
+	}
+
+	got, hasValue, err := capsules.Value(capsule)
+	if err != nil {
+		t.Fatalf("Value(): %v", err)
+	}
+	if !hasValue || got != value {
+		t.Fatalf("Value() = (%d,%v), want (%d,true)", got, hasValue, value)
+	}
+}
+
+func TestAdversarialValueMayBeTheListItself(t *testing.T) {
+	_, _, lists := newListTestFixture(t)
+	list, err := lists.NewList()
+	if err != nil {
+		t.Fatalf("NewList(): %v", err)
+	}
+	capsule, err := lists.Append(list, list)
+	if err != nil {
+		t.Fatalf("Append(list as value): %v", err)
+	}
+
+	got, err := lists.Elements(list)
+	if err != nil {
+		t.Fatalf("Elements(): %v", err)
+	}
+	if want := []NodeID{list}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("Elements() = %v, want %v", got, want)
+	}
+	value, hasValue, err := lists.capsules.Value(capsule)
+	if err != nil {
+		t.Fatalf("Value(): %v", err)
+	}
+	if !hasValue || value != list {
+		t.Fatalf("Value() = (%d,%v), want (%d,true)", value, hasValue, list)
+	}
+}
+
+func TestAdversarialSharedValueAcrossListsRemainsSeparateOccurrences(t *testing.T) {
+	g, _, lists := newListTestFixture(t)
+	listA, err := lists.NewList()
+	if err != nil {
+		t.Fatalf("NewList(A): %v", err)
+	}
+	listB, err := lists.NewList()
+	if err != nil {
+		t.Fatalf("NewList(B): %v", err)
+	}
+	value, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode(value): %v", err)
+	}
+
+	cA, err := lists.Append(listA, value)
+	if err != nil {
+		t.Fatalf("Append(A): %v", err)
+	}
+	cB, err := lists.Append(listB, value)
+	if err != nil {
+		t.Fatalf("Append(B): %v", err)
+	}
+	if cA == cB {
+		t.Fatal("two occurrences unexpectedly share one capsule")
+	}
+
+	occA, err := lists.OccurrencesOf(listA, value)
+	if err != nil {
+		t.Fatalf("OccurrencesOf(A): %v", err)
+	}
+	occB, err := lists.OccurrencesOf(listB, value)
+	if err != nil {
+		t.Fatalf("OccurrencesOf(B): %v", err)
+	}
+	if !reflect.DeepEqual(occA, []NodeID{cA}) || !reflect.DeepEqual(occB, []NodeID{cB}) {
+		t.Fatalf("OccurrencesOf = A:%v B:%v, want A:%v B:%v", occA, occB, []NodeID{cA}, []NodeID{cB})
+	}
+}
+
+func TestAdversarialDetachedCapsuleDoesNotBecomeListMember(t *testing.T) {
+	g, capsules, lists := newListTestFixture(t)
+	list, err := lists.NewList()
+	if err != nil {
+		t.Fatalf("NewList(): %v", err)
+	}
+	value, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode(value): %v", err)
+	}
+	capsule, err := capsules.NewCapsule(value)
+	if err != nil {
+		t.Fatalf("NewCapsule(): %v", err)
+	}
+
+	if _, _, err := lists.Contains(list, value); err != nil {
+		t.Fatalf("Contains(): %v", err)
+	}
+	if err := lists.RemoveWithoutDeletingCapsule(list, capsule); !errors.Is(err, ErrCapsuleNotInList) {
+		t.Fatalf("RemoveWithoutDeletingCapsule() error = %v, want %v", err, ErrCapsuleNotInList)
+	}
+	if !capsules.IsCapsule(capsule) || !g.NodeExists(capsule) {
+		t.Fatal("detached capsule was unexpectedly deleted or untagged")
+	}
+}
+
+func TestAdversarialListHeadAmbiguityFailsLoudly(t *testing.T) {
+	g, _, lists := newListTestFixture(t)
+	list, err := lists.NewList()
+	if err != nil {
+		t.Fatalf("NewList(): %v", err)
+	}
+	value, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode(value): %v", err)
+	}
+	c1, err := lists.Append(list, value)
+	if err != nil {
+		t.Fatalf("Append(): %v", err)
+	}
+	c2, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode(c2): %v", err)
+	}
+	if _, err := g.AddRelationship(lists.allHeads, c2); err != nil {
+		t.Fatalf("AddRelationship(AllHeads,c2): %v", err)
+	}
+	if _, err := g.AddRelationship(list, c2); err != nil {
+		t.Fatalf("AddRelationship(list,c2): %v", err)
+	}
+	_ = c1
+
+	_, _, err = lists.Head(list)
+	if !errors.Is(err, ErrAmbiguousPointerMetadata) {
+		t.Fatalf("Head() error = %v, want %v", err, ErrAmbiguousPointerMetadata)
+	}
+}
+
+func TestAdversarialCapsuleValueMissingIsDetected(t *testing.T) {
+	g, capsules := newCapsuleTestFixture(t)
+	value, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode(value): %v", err)
+	}
+	capsule, err := capsules.NewCapsule(value)
+	if err != nil {
+		t.Fatalf("NewCapsule(): %v", err)
+	}
+	slot, found, err := capsules.slotFor(capsule, capsules.valueSlots.allPointers)
+	if err != nil || !found {
+		t.Fatalf("slotFor(value): found=%v err=%v", found, err)
+	}
+	if _, err := g.RemoveRelationship(slot, value); err != nil {
+		t.Fatalf("RemoveRelationship(slot,value): %v", err)
+	}
+
+	_, hasValue, err := capsules.Value(capsule)
+	if err != nil {
+		t.Fatalf("Value(): %v", err)
+	}
+	if hasValue {
+		t.Fatal("Value() reported a value after the value edge was removed")
+	}
+}
