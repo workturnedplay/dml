@@ -6,6 +6,22 @@ findings. Sections 1–19 and 26–35 (single-graph foundation) are stable.
 Sections 36+ (distributed/cross-graph) contain genuine unresolved forks —
 these are marked explicitly rather than smoothed into false consensus.
 
+**Provenance note (this revision):** THEORY_NOTES_FROM_CONVERSATION.md has
+been fully coalesced into this document and is retired as a standalone
+source (a tombstone with a section-by-section map to its new home is kept
+in its place, since existing code comments cite it by name/section). Every
+idea it contained now lives in the section below that covers the same
+ground — either verbatim, where this document had already superseded it
+with a corrected write-up (e.g. §10a), or folded in as an explicitly
+labeled addendum (§6a, §9a, §10b, §10c, §11a, §19a, §74a, §76a) where
+THEORY_NOTES had a diagram or example this document had compressed away.
+No existing section number changes because of this merge — every
+cross-reference to this file elsewhere in the codebase still points at the
+same material it always did. implementation_state.md remains a separate
+document deliberately: it tracks Go implementation progress and
+next-task bookkeeping, which changes on a different cadence and for
+different reasons than the semantic theory captured here.
+
 ---
 
 ## PART A — SINGLE-GRAPH FOUNDATION (stable)
@@ -70,10 +86,50 @@ built explicitly via higher-level structure.
 etc. are ordinary NodeIDs; the bootstrap orchestrator maintains the
 text↔NodeID association outside the graph.
 
+**§6a — Naming invariants (merged from THEORY_NOTES_FROM_CONVERSATION.md
+§2).** A textual name and a NodeID are separate things: a name is
+bootstrap/debugging convenience whose semantic identity ultimately comes
+from its assigned NodeID (exactly as for ROOT, §12, and every
+foundational tag, §76). The intended invariants, DECIDED and validated by
+`NameRegistry`'s `ErrNameAlreadyBound`/`ErrNodeAlreadyNamed`/
+`ErrNameBoundToDeletedNode`: a named node must already have a NodeID; a
+name cannot be associated with more than one NodeID; a NodeID cannot have
+more than one name. The primitive graph does not need to store names at
+all — persistence of the name registry itself is a separate, later
+concern (§25).
+
 ## 7. Higher-level structures — core discipline
 
 > If an abstraction can be constructed from existing primitives, prefer
 > constructing it rather than introducing a new primitive kind of object.
+
+**§7a — Interpretation belongs above storage (merged from
+THEORY_NOTES_FROM_CONVERSATION.md §14–15).** A recurring design hazard is
+conflating *what exists in the graph* with *what a processor believes it
+means*. The primitive graph stores nodes and directed facts; a processor
+interprets those facts as Set membership, List membership, Pointer
+targets, Domain membership, metadata, instructions, or eventually
+executable structures. A fact therefore never acquires a universal
+semantic meaning merely because one processor gives it meaning — a
+different processor, or the same processor reused against a different
+tag, is free to interpret the identical shape of fact completely
+differently (exactly how `PointerRegistry` is reused unmodified across
+Representations A and B via §76's tag-parameterization). Concretely,
+every higher-level structure explored so far implies its own invariants
+that the primitive Graph does not and must not enforce:
+```text
+Pointer:        at most one target
+DomainPointer:  target must belong to a domain
+Ordered list:   previous/next relationships must be coherent
+Composite Set:  operand roles/order must be valid
+```
+These invariants are enforced by higher-level code (today, by re-deriving
+and re-checking on every call — see the PointerRegistry doc comment);
+eventually some of this enforcement machinery could itself be represented
+inside the graph (§16), but that is a future architectural possibility,
+not a current requirement. §73 later generalizes this into a single
+commit-time interception mechanism rather than one bespoke checker per
+structure.
 
 ## 8. Intermediary/relationship-object nodes
 
@@ -87,6 +143,48 @@ canonical; illustrative only.
 Minimal interpretation: `(A,B),(A,C),(A,D)` ⇒ B,C,D are members of A.
 Optionally `(AllSets,A)`. Not established as complete.
 
+**§9a — Elaboration on the minimal interpretation (merged from
+THEORY_NOTES_FROM_CONVERSATION.md §4).** Under `(X,Y) ⇒ Y is a member of
+Set X`, no special primitive Set object is required — any node can be
+interpreted as a Set by a processor. Consequences worth stating
+explicitly: `(X,X)` is a valid self-containing Set; duplicate membership
+is structurally impossible, since `(X,Y)` cannot exist more than once
+(§2.6); and a node can simultaneously be a Set and an element of some
+other Set (the same identity participating in two roles — §75's general
+pattern, applied here before it was named generally). A Set containing
+another Set does **not** by itself imply that the outer Set recursively
+contains the inner Set's members — direct membership and any
+recursive/expanded view are both processor-defined interpretations, not
+primitive facts. Caching a derived/expanded membership view would
+require higher-level invalidation/change-notification machinery (§35)
+and should not be pulled into the primitive graph prematurely.
+
+**§9b — Structured/composite Sets (obsolete as a spec; idea partially
+survives; merged from THEORY_NOTES_FROM_CONVERSATION.md §5 and §20).** An
+older experiment mixed Domains, Domain Sets, Sets-of-Sets, intermediary
+nodes, and richer membership rules into one diagram. That diagram is
+**obsolete** and must not be treated as a current design — it mixed too
+many not-yet-decided concepts into one illustration. Its one useful
+surviving contribution is that it first demonstrated the need for
+role-bearing intermediary nodes whenever the same underlying Set/Domain
+must participate in different roles (e.g. a composite Set referring to
+other Sets as additive or subtractive operands, with the same Set node
+usable in different roles across different composite structures) — the
+same construction §75 later names generally. Ordered add/subtract
+operations over composite Sets remain **explored**, not required.
+
+**§9c — Domains (explored, not decided; merged from
+THEORY_NOTES_FROM_CONVERSATION.md §6).** A Domain was explored as
+essentially a constrained Set: membership determines which nodes are
+legal targets for some operation. The interesting use is as a constraint
+mechanism for Pointers (§10c) and other structures, not as a
+fundamentally different primitive storage concept. `DomainSets` were
+explored as a way of combining multiple Domains into one effective
+allowed-membership universe — a possible higher-level construction, not
+a current primitive. Exact Domain/DomainSet representation remains OPEN
+(§22's list); Domains likely want Sets settled first, since a Domain is
+framed as a constrained Set.
+
 ## 10. Pointers
 
 `(AllPointers,P)` marks P as Pointer-kind; schema then imposes invariants
@@ -95,8 +193,9 @@ enforcement is a higher-layer job. See §68 for the generalized mechanism
 this implies.
 
 **§10a — Metadata role-identification must use per-role tags, not
-exclusion (correction, validated by `wtw`).** THEORY_NOTES_FROM_
-CONVERSATION.md section 7C / this section's Pointer summary both rely on
+exclusion (correction, validated by `wtw`).**
+THEORY_NOTES_FROM_CONVERSATION.md section 7C / this section's Pointer
+summary both rely on
 a metadata node M distinguishing "the subject" and "the target" among M's
 children. The original sketch identified them either directly (`M -> P`,
 `M -> I`) or via one tagged child plus "whichever child remains" (as
@@ -115,6 +214,82 @@ identity pattern applied to both roles instead of one. Implemented as
 deliberately-unfixed `PointerMetadataRegistry` (Representation C), the
 latter kept as a known-stricter representation useful for testing how
 higher layers should react to an overly restrictive lower layer (§73).
+
+Concretely, the corrected shape (merged from
+THEORY_NOTES_FROM_CONVERSATION.md §10) is:
+```text
+M -> U1
+U1 -> P
+M -> U2
+U2 -> I
+```
+where M identifies the metadata relationship, U1 and U2 are fresh,
+uniquely-tagged intermediary nodes carrying no meaning of their own,
+`U1 -> P` identifies the subject, and `U2 -> I` identifies the
+information/target. Because U1 and U2 are each freshly minted and
+distinct from P, I, and each other, `U1 -> P` and `U2 -> I` can never
+collide, even when `I == P`. Because U1 and U2 are each discovered *by
+their own tag* rather than by exclusion, M remains free to carry any
+number of additional, unrelated children — now or added later — without
+disturbing subject or information discovery. This is a general
+construction, not merely a pointer trick (§75).
+
+**§10b — The three (four) Pointer representations, side by side (merged
+from THEORY_NOTES_FROM_CONVERSATION.md §7 and §9).** They need not be
+mutually exclusive — different representations can carry different
+traversal/query costs, and `wtw` implements all of them side by side
+over the same primitive Graph:
+
+*Representation A — direct child:*
+```text
+(AllPointers,P)
+(P,X)
+```
+The processor interprets P as a Pointer and enforces zero-or-one relevant
+target directly on P's own children. Direct and cheap to traverse, but
+consumes P's entire direct-child space for the pointer role.
+
+*Representation B — intermediary pointer node:*
+```text
+(P,U)
+(U,X)
+(AllSubPointers,U)
+```
+U represents the particular pointer relationship/role, costing one extra
+node/traversal hop but leaving P's other direct children free for
+unrelated information. Implemented as the same `PointerRegistry` type as
+Representation A, parameterized on a different tag (§76) — not a
+separate code path.
+
+*Representation C — metadata structure (exclusion-based, deliberately
+kept stricter than necessary):* P remains the identity of the pointer
+while target information lives through a separate metadata node M
+associated with P, so P's direct children stay completely unconstrained.
+See above for why this representation's exclusion-based target lookup is
+a known, deliberately-retained limitation rather than an oversight.
+
+*Representation D — metadata structure (corrected, tag-based):* the fix
+above, giving both the subject-slot and the target-slot their own
+freshly-minted, independently tagged intermediary node.
+
+Cardinality constraints such as "at most one target" or "exactly one
+relevant child" are, in every representation above, enforced entirely by
+the processor/registry layer — never by the primitive Graph, which has no
+concept of "too many children." A processor is free to consider only
+specially-tagged children relevant to its structure (as Representation
+C/D's slot tags do), which is what lets a node carry many primitive
+children while a particular processor still considers its own narrower
+structure valid.
+
+**§10c — Domain Pointers (explored; merged from
+THEORY_NOTES_FROM_CONVERSATION.md §8).** A normal Pointer can potentially
+also be interpreted as a Domain Pointer via `(AllDomainPointers,P)`, with
+additional domain information associated with P so a processor can
+enforce that the pointer's target belongs to the permitted domain (§9c).
+This illustrates a broader property already implicit elsewhere in this
+document: the same node identity can participate in multiple
+higher-level interpretations at once without changing its primitive
+facts (the same point §68 later makes precise for the cross-graph case).
 
 ## 11. Ordered Lists
 
@@ -183,6 +358,48 @@ value, then filter by the (list,capsule) edge -- answers
 adding any new node, tag, or index structure at all. See
 `CapsuleRegistry.CapsulesWithValue` / `ListRegistry.Contains` /
 `ListRegistry.OccurrencesOf` in the Go implementation.
+
+**§11a — Illustrative structure diagrams (merged from
+THEORY_NOTES_FROM_CONVERSATION.md §11).** A list node points at its
+element capsules:
+```text
+list1 -> ElementCapsule1
+list1 -> ElementCapsule2
+list1 -> ElementCapsule3
+```
+Each capsule's previous-capsule, value, and next-capsule roles are three
+separate, freshly-minted, per-role-tagged intermediary nodes rather than
+positional children:
+```text
+ElementCapsule -> UPrev
+ElementCapsule -> UValue
+ElementCapsule -> UNext
+
+allPrevElementCapsules -> UPrev
+allElementsOfElementCapsules -> UValue
+allNextElementCapsules -> UNext
+```
+(`wtw`'s actual bootstrapped tag names are `AllElementCapsulePrevSlot` /
+`AllElementCapsuleValueSlot` / `AllElementCapsuleNextSlot`, and
+`AllElementCapsules` rather than the illustrative `AllCapsules` used
+above, to avoid implying a more generic capsule concept — see
+`implementation_state.md`.) Head/tail boundaries were originally sketched
+as `allHEADs`/`allTAILs`; the implementation uses `AllHeads`/`AllTails`
+for PascalCase consistency with every other tag. List elements are
+identified through the capsule tag rather than by assuming every direct
+child of a list is a capsule, leaving room for unrelated children such as
+list comments or metadata:
+```text
+(AllElementCapsules,Capsule)
+(list1,Y)             // Y need not be a capsule at all
+```
+The intended structure is a doubly linked ordered list. Head-to-tail
+traversal is the correct default access pattern for *positional* queries
+(visit every element in order) — but, per the resolved finding already
+stated above, value *membership* needs neither traversal nor a separate
+index: it is answered by reverse-lookup from the value's own
+`FindIncoming`, one hop further back than the existing `(list,capsule)`
+membership check.
 
 ## 12. ROOT and discoverability (single-graph)
 
@@ -265,6 +482,22 @@ First implementation may be a single serialized execution stream — not a
 design failure. Higher-level processors may still be logically concurrent
 and can still deadlock; deadlock avoidance belongs to the relevant
 abstraction level, not the primitive layer.
+
+**§19a — Multiple processors within a single graph (merged from
+THEORY_NOTES_FROM_CONVERSATION.md §17).** The current implementation is
+deliberately a single in-memory graph driven by higher-level Go code.
+Future concerns even before any network exists include multiple
+goroutines/processors sharing the one graph, shared mutable state,
+semantic deadlocks, and communication between processors. Simply adding
+locks around the primitive Graph may not by itself produce the right
+abstraction; a longer-term goal is for processors to communicate through
+graph operations rather than through arbitrary shared mutable memory —
+the same "communicate, don't share mutable memory" principle Part B's
+§28 later states for the fully distributed case. This is the same
+concern at smaller scale, not a separate one: whatever discipline ends up
+governing concurrent access to one process's graph should not need to be
+thrown away once a second process, and then a network, enters the
+picture.
 
 ---
 
@@ -492,22 +725,29 @@ suffices, is unresolved.
 
 Nested transactional views may provide a useful abstraction for composing higher-level operations and may have structural similarities to isolated/remote views. Investigate later.
 
+## 46. Primitive relationships assert existence only, never meaning
 
-The primitive relationship has no intrinsic domain-specific meaning, but a higher-level semantic system may assign meaning to it according to its schema and context.
-Because (A,B) still has primitive semantics: it asserts that the directed relationship exists.
+*(Formatting bug fixed this revision: this section previously had no `##`
+header and read as an orphaned continuation of §45. Content is unchanged;
+only the missing header and list formatting are restored.)*
 
-What it doesn't assert is whether that relationship means:
+`(A,B)` has primitive semantics only in the thin sense of §2.4: it
+asserts that the directed relationship exists. It carries no intrinsic
+domain-specific meaning; a higher-level semantic system assigns meaning
+to it according to its own schema and context (§7a). What `(A,B)`
+existing does **not**, by itself, assert is whether that relationship
+means, for example:
 
-A contains B
-A points to B
-B is the next element after A
-B is a member of A
-A is a parent of B
-A references B
-...
+- A contains B
+- A points to B
+- B is the next element after A
+- B is a member of A
+- A is a parent of B
+- A references B
+- ...(any other domain-specific interpretation)
 
-Those meanings belong to higher-level interpreters.
-
+Those meanings belong entirely to higher-level interpreters, never to the
+primitive graph itself.
 
 ## 47. Relationship mirroring via paired stand-ins (S and P)
 
@@ -827,6 +1067,15 @@ structure's aware layer instead. Every future NodeID-keyed external
 structure should expect to need its own version of this, not assume the
 primitive graph will notify it of deletions.
 
+**§74a — This was flagged, not discovered, here (merged from
+THEORY_NOTES_FROM_CONVERSATION.md §23).** Early implementation-direction
+notes already identified "deleting a node from `Graph` can leave a stale
+name registry entry" as a known, unaddressed boundary issue, on the same
+reasoning as this section: `Graph` must not know about `NameRegistry`.
+This section and `implementation_state.md` item 1 record its actual
+resolution (`NameRegistry.DeleteNode`'s coordinated delete); noted here
+only to confirm the concern was anticipated rather than found late.
+
 ## 75. Occurrence/role identity vs. value identity (general principle)
 
 **Explored, generalized from ordered-list design work.** Whenever the same
@@ -897,6 +1146,20 @@ convenience with no invariant of its own to enforce — unlike, say,
 one." Per §7's discipline, this should stay unbuilt until repeated call-site
 usage demonstrates an actual recurring pattern worth naming, not merely
 because the underlying primitive call is used more than once.
+
+**§76a — Historical vocabulary note (merged from
+THEORY_NOTES_FROM_CONVERSATION.md §21).** Early design discussion listed
+illustrative higher-level vocabulary expected to need bootstrapping this
+way: `AllPointers`, `AllCapsules`, `allHEADs`, `allTAILs`, `AllLists`,
+`AllDomainPointers`. The mechanism anticipated for them is exactly what
+this section confirms as built; the concrete names landed slightly
+differently once implementation started — `AllElementCapsules` rather
+than `AllCapsules`, and `AllHeads`/`AllTails` rather than
+`allHEADs`/`allTAILs` (capitalization consistency) — see
+`implementation_state.md` for the rename rationale. `AllDomainPointers`
+(§10c) remains unbootstrapped, per `FoundationalNames`'s own discipline
+of only adding a name once its representation is actually being
+implemented.
 
 ## 77. Changeset-level commit-time validation (extends §73) — OPEN
 
@@ -1051,6 +1314,11 @@ allocator as built, not to NodeID schemes in general.
 
 ## PART D — STATUS SUMMARY (consolidated)
 
+*(This part supersedes the early informal "explicitly not decided" list
+originally kept in THEORY_NOTES_FROM_CONVERSATION.md §22 — that list is
+retired in favor of the DECIDED/TENTATIVE/OPEN/REJECTED breakdown below,
+kept current as sections above resolve or split further.)*
+
 ### DECIDED
 - NodeID is the fundamental addressable object; uniqueness among existing
   nodes; nodes may exist relationship-free.
@@ -1144,3 +1412,35 @@ currently-unresolved difficulty lives — not a failure of the hypothesis,
 but the expected shape of the hard part: multi-owner autonomy without a
 central authority costs a unified semantic space, the same way §38 already
 found for ROOT. No implementation is implied by this document.
+
+### Recurring construction pattern (merged from
+THEORY_NOTES_FROM_CONVERSATION.md §24, §19)
+
+Across every structure explored so far — Sets, Pointers, Ordered Lists,
+cross-graph mirrors — the same construction keeps recurring:
+```text
+primitive facts
+    ↓
+tags / named nodes
+    ↓
+role-bearing intermediary nodes where needed
+    ↓
+processor interpretation
+    ↓
+invariants / queries / derived views
+```
+This is what lets the same primitive node participate in many structures
+simultaneously (§9a, §68) without the primitive graph ever needing to
+know about any of them. The discipline that has repeatedly made the
+design clearer, worth restating explicitly rather than leaving implicit,
+is to keep two questions separate for every proposed concept:
+
+1. **What primitive nodes and `(A,B)` facts physically represent this?**
+2. **What processor interprets those facts, and what invariants does it
+   enforce?**
+
+So far, every structure explored — subject to implementation and
+edge-case testing — has answered "yes" to the question this whole
+document is organized around: whether it can be expressed using nothing
+but NodeID existence and unique directed `(A,B)` facts, plus higher-level
+processor code layered on top.
