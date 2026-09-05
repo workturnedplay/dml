@@ -1372,8 +1372,8 @@ outer:
 // (tag, P).
 //
 // This same type and logic serves two of the three Pointer
-// representations described in THEORY_NOTES_FROM_CONVERSATION.md section
-// 7 / theorystate_v0.6.md section 10, distinguished only by which tag
+// representations described in theorystate_v0.6.md section 10 / 10b,
+// distinguished only by which tag
 // NodeID the caller passes to NewPointerRegistry -- there is no
 // per-representation code path:
 //   - Representation A (direct child): tag = AllPointers, applied
@@ -1390,8 +1390,8 @@ outer:
 // untouched; see PointerMetadataRegistry instead.
 //
 // This implements Representation A (and, via reuse, B) from
-// THEORY_NOTES_FROM_CONVERSATION.md section 7 / theorystate_v0.6.md
-// section 10: a Pointer's target, if any, is simply P's single direct
+// theorystate_v0.6.md section 10 / 10b: a Pointer's target, if any, is
+// simply P's single direct
 // child in the underlying Graph. The tag itself -- (AllPointers, P) -- is
 // ordinary graph structure, exactly like any other name-style tag. Like
 // NameRegistry and RootGraph, PointerRegistry adds nothing to the
@@ -1515,8 +1515,8 @@ func (p *PointerRegistry) Target(id NodeID) (target NodeID, hasTarget bool, err 
 // decision about data this registry did not create.
 //
 // Self-targeting, i.e. SetTarget(P, P), is allowed: self-relationships
-// are permitted at the primitive layer (THEORY_NOTES_FROM_CONVERSATION.md
-// section 1) and nothing about the Pointer invariant rules it out.
+// are permitted at the primitive layer (theorystate_v0.6.md section 2.8)
+// and nothing about the Pointer invariant rules it out.
 func (p *PointerRegistry) SetTarget(id, target NodeID) error {
 	current, hasTarget, err := p.currentTarget(id)
 	if err != nil {
@@ -1794,9 +1794,8 @@ func (b *subjectMetadataBase) HasMetadata(subject NodeID) (bool, error) {
 }
 
 // PointerMetadataRegistry implements Representation C (metadata
-// structure) of the Pointer processor,
-// THEORY_NOTES_FROM_CONVERSATION.md section 7C / theorystate_v0.6.md
-// section 10's generalized metadata construction.
+// structure) of the Pointer processor, theorystate_v0.6.md section 10's
+// generalized metadata construction (see also section 10b).
 //
 // Unlike PointerRegistry (Representations A and B), Representation C
 // keeps the subject node's own direct children completely untouched by
@@ -1813,13 +1812,13 @@ func (b *subjectMetadataBase) HasMetadata(subject NodeID) (bool, error) {
 // pointing directly at the subject (M -> subject): a naive two-edge
 // scheme (M -> subject, M -> target) cannot represent target == subject.
 // Because primitive relationships are unique pairs
-// (THEORY_NOTES_FROM_CONVERSATION.md section 1), "M -> subject" and
+// (theorystate_v0.6.md section 2.4/2.6), "M -> subject" and
 // "M -> target" would collapse into the identical single physical
 // relationship whenever target == subject, making self-targeting
 // indistinguishable from an empty target. A freshly-minted S node for the
-// subject-slot (the role/occurrence-identity pattern noted in
-// THEORY_NOTES_FROM_CONVERSATION.md section 12 and theorystate_v0.6.md
-// section 75 -- the same move as ElementCapsule nodes in the Ordered List
+// subject-slot (the role/occurrence-identity pattern named in
+// theorystate_v0.6.md section 75 -- the same move as ElementCapsule nodes
+// in the Ordered List
 // design) means M's two children -- S and the target -- can never
 // collide, since S is never equal to any subject value.
 //
@@ -1844,9 +1843,9 @@ func (b *subjectMetadataBase) HasMetadata(subject NodeID) (bool, error) {
 // nothing about the actual target changed. This is really the same
 // mistake as Representation A's "at most one child, period" -- just
 // shifted up one level -- and it also matches
-// THEORY_NOTES_FROM_CONVERSATION.md section 10's original "M -> P, M ->
-// I" sketch, which has an even sharper version of the same bug (those two
-// relationships collapse into one whenever target == subject, since
+// theorystate_v0.6.md section 10a's discussion of the original "M -> P, M
+// -> I" sketch, which has an even sharper version of the same bug (those
+// two relationships collapse into one whenever target == subject, since
 // primitive relationships are unique pairs). PointerMetadataRegistryD
 // (Representation D) is the corrected construction -- see its doc
 // comment. This type is kept as-is, limitation and all, rather than
@@ -1968,19 +1967,18 @@ func (m *PointerMetadataRegistry) RemoveTarget(subject NodeID) (removed bool, er
 
 // PointerMetadataRegistryD implements Representation D, a corrected
 // generalization of Representation C (PointerMetadataRegistry) /
-// THEORY_NOTES_FROM_CONVERSATION.md section 10's original "M -> P, M ->
-// I" sketch.
+// theorystate_v0.6.md section 10a's original "M -> P, M -> I" sketch.
 //
-// Representation C and section 10's original sketch share a real bug:
-// they each identify one of M's two children *by exclusion* -- "whichever
+// Representation C and that original sketch share a real bug: they each
+// identify one of M's two children *by exclusion* -- "whichever
 // child isn't the subject/subject-slot must be the target/information
-// node" (or, in section 10's even earlier sketch, "M -> P" and "M -> I"
+// node" (or, in the even earlier sketch, "M -> P" and "M -> I"
 // collapse into the same relationship whenever target == subject, since
-// primitive relationships are unique pairs -- THEORY_NOTES section 1).
-// Both are really the same underlying mistake as Representation A's "at
-// most one child, no room for anything else": M is implicitly assumed to
-// have *exactly* the relevant children and nothing more, which directly
-// contradicts section 10's own stated goal ("This is a general
+// primitive relationships are unique pairs -- theorystate_v0.6.md section
+// 2.4/2.6). Both are really the same underlying mistake as Representation
+// A's "at most one child, no room for anything else": M is implicitly
+// assumed to have *exactly* the relevant children and nothing more, which
+// directly contradicts section 10a's own stated goal ("This is a general
 // construction, not merely a pointer trick" -- i.e. M should be free to
 // grow additional, unrelated children later without breaking discovery).
 //
@@ -2183,8 +2181,8 @@ func (m *PointerMetadataRegistryD) RemoveTarget(subject NodeID) (removed bool, e
 }
 
 // CapsuleRegistry implements the ElementCapsule primitive of Ordered
-// Lists (THEORY_NOTES_FROM_CONVERSATION.md section 11 / theorystate_v0.6.md
-// section 11): each list-element *occurrence* gets its own freshly-minted
+// Lists (theorystate_v0.6.md section 11 / 11a): each list-element
+// *occurrence* gets its own freshly-minted
 // NodeID (the capsule) rather than reusing the value's own NodeID, so the
 // same value can occur multiple times in a list through different
 // capsules (theorystate_v0.6.md section 75's occurrence/role-identity
@@ -2192,8 +2190,8 @@ func (m *PointerMetadataRegistryD) RemoveTarget(subject NodeID) (removed bool, e
 //
 // A capsule's previous, value, and next roles are each represented by a
 // dedicated intermediary slot node -- exactly Pointer Representation B
-// (THEORY_NOTES_FROM_CONVERSATION.md section 7B / theorystate_v0.6.md
-// section 10), applied three times under three different tags:
+// (theorystate_v0.6.md section 10 / 10b), applied three times under
+// three different tags:
 //
 //	(AllElementCapsules, capsule)
 //	capsule -> Uprev    (AllElementCapsulePrevSlot, Uprev)   Uprev -> prevCapsule
@@ -2523,7 +2521,7 @@ func (c *CapsuleRegistry) SetValue(capsule, value NodeID) error {
 // additional, unrelated parents over time (some future metadata
 // structure referencing the slot node itself, for its own reasons --
 // nothing in this file prevents that, since a node may have any number
-// of parents, THEORY_NOTES_FROM_CONVERSATION.md section 1) without that
+// of parents, theorystate_v0.6.md section 2.8) without that
 // being confused for a second owning capsule. ErrAmbiguousPointerMetadata
 // (the same error findUniqueTaggedParent/findUniqueTaggedChild already
 // return elsewhere in this file for an analogous ambiguity) is returned
@@ -2785,8 +2783,8 @@ func (c *CapsuleRegistry) DeleteCapsule(capsule NodeID) error {
 	})
 }
 
-// ListRegistry implements Ordered Lists (THEORY_NOTES_FROM_CONVERSATION.md
-// section 11 / theorystate_v0.6.md section 11) on top of CapsuleRegistry.
+// ListRegistry implements Ordered Lists (theorystate_v0.6.md section 11
+// / 11a) on top of CapsuleRegistry.
 //
 // A list is an ordinary node tagged (AllLists, list). List membership --
 // which of a list's direct children are actual ElementCapsules, as
@@ -3164,8 +3162,8 @@ func (l *ListRegistry) Elements(list NodeID) ([]NodeID, error) {
 //
 // This exists because a value may legitimately occur more than once in
 // the same list, each occurrence via its own capsule
-// (THEORY_NOTES_FROM_CONVERSATION.md section 12 / theorystate_v0.6.md
-// section 75's occurrence-identity distinction) -- Contains below only
+// (theorystate_v0.6.md section 75's occurrence-identity distinction) --
+// Contains below only
 // needs to know whether at least one occurrence exists, but some callers
 // legitimately need all of them (e.g. removing every occurrence of a
 // value, or counting duplicates).
@@ -3238,9 +3236,9 @@ func (l *ListRegistry) Contains(list, value NodeID) (capsule NodeID, found bool,
 // cascade deletion, consistent with theorystate_v0.6.md section 18's
 // rejection of deleteNodeAndRelationships. capsule keeps its
 // AllElementCapsules tag and its value: list membership is a separate
-// concern from capsule-kind or value identity (theory section 8 -- the
-// same node identity can participate in multiple interpretations without
-// changing its primitive facts).
+// concern from capsule-kind or value identity (theorystate_v0.6.md
+// section 10c -- the same node identity can participate in multiple
+// interpretations without changing its primitive facts).
 //
 // This is the lower-level primitive Remove (below) builds on: Remove
 // calls this method first and then attempts CapsuleRegistry.DeleteCapsule
@@ -3338,7 +3336,7 @@ func (l *ListRegistry) RemoveWithoutDeletingCapsule(list, capsule NodeID) error 
 // then additionally attempts to delete capsule and its three role-slot
 // nodes via CapsuleRegistry.DeleteCapsule -- this is the list structure
 // cleaning up after itself: a capsule exists only to represent one
-// occurrence of a value within a list (theory section 12 / section 75),
+// occurrence of a value within a list (theorystate_v0.6.md section 75),
 // so once it is removed from its (only) list and nothing else has taken
 // an interest in it, there is no reason to leave it behind as an orphan.
 //

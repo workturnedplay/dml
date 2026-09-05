@@ -9,8 +9,8 @@ Current implementation:
 - RootGraph implemented and tested.
 - PointerRegistry implemented and tested, enforcing the Pointer invariant
   (at most one target) for nodes tagged (AllPointers, P), per
-  THEORY_NOTES_FROM_CONVERSATION.md section 7 / theorystate_v0.6.md
-  section 10. Its multi-step operations run inside Graph.Transact.
+  theorystate_v0.6.md section 10 / 10b. Its multi-step operations run
+  inside Graph.Transact.
 - Named nodes use an external name -> NodeID registry. Its
   CreateNamedNode also runs inside Graph.Transact.
 - ROOT is a real NodeID with special semantics only in RootGraph.
@@ -24,8 +24,8 @@ Completed milestones:
 
 Current next task:
 - The Pointer processor is now implemented across all four
-  representations described in THEORY_NOTES_FROM_CONVERSATION.md section
-  7 / theorystate_v0.6.md section 10 (this bullet list replaces a
+  representations described in theorystate_v0.6.md section 10 / 10b
+  (this bullet list replaces a
   previously stale version of itself that still claimed only
   Representation A existed after B and C had already been completed --
   see Resolved this session, item 8):
@@ -44,9 +44,8 @@ Current next task:
   - Representation D (corrected metadata structure, tag-based target
     lookup): PointerMetadataRegistryD, adding
     AllPointerMetadataTargetSlot. This is the construction
-    THEORY_NOTES_FROM_CONVERSATION.md section 10 should have described
-    from the start; see that section's correction and
-    theorystate_v0.6.md section 10a for why Representation C's
+    theorystate_v0.6.md section 10a should have described
+    from the start; see that section for why Representation C's
     exclusion-based approach doesn't generalize safely (item 8).
 - Open: whether a commit-time interception mechanism (theorystate_v0.6.md
   section 73) should eventually replace the re-check-every-call approach
@@ -69,13 +68,13 @@ After that:
   this. See theorystate_v0.6.md section 76 for the formal writeup. This
   bullet is corrected here because it had gone stale without being
   updated when that work landed.
-- Ordered Lists (THEORY_NOTES_FROM_CONVERSATION.md section 11,
-  theorystate section 11) has been chosen as the next higher-level
-  structure over Sets (theory section 9 / theorystate section 32's open
+- Ordered Lists (theorystate_v0.6.md section 11 / 11a)
+  has been chosen as the next higher-level
+  structure over Sets (theorystate_v0.6.md section 9 / section 32's open
   definitional questions are still genuinely unresolved design forks,
   whereas the List representation is already largely settled); Domains
-  (theory section 6) and Sets remain for later, Domains likely wanting
-  Sets first since it's framed as a constrained Set.
+  (theorystate_v0.6.md section 9c) and Sets remain for later, Domains
+  likely wanting Sets first since it's framed as a constrained Set.
 
   The ElementCapsule primitive (CapsuleRegistry, see item 10 above) is
   now implemented: list -> ElementCapsule does not by itself make every
@@ -158,8 +157,8 @@ its own delete). Expect the same shape of problem to recur for any future
 NodeID-keyed structure outside the primitive graph.
 
 4. PointerRegistry implements Representation A (direct child) of the
- Pointer processor described in THEORY_NOTES_FROM_CONVERSATION.md section
- 7 and theorystate_v0.6.md section 10: (AllPointers, P) tags P as
+ Pointer processor described in theorystate_v0.6.md section 10 / 10b:
+ (AllPointers, P) tags P as
  Pointer-kind, and P's target, if any, is enforced to be at most one
  direct child of P. Two ways to obtain a tagged Pointer node are
  provided: NewPointer() mints a fresh NodeID and tags it (trivially
@@ -247,16 +246,16 @@ NodeID-keyed structure outside the primitive graph.
 7. PointerRegistry generalized (doc-only, no code change) to cover Representation B via a second instance tagged AllSubPointers; PointerMetadataRegistry added implementing Representation C, using a subject-slot indirection node discovered during design — a naive M->subject/M->target two-edge scheme cannot represent self-targeting since the two edges would collapse into one relationship; singleChildTarget extracted from PointerRegistry.currentTarget as shared DRY logic used by both registries.
 
 
-8. Fixed a real design bug in Representation C / theory section 10, found
- during review: identifying "the target" as literally "whichever child
- of M isn't the tagged subject-slot" (exclusion) silently assumes M can
- never have any other child, ever -- contradicting the construction's
- own stated purpose of letting M grow structure later without
- disturbing what's already there. THEORY_NOTES_FROM_CONVERSATION.md
- section 10 has been corrected (its original "M -> P, M -> I" sketch
- had an even sharper version of the same bug: those two relationships
- collapse into one whenever target == subject, since primitive
- relationships are unique pairs). Added PointerMetadataRegistryD
+8. Fixed a real design bug in Representation C / theorystate_v0.6.md
+ section 10a, found during review: identifying "the target" as
+ literally "whichever child of M isn't the tagged subject-slot"
+ (exclusion) silently assumes M can never have any other child, ever --
+ contradicting the construction's own stated purpose of letting M grow
+ structure later without disturbing what's already there.
+ theorystate_v0.6.md section 10a records the correction (its original
+ "M -> P, M -> I" sketch had an even sharper version of the same bug:
+ those two relationships collapse into one whenever target == subject,
+ since primitive relationships are unique pairs). Added PointerMetadataRegistryD
  (Representation D), which gives both the subject and the target their
  own freshly-minted, independently-tagged slot node
  (AllPointerMetadataSubjectSlot, reused from Representation C, and the
@@ -317,8 +316,8 @@ NodeID-keyed structure outside the primitive graph.
  its own tagging into a single Transact call.
 
  Added CapsuleRegistry, implementing the ElementCapsule primitive of
- Ordered Lists (THEORY_NOTES_FROM_CONVERSATION.md section 11 /
- theorystate_v0.6.md section 11): AllElementCapsules tags capsule-kind
+ Ordered Lists (theorystate_v0.6.md section 11 / 11a): AllElementCapsules
+ tags capsule-kind
  nodes (renamed from the theory docs' illustrative "AllCapsules" to
  avoid implying a more generic capsule concept); each capsule's prev,
  value, and next roles are represented by a dedicated PointerRegistry
@@ -350,8 +349,8 @@ NodeID-keyed structure outside the primitive graph.
  capsule X is currently both head and tail.
 
 11. Added ListRegistry, implementing Ordered Lists
- (THEORY_NOTES_FROM_CONVERSATION.md section 11 / theorystate_v0.6.md
- section 11) on top of CapsuleRegistry (item 10). A list is an ordinary
+ (theorystate_v0.6.md section 11 / 11a) on top of CapsuleRegistry
+ (item 10). A list is an ordinary
  node tagged (AllLists, list). List membership is the ordinary
  (list, capsule) containment edge combined with the capsule's own
  (AllElementCapsules, capsule) tag -- a list's direct children are not
@@ -433,7 +432,8 @@ NodeID-keyed structure outside the primitive graph.
 
 13. Added value-membership queries -- CapsuleRegistry.CapsulesWithValue,
  ListRegistry.OccurrencesOf, and ListRegistry.Contains -- resolving what
- item 12 above and theory section 11 had flagged as a possible later
+ item 12 above and theorystate_v0.6.md section 11 had flagged as a
+ possible later
  "Set-like index" addition. No new node, tag, or index structure turned
  out to be needed: CapsulesWithValue is a pure reverse lookup from a
  value's own Graph.FindIncoming, filtered to genuine value-slot parents
@@ -508,8 +508,8 @@ NodeID-keyed structure outside the primitive graph.
  -- a capsule that legitimately cannot be deleted still ends up fully,
  successfully removed from the list. This is a new, separate method, not
  a change to Remove's existing behavior: Remove's own guarantee that it
- never deletes or untags capsule (item 12, theory section 8) is
- unchanged for existing callers.
+ never deletes or untags capsule (item 12, theorystate_v0.6.md section
+ 10c) is unchanged for existing callers.
 
  Also clarified and pinned by a new test
  (TestCapsuleRoleSlotsAreNotTaggedWithGenericAllPointers), following a
@@ -536,10 +536,6 @@ NodeID-keyed structure outside the primitive graph.
  TestListRemoveAndDeleteRequiresCapsuleInList,
  TestListRemoveAndDeleteRequiresListTag, and
  TestCapsuleRoleSlotsAreNotTaggedWithGenericAllPointers.
-
-14. Added CapsuleRegistry.DeleteCapsule and ListRegistry.RemoveAndDelete
- (see item 15 for the RemoveAndDelete rename), resolving item 13's "not
- yet addressed" note about deleting a fully detached capsule.
 
 15. Corrected a wrong premise found during review: Txn was believed
  unable to undo a Graph.DeleteNode call once it succeeded, and item 14's

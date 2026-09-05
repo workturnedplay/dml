@@ -7,20 +7,52 @@ Sections 36+ (distributed/cross-graph) contain genuine unresolved forks —
 these are marked explicitly rather than smoothed into false consensus.
 
 **Provenance note (this revision):** THEORY_NOTES_FROM_CONVERSATION.md has
-been fully coalesced into this document and is retired as a standalone
-source (a tombstone with a section-by-section map to its new home is kept
-in its place, since existing code comments cite it by name/section). Every
-idea it contained now lives in the section below that covers the same
-ground — either verbatim, where this document had already superseded it
-with a corrected write-up (e.g. §10a), or folded in as an explicitly
-labeled addendum (§6a, §9a, §10b, §10c, §11a, §19a, §74a, §76a) where
-THEORY_NOTES had a diagram or example this document had compressed away.
-No existing section number changes because of this merge — every
-cross-reference to this file elsewhere in the codebase still points at the
-same material it always did. implementation_state.md remains a separate
-document deliberately: it tracks Go implementation progress and
-next-task bookkeeping, which changes on a different cadence and for
-different reasons than the semantic theory captured here.
+been fully coalesced into this document and deleted outright — every code
+comment in main.go, main_test.go, and implementation_state.md that used to
+cite it by name/section has been updated in this same revision to cite the
+equivalent section here instead. Every idea it contained now lives in the
+section below that covers the same ground — either verbatim, where this
+document had already superseded it with a corrected write-up (e.g. §10a),
+or folded in as an explicitly labeled addendum (§2.8, §6a, §9a, §10b,
+§10c, §11a, §19a, §74a, §76a) where THEORY_NOTES had a diagram or example
+this document had compressed away. No existing section number changes
+because of this merge — every cross-reference to this file elsewhere in
+the codebase still points at the same material it always did. The table
+below maps every old THEORY_NOTES_FROM_CONVERSATION.md section to its new
+home here, kept only so old commit history/diffs referencing it by name
+remain navigable; the file itself no longer exists in the repository.
+
+| Old THEORY_NOTES_FROM_CONVERSATION.md section | New location here |
+|---|---|
+| §1 Primitive graph `(A,B)` | §1–2, §2.8 |
+| §2 Node IDs and names | §6, §6a |
+| §3 ROOT / RootGraph | §12, §12a |
+| §4 Sets: simplest interpretation | §9, §9a |
+| §5 Structured/composite Sets | §9b |
+| §6 Domains | §9c |
+| §7 Pointers: three representations | §10, §10a, §10b |
+| §8 Domain Pointers | §10c |
+| §9 Cardinality constraints | §7a, §10b |
+| §10 Metadata construction (+ correction) | §10a |
+| §11 Ordered Lists | §11, §11a |
+| §12 Element identity vs. value identity | §75 |
+| §13 Tags are ordinary graph structures | §6 |
+| §14 Interpretation belongs above storage | §7a |
+| §15 Higher-level processors and invariants | §7a |
+| §16 Transactions | §14–15 |
+| §17 Single graph vs. multiple processors | §19a |
+| §18 Remote / multiple graphs | Part B, §20–21 |
+| §19 Why the single-graph foundation matters | Part E |
+| §20 Old Domain/Set diagram | §9b |
+| §21 Current higher-level vocabulary | §76a |
+| §22 Explicitly not decided | Part D |
+| §23 Current implementation direction | implementation_state.md; §74a |
+| §24 General design pattern | Part E |
+
+implementation_state.md remains a separate document deliberately: it
+tracks Go implementation progress and next-task bookkeeping, which
+changes on a different cadence and for different reasons than the
+semantic theory captured here.
 
 ---
 
@@ -61,6 +93,14 @@ requires intermediary nodes (e.g. `List → E1 → A`, `List → E2 → A`).
 
 **2.7** Left side is source/meaning-giving; right side is target.
 `(AllPointers,P258)` ≠ `(P258,AllPointers)`.
+
+**2.8** Self-relationships `(A,A)` are permitted — nothing in the
+primitive model rules them out. A node may have zero or more incoming
+and outgoing relationships; multiple parents and multiple children are
+both ordinary, unremarkable states (merged from
+THEORY_NOTES_FROM_CONVERSATION.md §1, folded in here rather than given
+its own lettered addendum since it's a direct, one-line extension of
+2.1–2.7's enumeration rather than a separate topic).
 
 ## 3. Parents and children
 

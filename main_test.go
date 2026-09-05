@@ -3354,7 +3354,7 @@ func TestCapsuleRegistryDeleteCapsuleFailsIfSlotHasExtraParent(t *testing.T) {
 
 	// An unrelated node referencing the value slot for its own reasons
 	// -- ordinary permitted graph structure (a node may have any number
-	// of parents, THEORY_NOTES_FROM_CONVERSATION.md section 1) that
+	// of parents, theorystate_v0.6.md section 2.8) that
 	// DeleteCapsule must not silently delete out from under.
 	if _, err := g.AddRelationship(metadata, valueSlot); err != nil {
 		t.Fatalf("AddRelationship(metadata, valueSlot): %v", err)
