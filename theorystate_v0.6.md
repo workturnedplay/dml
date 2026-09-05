@@ -178,10 +178,15 @@ Example shape for a richer relationship-object: `R→L, R→R1,
 AllRelationships→R, AllLefts→L, AllRights→R1, L→A, R1→B`. Not decided as
 canonical; illustrative only.
 
-## 9. Sets — not fully defined
+## 9. Sets — minimal interpretation now decided; composite forms remain open
 
 Minimal interpretation: `(A,B),(A,C),(A,D)` ⇒ B,C,D are members of A.
-Optionally `(AllSets,A)`. Not established as complete.
+`(AllSets,A)` is now DECIDED as required, not optional (§79, revising
+this section's original "optionally" -- see §79 for why an explicit tag
+was chosen over §9a's original untagged-by-default framing). This minimal
+interpretation is implemented as `SetRegistry` (§79). Composite Set forms
+(§9b) and Domains (§9c) remain open; see §80–§85 for their current,
+fully-specified-but-deferred design.
 
 **§9a — Elaboration on the minimal interpretation (merged from
 THEORY_NOTES_FROM_CONVERSATION.md §4).** Under `(X,Y) ⇒ Y is a member of
@@ -199,6 +204,20 @@ primitive facts. Caching a derived/expanded membership view would
 require higher-level invalidation/change-notification machinery (§35)
 and should not be pulled into the primitive graph prematurely.
 
+**Addendum (session finding, revises this section's "any node can be
+interpreted as a Set" framing): an explicit tag is required after all,
+DECIDED in §79.** Leaving the `(AllSets,A)` tag optional, as originally
+written above, would mean every registry operation on an untagged node
+"succeeds" whether or not the caller actually meant it as a Set, which is
+exactly the class of silent ambiguity every other registry in the Go
+implementation (`IsPointer`/`IsList`/`IsCapsule`, each gating on a
+required tag and returning a dedicated `ErrNot*`) has consistently
+rejected in favor of a loud, explicit failure. This does not weaken any
+of this section's other claims — self-containment, impossibility of
+duplicate membership, simultaneous Set/element participation, and
+non-recursive containment all hold identically whether or not the tag is
+mandatory; only the "optional" framing itself is revised. See §79.
+
 **§9b — Structured/composite Sets (obsolete as a spec; idea partially
 survives; merged from THEORY_NOTES_FROM_CONVERSATION.md §5 and §20).** An
 older experiment mixed Domains, Domain Sets, Sets-of-Sets, intermediary
@@ -211,7 +230,11 @@ must participate in different roles (e.g. a composite Set referring to
 other Sets as additive or subtractive operands, with the same Set node
 usable in different roles across different composite structures) — the
 same construction §75 later names generally. Ordered add/subtract
-operations over composite Sets remain **explored**, not required.
+operations over composite Sets are now **DECIDED** as unordered
+union-then-difference for the plain composite form and as an
+order-sensitive fold for the log-based form — see §80–§83, which formalize
+and supersede this section's diagram with a concrete (still
+unimplemented) representation.
 
 **§9c — Domains (explored, not decided; merged from
 THEORY_NOTES_FROM_CONVERSATION.md §6).** A Domain was explored as
@@ -223,7 +246,9 @@ explored as a way of combining multiple Domains into one effective
 allowed-membership universe — a possible higher-level construction, not
 a current primitive. Exact Domain/DomainSet representation remains OPEN
 (§22's list); Domains likely want Sets settled first, since a Domain is
-framed as a constrained Set.
+framed as a constrained Set. The minimal Set representation this section
+wanted settled is now DECIDED and implemented (§79); Domain design itself
+remains unstarted.
 
 ## 10. Pointers
 
@@ -1386,6 +1411,329 @@ or an explicit reuse-safety proof) before transactional `DeleteNode`
 could be trusted again. This correction applies to the current toy
 allocator as built, not to NodeID schemes in general.
 
+## 79. SetRegistry — the minimal Set interpretation (DECIDED, implemented)
+
+`(AllSets,S)` tags `S` as Set-kind; `S`'s direct children in the
+underlying Graph are exactly its members. This resolves §9/§9a's minimal
+interpretation into a concrete, decided representation, and revises §9a's
+original "any node can be interpreted as a Set" framing: the tag is now
+required, not optional (see §9a's addendum for why).
+
+Unlike every intermediary-node-based structure elsewhere in this document
+(Pointer Representation B, ElementCapsule's role slots, PointerMetadata's
+subject/target slots), a Set needs no intermediary node at all. Two
+properties specific to Sets, which do not hold for those other
+structures, make this safe: Sets carry no order (§5), so there is no
+positional/sequencing information an intermediary node would need to
+carry; and primitive relationships are already unique pairs (§2.6), so
+`(S,X)` cannot exist more than once — duplicate membership is
+structurally impossible without any registry-level enforcement at all. A
+member is therefore simply a direct child of `S`.
+
+Self-membership (`Add(S,S)`) is permitted (§2.8, §9a). A Set containing
+another Set as a member does **not**, by itself, imply recursive
+membership expansion: plain `Members(S)` returns only `S`'s own direct
+children, never expanding into a member that itself happens to be
+tagged Set-kind. Recursive, operand-based expansion is a distinct,
+higher-level structure — see §80–§83 for the deferred composite forms
+that provide it, and for why expansion intent must be recorded
+explicitly per operand rather than inferred from an operand's own tags.
+
+**Mutual exclusivity (DECIDED).** A node may carry **at most one** of the
+three Set-representation tags — `AllSets`, `AllCompositeSets` (§81),
+`AllCompositeSetLogs` (§82) — never more than one at a time. This mirrors
+the existing precedent that no node is tagged both `AllPointers` and
+`AllPointerMetadata`. Enforcement is expected to be added once a second
+Set-representation tag actually exists in the implementation (§76a's
+"add a foundational name only once its representation is actually being
+implemented" discipline currently means only `AllSets` is bootstrapped;
+`SetRegistry` therefore cannot yet check against tags that don't exist).
+
+Validated by `wtw`'s `SetRegistry`: `IsSet`, `NewSet`, `TagAsSet`, `Add`,
+`Remove`, `Contains`, `Members`, `Size`, `DeleteSet` (delete-only-if-empty,
+mirroring `ListRegistry.DeleteList`'s "remove the tag inside the same
+transaction, then delete" shape, §18). Because a Set imposes no
+cardinality or structural invariant on its children beyond the tag
+itself, there is no adversarial out-of-band-mutation suite analogous to
+`CapsuleRegistry`/`ListRegistry`'s — there is no invariant for an
+out-of-band mutation to violate.
+
+## 80. Operand descriptors — shared mechanism for composite Set forms (§81, §82)
+
+**DECIDED (design), implementation deferred.** Both composite Set
+representations below need to record, per operand: (1) whether the
+operand participates additively or subtractively, and (2) whether the
+operand is a bare scalar member or a nested Set whose own membership
+should be expanded in. This section records the shared mechanism and the
+design mistake found and corrected before settling on it.
+
+**Rejected first attempt, and why (kept per this document's practice of
+recording corrected reasoning, e.g. §61, §78).** An early draft proposed
+inferring (2) from the operand node's own tags — "if the operand is
+itself tagged as some kind of Set, treat it as one to expand; otherwise
+treat it as a scalar." This is the same mistake §10a already diagnosed
+and corrected for subject/target identification, recurring one level up:
+a node's own identity (what it intrinsically *is*) is a different fact
+from what a specific relationship *means it as here*, and collapsing them
+silently forecloses the other meaning wherever it might legitimately be
+needed. Concretely, inferring expansion from the operand's own tag makes
+"add a Set object as a literal, unexpanded member of another Set" —
+explicitly permitted by §9a ("a node can simultaneously be a Set and an
+element of some other Set") — inexpressible: a Set-tagged node could then
+*only* ever be used as an expansion operand, never as a plain member,
+anywhere.
+
+**The fix: a fresh per-relationship descriptor node, §75 applied again.**
+Every operand is represented by a dedicated intermediary node `U` —
+the same occurrence/role-identity pattern already named generally in §75
+and already used for `PointerMetadataRegistryD`'s U1/U2 — carrying:
+```text
+U -> operand
+```
+tagged with **exactly one** tag from each of two independent,
+orthogonal axes:
+
+- Axis 1 (operation kind): `(AllAdditiveOp,U)` or `(AllSubtractiveOp,U)`
+- Axis 2 (operand kind, explicit, never inferred): `(AllScalarOperand,U)`
+  or `(AllSetOperand,U)`
+
+`U` carries both tags; `operand` itself carries neither — this is what
+lets the same node be an inert scalar member in one relationship and a
+Set-expansion operand in another, with zero ambiguity, since the role
+lives on `U`, never on the shared target.
+
+When axis 2 is `AllSetOperand`, `operand` must already carry one of the
+three Set-representation tags (§79/§81/§82) at the time `U` is wired —
+checked at write time, the same "check target validity before mutating"
+discipline `PointerRegistry.SetTarget` already follows. No requirement is
+imposed when axis 2 is `AllScalarOperand`: any existing node, of any
+kind, is a valid scalar operand.
+
+Four tags total (2×2 orthogonal), not a single set of combined
+identities — chosen deliberately so a future third operation kind costs
+one new tag on axis 1 alone, not a re-multiplication across axis 2.
+
+`CompositeSetRegistry` (§81) and `CompositeSetLogRegistry` (§82) share
+this exact descriptor shape and are expected to share one internal
+build/validate/resolve implementation for `U`, factored out once both are
+implemented — the same DRY extraction precedent as `subjectMetadataBase`
+(`implementation_state.md` item 9), not attempted before there are two
+real call sites to justify it (§7).
+
+## 81. CompositeSetRegistry — unordered composite Sets (TENTATIVE, deferred)
+
+Formalizes and supersedes §9b's obsolete diagram with a concrete,
+decided-in-shape representation, not yet implemented. `(AllCompositeSets,C)`
+tags `C`; `C`'s direct children are `U`-descriptor nodes (§80), each
+identifying one operand and how it participates.
+
+```text
+Evaluate(C) = (⋃ resolved(u) for every additive-tagged U of C)
+              \ (⋃ resolved(u) for every subtractive-tagged U of C)
+```
+where `resolved(u)` of a scalar-axis `U` is the singleton `{operand}`,
+and of a set-axis `U` is that Set's own current evaluated/derived
+membership, recursively resolved through whichever of the three
+representations it actually is (§83's dispatcher). Zero additive operands
+is valid, evaluating to `∅`. Operand order carries no meaning here —
+union and set-difference are commutative/associative within their own
+tag group — deliberately unlike §82, where order is load-bearing.
+
+Deliberately named `Evaluate`, not `Members`, signaling a real
+(recursive, potentially failing) graph walk rather than a single lookup.
+Deliberately never cached: recomputed fresh on every call, consistent
+with §9a/§35's reasoning that a cached derived-membership view cannot be
+kept honestly in sync without invalidation machinery that doesn't exist
+and should not be built ahead of an actual need. Cycle detection: §83.
+
+## 82. CompositeSetLogRegistry — append-only Set-mutation logs (TENTATIVE, deferred)
+
+**Reframing this structure is built on, worth stating explicitly since
+it's easy to mis-name (this section was itself renamed once for exactly
+this reason — see below):** this is **not** a Set that tolerates
+duplicate membership — a Set structurally cannot (§2.6 makes `(A,B)` a
+unique pair; §9a already establishes duplicate membership as impossible
+by construction). It is an **append-only log of Set-mutating
+operations**, where the Set is the *derived result of folding that log*.
+Renamed from an earlier working name ("OrderedCompositeSet") specifically
+because that name wrongly implied the structure preserves or exposes
+insertion order as a first-class property, the way an insertion-ordered
+collection type would; what it actually preserves is a replayable
+operation history whose *fold*, not whose order per se, determines
+current membership.
+
+**Representation.** The tagged node is dual-tagged `(AllLists,node)` and
+`(AllCompositeSetLogs,node)` — two simultaneous interpretations of one
+identity, explicitly sanctioned by §10c's precedent (a Pointer node may
+simultaneously be interpreted as a Domain Pointer without contradiction).
+`AllCompositeSetLogs` participates in §79's three-way mutual exclusivity;
+`AllLists` does not, since it is plumbing this representation happens to
+be built from, not a Set-representation tag itself. Each list capsule's
+value — via the ordinary, opaque `ListRegistry`/`CapsuleRegistry` value
+slot; this representation does not reach into or specialize any
+List/Capsule internal, it only uses the value slot exactly as any other
+caller would — is a `U`-descriptor node (§80), identifying one logged
+operation.
+
+**Fold (evaluation), head to tail:**
+```text
+accumulator := ∅
+for each capsule's U, in list order:
+    resolved := resolve(U)   // per U's axis-2 tag, §80
+    if U tagged additive:    accumulator := accumulator ∪ resolved
+    if U tagged subtractive: accumulator := accumulator \ resolved
+return accumulator
+```
+Order here is semantically load-bearing, unlike §81: a later operation
+mentioning a given element supersedes an earlier one. This is also the
+exact mechanism behind "ensure X exists in the resulting Set regardless
+of what happened before" — not a third operation kind, simply what a
+trailing additive mention of `X` naturally produces under left-to-right
+replay.
+
+**Proven property licensing an optimization.** For a fixed element `X`,
+its final membership is decided entirely by the *last* operation in the
+log whose currently-resolved operand-set contains `X` (additive → in,
+subtractive → out, never mentioned → out). This holds because every
+operation *after* that one, by definition of "last mentioning operation,"
+excludes `X` from its own resolved set, so no later union can reintroduce
+`X` and no later subtraction can remove it. Consequently `Contains(log,X)`
+may scan the log **backward** and stop at the first operation whose
+operand currently contains `X`, using a cheap `Contains` check against
+each operand rather than materializing that operand's full membership.
+This is a real optimization (cheaper per-step check; early exit on a
+hit) but not a complete one: the worst case — `X` absent from the log
+entirely, or only mentioned at the very head — still requires walking the
+entire log and fully resolving every nested operand encountered along the
+way. There is no way to avoid this without a cache, and this document has
+already established why one is not being built (§9a, §35, and the
+no-cache point below); this cost is written down explicitly rather than
+left implied.
+
+**No cache.** Consistent with §9a/§35: `Evaluate`/`Contains` are always
+computed fresh, for the same reason §81 is never cached.
+
+**Fail loud on malformed capsules.** A capsule created via this
+registry's own append-style operations always carries a well-formed `U`
+(both axes tagged). A capsule created by bypassing this registry and
+calling the underlying `ListRegistry.Append` directly produces a capsule
+whose value has no `U`-descriptor at all. `Evaluate`/`Contains` must fail
+loudly on encountering such a capsule — a dedicated error, not a guessed
+default operation kind — matching this codebase's existing
+fail-loud-not-silently-repair discipline (`ErrTooManyPointerTargets`,
+`ErrNameBoundToDeletedNode`).
+
+## 83. Cross-representation dispatch and cycle detection for composite Sets (TENTATIVE, deferred)
+
+Both §81 and §82 allow an operand to point at any of the three Set
+representations (§79/§81/§82), including recursively at each other, so
+resolving an operand requires a small dispatcher: given a NodeID,
+determine which one (at most one, by §79's mutual exclusivity) of the
+three Set-representation tags it carries, and forward to that
+representation's own resolution logic. Checking an operand's own tag to
+select *which* expansion code to run is not a repeat of §80's rejected
+mistake: by the time this dispatch happens, axis 2 (§80) has already told
+us, explicitly, that expansion was intended by whoever created this
+operand — the tag check here only decides which of three
+known-applicable expansion implementations to invoke, never whether to
+expand at all.
+
+**Cycle detection.** A cycle can only occur through a chain of
+composite-kind Set nodes (`CompositeSet` or `CompositeSetLog`)
+referencing each other, potentially crossing between the two
+representations (e.g. `CompositeSetLog → CompositeSet → CompositeSetLog →
+...`). A plain Set operand is always a leaf and can never participate in
+a cycle, so cycle tracking need only record composite-kind NodeIDs
+visited along the current resolution path — mirroring
+`ListRegistry.Elements`'s own visited-set approach (§11b), extended here
+to be threaded across a dispatch boundary between two different registry
+types rather than staying within one registry's own traversal. A
+revisited composite-kind NodeID on the current path is reported via a
+single shared cycle error (anticipated as `ErrCompositeSetCycle`), used
+by both §81 and §82 rather than minting one per representation.
+
+**No maximum nesting depth.** None is imposed, or needed: the underlying
+node universe is finite, so any acyclic resolution path necessarily
+terminates in a number of steps bounded by the graph's own size; a depth
+limit would be an arbitrary restriction on top of that, and the cycle
+detection above already rejects the only case — a genuine cycle — that
+would otherwise fail to terminate.
+
+## 84. Declined: concurrent/bidirectional Contains search (REJECTED FOR NOW, explored and found not to transfer)
+
+Explored during design discussion: since `CapsuleRegistry.CapsulesWithValue`
+(`implementation_state.md` item 13) answers "which capsules hold value X"
+via a cheap, narrow reverse lookup (`FindIncoming(X)` filtered to genuine
+value-slot parents) rather than a forward list traversal, the same idea
+was considered for composite-Set `Contains(container,X)` queries —
+searching "forward" from `container` toward `X` and "backward" from `X`
+toward `container` concurrently, stopping whichever direction finishes
+first.
+
+**Found not to transfer, for a structural reason, not merely a
+performance guess.** `CapsulesWithValue`'s reverse lookup works because
+the reverse edge set is narrow and exactly scoped: `FindIncoming(value)`,
+filtered to value-slots, yields precisely the capsules holding that
+value, in one hop, with no unrelated structure mixed in. The analogous
+"search backward from X" here would be `FindIncoming(X)` across the
+*entire graph*, returning every `U`-descriptor anywhere that happens to
+reference `X` as an operand — the overwhelming majority belonging to
+Sets structurally unrelated to the specific container being queried.
+Determining which of those (if any) actually leads back to the container
+being asked about requires walking upward through each candidate checking
+reachability, which is comparable work to answering the forward question
+directly. This is not "the same answer, cheaper" — it risks doing *more*
+work, fanned out across irrelevant structure, with no equivalent of
+`CapsulesWithValue`'s clean one-hop stopping point.
+
+Additionally, running the two directions concurrently would require
+either synchronized shared cycle-tracking state (§83) between two
+goroutines, or duplicated independent state in each — either reintroduces
+exactly the concurrency-control machinery this document has already,
+deliberately, deferred until genuinely needed (§19: "concurrency
+isolation... explicitly deferred until actually required"), for a
+technique whose expected benefit in this shape of problem is unproven per
+the point above.
+
+Kept here per this document's established practice of recording
+explored-and-declined designs with their reasoning rather than silently
+omitting them (§58's "Rejected variant (tried and found worse)" is the
+direct precedent for this kind of entry), so this is not re-explored from
+scratch without the reasoning already being available.
+
+## 85. Open: generalized "find the bridging node(s) given both path endpoints" query (OPEN, noted, not pursued yet)
+
+Raised during design discussion (attributed externally, via GPT-5.6
+Luna): given two known NodeIDs — call them `Left` and `Right` — with some
+existing relationship shape `Left -> X -> Right` (or a longer, specific
+path), is there a general, efficient way to find every qualifying `X`,
+faster than enumerating `Left`'s children (or `Right`'s parents) and
+checking each candidate against the other endpoint directly?
+
+This is a genuine generalization of the two-hop lookups already used
+throughout this document (`findUniqueTaggedParent`, `findUniqueTaggedChild`,
+`locateBySubjectSlot`'s two-hop subject → slot → metadata walk) — those
+already fix one endpoint plus a *tag* and search for the other; this
+question additionally fixes the far endpoint *concretely* rather than
+merely a tag it must satisfy.
+
+**Not currently blocking anything.** No registry designed so far —
+including §81/§82 above — has a caller that needs "find the existing `U`
+bridging `C` and this specific operand," since every current append-style
+operation mints a fresh `U` unconditionally rather than searching for a
+preexisting one first (§80–§82). Should a future caller need this (e.g.
+an idempotent append that reuses an existing operand-descriptor instead
+of creating a duplicate one), the concrete two-hop version is answered
+the same way as every other tagged lookup in this document: scan the near
+endpoint's outgoing (or the far endpoint's incoming) relationships, and
+check each candidate against the other known endpoint directly — exactly
+as `findUniqueTaggedParent`/`findUniqueTaggedChild` already do against a
+tag instead of a fixed node. Whether a more general/faster mechanism
+exists for longer or less specifically-shaped paths is left genuinely
+open here, per §7's construct-only-what's-needed discipline: not worth
+designing further until a real caller needs more than the direct approach
+already gives.
+
 ---
 
 ## PART D — STATUS SUMMARY (consolidated)
@@ -1424,6 +1772,20 @@ kept current as sections above resolve or split further.)*
   with empty relationship maps" (§18's own precondition for DeleteNode
   succeeding), and NodeIDs are never reused (§2.2), so no collision with
   an unrelated node can occur (§78, corrected).
+- The minimal Set interpretation (§9/§9a) is implemented as SetRegistry:
+  `(AllSets,S)` tags S, S's direct children are its members, no
+  intermediary node is needed since primitive relationship uniqueness
+  (§2.6) already precludes duplicate membership (§79).
+- A node may carry at most one of the three Set-representation tags
+  (AllSets / AllCompositeSets / AllCompositeSetLogs) (§79).
+- Composite Set operands are represented via per-relationship descriptor
+  nodes carrying two orthogonal, explicit axes (operation kind, operand
+  kind) rather than inferring operand kind from the operand's own tags
+  (§80).
+- Composite Set evaluation order: union-then-difference, order-insensitive
+  within each axis, for the unordered composite form (§81); an
+  order-sensitive left-to-right fold, where a later operation supersedes
+  an earlier mention of the same element, for the log-based form (§82).
 
 ### TENTATIVE
 - Monotonically increasing NodeIDs; serialized first implementation.
@@ -1435,6 +1797,8 @@ kept current as sections above resolve or split further.)*
 - Real-ID + capability-model permissions (current lean, §70) — untested
   against real-ID + access-control.
 - Selective, opt-in, tag-gated content-addressed versioning (§66).
+- CompositeSetRegistry and CompositeSetLogRegistry's exact shapes
+  (§80–§83) — designed and DECIDED-in-shape, not yet implemented.
 
 ### OPEN
 - Exact Set/Pointer/List definitions; exact primitive storage; whether a
@@ -1458,6 +1822,11 @@ kept current as sections above resolve or split further.)*
   rather than single operations, requiring `Txn` to gain a staged/overlay
   mode in tension with its current deliberately-non-staged design (§77,
   extends §73).
+- Domain / DomainSet exact representation (§9c) — now unblocked in
+  principle by §79's decided minimal Set representation, but not yet
+  designed.
+- Generalized "find the bridging node(s) given both path endpoints" query
+  for arbitrary, not-necessarily-tag-shaped paths (§85).
 
 ### REJECTED FOR NOW
 - Giving primitive relationships their own NodeIDs.
@@ -1470,6 +1839,9 @@ kept current as sections above resolve or split further.)*
 - Content-hashing NodeID itself as identity (§66).
 - The direction/target-only proxy variant traced this session (§58) — degrades
   to a live query channel under partition, not a true mirror.
+- Concurrent/bidirectional search for composite Set membership queries
+  (§84) — explored, found not to structurally transfer from
+  CapsulesWithValue's reverse-lookup precedent.
 
 ---
 

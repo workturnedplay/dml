@@ -68,11 +68,14 @@ After that:
   this. See theorystate_v0.6.md section 76 for the formal writeup. This
   bullet is corrected here because it had gone stale without being
   updated when that work landed.
-- Ordered Lists (theorystate_v0.6.md section 11 / 11a) are the current
-  higher-level structure being implemented over the still-open Set
-  semantics (theorystate_v0.6.md section 9 / section 32). Domains remain
-  later and likely still want Sets first, since the theory frames a Domain
-  as a constrained Set.
+- Ordered Lists (theorystate_v0.6.md section 11 / 11a) were implemented
+  ahead of Sets (theorystate_v0.6.md section 9 / section 32), which were
+  at the time still fully open. The minimal Set interpretation is now
+  decided and implemented as SetRegistry (item 17 below;
+  theorystate_v0.6.md section 79); Domains remain later still, and likely
+  still want the composite Set representations
+  (theorystate_v0.6.md sections 80-83, designed but not yet implemented)
+  settled first, since the theory frames a Domain as a constrained Set.
 
   The ElementCapsule primitive (CapsuleRegistry, item 10) is implemented:
   list -> ElementCapsule does not by itself make every list child a capsule;
@@ -618,7 +621,67 @@ NodeID-keyed structure outside the primitive graph.
  detector, and go vet were run against the resulting source with an older
  local Go toolchain, while the project's go.mod remains at Go 1.27.
 
+17. Added SetRegistry, implementing the minimal Set interpretation of
+ theorystate_v0.6.md section 9 / 9a (formalized as section 79):
+ (AllSets, S) tags S as Set-kind, and S's direct children are exactly its
+ members -- no intermediary node is needed, unlike every other structure
+ in this file, because primitive relationships are already unique pairs
+ (theorystate_v0.6.md section 2.6, ruling out duplicate membership by
+ construction) and Sets carry no order (section 5) needing an
+ occurrence-identity node (section 75) the way List elements do. IsSet /
+ NewSet / TagAsSet / Add / Remove / Contains / Members / Size / DeleteSet
+ are provided; DeleteSet mirrors ListRegistry.DeleteList's "remove the tag
+ as part of the same transaction, then delete only if empty" shape.
+ Self-membership is permitted (theorystate_v0.6.md section 2.8).
+ Members() deliberately does not recurse into a member that happens to
+ itself be tagged Set-kind (theorystate_v0.6.md section 9a) -- recursive
+ expansion is reserved for the separate, still-deferred
+ CompositeSetRegistry / CompositeSetLogRegistry designs (theorystate_v0.6.md
+ sections 80-83), which additionally required resolving a real design flaw
+ found during review before being written up: an operand's intent to be
+ expanded-as-a-set versus kept-as-a-scalar-member must be recorded
+ explicitly per operand (a fresh, per-relationship descriptor node, the
+ same theorystate_v0.6.md section 75 occurrence-identity pattern used
+ elsewhere), never inferred from the operand node's own tags -- inferring
+ it was found to silently make "add a Set as a literal member of another
+ Set" (explicitly permitted by section 9a) inexpressible. See
+ theorystate_v0.6.md sections 79-85 for the full write-up, including the
+ two composite representations' designs, why a cached derived-membership
+ view is not being built, and an explored-and-declined concurrent-lookup
+ optimization.
+
+ Because a Set imposes no cardinality or structural invariant on its
+ children beyond the tag itself, SetRegistry has no adversarial
+ out-of-band-mutation test suite analogous to CapsuleRegistry/
+ ListRegistry's -- there is no invariant for an out-of-band mutation to
+ violate. NameAllSets was added to FoundationalNames now that this
+ representation is actually being implemented, per this file's own
+ "add foundational names only when starting the corresponding
+ representation" discipline.
+
+ Covered by TestFoundationalNamesIncludesAllSets,
+ TestNewSetRegistryRequiresExistingAllSets,
+ TestNewSetTagsSetAndStartsEmpty, TestSetTagAsSetTagsFreshNode,
+ TestSetTagAsSetAllowsExistingChildren, TestSetTagAsSetIsIdempotent,
+ TestSetTagAsSetRequiresExistingNode, TestSetAddAddsMember,
+ TestSetAddIsIdempotentForExistingMember, TestSetAddAllowsSelfMembership,
+ TestSetAddRequiresExistingMember, TestSetContainsRequiresExistingMember,
+ TestSetRemoveRemovesExistingMember, TestSetRemoveNoOpWhenAbsent,
+ TestSetRemoveRequiresExistingMember, TestSetContainsReflectsMembership,
+ TestSetMembersReturnsAllDirectChildren,
+ TestSetMembersDoesNotRecurseIntoNestedSet,
+ TestSetSizeMatchesMemberCount, TestSetDeleteSetSucceedsWhenEmpty,
+ TestSetDeleteSetFailsIfNotEmpty, TestSetDeleteSetFailsIfReferencedElsewhere,
+ TestSetOperationsRequireSetTag, and TestSetOperationsRequireExistingSetNode.
+
 Currently unaddressed yet:
+- SetRegistry does not yet enforce theorystate_v0.6.md section 79's
+  mutual-exclusivity rule (at most one of AllSets / AllCompositeSets /
+  AllCompositeSetLogs per node), since neither of the other two tags
+  exists in this codebase yet. This must be added -- here, and in
+  whichever of CompositeSetRegistry / CompositeSetLogRegistry
+  (theorystate_v0.6.md sections 80-83) is implemented first -- once either
+  actually exists.
 - No commit-time interception exists to prevent a raw
   Graph.AddRelationship from creating a second child on an
   already-tagged Pointer node in the first place; PointerRegistry can

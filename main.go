@@ -853,6 +853,13 @@ const (
 	// Representation C/D's subject/target collision to guard against.
 	NameAllHeads = "AllHeads"
 	NameAllTails = "AllTails"
+
+	// NameAllSets tags a node as Set-kind via the relationship
+	// (AllSets, S) (theorystate_v0.6.md section 9 / 9a / 79): S's direct
+	// children are exactly its members, with no intermediary node needed
+	// -- see SetRegistry for why Sets do not need one, unlike every
+	// intermediary-node-based structure elsewhere in this file.
+	NameAllSets = "AllSets"
 )
 
 // FoundationalNames lists every name that setup code should bootstrap via
@@ -873,6 +880,7 @@ var FoundationalNames = []string{
 	NameAllLists,
 	NameAllHeads,
 	NameAllTails,
+	NameAllSets,
 }
 
 // ErrCannotDeleteRoot is returned when deletion of ROOT is attempted
@@ -1174,6 +1182,10 @@ var (
 	// ErrNotList is returned by ListRegistry when asked to operate on a
 	// node that is not tagged (AllLists, node).
 	ErrNotList = errors.New("node is not tagged as a list")
+
+	// ErrNotSet is returned by SetRegistry when asked to operate on a
+	// node that is not tagged (AllSets, node).
+	ErrNotSet = errors.New("node is not tagged as a set")
 
 	// ErrCapsuleNotInList is returned by ListRegistry.InsertAfter when
 	// the given capsule is not currently an element of the given list
@@ -3602,5 +3614,252 @@ func (l *ListRegistry) DeleteList(list NodeID) error {
 		// method no longer needs its own special-cased exception to a
 		// pattern the rest of the file follows uniformly.
 		return tx.DeleteNode(list)
+	})
+}
+
+// SetRegistry implements the minimal Set interpretation of
+// theorystate_v0.6.md section 9 / 9a (formalized further in section 79):
+// (AllSets, S) tags S as Set-kind, and S's direct children in the
+// underlying Graph are exactly its members.
+//
+// Unlike every intermediary-node-based structure elsewhere in this file
+// (PointerRegistry's Representation B, CapsuleRegistry's role slots,
+// PointerMetadataRegistry(D)'s subject/target slots), a Set needs no
+// intermediary node at all. Two properties specific to Sets, neither of
+// which holds for those other structures, make this safe:
+//   - Sets carry no order (theorystate_v0.6.md section 5), so there is no
+//     positional/sequencing information any intermediary node would need
+//     to carry.
+//   - Primitive relationships are already unique pairs
+//     (theorystate_v0.6.md section 2.6): (S, X) cannot exist more than
+//     once, so duplicate membership is structurally impossible without any
+//     registry-level enforcement at all.
+//
+// A member is therefore simply a direct child of S; adding/removing a
+// member is simply Graph.AddRelationship(S, X) / Graph.RemoveRelationship(S, X),
+// tag-gated by requiring S to already be tagged (AllSets, S).
+//
+// Because a Set imposes no cardinality or structural invariant on its
+// children beyond the tag itself, there is no analogue here of the
+// adversarial out-of-band-mutation test suites written for
+// CapsuleRegistry/ListRegistry: any child of a tagged node is, by
+// definition, a valid member. There is nothing an out-of-band mutation
+// could do to a tagged Set's children that this registry would need to
+// detect or reject.
+//
+// Self-membership (Add(S, S)) is permitted, matching
+// theorystate_v0.6.md sections 2.8 and 9a.
+//
+// A Set containing another Set as a member does NOT, by itself, imply
+// recursive membership expansion (theorystate_v0.6.md section 9a):
+// Members(S) returns S's own direct children only, and never expands into
+// a member that happens to itself be tagged Set-kind. Recursive,
+// operand-based expansion is a separate, higher-level structure -- see
+// theorystate_v0.6.md sections 80-83 for the deferred (not yet
+// implemented) CompositeSetRegistry / CompositeSetLogRegistry designs that
+// provide it, and for why expansion intent must be recorded explicitly per
+// operand rather than inferred from an operand's own tags.
+//
+// theorystate_v0.6.md section 79 additionally decides that a node may
+// carry at most one of the three Set-representation tags (AllSets,
+// AllCompositeSets, AllCompositeSetLogs) -- never more than one at a time.
+// SetRegistry does not yet enforce this mutual exclusivity in code, since
+// neither of the other two tags exists in this codebase yet
+// (theorystate_v0.6.md section 76a's "add a foundational name only once
+// its representation is actually being implemented" discipline). This
+// must be revisited here -- and in whichever of CompositeSetRegistry /
+// CompositeSetLogRegistry is implemented first -- once either exists.
+type SetRegistry struct {
+	graph   *Graph
+	allSets NodeID
+}
+
+// NewSetRegistry creates a SetRegistry over graph, using allSets as the
+// tagging node for the (AllSets, S) relationship. allSets must already
+// exist -- typically via NameRegistry.EnsureNamedNode(NameAllSets) or
+// NameRegistry.BootstrapNames(FoundationalNames).
+func NewSetRegistry(graph *Graph, allSets NodeID) (*SetRegistry, error) {
+	if !graph.NodeExists(allSets) {
+		return nil, ErrNodeNotFound
+	}
+
+	return &SetRegistry{
+		graph:   graph,
+		allSets: allSets,
+	}, nil
+}
+
+// IsSet reports whether id is currently tagged (AllSets, id).
+func (s *SetRegistry) IsSet(id NodeID) bool {
+	return s.graph.HasRelationship(s.allSets, id)
+}
+
+// NewSet creates a fresh NodeID and tags it (AllSets, id). The new set
+// starts empty.
+func (s *SetRegistry) NewSet() (NodeID, error) {
+	var id NodeID
+
+	err := s.graph.Transact(func(tx *Txn) error {
+		var err error
+		id, err = createTaggedNodeTx(tx, s.allSets)
+		return err
+	})
+	if err != nil {
+		return 0, err
+	}
+
+	return id, nil
+}
+
+// TagAsSet tags an existing node id as Set-kind.
+//
+// Unlike PointerRegistry.TagAsPointer, no invariant needs to be checked
+// before tagging: a Set imposes no cardinality constraint on its
+// children, so id's existing children, however many, simply become its
+// members once tagged. Tagging an id that is already tagged Set-kind is
+// an idempotent success, exactly like the underlying
+// Graph.AddRelationship being idempotent for an already-existing
+// relationship.
+//
+// See the SetRegistry doc comment for why mutual exclusivity against the
+// other two, not-yet-implemented Set-representation tags is not enforced
+// here yet.
+func (s *SetRegistry) TagAsSet(id NodeID) error {
+	if !s.graph.NodeExists(id) {
+		return ErrNodeNotFound
+	}
+
+	_, err := s.graph.AddRelationship(s.allSets, id)
+	return err
+}
+
+// Add adds member to set. Both must already exist, and set must already
+// be tagged (AllSets, set).
+//
+// added reports whether member was newly added. Adding an
+// already-present member -- including self-membership, Add(set, set),
+// which is permitted (theorystate_v0.6.md section 2.8) -- is an
+// idempotent no-op reporting added == false on the repeat call.
+func (s *SetRegistry) Add(set, member NodeID) (added bool, err error) {
+	if !s.graph.NodeExists(set) {
+		return false, ErrNodeNotFound
+	}
+
+	if !s.IsSet(set) {
+		return false, ErrNotSet
+	}
+
+	if !s.graph.NodeExists(member) {
+		return false, ErrNodeNotFound
+	}
+
+	return s.graph.AddRelationship(set, member)
+}
+
+// Remove removes member from set, if present.
+//
+// removed reports whether member was actually a member and was removed;
+// removing a member that was never present is a no-op reporting
+// removed == false, not an error.
+func (s *SetRegistry) Remove(set, member NodeID) (removed bool, err error) {
+	if !s.graph.NodeExists(set) {
+		return false, ErrNodeNotFound
+	}
+
+	if !s.IsSet(set) {
+		return false, ErrNotSet
+	}
+
+	if !s.graph.NodeExists(member) {
+		return false, ErrNodeNotFound
+	}
+
+	return s.graph.RemoveRelationship(set, member)
+}
+
+// Contains reports whether member currently belongs to set.
+func (s *SetRegistry) Contains(set, member NodeID) (bool, error) {
+	if !s.graph.NodeExists(set) {
+		return false, ErrNodeNotFound
+	}
+
+	if !s.IsSet(set) {
+		return false, ErrNotSet
+	}
+
+	if !s.graph.NodeExists(member) {
+		return false, ErrNodeNotFound
+	}
+
+	return s.graph.HasRelationship(set, member), nil
+}
+
+// Members returns every current member of set, i.e. every direct child of
+// set in the underlying Graph.
+//
+// This does NOT recurse into any member that happens to itself be tagged
+// Set-kind -- see the SetRegistry doc comment.
+func (s *SetRegistry) Members(set NodeID) ([]NodeID, error) {
+	if !s.graph.NodeExists(set) {
+		return nil, ErrNodeNotFound
+	}
+
+	if !s.IsSet(set) {
+		return nil, ErrNotSet
+	}
+
+	outgoing, err := s.graph.FindOutgoing(set)
+	if err != nil {
+		return nil, err
+	}
+
+	members := make([]NodeID, 0, len(outgoing))
+	for _, rel := range outgoing {
+		members = append(members, rel.To)
+	}
+
+	return members, nil
+}
+
+// Size returns the number of current members of set.
+func (s *SetRegistry) Size(set NodeID) (int, error) {
+	members, err := s.Members(set)
+	if err != nil {
+		return 0, err
+	}
+
+	return len(members), nil
+}
+
+// DeleteSet deletes set from the underlying graph, additionally removing
+// its (AllSets, set) tag as part of the same transaction -- mirroring
+// ListRegistry.DeleteList: the AllSets tag is itself an ordinary
+// primitive relationship *into* set, and therefore itself counts toward
+// set's relationship count, so it must be removed before Graph.DeleteNode
+// can succeed, not after.
+//
+// Per theorystate_v0.6.md section 18, deletion is deliberately "delete
+// only if empty," not cascade: DeleteSet refuses with ErrNodeNotEmpty
+// (resolvable by removing every member and retrying) if set currently has
+// any members, or is itself currently a member of some other Set or
+// otherwise referenced elsewhere -- Graph.DeleteNode requires both
+// outgoing and incoming relationships to be empty.
+//
+// set must currently be tagged (AllSets, set).
+func (s *SetRegistry) DeleteSet(set NodeID) error {
+	if !s.graph.NodeExists(set) {
+		return ErrNodeNotFound
+	}
+
+	if !s.IsSet(set) {
+		return ErrNotSet
+	}
+
+	return s.graph.Transact(func(tx *Txn) error {
+		if _, err := tx.RemoveRelationship(s.allSets, set); err != nil {
+			return err
+		}
+
+		return tx.DeleteNode(set)
 	})
 }
