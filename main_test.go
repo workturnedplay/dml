@@ -242,12 +242,12 @@ func TestFindOutgoing(t *testing.T) {
 		t.Fatalf("CreateNode() returned error: %v", err)
 	}
 
-	if _, err := g.AddRelationship(a, b); err != nil {
-		t.Fatalf("AddRelationship(%d,%d): %v", a, b, err)
+	if _, err2 := g.AddRelationship(a, b); err2 != nil {
+		t.Fatalf("AddRelationship(%d,%d): %v", a, b, err2)
 	}
 
-	if _, err := g.AddRelationship(a, c); err != nil {
-		t.Fatalf("AddRelationship(%d,%d): %v", a, c, err)
+	if _, err3 := g.AddRelationship(a, c); err3 != nil {
+		t.Fatalf("AddRelationship(%d,%d): %v", a, c, err3)
 	}
 
 	relationships, err := g.FindOutgoing(a)
@@ -286,12 +286,12 @@ func TestFindIncoming(t *testing.T) {
 		t.Fatalf("CreateNode() returned error: %v", err)
 	}
 
-	if _, err := g.AddRelationship(a, c); err != nil {
-		t.Fatalf("AddRelationship(%d,%d): %v", a, c, err)
+	if _, err2 := g.AddRelationship(a, c); err2 != nil {
+		t.Fatalf("AddRelationship(%d,%d): %v", a, c, err2)
 	}
 
-	if _, err := g.AddRelationship(b, c); err != nil {
-		t.Fatalf("AddRelationship(%d,%d): %v", b, c, err)
+	if _, err3 := g.AddRelationship(b, c); err3 != nil {
+		t.Fatalf("AddRelationship(%d,%d): %v", b, c, err3)
 	}
 
 	relationships, err := g.FindIncoming(c)
@@ -325,8 +325,8 @@ func TestFindRelationship(t *testing.T) {
 		t.Fatalf("CreateNode() returned error: %v", err)
 	}
 
-	if _, err := g.AddRelationship(a, b); err != nil {
-		t.Fatalf("AddRelationship(%d,%d): %v", a, b, err)
+	if _, err2 := g.AddRelationship(a, b); err2 != nil {
+		t.Fatalf("AddRelationship(%d,%d): %v", a, b, err2)
 	}
 
 	relationship, exists, err := g.FindRelationship(a, b)
@@ -419,8 +419,8 @@ func TestRemoveRelationship(t *testing.T) {
 		t.Fatalf("CreateNode() returned error: %v", err)
 	}
 
-	if _, err := g.AddRelationship(a, b); err != nil {
-		t.Fatalf("AddRelationship() returned error: %v", err)
+	if _, err2 := g.AddRelationship(a, b); err2 != nil {
+		t.Fatalf("AddRelationship() returned error: %v", err2)
 	}
 
 	removed, err := g.RemoveRelationship(a, b)
@@ -468,8 +468,8 @@ func TestDeleteNodeRequiresNoRelationships(t *testing.T) {
 		t.Fatalf("CreateNode() returned error: %v", err)
 	}
 
-	if _, err := g.AddRelationship(a, b); err != nil {
-		t.Fatalf("AddRelationship() returned error: %v", err)
+	if _, err2 := g.AddRelationship(a, b); err2 != nil {
+		t.Fatalf("AddRelationship() returned error: %v", err2)
 	}
 
 	err = g.DeleteNode(a)
@@ -492,10 +492,10 @@ func TestDeleteNodeRequiresNoRelationships(t *testing.T) {
 		t.Fatalf("RemoveRelationship() returned error: %v", err)
 	}
 
-	if err := g.DeleteNode(a); err != nil {
+	if err3 := g.DeleteNode(a); err3 != nil {
 		t.Fatalf(
 			"DeleteNode(%d) after removing relationships returned error: %v",
-			a, err,
+			a, err3,
 		)
 	}
 
@@ -517,8 +517,8 @@ func TestDeleteNodeWithIncomingRelationshipAlsoFails(t *testing.T) {
 		t.Fatalf("CreateNode() returned error: %v", err)
 	}
 
-	if _, err := g.AddRelationship(a, b); err != nil {
-		t.Fatalf("AddRelationship() returned error: %v", err)
+	if _, err2 := g.AddRelationship(a, b); err2 != nil {
+		t.Fatalf("AddRelationship() returned error: %v", err2)
 	}
 
 	err = g.DeleteNode(b)
@@ -687,8 +687,8 @@ func TestNameRegistryNameIsUnique(t *testing.T) {
 		t.Fatalf("CreateNode() returned error: %v", err)
 	}
 
-	if err := names.Bind("A", a); err != nil {
-		t.Fatalf("first Bind() returned error: %v", err)
+	if err2 := names.Bind("A", a); err2 != nil {
+		t.Fatalf("first Bind() returned error: %v", err2)
 	}
 
 	err = names.Bind("A", b)
@@ -711,8 +711,8 @@ func TestNameRegistryNodeIDIsUnique(t *testing.T) {
 		t.Fatalf("CreateNode() returned error: %v", err)
 	}
 
-	if err := names.Bind("A", id); err != nil {
-		t.Fatalf("first Bind() returned error: %v", err)
+	if err2 := names.Bind("A", id); err2 != nil {
+		t.Fatalf("first Bind() returned error: %v", err2)
 	}
 
 	err = names.Bind("B", id)
@@ -851,8 +851,8 @@ func TestNameRegistryDeleteNodeFailsIfNotEmpty(t *testing.T) {
 		t.Fatalf("CreateNode(): %v", err)
 	}
 
-	if _, err := g.AddRelationship(a, b); err != nil {
-		t.Fatalf("AddRelationship(): %v", err)
+	if _, err2 := g.AddRelationship(a, b); err2 != nil {
+		t.Fatalf("AddRelationship(): %v", err2)
 	}
 
 	err = names.DeleteNode(a)
@@ -961,8 +961,8 @@ func TestNameRegistryEnsureNamedNodeFindsExistingBinding(t *testing.T) {
 		t.Fatalf("CreateNode() returned error: %v", err)
 	}
 
-	if err := names.Bind("A", id); err != nil {
-		t.Fatalf("Bind() returned error: %v", err)
+	if err2 := names.Bind("A", id); err2 != nil {
+		t.Fatalf("Bind() returned error: %v", err2)
 	}
 
 	found, err := names.EnsureNamedNode("A")
@@ -987,14 +987,14 @@ func TestNameRegistryEnsureNamedNodeFailsOnStaleBinding(t *testing.T) {
 		t.Fatalf("CreateNode(): %v", err)
 	}
 
-	if err := names.Bind("A", id); err != nil {
-		t.Fatalf("Bind(): %v", err)
+	if err2 := names.Bind("A", id); err2 != nil {
+		t.Fatalf("Bind(): %v", err2)
 	}
 
 	// Bypass NameRegistry.DeleteNode on purpose, simulating a caller bug
 	// that deletes the node without coordinating with the name registry.
-	if err := g.DeleteNode(id); err != nil {
-		t.Fatalf("DeleteNode(%d) via raw Graph: %v", id, err)
+	if err3 := g.DeleteNode(id); err3 != nil {
+		t.Fatalf("DeleteNode(%d) via raw Graph: %v", id, err3)
 	}
 
 	_, err = names.EnsureNamedNode("A")
@@ -1012,12 +1012,12 @@ func TestNameRegistryCreateNamedNodeFailsOnStaleBinding(t *testing.T) {
 		t.Fatalf("CreateNode(): %v", err)
 	}
 
-	if err := names.Bind("A", id); err != nil {
-		t.Fatalf("Bind(): %v", err)
+	if err2 := names.Bind("A", id); err2 != nil {
+		t.Fatalf("Bind(): %v", err2)
 	}
 
-	if err := g.DeleteNode(id); err != nil {
-		t.Fatalf("DeleteNode(%d) via raw Graph: %v", id, err)
+	if err3 := g.DeleteNode(id); err3 != nil {
+		t.Fatalf("DeleteNode(%d) via raw Graph: %v", id, err3)
 	}
 
 	_, err = names.CreateNamedNode("A")
@@ -1035,12 +1035,12 @@ func TestNameRegistryBindFailsOnStaleBindingToDifferentNode(t *testing.T) {
 		t.Fatalf("CreateNode() for stale: %v", err)
 	}
 
-	if err := names.Bind("A", stale); err != nil {
-		t.Fatalf("Bind(): %v", err)
+	if err2 := names.Bind("A", stale); err2 != nil {
+		t.Fatalf("Bind(): %v", err2)
 	}
 
-	if err := g.DeleteNode(stale); err != nil {
-		t.Fatalf("DeleteNode(%d) via raw Graph: %v", stale, err)
+	if err3 := g.DeleteNode(stale); err3 != nil {
+		t.Fatalf("DeleteNode(%d) via raw Graph: %v", stale, err3)
 	}
 
 	replacement, err := g.CreateNode()
@@ -1063,12 +1063,12 @@ func TestBootstrapNamesFailsOnStaleBinding(t *testing.T) {
 		t.Fatalf("CreateNode(): %v", err)
 	}
 
-	if err := names.Bind("A", id); err != nil {
-		t.Fatalf("Bind(): %v", err)
+	if err2 := names.Bind("A", id); err2 != nil {
+		t.Fatalf("Bind(): %v", err2)
 	}
 
-	if err := g.DeleteNode(id); err != nil {
-		t.Fatalf("DeleteNode(%d) via raw Graph: %v", id, err)
+	if err3 := g.DeleteNode(id); err3 != nil {
+		t.Fatalf("DeleteNode(%d) via raw Graph: %v", id, err3)
 	}
 
 	_, err = names.BootstrapNames([]string{"A", "B"})
@@ -1302,8 +1302,8 @@ func TestRootCanHaveParents(t *testing.T) {
 		t.Fatalf("CreateNode() for a: %v", err)
 	}
 
-	if _, err := g.AddRelationship(a, root); err != nil {
-		t.Fatalf("AddRelationship(a, ROOT): %v", err)
+	if _, err2 := g.AddRelationship(a, root); err2 != nil {
+		t.Fatalf("AddRelationship(a, ROOT): %v", err2)
 	}
 
 	r, err := NewRootGraph(&g, root)
@@ -1515,8 +1515,8 @@ func TestRootDelegatesNonRootRelationships(t *testing.T) {
 		t.Fatalf("NewRootGraph(): %v", err)
 	}
 
-	if _, err := r.AddRelationship(a, b); err != nil {
-		t.Fatalf("AddRelationship(a, b): %v", err)
+	if _, err2 := r.AddRelationship(a, b); err2 != nil {
+		t.Fatalf("AddRelationship(a, b): %v", err2)
 	}
 
 	got, err := r.FindOutgoing(a)
@@ -1551,8 +1551,8 @@ func TestRootFindRelationshipsIncludesVirtualRelationships(t *testing.T) {
 		t.Fatalf("CreateNode() for b: %v", err)
 	}
 
-	if _, err := g.AddRelationship(a, b); err != nil {
-		t.Fatalf("AddRelationship(a, b): %v", err)
+	if _, err2 := g.AddRelationship(a, b); err2 != nil {
+		t.Fatalf("AddRelationship(a, b): %v", err2)
 	}
 
 	r, err := NewRootGraph(&g, root)
@@ -1640,8 +1640,8 @@ func TestRootPhysicalRelationshipDoesNotDuplicateVirtualRelationship(t *testing.
 		t.Fatalf("CreateNode() for a: %v", err)
 	}
 
-	if _, err := g.AddRelationship(root, a); err != nil {
-		t.Fatalf("AddRelationship(ROOT, a) in primitive graph: %v", err)
+	if _, err2 := g.AddRelationship(root, a); err2 != nil {
+		t.Fatalf("AddRelationship(ROOT, a) in primitive graph: %v", err2)
 	}
 
 	r, err := NewRootGraph(&g, root)
@@ -1680,8 +1680,8 @@ func TestRootPhysicalSelfRelationshipIsHidden(t *testing.T) {
 		t.Fatalf("CreateNode() for ROOT: %v", err)
 	}
 
-	if _, err := g.AddRelationship(root, root); err != nil {
-		t.Fatalf("AddRelationship(ROOT, ROOT) in primitive graph: %v", err)
+	if _, err2 := g.AddRelationship(root, root); err2 != nil {
+		t.Fatalf("AddRelationship(ROOT, ROOT) in primitive graph: %v", err2)
 	}
 
 	if !g.HasRelationship(root, root) {
@@ -1793,8 +1793,8 @@ func TestPointerRegistrySetTargetAddsFirstTarget(t *testing.T) {
 		t.Fatalf("CreateNode() for x: %v", err)
 	}
 
-	if err := pointers.SetTarget(p, x); err != nil {
-		t.Fatalf("SetTarget(%d,%d): %v", p, x, err)
+	if err2 := pointers.SetTarget(p, x); err2 != nil {
+		t.Fatalf("SetTarget(%d,%d): %v", p, x, err2)
 	}
 
 	target, hasTarget, err := pointers.Target(p)
@@ -1820,12 +1820,12 @@ func TestPointerRegistrySetTargetIsIdempotentForSameTarget(t *testing.T) {
 		t.Fatalf("CreateNode() for x: %v", err)
 	}
 
-	if err := pointers.SetTarget(p, x); err != nil {
-		t.Fatalf("first SetTarget(%d,%d): %v", p, x, err)
+	if err2 := pointers.SetTarget(p, x); err2 != nil {
+		t.Fatalf("first SetTarget(%d,%d): %v", p, x, err2)
 	}
 
-	if err := pointers.SetTarget(p, x); err != nil {
-		t.Fatalf("second SetTarget(%d,%d): %v", p, x, err)
+	if err3 := pointers.SetTarget(p, x); err3 != nil {
+		t.Fatalf("second SetTarget(%d,%d): %v", p, x, err3)
 	}
 
 	outgoing, err := g.FindOutgoing(p)
@@ -1856,12 +1856,12 @@ func TestPointerRegistrySetTargetReplacesExistingTarget(t *testing.T) {
 		t.Fatalf("CreateNode() for y: %v", err)
 	}
 
-	if err := pointers.SetTarget(p, x); err != nil {
-		t.Fatalf("SetTarget(%d,%d): %v", p, x, err)
+	if err2 := pointers.SetTarget(p, x); err2 != nil {
+		t.Fatalf("SetTarget(%d,%d): %v", p, x, err2)
 	}
 
-	if err := pointers.SetTarget(p, y); err != nil {
-		t.Fatalf("SetTarget(%d,%d): %v", p, y, err)
+	if err3 := pointers.SetTarget(p, y); err3 != nil {
+		t.Fatalf("SetTarget(%d,%d): %v", p, y, err3)
 	}
 
 	target, hasTarget, err := pointers.Target(p)
@@ -1895,8 +1895,8 @@ func TestPointerRegistrySetTargetAllowsSelfTarget(t *testing.T) {
 		t.Fatalf("NewPointer(): %v", err)
 	}
 
-	if err := pointers.SetTarget(p, p); err != nil {
-		t.Fatalf("SetTarget(%d,%d) self-target: %v", p, p, err)
+	if err2 := pointers.SetTarget(p, p); err2 != nil {
+		t.Fatalf("SetTarget(%d,%d) self-target: %v", p, p, err2)
 	}
 
 	target, hasTarget, err := pointers.Target(p)
@@ -1957,8 +1957,8 @@ func TestPointerRegistryRemoveTargetRemovesExisting(t *testing.T) {
 		t.Fatalf("CreateNode() for x: %v", err)
 	}
 
-	if err := pointers.SetTarget(p, x); err != nil {
-		t.Fatalf("SetTarget(%d,%d): %v", p, x, err)
+	if err2 := pointers.SetTarget(p, x); err2 != nil {
+		t.Fatalf("SetTarget(%d,%d): %v", p, x, err2)
 	}
 
 	removed, err := pointers.RemoveTarget(p)
@@ -2032,12 +2032,12 @@ func TestPointerRegistryTagAsPointerAllowsExistingSingleChild(t *testing.T) {
 		t.Fatalf("CreateNode() for x: %v", err)
 	}
 
-	if _, err := g.AddRelationship(id, x); err != nil {
-		t.Fatalf("AddRelationship(%d,%d): %v", id, x, err)
+	if _, err2 := g.AddRelationship(id, x); err2 != nil {
+		t.Fatalf("AddRelationship(%d,%d): %v", id, x, err2)
 	}
 
-	if err := pointers.TagAsPointer(id); err != nil {
-		t.Fatalf("TagAsPointer(%d): %v", id, err)
+	if err3 := pointers.TagAsPointer(id); err3 != nil {
+		t.Fatalf("TagAsPointer(%d): %v", id, err3)
 	}
 
 	target, hasTarget, err := pointers.Target(id)
@@ -2068,12 +2068,12 @@ func TestPointerRegistryTagAsPointerRejectsMultipleExistingChildren(t *testing.T
 		t.Fatalf("CreateNode() for y: %v", err)
 	}
 
-	if _, err := g.AddRelationship(id, x); err != nil {
-		t.Fatalf("AddRelationship(%d,%d): %v", id, x, err)
+	if _, err2 := g.AddRelationship(id, x); err2 != nil {
+		t.Fatalf("AddRelationship(%d,%d): %v", id, x, err2)
 	}
 
-	if _, err := g.AddRelationship(id, y); err != nil {
-		t.Fatalf("AddRelationship(%d,%d): %v", id, y, err)
+	if _, err3 := g.AddRelationship(id, y); err3 != nil {
+		t.Fatalf("AddRelationship(%d,%d): %v", id, y, err3)
 	}
 
 	err = pointers.TagAsPointer(id)
@@ -2123,16 +2123,16 @@ func TestPointerRegistryDetectsOutOfBandInvariantViolation(t *testing.T) {
 
 	// Bypass PointerRegistry entirely, simulating a caller bug that
 	// mutates a tagged Pointer node directly through the primitive Graph.
-	if _, err := g.AddRelationship(p, x); err != nil {
-		t.Fatalf("AddRelationship(%d,%d) via raw Graph: %v", p, x, err)
+	if _, err2 := g.AddRelationship(p, x); err2 != nil {
+		t.Fatalf("AddRelationship(%d,%d) via raw Graph: %v", p, x, err2)
 	}
 
-	if _, err := g.AddRelationship(p, y); err != nil {
-		t.Fatalf("AddRelationship(%d,%d) via raw Graph: %v", p, y, err)
+	if _, err3 := g.AddRelationship(p, y); err3 != nil {
+		t.Fatalf("AddRelationship(%d,%d) via raw Graph: %v", p, y, err3)
 	}
 
-	if _, _, err := pointers.Target(p); !errors.Is(err, ErrTooManyPointerTargets) {
-		t.Fatalf("Target() error = %v, want %v", err, ErrTooManyPointerTargets)
+	if _, _, err4 := pointers.Target(p); !errors.Is(err4, ErrTooManyPointerTargets) {
+		t.Fatalf("Target() error = %v, want %v", err4, ErrTooManyPointerTargets)
 	}
 
 	z, err := g.CreateNode()
@@ -2140,12 +2140,12 @@ func TestPointerRegistryDetectsOutOfBandInvariantViolation(t *testing.T) {
 		t.Fatalf("CreateNode() for z: %v", err)
 	}
 
-	if err := pointers.SetTarget(p, z); !errors.Is(err, ErrTooManyPointerTargets) {
-		t.Fatalf("SetTarget() error = %v, want %v", err, ErrTooManyPointerTargets)
+	if err5 := pointers.SetTarget(p, z); !errors.Is(err5, ErrTooManyPointerTargets) {
+		t.Fatalf("SetTarget() error = %v, want %v", err5, ErrTooManyPointerTargets)
 	}
 
-	if _, err := pointers.RemoveTarget(p); !errors.Is(err, ErrTooManyPointerTargets) {
-		t.Fatalf("RemoveTarget() error = %v, want %v", err, ErrTooManyPointerTargets)
+	if _, err6 := pointers.RemoveTarget(p); !errors.Is(err6, ErrTooManyPointerTargets) {
+		t.Fatalf("RemoveTarget() error = %v, want %v", err6, ErrTooManyPointerTargets)
 	}
 
 	// Confirm none of the failed calls above mutated anything.
@@ -2238,16 +2238,16 @@ func TestTransactRollsBackRelationshipsInLIFOOrder(t *testing.T) {
 	const nonexistent NodeID = 999999
 
 	err = g.Transact(func(tx *Txn) error {
-		if _, err := tx.AddRelationship(a, b); err != nil {
-			return err
+		if _, err2 := tx.AddRelationship(a, b); err2 != nil {
+			return err2
 		}
 
-		if _, err := tx.AddRelationship(a, c); err != nil {
-			return err
+		if _, err3 := tx.AddRelationship(a, c); err3 != nil {
+			return err3
 		}
 
-		_, err := tx.AddRelationship(a, nonexistent)
-		return err
+		_, err4 := tx.AddRelationship(a, nonexistent)
+		return err4
 	})
 
 	if !errors.Is(err, ErrNodeNotFound) {
@@ -2276,19 +2276,19 @@ func TestTransactRollsBackRemoveRelationshipOnLaterFailure(t *testing.T) {
 		t.Fatalf("CreateNode() for b: %v", err)
 	}
 
-	if _, err := g.AddRelationship(a, b); err != nil {
-		t.Fatalf("AddRelationship(%d,%d): %v", a, b, err)
+	if _, err2 := g.AddRelationship(a, b); err2 != nil {
+		t.Fatalf("AddRelationship(%d,%d): %v", a, b, err2)
 	}
 
 	const nonexistent NodeID = 999999
 
 	err = g.Transact(func(tx *Txn) error {
-		if _, err := tx.RemoveRelationship(a, b); err != nil {
-			return err
+		if _, err3 := tx.RemoveRelationship(a, b); err3 != nil {
+			return err3
 		}
 
-		_, err := tx.AddRelationship(a, nonexistent)
-		return err
+		_, err4 := tx.AddRelationship(a, nonexistent)
+		return err4
 	})
 
 	if !errors.Is(err, ErrNodeNotFound) {
@@ -2313,8 +2313,8 @@ func TestTransactDoesNotUndoPreexistingRelationship(t *testing.T) {
 		t.Fatalf("CreateNode() for b: %v", err)
 	}
 
-	if _, err := g.AddRelationship(a, b); err != nil {
-		t.Fatalf("AddRelationship(%d,%d): %v", a, b, err)
+	if _, err2 := g.AddRelationship(a, b); err2 != nil {
+		t.Fatalf("AddRelationship(%d,%d): %v", a, b, err2)
 	}
 
 	const nonexistent NodeID = 999999
@@ -2323,16 +2323,16 @@ func TestTransactDoesNotUndoPreexistingRelationship(t *testing.T) {
 		// (a,b) already exists, so this call reports created == false and
 		// must not schedule an undo step for a relationship this
 		// transaction did not itself create.
-		created, err := tx.AddRelationship(a, b)
-		if err != nil {
-			return err
+		created, err3 := tx.AddRelationship(a, b)
+		if err3 != nil {
+			return err3
 		}
 		if created {
 			t.Fatal("AddRelationship() reported creating an already-existing relationship")
 		}
 
-		_, err = tx.AddRelationship(a, nonexistent)
-		return err
+		_, err3 = tx.AddRelationship(a, nonexistent)
+		return err3
 	})
 
 	if !errors.Is(err, ErrNodeNotFound) {
@@ -2397,8 +2397,8 @@ func TestSubPointerReusesPointerRegistryUnderDifferentTag(t *testing.T) {
 		t.Fatalf("NewPointer() for u: %v", err)
 	}
 
-	if _, err := g.AddRelationship(p, u); err != nil {
-		t.Fatalf("AddRelationship(p, u): %v", err)
+	if _, err2 := g.AddRelationship(p, u); err2 != nil {
+		t.Fatalf("AddRelationship(p, u): %v", err2)
 	}
 
 	other, err := g.CreateNode()
@@ -2406,8 +2406,8 @@ func TestSubPointerReusesPointerRegistryUnderDifferentTag(t *testing.T) {
 		t.Fatalf("CreateNode() for other: %v", err)
 	}
 
-	if _, err := g.AddRelationship(p, other); err != nil {
-		t.Fatalf("AddRelationship(p, other): %v", err)
+	if _, err3 := g.AddRelationship(p, other); err3 != nil {
+		t.Fatalf("AddRelationship(p, other): %v", err3)
 	}
 
 	x, err := g.CreateNode()
@@ -2415,8 +2415,8 @@ func TestSubPointerReusesPointerRegistryUnderDifferentTag(t *testing.T) {
 		t.Fatalf("CreateNode() for x: %v", err)
 	}
 
-	if err := subPointers.SetTarget(u, x); err != nil {
-		t.Fatalf("SetTarget(u, x): %v", err)
+	if err4 := subPointers.SetTarget(u, x); err4 != nil {
+		t.Fatalf("SetTarget(u, x): %v", err4)
 	}
 
 	target, hasTarget, err := subPointers.Target(u)
@@ -2512,8 +2512,8 @@ func TestPointerMetadataRegistrySetTargetLeavesSubjectChildrenUntouched(t *testi
 		t.Fatalf("CreateNode() for preexisting: %v", err)
 	}
 
-	if _, err := g.AddRelationship(subject, preexisting); err != nil {
-		t.Fatalf("AddRelationship(subject, preexisting): %v", err)
+	if _, err2 := g.AddRelationship(subject, preexisting); err2 != nil {
+		t.Fatalf("AddRelationship(subject, preexisting): %v", err2)
 	}
 
 	x, err := g.CreateNode()
@@ -2521,8 +2521,8 @@ func TestPointerMetadataRegistrySetTargetLeavesSubjectChildrenUntouched(t *testi
 		t.Fatalf("CreateNode() for x: %v", err)
 	}
 
-	if err := metadata.SetTarget(subject, x); err != nil {
-		t.Fatalf("SetTarget(subject, x): %v", err)
+	if err3 := metadata.SetTarget(subject, x); err3 != nil {
+		t.Fatalf("SetTarget(subject, x): %v", err3)
 	}
 
 	outgoing, err := g.FindOutgoing(subject)
@@ -2552,8 +2552,8 @@ func TestPointerMetadataRegistrySetTargetAllowsSelfTarget(t *testing.T) {
 		t.Fatalf("CreateNode(): %v", err)
 	}
 
-	if err := metadata.SetTarget(subject, subject); err != nil {
-		t.Fatalf("SetTarget(subject, subject): %v", err)
+	if err2 := metadata.SetTarget(subject, subject); err2 != nil {
+		t.Fatalf("SetTarget(subject, subject): %v", err2)
 	}
 
 	target, hasTarget, err := metadata.Target(subject)
@@ -2583,12 +2583,12 @@ func TestPointerMetadataRegistrySetTargetReplacesExistingTarget(t *testing.T) {
 		t.Fatalf("CreateNode() for y: %v", err)
 	}
 
-	if err := metadata.SetTarget(subject, x); err != nil {
-		t.Fatalf("SetTarget(subject, x): %v", err)
+	if err2 := metadata.SetTarget(subject, x); err2 != nil {
+		t.Fatalf("SetTarget(subject, x): %v", err2)
 	}
 
-	if err := metadata.SetTarget(subject, y); err != nil {
-		t.Fatalf("SetTarget(subject, y): %v", err)
+	if err3 := metadata.SetTarget(subject, y); err3 != nil {
+		t.Fatalf("SetTarget(subject, y): %v", err3)
 	}
 
 	target, hasTarget, err := metadata.Target(subject)
@@ -2613,8 +2613,8 @@ func TestPointerMetadataRegistryRemoveTargetRemovesExisting(t *testing.T) {
 		t.Fatalf("CreateNode() for x: %v", err)
 	}
 
-	if err := metadata.SetTarget(subject, x); err != nil {
-		t.Fatalf("SetTarget(subject, x): %v", err)
+	if err2 := metadata.SetTarget(subject, x); err2 != nil {
+		t.Fatalf("SetTarget(subject, x): %v", err2)
 	}
 
 	removed, err := metadata.RemoveTarget(subject)
@@ -2753,8 +2753,8 @@ func TestPointerMetadataRegistryDSetTargetLeavesSubjectChildrenUntouched(t *test
 		t.Fatalf("CreateNode() for preexisting: %v", err)
 	}
 
-	if _, err := g.AddRelationship(subject, preexisting); err != nil {
-		t.Fatalf("AddRelationship(subject, preexisting): %v", err)
+	if _, err2 := g.AddRelationship(subject, preexisting); err2 != nil {
+		t.Fatalf("AddRelationship(subject, preexisting): %v", err2)
 	}
 
 	x, err := g.CreateNode()
@@ -2762,8 +2762,8 @@ func TestPointerMetadataRegistryDSetTargetLeavesSubjectChildrenUntouched(t *test
 		t.Fatalf("CreateNode() for x: %v", err)
 	}
 
-	if err := metadata.SetTarget(subject, x); err != nil {
-		t.Fatalf("SetTarget(subject, x): %v", err)
+	if err3 := metadata.SetTarget(subject, x); err3 != nil {
+		t.Fatalf("SetTarget(subject, x): %v", err3)
 	}
 
 	outgoing, err := g.FindOutgoing(subject)
@@ -2793,8 +2793,8 @@ func TestPointerMetadataRegistryDSetTargetAllowsSelfTarget(t *testing.T) {
 		t.Fatalf("CreateNode(): %v", err)
 	}
 
-	if err := metadata.SetTarget(subject, subject); err != nil {
-		t.Fatalf("SetTarget(subject, subject): %v", err)
+	if err2 := metadata.SetTarget(subject, subject); err2 != nil {
+		t.Fatalf("SetTarget(subject, subject): %v", err2)
 	}
 
 	target, hasTarget, err := metadata.Target(subject)
@@ -2824,12 +2824,12 @@ func TestPointerMetadataRegistryDSetTargetReplacesExistingTarget(t *testing.T) {
 		t.Fatalf("CreateNode() for y: %v", err)
 	}
 
-	if err := metadata.SetTarget(subject, x); err != nil {
-		t.Fatalf("SetTarget(subject, x): %v", err)
+	if err2 := metadata.SetTarget(subject, x); err2 != nil {
+		t.Fatalf("SetTarget(subject, x): %v", err2)
 	}
 
-	if err := metadata.SetTarget(subject, y); err != nil {
-		t.Fatalf("SetTarget(subject, y): %v", err)
+	if err3 := metadata.SetTarget(subject, y); err3 != nil {
+		t.Fatalf("SetTarget(subject, y): %v", err3)
 	}
 
 	target, hasTarget, err := metadata.Target(subject)
@@ -2854,8 +2854,8 @@ func TestPointerMetadataRegistryDRemoveTargetRemovesExisting(t *testing.T) {
 		t.Fatalf("CreateNode() for x: %v", err)
 	}
 
-	if err := metadata.SetTarget(subject, x); err != nil {
-		t.Fatalf("SetTarget(subject, x): %v", err)
+	if err2 := metadata.SetTarget(subject, x); err2 != nil {
+		t.Fatalf("SetTarget(subject, x): %v", err2)
 	}
 
 	removed, err := metadata.RemoveTarget(subject)
@@ -2909,8 +2909,8 @@ func TestPointerMetadataRegistryDAllowsUnrelatedMetadataChildren(t *testing.T) {
 		t.Fatalf("CreateNode() for x: %v", err)
 	}
 
-	if err := metadata.SetTarget(subject, x); err != nil {
-		t.Fatalf("SetTarget(subject, x): %v", err)
+	if err2 := metadata.SetTarget(subject, x); err2 != nil {
+		t.Fatalf("SetTarget(subject, x): %v", err2)
 	}
 
 	m, err := metadata.EnsureMetadata(subject)
@@ -2927,8 +2927,8 @@ func TestPointerMetadataRegistryDAllowsUnrelatedMetadataChildren(t *testing.T) {
 	// M. Representation C's exclusion-based target lookup would break
 	// (ErrTooManyPointerTargets) if this were done to its metadata node;
 	// Representation D must not be affected at all.
-	if _, err := g.AddRelationship(m, unrelated); err != nil {
-		t.Fatalf("AddRelationship(m, unrelated): %v", err)
+	if _, err3 := g.AddRelationship(m, unrelated); err3 != nil {
+		t.Fatalf("AddRelationship(m, unrelated): %v", err3)
 	}
 
 	target, hasTarget, err := metadata.Target(subject)

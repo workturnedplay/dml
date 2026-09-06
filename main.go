@@ -1883,23 +1883,23 @@ func ensureMetadataWithSubjectSlot(g *Graph, subject, allPointerMetadata, allSub
 	}
 
 	err = g.Transact(func(tx *Txn) error {
-		var err error
+		var err2 error
 
-		subjectSlot, err = createTaggedNodeTx(tx, allSubjectSlots)
-		if err != nil {
-			return err
+		subjectSlot, err2 = createTaggedNodeTx(tx, allSubjectSlots)
+		if err2 != nil {
+			return err2
 		}
-		if _, err := tx.AddRelationship(subjectSlot, subject); err != nil {
-			return err
-		}
-
-		metadata, err = createTaggedNodeTx(tx, allPointerMetadata)
-		if err != nil {
-			return err
+		if _, err3 := tx.AddRelationship(subjectSlot, subject); err3 != nil {
+			return err3
 		}
 
-		_, err = tx.AddRelationship(metadata, subjectSlot)
-		return err
+		metadata, err2 = createTaggedNodeTx(tx, allPointerMetadata)
+		if err2 != nil {
+			return err2
+		}
+
+		_, err2 = tx.AddRelationship(metadata, subjectSlot)
+		return err2
 	})
 	if err != nil {
 		return 0, 0, err
@@ -2501,19 +2501,19 @@ func buildCapsuleTx(tx txOps, allElementCapsules, allPrevSlot, allValueSlot, all
 	if err != nil {
 		return 0, err
 	}
-	if _, err := tx.AddRelationship(capsule, prevSlot); err != nil {
-		return 0, err
+	if _, err2 := tx.AddRelationship(capsule, prevSlot); err2 != nil {
+		return 0, err2
 	}
 
 	valueSlot, err := newPointerTx(tx, allValueSlot)
 	if err != nil {
 		return 0, err
 	}
-	if _, err := tx.AddRelationship(capsule, valueSlot); err != nil {
-		return 0, err
+	if _, err3 := tx.AddRelationship(capsule, valueSlot); err3 != nil {
+		return 0, err3
 	}
-	if _, err := tx.AddRelationship(valueSlot, value); err != nil {
-		return 0, err
+	if _, err4 := tx.AddRelationship(valueSlot, value); err4 != nil {
+		return 0, err4
 	}
 
 	nextSlot, err := newPointerTx(tx, allNextSlot)
@@ -3174,23 +3174,23 @@ func (l *ListRegistry) appendTx(tx txOps, list, value NodeID) (NodeID, error) {
 		return 0, err
 	}
 
-	if _, err := tx.AddRelationship(list, capsule); err != nil {
-		return 0, err
+	if _, err2 := tx.AddRelationship(list, capsule); err2 != nil {
+		return 0, err2
 	}
 
 	if hasTail {
-		if err := l.capsules.setPrevTx(tx, capsule, oldTail); err != nil {
-			return 0, err
+		if err3 := l.capsules.setPrevTx(tx, capsule, oldTail); err3 != nil {
+			return 0, err3
 		}
-		if err := l.capsules.setNextTx(tx, oldTail, capsule); err != nil {
-			return 0, err
+		if err4 := l.capsules.setNextTx(tx, oldTail, capsule); err4 != nil {
+			return 0, err4
 		}
-		if _, err := tx.RemoveRelationship(l.allTails, oldTail); err != nil {
-			return 0, err
+		if _, err5 := tx.RemoveRelationship(l.allTails, oldTail); err5 != nil {
+			return 0, err5
 		}
 	} else {
-		if _, err := tx.AddRelationship(l.allHeads, capsule); err != nil {
-			return 0, err
+		if _, err6 := tx.AddRelationship(l.allHeads, capsule); err6 != nil {
+			return 0, err6
 		}
 	}
 
@@ -3230,23 +3230,23 @@ func (l *ListRegistry) Prepend(list, value NodeID) (NodeID, error) {
 			return err
 		}
 
-		if _, err := tx.AddRelationship(list, capsule); err != nil {
-			return err
+		if _, err2 := tx.AddRelationship(list, capsule); err2 != nil {
+			return err2
 		}
 
 		if hasHead {
-			if err := l.capsules.setNextTx(tx, capsule, oldHead); err != nil {
-				return err
+			if err3 := l.capsules.setNextTx(tx, capsule, oldHead); err3 != nil {
+				return err3
 			}
-			if err := l.capsules.setPrevTx(tx, oldHead, capsule); err != nil {
-				return err
+			if err4 := l.capsules.setPrevTx(tx, oldHead, capsule); err4 != nil {
+				return err4
 			}
-			if _, err := tx.RemoveRelationship(l.allHeads, oldHead); err != nil {
-				return err
+			if _, err5 := tx.RemoveRelationship(l.allHeads, oldHead); err5 != nil {
+				return err5
 			}
 		} else {
-			if _, err := tx.AddRelationship(l.allTails, capsule); err != nil {
-				return err
+			if _, err6 := tx.AddRelationship(l.allTails, capsule); err6 != nil {
+				return err6
 			}
 		}
 
@@ -3302,29 +3302,29 @@ func (l *ListRegistry) InsertAfter(list, afterCapsule, value NodeID) (NodeID, er
 			return err
 		}
 
-		if _, err := tx.AddRelationship(list, capsule); err != nil {
-			return err
+		if _, err2 := tx.AddRelationship(list, capsule); err2 != nil {
+			return err2
 		}
 
-		if err := l.capsules.setPrevTx(tx, capsule, afterCapsule); err != nil {
-			return err
+		if err3 := l.capsules.setPrevTx(tx, capsule, afterCapsule); err3 != nil {
+			return err3
 		}
-		if err := l.capsules.setNextTx(tx, afterCapsule, capsule); err != nil {
-			return err
+		if err4 := l.capsules.setNextTx(tx, afterCapsule, capsule); err4 != nil {
+			return err4
 		}
 
 		if hasNext {
-			if err := l.capsules.setNextTx(tx, capsule, oldNext); err != nil {
-				return err
+			if err5 := l.capsules.setNextTx(tx, capsule, oldNext); err5 != nil {
+				return err5
 			}
-			if err := l.capsules.setPrevTx(tx, oldNext, capsule); err != nil {
-				return err
+			if err6 := l.capsules.setPrevTx(tx, oldNext, capsule); err6 != nil {
+				return err6
 			}
 			return nil
 		}
 
-		if _, err := tx.RemoveRelationship(l.allTails, afterCapsule); err != nil {
-			return err
+		if _, err7 := tx.RemoveRelationship(l.allTails, afterCapsule); err7 != nil {
+			return err7
 		}
 		_, err = tx.AddRelationship(l.allTails, capsule)
 		return err
@@ -3621,52 +3621,52 @@ func (l *ListRegistry) RemoveWithoutDeletingCapsule(list, capsule NodeID) error 
 		case hasPrev && hasNext:
 			// Removing a middle element: splice prev and next together
 			// directly. Head/tail are unaffected.
-			if err := l.capsules.setNextTx(tx, prev, next); err != nil {
-				return err
+			if err2 := l.capsules.setNextTx(tx, prev, next); err2 != nil {
+				return err2
 			}
-			if err := l.capsules.setPrevTx(tx, next, prev); err != nil {
-				return err
+			if err3 := l.capsules.setPrevTx(tx, next, prev); err3 != nil {
+				return err3
 			}
 
 		case hasPrev:
 			// capsule was the tail: prev becomes the new tail.
-			if _, err := l.capsules.removeNextTx(tx, prev); err != nil {
-				return err
+			if _, err4 := l.capsules.removeNextTx(tx, prev); err4 != nil {
+				return err4
 			}
-			if _, err := tx.RemoveRelationship(l.allTails, capsule); err != nil {
-				return err
+			if _, err5 := tx.RemoveRelationship(l.allTails, capsule); err5 != nil {
+				return err5
 			}
-			if _, err := tx.AddRelationship(l.allTails, prev); err != nil {
-				return err
+			if _, err6 := tx.AddRelationship(l.allTails, prev); err6 != nil {
+				return err6
 			}
 
 		case hasNext:
 			// capsule was the head: next becomes the new head.
-			if _, err := l.capsules.removePrevTx(tx, next); err != nil {
-				return err
+			if _, err7 := l.capsules.removePrevTx(tx, next); err7 != nil {
+				return err7
 			}
-			if _, err := tx.RemoveRelationship(l.allHeads, capsule); err != nil {
-				return err
+			if _, err8 := tx.RemoveRelationship(l.allHeads, capsule); err8 != nil {
+				return err8
 			}
-			if _, err := tx.AddRelationship(l.allHeads, next); err != nil {
-				return err
+			if _, err9 := tx.AddRelationship(l.allHeads, next); err9 != nil {
+				return err9
 			}
 
 		default:
 			// capsule was the sole element: the list becomes empty.
-			if _, err := tx.RemoveRelationship(l.allHeads, capsule); err != nil {
-				return err
+			if _, err10 := tx.RemoveRelationship(l.allHeads, capsule); err10 != nil {
+				return err10
 			}
-			if _, err := tx.RemoveRelationship(l.allTails, capsule); err != nil {
-				return err
+			if _, err11 := tx.RemoveRelationship(l.allTails, capsule); err11 != nil {
+				return err11
 			}
 		}
 
-		if _, err := l.capsules.removePrevTx(tx, capsule); err != nil {
-			return err
+		if _, err12 := l.capsules.removePrevTx(tx, capsule); err12 != nil {
+			return err12
 		}
-		if _, err := l.capsules.removeNextTx(tx, capsule); err != nil {
-			return err
+		if _, err13 := l.capsules.removeNextTx(tx, capsule); err13 != nil {
+			return err13
 		}
 
 		_, err = tx.RemoveRelationship(list, capsule)
@@ -4116,11 +4116,11 @@ func buildOperandDescriptorTx(tx txOps, additiveTag, subtractiveTag, scalarTag, 
 	if err != nil {
 		return 0, err
 	}
-	if err := tagNodeTx(tx, operationTag, u); err != nil {
-		return 0, err
+	if err2 := tagNodeTx(tx, operationTag, u); err2 != nil {
+		return 0, err2
 	}
-	if err := tagNodeTx(tx, operandTag, u); err != nil {
-		return 0, err
+	if err3 := tagNodeTx(tx, operandTag, u); err3 != nil {
+		return 0, err3
 	}
 
 	_, err = tx.AddRelationship(u, operand)
@@ -4470,14 +4470,14 @@ func (c *CompositeSetRegistry) AddOperand(set, operand NodeID, additive, expand 
 	}
 
 	err = c.graph.Transact(func(tx *Txn) error {
-		var err error
-		u, err = buildOperandDescriptorTx(tx, c.allAdditiveOp, c.allSubtractiveOp, c.allScalarOperand, c.allSetOperand, operand, additive, expand)
-		if err != nil {
-			return err
+		var err2 error
+		u, err2 = buildOperandDescriptorTx(tx, c.allAdditiveOp, c.allSubtractiveOp, c.allScalarOperand, c.allSetOperand, operand, additive, expand)
+		if err2 != nil {
+			return err2
 		}
 
-		_, err = tx.AddRelationship(set, u)
-		return err
+		_, err2 = tx.AddRelationship(set, u)
+		return err2
 	})
 	if err != nil {
 		return 0, err
@@ -4906,14 +4906,14 @@ func (c *CompositeSetLogRegistry) AppendOperation(log, operand NodeID, additive,
 	}
 
 	err = c.graph.Transact(func(tx *Txn) error {
-		var err error
-		u, err = buildOperandDescriptorTx(tx, c.allAdditiveOp, c.allSubtractiveOp, c.allScalarOperand, c.allSetOperand, operand, additive, expand)
-		if err != nil {
-			return err
+		var err2 error
+		u, err2 = buildOperandDescriptorTx(tx, c.allAdditiveOp, c.allSubtractiveOp, c.allScalarOperand, c.allSetOperand, operand, additive, expand)
+		if err2 != nil {
+			return err2
 		}
 
-		capsule, err = c.lists.appendTx(tx, log, u)
-		return err
+		capsule, err2 = c.lists.appendTx(tx, log, u)
+		return err2
 	})
 	if err != nil {
 		return 0, 0, err
@@ -4970,12 +4970,12 @@ func (c *CompositeSetLogRegistry) RemoveOperation(log, capsule NodeID) error {
 		return err
 	}
 
-	if err := c.lists.RemoveWithoutDeletingCapsule(log, capsule); err != nil {
-		return err
+	if err2 := c.lists.RemoveWithoutDeletingCapsule(log, capsule); err2 != nil {
+		return err2
 	}
 
-	if err := c.lists.capsules.DeleteCapsule(capsule); err != nil {
-		return err
+	if err3 := c.lists.capsules.DeleteCapsule(capsule); err3 != nil {
+		return err3
 	}
 
 	err = c.graph.Transact(func(tx *Txn) error {
