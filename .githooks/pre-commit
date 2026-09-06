@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Enforce strict error handling in the shell execution path
+set -euo pipefail
+
+# Extract staged files, suppressing non-zero exit codes if grep finds nothing
+STAGED_FILES=$(git diff --cached --name-only --diff-filter=ACM | grep -E '\.(go|md)$' || true)
+
+# Short-circuit if no relevant files are staged
+if [ -z "$STAGED_FILES" ]; then
+    exit 0
+fi
+
+# Execute the Go validator. 
+echo "PWD is $PWD or `pwd`"
+
+# Ensure the local binary directory exists
+mkdir -p bin
+
+BINARY="bin/licensecheck.exe"
+
+# Automatically compile the checker if it does not yet exist
+if [ ! -f "$BINARY" ]; then
+    go build -o "$BINARY" cmd/licensecheck/main.go
+fi
+
+# Execute the compiled binary against the staged files
+./"$BINARY" $STAGED_FILES
