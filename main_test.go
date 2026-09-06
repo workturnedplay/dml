@@ -2355,7 +2355,7 @@ func TestTransactRollsBackOnPanic(t *testing.T) {
 			}
 		}()
 
-		_ = g.Transact(func(tx *Txn) error {
+		if err := g.Transact(func(tx *Txn) error {
 			var err error
 			id, err = tx.CreateNode()
 			if err != nil {
@@ -2363,7 +2363,9 @@ func TestTransactRollsBackOnPanic(t *testing.T) {
 			}
 
 			panic("boom")
-		})
+		}); err != nil {
+			t.Fatalf("Transact() returned error: %v", err)
+		}
 	}()
 
 	if g.NodeExists(id) {
@@ -3884,7 +3886,10 @@ func TestListPrependAddsAtFront(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Head(%d): %v", list, err)
 	}
-	headValue, _, _ := lists.capsules.Value(head)
+	headValue, _, err := lists.capsules.Value(head)
+	if err != nil {
+		t.Fatalf("Value(head): %v", err)
+	}
 	if !hasHead || headValue != b {
 		t.Fatalf("head value = %d, want %d", headValue, b)
 	}
@@ -3937,7 +3942,10 @@ func TestListInsertAfterMiddle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Tail(%d): %v", list, err)
 	}
-	tailValue, _, _ := lists.capsules.Value(tail)
+	tailValue, _, err := lists.capsules.Value(tail)
+	if err != nil {
+		t.Fatalf("Value(tail): %v", err)
+	}
 	if !hasTail || tailValue != c {
 		t.Fatalf("tail value = %d, want %d (tail should be unaffected by a middle insert)", tailValue, c)
 	}
@@ -4296,7 +4304,10 @@ func TestListRemoveWithoutDeletingCapsuleMiddleElement(t *testing.T) {
 	if !hasNext {
 		t.Fatal("capsuleA lost its next link after an unrelated middle removal")
 	}
-	nextValue, _, _ := lists.capsules.Value(next)
+	nextValue, _, err := lists.capsules.Value(next)
+	if err != nil {
+		t.Fatalf("Value(next): %v", err)
+	}
 	if nextValue != c {
 		t.Fatalf("capsuleA's next value = %d, want %d", nextValue, c)
 	}

@@ -435,7 +435,9 @@ func (tx *Txn) CreateNode() (NodeID, error) {
 		// has no error return of its own to report it through, and a
 		// caller misusing Txn this way is a bug in the caller, not
 		// something Txn can prevent by construction.
-		_ = tx.graph.DeleteNode(id)
+		if err := tx.graph.DeleteNode(id); err != nil {
+			_ = err
+		}
 	})
 
 	return id, nil
@@ -455,7 +457,11 @@ func (tx *Txn) AddRelationship(a, b NodeID) (created bool, err error) {
 
 	if created {
 		tx.undo = append(tx.undo, func() {
-			_, _ = tx.graph.RemoveRelationship(a, b)
+			// Best-effort: deliberately swallowed, mirroring
+			// Txn.CreateNode's undo closure above.
+			if _, err := tx.graph.RemoveRelationship(a, b); err != nil {
+				_ = err
+			}
 		})
 	}
 
@@ -474,7 +480,11 @@ func (tx *Txn) RemoveRelationship(a, b NodeID) (removed bool, err error) {
 
 	if removed {
 		tx.undo = append(tx.undo, func() {
-			_, _ = tx.graph.AddRelationship(a, b)
+			// Best-effort: deliberately swallowed, mirroring
+			// Txn.CreateNode's undo closure above.
+			if _, err := tx.graph.AddRelationship(a, b); err != nil {
+				_ = err
+			}
 		})
 	}
 
@@ -2276,16 +2286,16 @@ func (m *PointerMetadataRegistryD) SetTarget(subject, target NodeID) error {
 
 	if !found {
 		return m.graph.Transact(func(tx *Txn) error {
-			var err error
-			slot, err = createTaggedNodeTx(tx, m.allTargetSlots)
-			if err != nil {
-				return err
+			var txErr error
+			slot, txErr = createTaggedNodeTx(tx, m.allTargetSlots)
+			if txErr != nil {
+				return txErr
 			}
-			if _, err := tx.AddRelationship(metadata, slot); err != nil {
-				return err
+			if _, txErr = tx.AddRelationship(metadata, slot); txErr != nil {
+				return txErr
 			}
-			_, err = tx.AddRelationship(slot, target)
-			return err
+			_, txErr = tx.AddRelationship(slot, target)
+			return txErr
 		})
 	}
 

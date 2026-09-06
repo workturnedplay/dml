@@ -18,9 +18,11 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 )
 
 func main() {
@@ -28,8 +30,8 @@ func main() {
 		return // No files passed
 	}
 
-	target := []byte("SPDX-License-Identifier:"+" "+ "Apache-2.0") // so it doesn't match this in this file!
-	
+	target := []byte("SPDX-License-Identifier:" + " " + "Apache-2.0") // so it doesn't match this in this file!
+
 	// Pre-allocate a single buffer for all reads to eliminate loop heap allocations.
 	// 1024 bytes safely covers maximum expected copyright header lengths.
 	buf := make([]byte, 1024)
@@ -49,22 +51,23 @@ func main() {
 }
 
 func checkFile(path string, target, buf []byte) bool {
-	f, err := os.Open(path)
+	cleanPath := filepath.Clean(path)
+	f, err := os.Open(cleanPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR: Syscall failed to open %s: %v\n", path, err)
 		return false
 	}
 	// Explicit cleanup via defer guarantees fd release regardless of read success
-	defer f.Close() 
+	defer f.Close()
 
 	n, err := io.ReadFull(f, buf)
 	// io.ErrUnexpectedEOF and io.EOF are acceptable here if the file size < 1024 bytes.
-	if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
+	if err != nil && !errors.Is(err, io.ErrUnexpectedEOF) && !errors.Is(err, io.EOF) {
 		fmt.Fprintf(os.Stderr, "ERROR: I/O read failure on %s: %v\n", path, err)
 		return false
 	}
 
-	// Slice the buffer strictly to bytes read to avoid bounds panic or false 
+	// Slice the buffer strictly to bytes read to avoid bounds panic or false
 	// positives from residual data in the reused buffer.
 	return bytes.Contains(buf[:n], target)
 }

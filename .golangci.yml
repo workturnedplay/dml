@@ -1,0 +1,140 @@
+version: "2"
+
+run:
+  timeout: 5m
+  tests: true
+  # 'skip-dirs-use-default' was removed here. Default excludes are now handled automatically.
+
+# In v2, custom severity rules belong in this top-level block
+severity:
+  default: warning
+  rules:
+    - linters:
+        - govet
+      text: "shadows declaration"
+      severity: error
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+  new: false
+
+linters:
+  enable:
+    # --- correctness & bugs ---
+    - govet
+    - staticcheck
+    - errcheck
+    - ineffassign
+    - nilerr
+    - nilnil
+    - bodyclose
+    - rowserrcheck
+
+    # --- security / footguns ---
+    - gosec
+    - sqlclosecheck
+
+    # --- error handling & logic ---
+    - errorlint
+    - wrapcheck
+    - exhaustive
+    - copyloopvar
+
+    # --- concurrency ---
+    - gocritic
+    - prealloc
+
+    # --- style (light, not pedantic) ---
+    - revive
+    - misspell
+    - unconvert
+    # - whitespace #no more: unnecessary trailing newline (whitespace)
+
+    # --- unused / dead code ---
+    - unused
+  # This replaces the old "exclude-use-default: true" behavior:
+  exclusions:
+    presets:
+      - comments                # Excludes missing comment warnings for exported fields/types
+      - std-error-handling      # Excludes unhandled errors on common functions like fmt.Println or os.Close
+      - common-false-positives  # Excludes noisy gosec rules on variables/subprocesses
+      - legacy                  # Excludes other v1-specific default exclusion rules
+      
+  settings:
+    
+    errorlint:
+      asserts: true
+      comparison: true
+      
+    govet:
+      enable:
+        - shadow # Explicitly enable the shadowing check
+        - copylocks # if you use atomic var without .Load() in a printf, it should be an err not warn
+      settings:
+        shadow:
+          strict: false # This makes it even more aggressive, if 'true'
+      enable-all: true
+      disable:
+        - fieldalignment  # good to know, rarely worth the churn
+
+    staticcheck:
+      checks:
+        - "all"
+        - "-ST1003" #ST1003: should not use ALL_CAPS in Go names; use CamelCase instead (staticcheck)go-golangci-lint-v2
+        - "-QF1011" #QF1011: could omit type bool from declaration; it will be inferred from the right-hand side (staticcheck)go-golangci-lint-v2
+
+    errcheck:
+      check-type-assertions: true
+      check-blank: true
+
+    wrapcheck:
+      ignore-sigs: # Fixed from ignoreSigs
+        - .Errorf(
+        - errors.New(
+        - fmt.Errorf(
+      ignore-package-globs: # Fixed from ignorePackageGlobs
+        - net/http
+        - database/sql
+
+    revive:
+      #enable-all-rules: false
+      severity: warning
+      rules:
+        - name: var-naming
+          disabled: true
+        - name: early-return
+          disabled: true
+        - name: error-strings
+        - name: error-naming
+        - name: exported
+          disabled: true #no more  exported: exported type FailoverSelector should have comment or be unexported (revive)
+        - name: unexported-return
+        - name: unused-parameter
+        - name: empty-lines
+        - name: var-declaration
+          disabled: true
+
+    gocritic:
+      enabled-tags:
+        - diagnostic
+        - style
+        - performance
+        - opinionated
+      disabled-checks:
+        - emptyStringTest
+        - unnamedResult       # you *intentionally* use named returns
+        - ifElseChain
+        - octalLiteral
+        - hugeParam
+        - commentFormatting #commentFormatting: put a space between `//` and comment text (gocritic)go-golangci-lint-v2
+        - commentedOutCode #no more  commentedOutCode: may want to remove commented-out code (gocritic) 
+
+    gosec:
+      severity: medium
+      confidence: medium
+      excludes:
+        - G104  # ignoring errors from deferred Close is often fine
+
+   
+
