@@ -3815,14 +3815,14 @@ func TestListAppendMultipleMaintainsOrder(t *testing.T) {
 
 	var values []NodeID
 	for i := 0; i < 3; i++ {
-		v, err := g.CreateNode()
-		if err != nil {
-			t.Fatalf("CreateNode() for value %d: %v", i, err)
+		v, err2 := g.CreateNode()
+		if err2 != nil {
+			t.Fatalf("CreateNode() for value %d: %v", i, err2)
 		}
 		values = append(values, v)
 
-		if _, err := lists.Append(list, v); err != nil {
-			t.Fatalf("Append(%d): %v", v, err)
+		if _, err3 := lists.Append(list, v); err3 != nil {
+			t.Fatalf("Append(%d): %v", v, err3)
 		}
 	}
 
@@ -3865,11 +3865,11 @@ func TestListPrependAddsAtFront(t *testing.T) {
 		t.Fatalf("CreateNode() for b: %v", err)
 	}
 
-	if _, err := lists.Append(list, a); err != nil {
-		t.Fatalf("Append(a): %v", err)
+	if _, err2 := lists.Append(list, a); err2 != nil {
+		t.Fatalf("Append(a): %v", err2)
 	}
-	if _, err := lists.Prepend(list, b); err != nil {
-		t.Fatalf("Prepend(b): %v", err)
+	if _, err3 := lists.Prepend(list, b); err3 != nil {
+		t.Fatalf("Prepend(b): %v", err3)
 	}
 
 	got, err := lists.Elements(list)
@@ -3920,12 +3920,12 @@ func TestListInsertAfterMiddle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Append(a): %v", err)
 	}
-	if _, err := lists.Append(list, c); err != nil {
-		t.Fatalf("Append(c): %v", err)
+	if _, err2 := lists.Append(list, c); err2 != nil {
+		t.Fatalf("Append(c): %v", err2)
 	}
 
-	if _, err := lists.InsertAfter(list, capsuleA, b); err != nil {
-		t.Fatalf("InsertAfter(capsuleA, b): %v", err)
+	if _, err3 := lists.InsertAfter(list, capsuleA, b); err3 != nil {
+		t.Fatalf("InsertAfter(capsuleA, b): %v", err3)
 	}
 
 	got, err := lists.Elements(list)
@@ -4079,15 +4079,15 @@ func TestListContainsFindsValue(t *testing.T) {
 		t.Fatalf("CreateNode() for c: %v", err)
 	}
 
-	if _, err := lists.Append(list, a); err != nil {
-		t.Fatalf("Append(a): %v", err)
+	if _, err2 := lists.Append(list, a); err2 != nil {
+		t.Fatalf("Append(a): %v", err2)
 	}
 	capsuleB, err := lists.Append(list, b)
 	if err != nil {
 		t.Fatalf("Append(b): %v", err)
 	}
-	if _, err := lists.Append(list, c); err != nil {
-		t.Fatalf("Append(c): %v", err)
+	if _, err3 := lists.Append(list, c); err3 != nil {
+		t.Fatalf("Append(c): %v", err3)
 	}
 
 	got, found, err := lists.Contains(list, b)
@@ -4117,8 +4117,8 @@ func TestListContainsFalseForAbsentValue(t *testing.T) {
 		t.Fatalf("CreateNode() for absent: %v", err)
 	}
 
-	if _, err := lists.Append(list, a); err != nil {
-		t.Fatalf("Append(a): %v", err)
+	if _, err2 := lists.Append(list, a); err2 != nil {
+		t.Fatalf("Append(a): %v", err2)
 	}
 
 	_, found, err := lists.Contains(list, absent)
@@ -4148,8 +4148,8 @@ func TestListContainsScopedToOwningList(t *testing.T) {
 		t.Fatalf("CreateNode() for value: %v", err)
 	}
 
-	if _, err := lists.Append(listB, value); err != nil {
-		t.Fatalf("Append(listB, value): %v", err)
+	if _, err2 := lists.Append(listB, value); err2 != nil {
+		t.Fatalf("Append(listB, value): %v", err2)
 	}
 
 	_, found, err := lists.Contains(listA, value)
@@ -4279,12 +4279,12 @@ func TestListRemoveWithoutDeletingCapsuleMiddleElement(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Append(b): %v", err)
 	}
-	if _, err := lists.Append(list, c); err != nil {
-		t.Fatalf("Append(c): %v", err)
+	if _, err2 := lists.Append(list, c); err2 != nil {
+		t.Fatalf("Append(c): %v", err2)
 	}
 
-	if err := lists.RemoveWithoutDeletingCapsule(list, capsuleB); err != nil {
-		t.Fatalf("RemoveWithoutDeletingCapsule(capsuleB): %v", err)
+	if err2 := lists.RemoveWithoutDeletingCapsule(list, capsuleB); err2 != nil {
+		t.Fatalf("RemoveWithoutDeletingCapsule(capsuleB): %v", err2)
 	}
 
 	got, err := lists.Elements(list)
@@ -4339,8 +4339,8 @@ func TestListRemoveWithoutDeletingCapsuleHeadUpdatesHead(t *testing.T) {
 		t.Fatalf("Append(b): %v", err)
 	}
 
-	if err := lists.RemoveWithoutDeletingCapsule(list, capsuleA); err != nil {
-		t.Fatalf("RemoveWithoutDeletingCapsule(capsuleA): %v", err)
+	if err2 := lists.RemoveWithoutDeletingCapsule(list, capsuleA); err2 != nil {
+		t.Fatalf("RemoveWithoutDeletingCapsule(capsuleA): %v", err2)
 	}
 
 	head, hasHead, err := lists.Head(list)
@@ -4384,8 +4384,8 @@ func TestListRemoveWithoutDeletingCapsuleTailUpdatesTail(t *testing.T) {
 		t.Fatalf("Append(b): %v", err)
 	}
 
-	if err := lists.RemoveWithoutDeletingCapsule(list, capsuleB); err != nil {
-		t.Fatalf("RemoveWithoutDeletingCapsule(capsuleB): %v", err)
+	if err2 := lists.RemoveWithoutDeletingCapsule(list, capsuleB); err2 != nil {
+		t.Fatalf("RemoveWithoutDeletingCapsule(capsuleB): %v", err2)
 	}
 
 	tail, hasTail, err := lists.Tail(list)
@@ -4421,18 +4421,18 @@ func TestListRemoveWithoutDeletingCapsuleSoleElementEmptiesList(t *testing.T) {
 		t.Fatalf("Append(a): %v", err)
 	}
 
-	if err := lists.RemoveWithoutDeletingCapsule(list, capsuleA); err != nil {
-		t.Fatalf("RemoveWithoutDeletingCapsule(capsuleA): %v", err)
+	if err2 := lists.RemoveWithoutDeletingCapsule(list, capsuleA); err2 != nil {
+		t.Fatalf("RemoveWithoutDeletingCapsule(capsuleA): %v", err2)
 	}
 
-	if _, hasHead, err := lists.Head(list); err != nil {
-		t.Fatalf("Head(%d): %v", list, err)
+	if _, hasHead, err2 := lists.Head(list); err2 != nil {
+		t.Fatalf("Head(%d): %v", list, err2)
 	} else if hasHead {
 		t.Fatal("list unexpectedly still has a head after removing its sole element")
 	}
 
-	if _, hasTail, err := lists.Tail(list); err != nil {
-		t.Fatalf("Tail(%d): %v", list, err)
+	if _, hasTail, err3 := lists.Tail(list); err3 != nil {
+		t.Fatalf("Tail(%d): %v", list, err3)
 	} else if hasTail {
 		t.Fatal("list unexpectedly still has a tail after removing its sole element")
 	}
@@ -4467,29 +4467,29 @@ func TestListRemoveWithoutDeletingCapsuleClearsCapsuleOwnLinks(t *testing.T) {
 		t.Fatalf("CreateNode() for c: %v", err)
 	}
 
-	if _, err := lists.Append(list, a); err != nil {
-		t.Fatalf("Append(a): %v", err)
+	if _, err2 := lists.Append(list, a); err2 != nil {
+		t.Fatalf("Append(a): %v", err2)
 	}
 	capsuleB, err := lists.Append(list, b)
 	if err != nil {
 		t.Fatalf("Append(b): %v", err)
 	}
-	if _, err := lists.Append(list, c); err != nil {
-		t.Fatalf("Append(c): %v", err)
+	if _, err3 := lists.Append(list, c); err3 != nil {
+		t.Fatalf("Append(c): %v", err3)
 	}
 
-	if err := lists.RemoveWithoutDeletingCapsule(list, capsuleB); err != nil {
-		t.Fatalf("RemoveWithoutDeletingCapsule(capsuleB): %v", err)
+	if err4 := lists.RemoveWithoutDeletingCapsule(list, capsuleB); err4 != nil {
+		t.Fatalf("RemoveWithoutDeletingCapsule(capsuleB): %v", err4)
 	}
 
-	if _, hasPrev, err := lists.capsules.Prev(capsuleB); err != nil {
-		t.Fatalf("Prev(capsuleB): %v", err)
+	if _, hasPrev, err5 := lists.capsules.Prev(capsuleB); err5 != nil {
+		t.Fatalf("Prev(capsuleB): %v", err5)
 	} else if hasPrev {
 		t.Fatal("removed capsuleB still has a prev link into its old list")
 	}
 
-	if _, hasNext, err := lists.capsules.Next(capsuleB); err != nil {
-		t.Fatalf("Next(capsuleB): %v", err)
+	if _, hasNext, err6 := lists.capsules.Next(capsuleB); err6 != nil {
+		t.Fatalf("Next(capsuleB): %v", err6)
 	} else if hasNext {
 		t.Fatal("removed capsuleB still has a next link into its old list")
 	}
@@ -4585,8 +4585,8 @@ func TestListDeleteListFailsIfNotEmpty(t *testing.T) {
 		t.Fatalf("CreateNode() for value: %v", err)
 	}
 
-	if _, err := lists.Append(list, value); err != nil {
-		t.Fatalf("Append(): %v", err)
+	if _, err2 := lists.Append(list, value); err2 != nil {
+		t.Fatalf("Append(): %v", err2)
 	}
 
 	err = lists.DeleteList(list)
@@ -4725,8 +4725,8 @@ func TestListRemoveKeepsCapsuleIfStillReferencedElsewhere(t *testing.T) {
 	// Something unrelated referencing one of the capsule's slots -- this
 	// alone must be enough to make deletion unsafe, even though Remove
 	// itself does not care about it.
-	if _, err := g.AddRelationship(metadata, valueSlot); err != nil {
-		t.Fatalf("AddRelationship(metadata, valueSlot): %v", err)
+	if _, err2 := g.AddRelationship(metadata, valueSlot); err2 != nil {
+		t.Fatalf("AddRelationship(metadata, valueSlot): %v", err2)
 	}
 
 	deleted, err := lists.Remove(list, capsule)
@@ -4824,19 +4824,19 @@ func TestAdversarialListIgnoresUnrelatedListChild(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateNode(b): %v", err)
 	}
-	if _, err := lists.Append(list, a); err != nil {
-		t.Fatalf("Append(a): %v", err)
+	if _, err2 := lists.Append(list, a); err2 != nil {
+		t.Fatalf("Append(a): %v", err2)
 	}
-	if _, err := lists.Append(list, b); err != nil {
-		t.Fatalf("Append(b): %v", err)
+	if _, err3 := lists.Append(list, b); err3 != nil {
+		t.Fatalf("Append(b): %v", err3)
 	}
 
 	unrelated, err := g.CreateNode()
 	if err != nil {
 		t.Fatalf("CreateNode(unrelated): %v", err)
 	}
-	if _, err := g.AddRelationship(list, unrelated); err != nil {
-		t.Fatalf("AddRelationship(list, unrelated): %v", err)
+	if _, err4 := g.AddRelationship(list, unrelated); err4 != nil {
+		t.Fatalf("AddRelationship(list, unrelated): %v", err4)
 	}
 
 	got, err := lists.Elements(list)
@@ -4846,11 +4846,11 @@ func TestAdversarialListIgnoresUnrelatedListChild(t *testing.T) {
 	if want := []NodeID{a, b}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("Elements() = %v, want %v", got, want)
 	}
-	if _, _, err := lists.Head(list); err != nil {
-		t.Fatalf("Head(): %v", err)
+	if _, _, err5 := lists.Head(list); err5 != nil {
+		t.Fatalf("Head(): %v", err5)
 	}
-	if _, _, err := lists.Tail(list); err != nil {
-		t.Fatalf("Tail(): %v", err)
+	if _, _, err6 := lists.Tail(list); err6 != nil {
+		t.Fatalf("Tail(): %v", err6)
 	}
 }
 
@@ -4869,8 +4869,8 @@ func TestAdversarialCapsuleIgnoresUnrelatedChild(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateNode(unrelated): %v", err)
 	}
-	if _, err := g.AddRelationship(capsule, unrelated); err != nil {
-		t.Fatalf("AddRelationship(capsule, unrelated): %v", err)
+	if _, err2 := g.AddRelationship(capsule, unrelated); err2 != nil {
+		t.Fatalf("AddRelationship(capsule, unrelated): %v", err2)
 	}
 
 	got, hasValue, err := capsules.Value(capsule)
@@ -4993,11 +4993,11 @@ func TestAdversarialListHeadAmbiguityFailsLoudly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateNode(c2): %v", err)
 	}
-	if _, err := g.AddRelationship(lists.allHeads, c2); err != nil {
-		t.Fatalf("AddRelationship(AllHeads,c2): %v", err)
+	if _, err2 := g.AddRelationship(lists.allHeads, c2); err2 != nil {
+		t.Fatalf("AddRelationship(AllHeads,c2): %v", err2)
 	}
-	if _, err := g.AddRelationship(list, c2); err != nil {
-		t.Fatalf("AddRelationship(list,c2): %v", err)
+	if _, err3 := g.AddRelationship(list, c2); err3 != nil {
+		t.Fatalf("AddRelationship(list,c2): %v", err3)
 	}
 	_ = c1
 
@@ -5021,8 +5021,8 @@ func TestAdversarialCapsuleValueMissingIsDetected(t *testing.T) {
 	if err != nil || !found {
 		t.Fatalf("slotFor(value): found=%v err=%v", found, err)
 	}
-	if _, err := g.RemoveRelationship(slot, value); err != nil {
-		t.Fatalf("RemoveRelationship(slot,value): %v", err)
+	if _, err2 := g.RemoveRelationship(slot, value); err2 != nil {
+		t.Fatalf("RemoveRelationship(slot,value): %v", err2)
 	}
 
 	_, hasValue, err := capsules.Value(capsule)
@@ -5064,15 +5064,15 @@ func TestAdversarialListNextCycleIsDetectedWithoutTimeout(t *testing.T) {
 	if err != nil || !found {
 		t.Fatalf("slotFor(c2,next): found=%v err=%v", found, err)
 	}
-	if _, err := g.AddRelationship(nextSlot2, c1); err != nil {
-		t.Fatal(err)
+	if _, err2 := g.AddRelationship(nextSlot2, c1); err2 != nil {
+		t.Fatal(err2)
 	}
 	prevSlot1, found, err := capsules.slotFor(c1, capsules.prevSlots.allPointers)
 	if err != nil || !found {
 		t.Fatalf("slotFor(c1,prev): found=%v err=%v", found, err)
 	}
-	if _, err := g.AddRelationship(prevSlot1, c2); err != nil {
-		t.Fatal(err)
+	if _, err3 := g.AddRelationship(prevSlot1, c2); err3 != nil {
+		t.Fatal(err3)
 	}
 
 	got, err := lists.Elements(list)
@@ -5111,8 +5111,8 @@ func TestAdversarialListPrevCycleIsDetectedViaNextChain(t *testing.T) {
 	if err != nil || !found {
 		t.Fatalf("slotFor(c1,prev): found=%v err=%v", found, err)
 	}
-	if _, err := g.AddRelationship(prevSlot1, c2); err != nil {
-		t.Fatal(err)
+	if _, err2 := g.AddRelationship(prevSlot1, c2); err2 != nil {
+		t.Fatal(err2)
 	}
 
 	got, err := lists.Elements(list)
@@ -5154,8 +5154,8 @@ func TestAdversarialListChainCanContainCapsuleFromAnotherList(t *testing.T) {
 	if err != nil || !found {
 		t.Fatalf("slotFor(c1,next): found=%v err=%v", found, err)
 	}
-	if _, err := g.AddRelationship(nextSlot1, c2); err != nil {
-		t.Fatal(err)
+	if _, err2 := g.AddRelationship(nextSlot1, c2); err2 != nil {
+		t.Fatal(err2)
 	}
 
 	got, err := lists.Elements(listA)
@@ -5186,8 +5186,8 @@ func TestAdversarialDisconnectedListMemberIsIgnoredByElements(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := g.AddRelationship(list, disconnected); err != nil {
-		t.Fatal(err)
+	if _, err2 := g.AddRelationship(list, disconnected); err2 != nil {
+		t.Fatal(err2)
 	}
 
 	got, err := lists.Elements(list)
