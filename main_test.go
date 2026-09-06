@@ -5638,7 +5638,7 @@ func newSetTestFixture(t *testing.T) (*Graph, *SetRegistry) {
 		t.Fatalf("BootstrapNames(): %v", err)
 	}
 
-	sets, err := NewSetRegistry(&g, ids[NameAllSets], ids[NameAllCompositeSets])
+	sets, err := NewSetRegistry(&g, ids[NameAllSets], ids[NameAllCompositeSets], ids[NameAllCompositeSetLogs])
 	if err != nil {
 		t.Fatalf("NewSetRegistry(): %v", err)
 	}
@@ -6337,7 +6337,7 @@ func newCompositeSetTestFixture(t *testing.T) (*Graph, *SetRegistry, *CompositeS
 		t.Fatalf("BootstrapNames(): %v", err)
 	}
 
-	sets, err := NewSetRegistry(&g, ids[NameAllSets], ids[NameAllCompositeSets])
+	sets, err := NewSetRegistry(&g, ids[NameAllSets], ids[NameAllCompositeSets], ids[NameAllCompositeSetLogs])
 	if err != nil {
 		t.Fatalf("NewSetRegistry(): %v", err)
 	}
@@ -6853,5 +6853,855 @@ func TestCompositeSetEvaluateDetectsMalformedDescriptor(t *testing.T) {
 	_, err = composites.Evaluate(set)
 	if !errors.Is(err, ErrInvalidOperandDescriptor) {
 		t.Fatalf("Evaluate() error = %v, want %v", err, ErrInvalidOperandDescriptor)
+	}
+}
+
+// newCompositeSetLogTestFixture creates a fresh Graph plus every registry
+// needed to exercise CompositeSetLogRegistry, with full bidirectional
+// cross-representation dispatch already wired via
+// CompositeSetRegistry.SetLogs.
+func newCompositeSetLogTestFixture(t *testing.T) (*Graph, *SetRegistry, *CompositeSetRegistry, *CompositeSetLogRegistry) {
+	t.Helper()
+
+	var g Graph
+	names := NewNameRegistry(&g)
+
+	ids, err := names.BootstrapNames(FoundationalNames)
+	if err != nil {
+		t.Fatalf("BootstrapNames(): %v", err)
+	}
+
+	sets, err := NewSetRegistry(&g, ids[NameAllSets], ids[NameAllCompositeSets], ids[NameAllCompositeSetLogs])
+	if err != nil {
+		t.Fatalf("NewSetRegistry(): %v", err)
+	}
+
+	composites, err := NewCompositeSetRegistry(
+		&g,
+		sets,
+		ids[NameAllCompositeSets],
+		ids[NameAllAdditiveOp],
+		ids[NameAllSubtractiveOp],
+		ids[NameAllScalarOperand],
+		ids[NameAllSetOperand],
+	)
+	if err != nil {
+		t.Fatalf("NewCompositeSetRegistry(): %v", err)
+	}
+
+	capsules, err := NewCapsuleRegistry(
+		&g,
+		ids[NameAllElementCapsules],
+		ids[NameAllElementCapsulePrevSlot],
+		ids[NameAllElementCapsuleValueSlot],
+		ids[NameAllElementCapsuleNextSlot],
+	)
+	if err != nil {
+		t.Fatalf("NewCapsuleRegistry(): %v", err)
+	}
+
+	lists, err := NewListRegistry(&g, capsules, ids[NameAllLists], ids[NameAllHeads], ids[NameAllTails])
+	if err != nil {
+		t.Fatalf("NewListRegistry(): %v", err)
+	}
+
+	logs, err := NewCompositeSetLogRegistry(
+		&g,
+		lists,
+		composites,
+		ids[NameAllCompositeSetLogs],
+		ids[NameAllAdditiveOp],
+		ids[NameAllSubtractiveOp],
+		ids[NameAllScalarOperand],
+		ids[NameAllSetOperand],
+	)
+	if err != nil {
+		t.Fatalf("NewCompositeSetLogRegistry(): %v", err)
+	}
+
+	composites.SetLogs(logs)
+
+	return &g, sets, composites, logs
+}
+
+func TestFoundationalNamesIncludesAllCompositeSetLogs(t *testing.T) {
+	for _, name := range FoundationalNames {
+		if name == NameAllCompositeSetLogs {
+			return
+		}
+	}
+
+	t.Fatalf("FoundationalNames %v does not include %q", FoundationalNames, NameAllCompositeSetLogs)
+}
+
+func TestNewCompositeSetLogRegistryRequiresExistingTags(t *testing.T) {
+	var g Graph
+	names := NewNameRegistry(&g)
+
+	ids, err := names.BootstrapNames(FoundationalNames)
+	if err != nil {
+		t.Fatalf("BootstrapNames(): %v", err)
+	}
+
+	sets, err := NewSetRegistry(&g, ids[NameAllSets], ids[NameAllCompositeSets], ids[NameAllCompositeSetLogs])
+	if err != nil {
+		t.Fatalf("NewSetRegistry(): %v", err)
+	}
+
+	composites, err := NewCompositeSetRegistry(
+		&g,
+		sets,
+		ids[NameAllCompositeSets],
+		ids[NameAllAdditiveOp],
+		ids[NameAllSubtractiveOp],
+		ids[NameAllScalarOperand],
+		ids[NameAllSetOperand],
+	)
+	if err != nil {
+		t.Fatalf("NewCompositeSetRegistry(): %v", err)
+	}
+
+	capsules, err := NewCapsuleRegistry(
+		&g,
+		ids[NameAllElementCapsules],
+		ids[NameAllElementCapsulePrevSlot],
+		ids[NameAllElementCapsuleValueSlot],
+		ids[NameAllElementCapsuleNextSlot],
+	)
+	if err != nil {
+		t.Fatalf("NewCapsuleRegistry(): %v", err)
+	}
+
+	lists, err := NewListRegistry(&g, capsules, ids[NameAllLists], ids[NameAllHeads], ids[NameAllTails])
+	if err != nil {
+		t.Fatalf("NewListRegistry(): %v", err)
+	}
+
+	const nonexistent NodeID = 999999
+	existing := ids[NameAllCompositeSetLogs]
+
+	if _, err := NewCompositeSetLogRegistry(&g, lists, composites, nonexistent, existing, existing, existing, existing); !errors.Is(err, ErrNodeNotFound) {
+		t.Fatalf("NewCompositeSetLogRegistry() error = %v, want %v", err, ErrNodeNotFound)
+	}
+	if _, err := NewCompositeSetLogRegistry(&g, lists, composites, existing, nonexistent, existing, existing, existing); !errors.Is(err, ErrNodeNotFound) {
+		t.Fatalf("NewCompositeSetLogRegistry() error = %v, want %v", err, ErrNodeNotFound)
+	}
+	if _, err := NewCompositeSetLogRegistry(&g, lists, composites, existing, existing, nonexistent, existing, existing); !errors.Is(err, ErrNodeNotFound) {
+		t.Fatalf("NewCompositeSetLogRegistry() error = %v, want %v", err, ErrNodeNotFound)
+	}
+	if _, err := NewCompositeSetLogRegistry(&g, lists, composites, existing, existing, existing, nonexistent, existing); !errors.Is(err, ErrNodeNotFound) {
+		t.Fatalf("NewCompositeSetLogRegistry() error = %v, want %v", err, ErrNodeNotFound)
+	}
+	if _, err := NewCompositeSetLogRegistry(&g, lists, composites, existing, existing, existing, existing, nonexistent); !errors.Is(err, ErrNodeNotFound) {
+		t.Fatalf("NewCompositeSetLogRegistry() error = %v, want %v", err, ErrNodeNotFound)
+	}
+}
+
+func TestNewCompositeSetLogTagsBothAllListsAndAllCompositeSetLogs(t *testing.T) {
+	g, _, _, logs := newCompositeSetLogTestFixture(t)
+
+	log, err := logs.NewCompositeSetLog()
+	if err != nil {
+		t.Fatalf("NewCompositeSetLog(): %v", err)
+	}
+
+	if !g.NodeExists(log) {
+		t.Fatalf("NewCompositeSetLog() returned NodeID %d that does not exist", log)
+	}
+	if !logs.IsCompositeSetLog(log) {
+		t.Fatalf("NewCompositeSetLog() did not tag %d as a composite set log", log)
+	}
+	if !logs.lists.IsList(log) {
+		t.Fatalf("NewCompositeSetLog() did not also tag %d as a list", log)
+	}
+
+	ops, err := logs.Operations(log)
+	if err != nil {
+		t.Fatalf("Operations(): %v", err)
+	}
+	if len(ops) != 0 {
+		t.Fatalf("Operations() = %v, want empty", ops)
+	}
+
+	members, err := logs.Evaluate(log)
+	if err != nil {
+		t.Fatalf("Evaluate(): %v", err)
+	}
+	if len(members) != 0 {
+		t.Fatalf("Evaluate() = %v, want empty", members)
+	}
+}
+
+func TestCompositeSetLogAppendOperationScalarAdditive(t *testing.T) {
+	g, _, _, logs := newCompositeSetLogTestFixture(t)
+
+	log, err := logs.NewCompositeSetLog()
+	if err != nil {
+		t.Fatalf("NewCompositeSetLog(): %v", err)
+	}
+
+	x, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for x: %v", err)
+	}
+
+	u, capsule, err := logs.AppendOperation(log, x, true, false)
+	if err != nil {
+		t.Fatalf("AppendOperation(x, additive, scalar): %v", err)
+	}
+
+	if !g.HasRelationship(log, capsule) {
+		t.Fatalf("capsule %d is not linked into log", capsule)
+	}
+
+	target, err := logs.OperandTarget(u)
+	if err != nil {
+		t.Fatalf("OperandTarget(u): %v", err)
+	}
+	if target != x {
+		t.Fatalf("OperandTarget(u) = %d, want %d", target, x)
+	}
+
+	isAdditive, err := logs.OperandIsAdditive(u)
+	if err != nil {
+		t.Fatalf("OperandIsAdditive(u): %v", err)
+	}
+	if !isAdditive {
+		t.Fatal("OperandIsAdditive(u) = false, want true")
+	}
+
+	isSetOperand, err := logs.OperandIsSetOperand(u)
+	if err != nil {
+		t.Fatalf("OperandIsSetOperand(u): %v", err)
+	}
+	if isSetOperand {
+		t.Fatal("OperandIsSetOperand(u) = true, want false")
+	}
+
+	got, err := logs.Evaluate(log)
+	if err != nil {
+		t.Fatalf("Evaluate(): %v", err)
+	}
+	want := []NodeID{x}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("Evaluate() = %v, want %v", got, want)
+	}
+
+	ops, err := logs.Operations(log)
+	if err != nil {
+		t.Fatalf("Operations(): %v", err)
+	}
+	wantOps := []NodeID{u}
+	if !reflect.DeepEqual(ops, wantOps) {
+		t.Fatalf("Operations() = %v, want %v", ops, wantOps)
+	}
+}
+
+// TestCompositeSetLogEvaluateOrderSensitiveFold pins down theorystate.md
+// section 82's core distinguishing property from CompositeSetRegistry: a
+// later operation mentioning a given element supersedes an earlier one,
+// regardless of additive/subtractive grouping (unlike section 81's
+// order-insensitive union-then-difference).
+func TestCompositeSetLogEvaluateOrderSensitiveFold(t *testing.T) {
+	g, _, _, logs := newCompositeSetLogTestFixture(t)
+
+	log, err := logs.NewCompositeSetLog()
+	if err != nil {
+		t.Fatalf("NewCompositeSetLog(): %v", err)
+	}
+
+	x, err := g.CreateNode()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Append x, remove it, then re-add it. If evaluation were order-
+	// insensitive (union-then-difference, like CompositeSetRegistry),
+	// the trailing additive mention would still need to win -- this
+	// specifically checks the log respects append order rather than
+	// grouping by operation kind first.
+	if _, _, err := logs.AppendOperation(log, x, true, false); err != nil {
+		t.Fatalf("AppendOperation(x, additive): %v", err)
+	}
+	if _, _, err := logs.AppendOperation(log, x, false, false); err != nil {
+		t.Fatalf("AppendOperation(x, subtractive): %v", err)
+	}
+
+	got, err := logs.Evaluate(log)
+	if err != nil {
+		t.Fatalf("Evaluate() after add-then-remove: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("Evaluate() = %v, want empty after add-then-remove", got)
+	}
+
+	if _, _, err := logs.AppendOperation(log, x, true, false); err != nil {
+		t.Fatalf("AppendOperation(x, additive again): %v", err)
+	}
+
+	got, err = logs.Evaluate(log)
+	if err != nil {
+		t.Fatalf("Evaluate() after re-add: %v", err)
+	}
+	want := []NodeID{x}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("Evaluate() = %v, want %v after re-add", got, want)
+	}
+}
+
+func TestCompositeSetLogAppendOperationRequiresKnownSetTagWhenExpand(t *testing.T) {
+	g, _, _, logs := newCompositeSetLogTestFixture(t)
+
+	log, err := logs.NewCompositeSetLog()
+	if err != nil {
+		t.Fatalf("NewCompositeSetLog(): %v", err)
+	}
+
+	notASet, err := g.CreateNode()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, _, err = logs.AppendOperation(log, notASet, true, true)
+	if !errors.Is(err, ErrInvalidSetOperand) {
+		t.Fatalf("AppendOperation() error = %v, want %v", err, ErrInvalidSetOperand)
+	}
+}
+
+func TestCompositeSetLogEvaluateResolvesSetOperand(t *testing.T) {
+	g, sets, _, logs := newCompositeSetLogTestFixture(t)
+
+	set, err := sets.NewSet()
+	if err != nil {
+		t.Fatalf("NewSet(): %v", err)
+	}
+	a, err := g.CreateNode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sets.Add(set, a); err != nil {
+		t.Fatal(err)
+	}
+
+	log, err := logs.NewCompositeSetLog()
+	if err != nil {
+		t.Fatalf("NewCompositeSetLog(): %v", err)
+	}
+
+	if _, _, err := logs.AppendOperation(log, set, true, true); err != nil {
+		t.Fatalf("AppendOperation(set, additive, expand): %v", err)
+	}
+
+	got, err := logs.Evaluate(log)
+	if err != nil {
+		t.Fatalf("Evaluate(): %v", err)
+	}
+	want := []NodeID{a}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("Evaluate() = %v, want %v", got, want)
+	}
+}
+
+func TestCompositeSetLogEvaluateResolvesCompositeSetOperand(t *testing.T) {
+	g, _, composites, logs := newCompositeSetLogTestFixture(t)
+
+	composite, err := composites.NewCompositeSet()
+	if err != nil {
+		t.Fatalf("NewCompositeSet(): %v", err)
+	}
+	x, err := g.CreateNode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := composites.AddOperand(composite, x, true, false); err != nil {
+		t.Fatal(err)
+	}
+
+	log, err := logs.NewCompositeSetLog()
+	if err != nil {
+		t.Fatalf("NewCompositeSetLog(): %v", err)
+	}
+
+	if _, _, err := logs.AppendOperation(log, composite, true, true); err != nil {
+		t.Fatalf("AppendOperation(composite, additive, expand): %v", err)
+	}
+
+	got, err := logs.Evaluate(log)
+	if err != nil {
+		t.Fatalf("Evaluate(): %v", err)
+	}
+	want := []NodeID{x}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("Evaluate() = %v, want %v", got, want)
+	}
+}
+
+// TestCompositeSetLogEvaluateResolvesNestedCompositeSetLogOperand covers
+// recursive self-type resolution: a CompositeSetLog operand nested inside
+// another CompositeSetLog.
+func TestCompositeSetLogEvaluateResolvesNestedCompositeSetLogOperand(t *testing.T) {
+	g, _, _, logs := newCompositeSetLogTestFixture(t)
+
+	inner, err := logs.NewCompositeSetLog()
+	if err != nil {
+		t.Fatalf("NewCompositeSetLog() for inner: %v", err)
+	}
+	x, err := g.CreateNode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := logs.AppendOperation(inner, x, true, false); err != nil {
+		t.Fatal(err)
+	}
+
+	outer, err := logs.NewCompositeSetLog()
+	if err != nil {
+		t.Fatalf("NewCompositeSetLog() for outer: %v", err)
+	}
+	if _, _, err := logs.AppendOperation(outer, inner, true, true); err != nil {
+		t.Fatalf("AppendOperation(outer, inner, additive, expand): %v", err)
+	}
+
+	got, err := logs.Evaluate(outer)
+	if err != nil {
+		t.Fatalf("Evaluate(outer): %v", err)
+	}
+	want := []NodeID{x}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("Evaluate(outer) = %v, want %v", got, want)
+	}
+}
+
+// TestCompositeSetRegistryResolvesCompositeSetLogOperand covers dispatch
+// in the other direction: CompositeSetRegistry.Evaluate resolving a
+// CompositeSetLog-kind operand, only possible once SetLogs has wired the
+// two registries together.
+func TestCompositeSetRegistryResolvesCompositeSetLogOperand(t *testing.T) {
+	g, _, composites, logs := newCompositeSetLogTestFixture(t)
+
+	log, err := logs.NewCompositeSetLog()
+	if err != nil {
+		t.Fatalf("NewCompositeSetLog(): %v", err)
+	}
+	x, err := g.CreateNode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := logs.AppendOperation(log, x, true, false); err != nil {
+		t.Fatal(err)
+	}
+
+	composite, err := composites.NewCompositeSet()
+	if err != nil {
+		t.Fatalf("NewCompositeSet(): %v", err)
+	}
+	if _, err := composites.AddOperand(composite, log, true, true); err != nil {
+		t.Fatalf("AddOperand(composite, log, additive, expand): %v", err)
+	}
+
+	got, err := composites.Evaluate(composite)
+	if err != nil {
+		t.Fatalf("Evaluate(composite): %v", err)
+	}
+	want := []NodeID{x}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("Evaluate(composite) = %v, want %v", got, want)
+	}
+}
+
+// TestCompositeSetRegistryWithoutSetLogsRejectsCompositeSetLogOperand
+// pins down that SetLogs is required, not automatic: a
+// CompositeSetRegistry that has never had SetLogs called must treat a
+// CompositeSetLog-kind operand exactly like any other node carrying no
+// recognized Set-representation tag.
+func TestCompositeSetRegistryWithoutSetLogsRejectsCompositeSetLogOperand(t *testing.T) {
+	var g Graph
+	names := NewNameRegistry(&g)
+
+	ids, err := names.BootstrapNames(FoundationalNames)
+	if err != nil {
+		t.Fatalf("BootstrapNames(): %v", err)
+	}
+
+	sets, err := NewSetRegistry(&g, ids[NameAllSets], ids[NameAllCompositeSets], ids[NameAllCompositeSetLogs])
+	if err != nil {
+		t.Fatalf("NewSetRegistry(): %v", err)
+	}
+
+	composites, err := NewCompositeSetRegistry(
+		&g,
+		sets,
+		ids[NameAllCompositeSets],
+		ids[NameAllAdditiveOp],
+		ids[NameAllSubtractiveOp],
+		ids[NameAllScalarOperand],
+		ids[NameAllSetOperand],
+	)
+	if err != nil {
+		t.Fatalf("NewCompositeSetRegistry(): %v", err)
+	}
+
+	capsules, err := NewCapsuleRegistry(
+		&g,
+		ids[NameAllElementCapsules],
+		ids[NameAllElementCapsulePrevSlot],
+		ids[NameAllElementCapsuleValueSlot],
+		ids[NameAllElementCapsuleNextSlot],
+	)
+	if err != nil {
+		t.Fatalf("NewCapsuleRegistry(): %v", err)
+	}
+
+	lists, err := NewListRegistry(&g, capsules, ids[NameAllLists], ids[NameAllHeads], ids[NameAllTails])
+	if err != nil {
+		t.Fatalf("NewListRegistry(): %v", err)
+	}
+
+	logs, err := NewCompositeSetLogRegistry(
+		&g,
+		lists,
+		composites,
+		ids[NameAllCompositeSetLogs],
+		ids[NameAllAdditiveOp],
+		ids[NameAllSubtractiveOp],
+		ids[NameAllScalarOperand],
+		ids[NameAllSetOperand],
+	)
+	if err != nil {
+		t.Fatalf("NewCompositeSetLogRegistry(): %v", err)
+	}
+	// Deliberately not calling composites.SetLogs(logs).
+
+	log, err := logs.NewCompositeSetLog()
+	if err != nil {
+		t.Fatalf("NewCompositeSetLog(): %v", err)
+	}
+
+	composite, err := composites.NewCompositeSet()
+	if err != nil {
+		t.Fatalf("NewCompositeSet(): %v", err)
+	}
+
+	_, err = composites.AddOperand(composite, log, true, true)
+	if !errors.Is(err, ErrInvalidSetOperand) {
+		t.Fatalf("AddOperand() error = %v, want %v", err, ErrInvalidSetOperand)
+	}
+}
+
+func TestCompositeSetLogEvaluateDetectsCycle(t *testing.T) {
+	_, _, _, logs := newCompositeSetLogTestFixture(t)
+
+	l1, err := logs.NewCompositeSetLog()
+	if err != nil {
+		t.Fatalf("NewCompositeSetLog() for l1: %v", err)
+	}
+	l2, err := logs.NewCompositeSetLog()
+	if err != nil {
+		t.Fatalf("NewCompositeSetLog() for l2: %v", err)
+	}
+
+	if _, _, err := logs.AppendOperation(l1, l2, true, true); err != nil {
+		t.Fatalf("AppendOperation(l1, l2): %v", err)
+	}
+	if _, _, err := logs.AppendOperation(l2, l1, true, true); err != nil {
+		t.Fatalf("AppendOperation(l2, l1): %v", err)
+	}
+
+	_, err = logs.Evaluate(l1)
+	if !errors.Is(err, ErrCompositeSetCycle) {
+		t.Fatalf("Evaluate(l1) error = %v, want %v", err, ErrCompositeSetCycle)
+	}
+}
+
+// TestCompositeSetLogEvaluateDetectsCrossRepresentationCycle covers a
+// cycle crossing between CompositeSetLog and CompositeSet, per
+// theorystate.md section 83's requirement that cycle tracking be shared
+// across both composite-kind representations.
+func TestCompositeSetLogEvaluateDetectsCrossRepresentationCycle(t *testing.T) {
+	_, _, composites, logs := newCompositeSetLogTestFixture(t)
+
+	log, err := logs.NewCompositeSetLog()
+	if err != nil {
+		t.Fatalf("NewCompositeSetLog(): %v", err)
+	}
+	composite, err := composites.NewCompositeSet()
+	if err != nil {
+		t.Fatalf("NewCompositeSet(): %v", err)
+	}
+
+	if _, _, err := logs.AppendOperation(log, composite, true, true); err != nil {
+		t.Fatalf("AppendOperation(log, composite): %v", err)
+	}
+	if _, err := composites.AddOperand(composite, log, true, true); err != nil {
+		t.Fatalf("AddOperand(composite, log): %v", err)
+	}
+
+	_, err = logs.Evaluate(log)
+	if !errors.Is(err, ErrCompositeSetCycle) {
+		t.Fatalf("Evaluate(log) error = %v, want %v", err, ErrCompositeSetCycle)
+	}
+
+	_, err = composites.Evaluate(composite)
+	if !errors.Is(err, ErrCompositeSetCycle) {
+		t.Fatalf("Evaluate(composite) error = %v, want %v", err, ErrCompositeSetCycle)
+	}
+}
+
+func TestCompositeSetLogContainsMatchesEvaluate(t *testing.T) {
+	g, _, _, logs := newCompositeSetLogTestFixture(t)
+
+	log, err := logs.NewCompositeSetLog()
+	if err != nil {
+		t.Fatalf("NewCompositeSetLog(): %v", err)
+	}
+
+	a, err := g.CreateNode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := g.CreateNode()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, _, err := logs.AppendOperation(log, a, true, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := logs.AppendOperation(log, b, true, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := logs.AppendOperation(log, a, false, false); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := logs.Contains(log, a)
+	if err != nil {
+		t.Fatalf("Contains(log, a): %v", err)
+	}
+	if got {
+		t.Fatal("Contains(log, a) = true, want false (a was subtracted last)")
+	}
+
+	got, err = logs.Contains(log, b)
+	if err != nil {
+		t.Fatalf("Contains(log, b): %v", err)
+	}
+	if !got {
+		t.Fatal("Contains(log, b) = false, want true")
+	}
+
+	evaluated, err := logs.Evaluate(log)
+	if err != nil {
+		t.Fatalf("Evaluate(log): %v", err)
+	}
+	want := []NodeID{b}
+	if !reflect.DeepEqual(evaluated, want) {
+		t.Fatalf("Evaluate(log) = %v, want %v", evaluated, want)
+	}
+}
+
+func TestCompositeSetLogContainsRequiresExistingValue(t *testing.T) {
+	_, _, _, logs := newCompositeSetLogTestFixture(t)
+
+	log, err := logs.NewCompositeSetLog()
+	if err != nil {
+		t.Fatalf("NewCompositeSetLog(): %v", err)
+	}
+
+	const nonexistent NodeID = 999999
+	if _, err := logs.Contains(log, nonexistent); !errors.Is(err, ErrNodeNotFound) {
+		t.Fatalf("Contains() error = %v, want %v", err, ErrNodeNotFound)
+	}
+}
+
+func TestCompositeSetLogRemoveOperationDeletesDescriptorAndCapsule(t *testing.T) {
+	g, _, _, logs := newCompositeSetLogTestFixture(t)
+
+	log, err := logs.NewCompositeSetLog()
+	if err != nil {
+		t.Fatalf("NewCompositeSetLog(): %v", err)
+	}
+	x, err := g.CreateNode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	u, capsule, err := logs.AppendOperation(log, x, true, false)
+	if err != nil {
+		t.Fatalf("AppendOperation(): %v", err)
+	}
+
+	if err := logs.RemoveOperation(log, capsule); err != nil {
+		t.Fatalf("RemoveOperation(): %v", err)
+	}
+
+	if g.NodeExists(u) {
+		t.Fatalf("descriptor %d still exists after RemoveOperation()", u)
+	}
+	if g.NodeExists(capsule) {
+		t.Fatalf("capsule %d still exists after RemoveOperation()", capsule)
+	}
+	if !g.NodeExists(x) {
+		t.Fatal("RemoveOperation() incorrectly deleted the operand target")
+	}
+
+	got, err := logs.Evaluate(log)
+	if err != nil {
+		t.Fatalf("Evaluate(): %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("Evaluate() = %v, want empty after RemoveOperation()", got)
+	}
+}
+
+func TestCompositeSetLogRemoveOperationRequiresOperationInLog(t *testing.T) {
+	g, _, _, logs := newCompositeSetLogTestFixture(t)
+
+	logA, err := logs.NewCompositeSetLog()
+	if err != nil {
+		t.Fatal(err)
+	}
+	logB, err := logs.NewCompositeSetLog()
+	if err != nil {
+		t.Fatal(err)
+	}
+	x, err := g.CreateNode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, capsule, err := logs.AppendOperation(logA, x, true, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = logs.RemoveOperation(logB, capsule)
+	if !errors.Is(err, ErrCapsuleNotInList) {
+		t.Fatalf("RemoveOperation() error = %v, want %v", err, ErrCapsuleNotInList)
+	}
+}
+
+func TestCompositeSetLogDeleteCompositeSetLogSucceedsWhenEmpty(t *testing.T) {
+	g, _, _, logs := newCompositeSetLogTestFixture(t)
+
+	log, err := logs.NewCompositeSetLog()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := logs.DeleteCompositeSetLog(log); err != nil {
+		t.Fatalf("DeleteCompositeSetLog(): %v", err)
+	}
+	if g.NodeExists(log) {
+		t.Fatalf("log %d still exists after successful DeleteCompositeSetLog()", log)
+	}
+}
+
+func TestCompositeSetLogDeleteCompositeSetLogFailsIfNotEmpty(t *testing.T) {
+	g, _, _, logs := newCompositeSetLogTestFixture(t)
+
+	log, err := logs.NewCompositeSetLog()
+	if err != nil {
+		t.Fatal(err)
+	}
+	x, err := g.CreateNode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := logs.AppendOperation(log, x, true, false); err != nil {
+		t.Fatal(err)
+	}
+
+	err = logs.DeleteCompositeSetLog(log)
+	if !errors.Is(err, ErrNodeNotEmpty) {
+		t.Fatalf("DeleteCompositeSetLog() error = %v, want %v", err, ErrNodeNotEmpty)
+	}
+	if !g.NodeExists(log) {
+		t.Fatal("log disappeared despite a failed DeleteCompositeSetLog()")
+	}
+	if !logs.IsCompositeSetLog(log) {
+		t.Fatal("log lost its AllCompositeSetLogs tag despite a failed DeleteCompositeSetLog()")
+	}
+	if !logs.lists.IsList(log) {
+		t.Fatal("log lost its AllLists tag despite a failed DeleteCompositeSetLog()")
+	}
+}
+
+func TestCompositeSetLogOperationsRequireCompositeSetLogTag(t *testing.T) {
+	g, _, _, logs := newCompositeSetLogTestFixture(t)
+
+	notALog, err := g.CreateNode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	x, err := g.CreateNode()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, _, err := logs.AppendOperation(notALog, x, true, false); !errors.Is(err, ErrNotCompositeSetLog) {
+		t.Fatalf("AppendOperation() error = %v, want %v", err, ErrNotCompositeSetLog)
+	}
+	if _, err := logs.Operations(notALog); !errors.Is(err, ErrNotCompositeSetLog) {
+		t.Fatalf("Operations() error = %v, want %v", err, ErrNotCompositeSetLog)
+	}
+	if _, err := logs.Evaluate(notALog); !errors.Is(err, ErrNotCompositeSetLog) {
+		t.Fatalf("Evaluate() error = %v, want %v", err, ErrNotCompositeSetLog)
+	}
+	if _, err := logs.Contains(notALog, x); !errors.Is(err, ErrNotCompositeSetLog) {
+		t.Fatalf("Contains() error = %v, want %v", err, ErrNotCompositeSetLog)
+	}
+	if err := logs.DeleteCompositeSetLog(notALog); !errors.Is(err, ErrNotCompositeSetLog) {
+		t.Fatalf("DeleteCompositeSetLog() error = %v, want %v", err, ErrNotCompositeSetLog)
+	}
+	if err := logs.RemoveOperation(notALog, x); !errors.Is(err, ErrNotCompositeSetLog) {
+		t.Fatalf("RemoveOperation() error = %v, want %v", err, ErrNotCompositeSetLog)
+	}
+}
+
+// TestCompositeSetLogEvaluateDetectsMalformedDescriptor covers bypassing
+// AppendOperation entirely by calling the underlying ListRegistry.Append
+// directly, producing a capsule whose value carries no descriptor tags at
+// all -- Evaluate must fail loudly rather than guess a default operation
+// kind.
+func TestCompositeSetLogEvaluateDetectsMalformedDescriptor(t *testing.T) {
+	g, _, _, logs := newCompositeSetLogTestFixture(t)
+
+	log, err := logs.NewCompositeSetLog()
+	if err != nil {
+		t.Fatal(err)
+	}
+	x, err := g.CreateNode()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := logs.lists.Append(log, x); err != nil {
+		t.Fatalf("Append() bypassing AppendOperation: %v", err)
+	}
+
+	_, err = logs.Evaluate(log)
+	if !errors.Is(err, ErrInvalidOperandDescriptor) {
+		t.Fatalf("Evaluate() error = %v, want %v", err, ErrInvalidOperandDescriptor)
+	}
+}
+
+// TestSetRegistryTagAsSetRejectsCompositeSetLogConflict pins down
+// theorystate.md section 79's mutual-exclusivity rule for the third and
+// final Set-representation tag: SetRegistry.TagAsSet must refuse to tag
+// a node already tagged AllCompositeSetLogs.
+func TestSetRegistryTagAsSetRejectsCompositeSetLogConflict(t *testing.T) {
+	_, sets, _, logs := newCompositeSetLogTestFixture(t)
+
+	log, err := logs.NewCompositeSetLog()
+	if err != nil {
+		t.Fatalf("NewCompositeSetLog(): %v", err)
+	}
+
+	err = sets.TagAsSet(log)
+	if !errors.Is(err, ErrSetRepresentationConflict) {
+		t.Fatalf("TagAsSet() error = %v, want %v", err, ErrSetRepresentationConflict)
+	}
+
+	if sets.IsSet(log) {
+		t.Fatal("node was tagged AllSets despite already being AllCompositeSetLogs-tagged")
 	}
 }

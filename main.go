@@ -839,7 +839,9 @@ const (
 	NameAllElementCapsuleNextSlot  = "AllElementCapsuleNextSlot"
 
 	// NameAllLists tags a node as a List (THEORY_NOTES_FROM_CONVERSATION.md
-	// section 11 / theorystate.md section 11). See ListRegistry.
+	// section 11 / theorystate.md section 11). See ListRegistry. Also
+	// reused, dual-tagged alongside NameAllCompositeSetLogs, by
+	// CompositeSetLogRegistry (theorystate.md section 82).
 	NameAllLists = "AllLists"
 
 	// NameAllHeads and NameAllTails each tag a capsule as currently being
@@ -889,6 +891,15 @@ const (
 	// these two tags applies to any given descriptor node.
 	NameAllScalarOperand = "AllScalarOperand"
 	NameAllSetOperand    = "AllSetOperand"
+
+	// NameAllCompositeSetLogs tags a node as CompositeSetLog-kind via the
+	// relationship (AllCompositeSetLogs, node) (theorystate.md section
+	// 82): the same node is simultaneously tagged (AllLists, node), since
+	// a CompositeSetLog is an ordinary List reused and reinterpreted as
+	// an append-only log of Set-mutating operations (section 10c's
+	// precedent for one identity carrying more than one simultaneous
+	// interpretation). See CompositeSetLogRegistry.
+	NameAllCompositeSetLogs = "AllCompositeSetLogs"
 )
 
 // FoundationalNames lists every name that setup code should bootstrap via
@@ -915,6 +926,7 @@ var FoundationalNames = []string{
 	NameAllSubtractiveOp,
 	NameAllScalarOperand,
 	NameAllSetOperand,
+	NameAllCompositeSetLogs,
 }
 
 // ErrCannotDeleteRoot is returned when deletion of ROOT is attempted
@@ -1231,37 +1243,50 @@ var (
 	// to operate on a node that is not tagged (AllCompositeSets, node).
 	ErrNotCompositeSet = errors.New("node is not tagged as a composite set")
 
+	// ErrNotCompositeSetLog is returned by CompositeSetLogRegistry when
+	// asked to operate on a node that is not tagged
+	// (AllCompositeSetLogs, node).
+	ErrNotCompositeSetLog = errors.New("node is not tagged as a composite set log")
+
 	// ErrOperandNotInCompositeSet is returned by
 	// CompositeSetRegistry.RemoveOperand when the given descriptor node
-	// is not currently a direct child of the given composite set.
+	// is not currently a direct child of the given composite set, and
+	// reused by CompositeSetLogRegistry.RemoveOperation for the
+	// identically-shaped problem (the descriptor is not currently an
+	// operation of the given log).
 	ErrOperandNotInCompositeSet = errors.New("descriptor is not an operand of this composite set")
-
 	// ErrInvalidOperandDescriptor is returned when an operand-descriptor
 	// node (theorystate.md section 80) does not have exactly the shape
-	// CompositeSetRegistry.AddOperand always creates: exactly one
-	// operation-kind tag (additive xor subtractive), exactly one
-	// operand-kind tag (scalar xor set), and exactly one outgoing
-	// relationship identifying its operand. This can only happen through
-	// an out-of-band Graph mutation.
+	// CompositeSetRegistry.AddOperand / CompositeSetLogRegistry.AppendOperation
+	// always create: exactly one operation-kind tag (additive xor
+	// subtractive), exactly one operand-kind tag (scalar xor set), and
+	// exactly one outgoing relationship identifying its operand. This can
+	// happen through an out-of-band Graph mutation, or (for
+	// CompositeSetLogRegistry specifically) by appending a value directly
+	// via the underlying ListRegistry.Append instead of going through
+	// AppendOperation.
 	ErrInvalidOperandDescriptor = errors.New("operand descriptor does not have the expected shape")
-
 	// ErrInvalidSetOperand is returned when an operand-descriptor tagged
 	// as a set-expansion operand (AllSetOperand) points at a node that
 	// does not currently carry any known Set-representation tag. This is
-	// checked both when the descriptor is created (AddOperand) and
-	// freshly re-checked every time it is resolved (Evaluate never
-	// caches), so it can also surface if the operand's Set-representation
-	// tag was removed after the descriptor was created.
+	// checked both when the descriptor is created (AddOperand /
+	// AppendOperation) and freshly re-checked every time it is resolved
+	// (Evaluate never caches), so it can also surface if the operand's
+	// Set-representation tag was removed after the descriptor was
+	// created. Also returned by CompositeSetRegistry.resolveSetOperand /
+	// CompositeSetLogRegistry.resolveSetOperand if an operand somehow
+	// carries none of the three currently-recognized representations at
+	// resolve time.
 	ErrInvalidSetOperand = errors.New("set operand does not carry a known set-representation tag")
-
 	// ErrCompositeSetCycle is returned by CompositeSetRegistry.Evaluate
-	// when resolving a set-expansion operand would revisit a
-	// composite-kind node already on the current resolution path
-	// (theorystate.md section 83). A plain Set operand can never
-	// participate in a cycle, since it is always a leaf; only chains of
-	// composite-kind nodes referencing each other can cycle.
+	// and CompositeSetLogRegistry.Evaluate/Contains when resolving a
+	// set-expansion operand would revisit a composite-kind node already
+	// on the current resolution path (theorystate.md section 83). A
+	// plain Set operand can never participate in a cycle, since it is
+	// always a leaf; only chains of composite-kind nodes (CompositeSet
+	// and/or CompositeSetLog, in any combination) referencing each other
+	// can cycle.
 	ErrCompositeSetCycle = errors.New("composite set operand graph contains a cycle")
-
 	// ErrCapsuleNotInList is returned by ListRegistry.InsertAfter when
 	// the given capsule is not currently an element of the given list
 	// (i.e. (list, capsule) does not exist).
@@ -3105,37 +3130,8 @@ func (l *ListRegistry) Append(list, value NodeID) (NodeID, error) {
 	var capsule NodeID
 
 	err := l.graph.Transact(func(tx *Txn) error {
-		oldTail, hasTail, err := findUniqueTaggedChild(l.graph, list, l.allTails)
-		if err != nil {
-			return err
-		}
-
-		capsule, err = l.capsules.newCapsuleTx(tx, value)
-		if err != nil {
-			return err
-		}
-
-		if _, err := tx.AddRelationship(list, capsule); err != nil {
-			return err
-		}
-
-		if hasTail {
-			if err := l.capsules.setPrevTx(tx, capsule, oldTail); err != nil {
-				return err
-			}
-			if err := l.capsules.setNextTx(tx, oldTail, capsule); err != nil {
-				return err
-			}
-			if _, err := tx.RemoveRelationship(l.allTails, oldTail); err != nil {
-				return err
-			}
-		} else {
-			if _, err := tx.AddRelationship(l.allHeads, capsule); err != nil {
-				return err
-			}
-		}
-
-		_, err = tx.AddRelationship(l.allTails, capsule)
+		var err error
+		capsule, err = l.appendTx(tx, list, value)
 		return err
 	})
 	if err != nil {
@@ -3143,6 +3139,53 @@ func (l *ListRegistry) Append(list, value NodeID) (NodeID, error) {
 	}
 
 	return capsule, nil
+}
+
+// appendTx is Append's tx-composable core: mint a fresh capsule holding
+// value and link it as the new tail of list, against tx, without opening
+// its own Graph.Transact call. Factored out so a larger composite
+// operation (CompositeSetLogRegistry.AppendOperation) can append a value
+// as one step of its own enclosing transaction, mirroring the existing
+// newCapsuleTx/setPrevTx/setNextTx composability discipline
+// (implementation_state.md item 11).
+//
+// list is assumed to already be confirmed to exist and be tagged
+// (AllLists, list), and value to already exist -- exactly like every
+// other *Tx helper in this file, callers are responsible for the checks
+// Append itself performs before opening its transaction.
+func (l *ListRegistry) appendTx(tx txOps, list, value NodeID) (NodeID, error) {
+	oldTail, hasTail, err := findUniqueTaggedChild(l.graph, list, l.allTails)
+	if err != nil {
+		return 0, err
+	}
+
+	capsule, err := l.capsules.newCapsuleTx(tx, value)
+	if err != nil {
+		return 0, err
+	}
+
+	if _, err := tx.AddRelationship(list, capsule); err != nil {
+		return 0, err
+	}
+
+	if hasTail {
+		if err := l.capsules.setPrevTx(tx, capsule, oldTail); err != nil {
+			return 0, err
+		}
+		if err := l.capsules.setNextTx(tx, oldTail, capsule); err != nil {
+			return 0, err
+		}
+		if _, err := tx.RemoveRelationship(l.allTails, oldTail); err != nil {
+			return 0, err
+		}
+	} else {
+		if _, err := tx.AddRelationship(l.allHeads, capsule); err != nil {
+			return 0, err
+		}
+	}
+
+	_, err = tx.AddRelationship(l.allTails, capsule)
+	return capsule, err
 }
 
 // Prepend creates a fresh capsule holding value and links it as the new
@@ -3774,15 +3817,12 @@ func (l *ListRegistry) DeleteList(list NodeID) error {
 // theorystate.md section 79 additionally decides that a node may
 // carry at most one of the three Set-representation tags (AllSets,
 // AllCompositeSets, AllCompositeSetLogs) -- never more than one at a
-// time. This is now enforced: NewSetRegistry accepts the tag NodeIDs of
-// every other currently-implemented Set representation (AllCompositeSets,
-// as of CompositeSetRegistry's addition), and TagAsSet refuses
-// (ErrSetRepresentationConflict) to tag a node already carrying any of
-// them. AllCompositeSetLogs does not exist yet (theorystate.md section
-// 76a's "add a foundational name only once its representation is
-// actually being implemented" discipline), so it is not yet one of the
-// tags checked; whichever registry implements it next must be added
-// here too, exactly as CompositeSetRegistry's tag was.
+// time. This is now enforced for all three: NewSetRegistry accepts the
+// tag NodeIDs of every other currently-implemented Set representation
+// (AllCompositeSets, as of CompositeSetRegistry's addition, and
+// AllCompositeSetLogs, as of CompositeSetLogRegistry's), and TagAsSet
+// refuses (ErrSetRepresentationConflict) to tag a node already carrying
+// any of them.
 type SetRegistry struct {
 	graph   *Graph
 	allSets NodeID
@@ -3801,12 +3841,12 @@ type SetRegistry struct {
 // NameRegistry.BootstrapNames(FoundationalNames).
 //
 // otherSetTags should list the tag NodeID of every other
-// currently-implemented Set representation (e.g. AllCompositeSets), so
-// that TagAsSet can enforce theorystate.md section 79's mutual
-// exclusivity. Each, if given, must already exist. Passing none is valid
-// (no cross-representation check is performed), which is only
-// appropriate if no other Set representation exists in the calling
-// program yet.
+// currently-implemented Set representation (e.g. AllCompositeSets,
+// AllCompositeSetLogs), so that TagAsSet can enforce theorystate.md
+// section 79's mutual exclusivity. Each, if given, must already exist.
+// Passing none is valid (no cross-representation check is performed),
+// which is only appropriate if no other Set representation exists in the
+// calling program yet.
 func NewSetRegistry(graph *Graph, allSets NodeID, otherSetTags ...NodeID) (*SetRegistry, error) {
 	if !graph.NodeExists(allSets) {
 		return nil, ErrNodeNotFound
@@ -4007,6 +4047,222 @@ func (s *SetRegistry) DeleteSet(set NodeID) error {
 	})
 }
 
+// operandDescriptorAxes reads back descriptor node u's current
+// operation-kind and operand-kind tags (theorystate.md section 80), plus
+// its operand target, as concrete tag NodeIDs rather than the plain
+// booleans exactlyOneTag reports -- needed before removing a descriptor,
+// since removal must know exactly which tag relationship to remove, not
+// merely which side of each axis currently holds. Shared by
+// CompositeSetRegistry.RemoveOperand and
+// CompositeSetLogRegistry.RemoveOperation.
+func operandDescriptorAxes(graph *Graph, u, allAdditiveOp, allSubtractiveOp, allScalarOperand, allSetOperand NodeID) (operand NodeID, hasOperand bool, operationTag, operandTag NodeID, err error) {
+	operand, hasOperand, err = singleChildTarget(graph, u)
+	if err != nil {
+		return 0, false, 0, 0, err
+	}
+
+	additive, err := exactlyOneTag(graph, u, allAdditiveOp, allSubtractiveOp)
+	if err != nil {
+		return 0, false, 0, 0, err
+	}
+	operationTag = allAdditiveOp
+	if !additive {
+		operationTag = allSubtractiveOp
+	}
+
+	expand, err := exactlyOneTag(graph, u, allSetOperand, allScalarOperand)
+	if err != nil {
+		return 0, false, 0, 0, err
+	}
+	operandTag = allScalarOperand
+	if expand {
+		operandTag = allSetOperand
+	}
+
+	return operand, hasOperand, operationTag, operandTag, nil
+}
+
+// buildOperandDescriptorTx creates a fresh descriptor node U, tags it
+// with exactly one operation-kind tag (additiveTag xor subtractiveTag)
+// and exactly one operand-kind tag (scalarTag xor setTag), and wires
+// U -> operand, entirely against tx. This is the shared "mint one
+// operand descriptor" sequence behind CompositeSetRegistry.AddOperand
+// and CompositeSetLogRegistry.AppendOperation (theorystate.md section
+// 80): both structures record operands via freshly-minted, identically
+// dual-tagged descriptor nodes, differing only in *where* the descriptor
+// is then attached (a direct child of the composite set vs. a list
+// capsule's value).
+func buildOperandDescriptorTx(tx txOps, additiveTag, subtractiveTag, scalarTag, setTag, operand NodeID, additive, expand bool) (u NodeID, err error) {
+	operationTag := additiveTag
+	if !additive {
+		operationTag = subtractiveTag
+	}
+	operandTag := scalarTag
+	if expand {
+		operandTag = setTag
+	}
+
+	u, err = tx.CreateNode()
+	if err != nil {
+		return 0, err
+	}
+	if err := tagNodeTx(tx, operationTag, u); err != nil {
+		return 0, err
+	}
+	if err := tagNodeTx(tx, operandTag, u); err != nil {
+		return 0, err
+	}
+
+	_, err = tx.AddRelationship(u, operand)
+	return u, err
+}
+
+// clearOperandDescriptorEdgesTx removes descriptor u's own edge to its
+// operand (if any) and both of its axis tags, against tx, without
+// deleting u itself. Factored out from deleteOperandDescriptorTx so
+// CompositeSetLogRegistry.RemoveOperation can clear u's own edges in an
+// earlier step, deferring u's deletion to a later step once u's one
+// remaining incoming edge (from its owning capsule's value slot) has
+// also been cleared -- see RemoveOperation's doc comment for why that
+// ordering is required there.
+func clearOperandDescriptorEdgesTx(tx txOps, operand NodeID, hasOperand bool, operationTag, operandTag, u NodeID) error {
+	if hasOperand {
+		if _, err := tx.RemoveRelationship(u, operand); err != nil {
+			return err
+		}
+	}
+
+	if _, err := tx.RemoveRelationship(operationTag, u); err != nil {
+		return err
+	}
+
+	_, err := tx.RemoveRelationship(operandTag, u)
+	return err
+}
+
+// deleteOperandDescriptorTx clears descriptor u's own edges (see
+// clearOperandDescriptorEdgesTx) and then deletes u itself, against tx.
+// This is the shared "tear down one descriptor node" sequence behind
+// CompositeSetRegistry.RemoveOperand: a CompositeSetRegistry descriptor
+// has no incoming edges beyond what clearOperandDescriptorEdgesTx itself
+// clears, so u can be deleted immediately afterward in the same step.
+// CompositeSetLogRegistry.RemoveOperation cannot use this directly for
+// exactly that reason -- see clearOperandDescriptorEdgesTx's doc comment.
+func deleteOperandDescriptorTx(tx txOps, operand NodeID, hasOperand bool, operationTag, operandTag, u NodeID) error {
+	if err := clearOperandDescriptorEdgesTx(tx, operand, hasOperand, operationTag, operandTag, u); err != nil {
+		return err
+	}
+
+	return tx.DeleteNode(u)
+}
+
+// operandTargetGeneric returns descriptor u's operand, i.e. u's single
+// outgoing relationship target. Shared by CompositeSetRegistry.OperandTarget
+// and CompositeSetLogRegistry.OperandTarget, since both build identically
+// shaped descriptors (theorystate.md section 80).
+func operandTargetGeneric(graph *Graph, u NodeID) (operand NodeID, err error) {
+	operand, found, err := singleChildTarget(graph, u)
+	if err != nil {
+		return 0, err
+	}
+	if !found {
+		return 0, ErrInvalidOperandDescriptor
+	}
+
+	return operand, nil
+}
+
+// operandCarriesKnownSetTag reports whether operand currently carries any
+// currently-recognized Set-representation tag (theorystate.md section
+// 79): AllSets (via sets), AllCompositeSets (via composites), or, if
+// logs is non-nil (see CompositeSetRegistry.SetLogs), AllCompositeSetLogs
+// (via logs). Shared by CompositeSetRegistry.AddOperand and
+// CompositeSetLogRegistry.AppendOperation's identical expand-time
+// validation.
+func operandCarriesKnownSetTag(sets *SetRegistry, composites *CompositeSetRegistry, logs *CompositeSetLogRegistry, operand NodeID) bool {
+	if sets.IsSet(operand) {
+		return true
+	}
+	if composites.IsCompositeSet(operand) {
+		return true
+	}
+	if logs != nil && logs.IsCompositeSetLog(operand) {
+		return true
+	}
+	return false
+}
+
+// resolveSetOperandGeneric resolves operand's own current membership,
+// dispatched by whichever of the three currently-implemented Set
+// representations operand actually carries (theorystate.md section 83):
+// a plain Set (delegated to sets), a CompositeSet (delegated to
+// composites, resolved recursively), or a CompositeSetLog (delegated to
+// logs, resolved recursively) -- logs may be nil if the caller has not
+// wired cross-representation dispatch to a CompositeSetLogRegistry yet
+// (see CompositeSetRegistry.SetLogs), in which case a CompositeSetLog
+// operand is reported via ErrInvalidSetOperand exactly like any other
+// operand carrying no known Set-representation tag. Shared by
+// CompositeSetRegistry and CompositeSetLogRegistry's resolveOperand
+// methods, via resolveOperandGeneric below.
+//
+// visited tracks composite-kind (CompositeSet or CompositeSetLog)
+// NodeIDs currently on the resolution path, shared across both
+// representations, so a cycle crossing between them is still detected
+// (theorystate.md section 83).
+func resolveSetOperandGeneric(sets *SetRegistry, composites *CompositeSetRegistry, logs *CompositeSetLogRegistry, operand NodeID, visited map[NodeID]struct{}) ([]NodeID, error) {
+	switch {
+	case sets.IsSet(operand):
+		return sets.Members(operand)
+
+	case composites.IsCompositeSet(operand):
+		if _, seen := visited[operand]; seen {
+			return nil, ErrCompositeSetCycle
+		}
+		visited[operand] = struct{}{}
+		defer delete(visited, operand)
+
+		return composites.evaluate(operand, visited)
+
+	case logs != nil && logs.IsCompositeSetLog(operand):
+		if _, seen := visited[operand]; seen {
+			return nil, ErrCompositeSetCycle
+		}
+		visited[operand] = struct{}{}
+		defer delete(visited, operand)
+
+		return logs.evaluate(operand, visited)
+
+	default:
+		return nil, ErrInvalidSetOperand
+	}
+}
+
+// resolveOperandGeneric returns the set of NodeIDs descriptor u currently
+// contributes: the singleton {operand} for a scalar-axis descriptor, or
+// operand's own resolved membership (via resolveSetOperandGeneric) for a
+// set-axis descriptor. Shared by CompositeSetRegistry.resolveOperand and
+// CompositeSetLogRegistry.resolveOperand.
+func resolveOperandGeneric(graph *Graph, allScalarOperand, allSetOperand NodeID, sets *SetRegistry, composites *CompositeSetRegistry, logs *CompositeSetLogRegistry, u NodeID, visited map[NodeID]struct{}) ([]NodeID, error) {
+	operand, found, err := singleChildTarget(graph, u)
+	if err != nil {
+		return nil, err
+	}
+	if !found {
+		return nil, ErrInvalidOperandDescriptor
+	}
+
+	expand, err := exactlyOneTag(graph, u, allSetOperand, allScalarOperand)
+	if err != nil {
+		return nil, err
+	}
+
+	if !expand {
+		return []NodeID{operand}, nil
+	}
+
+	return resolveSetOperandGeneric(sets, composites, logs, operand, visited)
+}
+
 // CompositeSetRegistry implements the unordered composite Set
 // representation of theorystate.md sections 80/81: (AllCompositeSets, C)
 // tags C as CompositeSet-kind, and C's direct children are
@@ -4049,16 +4305,13 @@ func (s *SetRegistry) DeleteSet(set NodeID) error {
 //	Evaluate(set) = (union of resolved(u) for every additive u)
 //	                minus (union of resolved(u) for every subtractive u)
 //
-// where resolved(u) of a scalar-axis u is the singleton {operand}, and of
+// where `resolved(u)` of a scalar-axis u is the singleton {operand}, and of
 // a set-axis u is operand's own current evaluated/derived membership,
 // recursively resolved through whichever of the currently-implemented Set
 // representations operand actually is -- a plain Set (delegated to the
-// embedded SetRegistry) or another CompositeSet (resolved recursively) --
-// theorystate.md section 83's dispatcher. CompositeSetLogRegistry
-// (theorystate.md section 82) is designed in theory but not yet
-// implemented, so the dispatcher does not yet need to consider it;
-// extending resolveSetOperand's switch is the only change a future
-// CompositeSetLogRegistry should need on this side.
+// embedded SetRegistry), another CompositeSet (resolved recursively), or
+// a CompositeSetLog (delegated to the logs field, resolved recursively,
+// once wired via SetLogs) -- theorystate.md section 83's dispatcher.
 //
 // Like SetRegistry.Members, Evaluate is deliberately never cached: it is
 // recomputed fresh from the Graph on every call, for the same reason
@@ -4071,7 +4324,7 @@ func (s *SetRegistry) DeleteSet(set NodeID) error {
 // an existing identical one.
 //
 // Per theorystate.md section 79, a node may carry at most one of the
-// Set-representation tags (AllSets, AllCompositeSets, and eventually
+// Set-representation tags (AllSets, AllCompositeSets, and
 // AllCompositeSetLogs) at a time. NewCompositeSet always mints a fresh
 // node, which cannot already carry any other tag, and this registry does
 // not (yet) provide a TagAsCompositeSet analogous to SetRegistry.TagAsSet
@@ -4083,6 +4336,7 @@ func (s *SetRegistry) DeleteSet(set NodeID) error {
 type CompositeSetRegistry struct {
 	graph            *Graph
 	sets             *SetRegistry
+	logs             *CompositeSetLogRegistry
 	allCompositeSets NodeID
 	allAdditiveOp    NodeID
 	allSubtractiveOp NodeID
@@ -4098,6 +4352,12 @@ type CompositeSetRegistry struct {
 // descriptor's operation-kind axis; allScalarOperand/allSetOperand tag a
 // descriptor's operand-kind axis. All five tag NodeIDs must already
 // exist -- typically via NameRegistry.BootstrapNames(FoundationalNames).
+//
+// The returned registry cannot yet resolve CompositeSetLog-kind operands
+// (theorystate.md section 82) -- call SetLogs once a
+// CompositeSetLogRegistry exists to enable that; see SetLogs's doc
+// comment for why this is a required second step rather than a
+// constructor parameter.
 func NewCompositeSetRegistry(graph *Graph, sets *SetRegistry, allCompositeSets, allAdditiveOp, allSubtractiveOp, allScalarOperand, allSetOperand NodeID) (*CompositeSetRegistry, error) {
 	for _, tag := range []NodeID{allCompositeSets, allAdditiveOp, allSubtractiveOp, allScalarOperand, allSetOperand} {
 		if !graph.NodeExists(tag) {
@@ -4114,6 +4374,29 @@ func NewCompositeSetRegistry(graph *Graph, sets *SetRegistry, allCompositeSets, 
 		allScalarOperand: allScalarOperand,
 		allSetOperand:    allSetOperand,
 	}, nil
+}
+
+// SetLogs wires this CompositeSetRegistry to logs, letting Evaluate/
+// AddOperand recognize and resolve operands that are themselves
+// CompositeSetLog-kind (theorystate.md section 82/83). This is separate
+// from NewCompositeSetRegistry because CompositeSetLogRegistry itself
+// depends on an existing *CompositeSetRegistry (to resolve its own
+// CompositeSet-kind operands, and to obtain the shared *SetRegistry it
+// dispatches plain-Set operands through -- see
+// NewCompositeSetLogRegistry) -- the two representations mutually
+// reference each other, and Go cannot construct two such values in a
+// single mutually-referential step. Construct in the order
+// SetRegistry -> CompositeSetRegistry -> CompositeSetLogRegistry(composites)
+// -> composites.SetLogs(that log registry).
+//
+// Calling this is optional: a CompositeSetRegistry with logs left unset
+// (nil) still works for every other operand kind --
+// resolveSetOperandGeneric treats a nil logs exactly like "this operand
+// doesn't carry a recognized Set-representation tag," surfacing
+// ErrInvalidSetOperand rather than panicking. Calling SetLogs again
+// simply replaces the previous value; passing nil un-wires it.
+func (c *CompositeSetRegistry) SetLogs(logs *CompositeSetLogRegistry) {
+	c.logs = logs
 }
 
 // IsCompositeSet reports whether id is currently tagged
@@ -4151,10 +4434,12 @@ func (c *CompositeSetRegistry) NewCompositeSet() (NodeID, error) {
 // false: operand is used as a single literal member).
 //
 // If expand is true, operand must already carry one of the
-// currently-implemented Set-representation tags (AllSets or
-// AllCompositeSets) -- checked here, at write time, before U is created
-// at all -- returning ErrInvalidSetOperand otherwise. If expand is false,
-// operand may be any existing node of any kind.
+// currently-recognized Set-representation tags (AllSets,
+// AllCompositeSets, or, if this registry has been wired via SetLogs,
+// AllCompositeSetLogs) -- checked here, at write time, before U is
+// created at all, via operandCarriesKnownSetTag -- returning
+// ErrInvalidSetOperand otherwise. If expand is false, operand may be any
+// existing node of any kind.
 //
 // set must already be tagged (AllCompositeSets, set); operand must
 // already exist. Per theorystate.md section 85, no existing identical
@@ -4170,38 +4455,18 @@ func (c *CompositeSetRegistry) AddOperand(set, operand NodeID, additive, expand 
 	if !c.graph.NodeExists(operand) {
 		return 0, ErrNodeNotFound
 	}
-	if expand && !c.sets.IsSet(operand) && !c.IsCompositeSet(operand) {
+	if expand && !operandCarriesKnownSetTag(c.sets, c, c.logs, operand) {
 		return 0, ErrInvalidSetOperand
-	}
-
-	operationTag := c.allAdditiveOp
-	if !additive {
-		operationTag = c.allSubtractiveOp
-	}
-
-	operandTag := c.allScalarOperand
-	if expand {
-		operandTag = c.allSetOperand
 	}
 
 	err = c.graph.Transact(func(tx *Txn) error {
 		var err error
-		u, err = tx.CreateNode()
+		u, err = buildOperandDescriptorTx(tx, c.allAdditiveOp, c.allSubtractiveOp, c.allScalarOperand, c.allSetOperand, operand, additive, expand)
 		if err != nil {
 			return err
 		}
 
-		if err := tagNodeTx(tx, operationTag, u); err != nil {
-			return err
-		}
-		if err := tagNodeTx(tx, operandTag, u); err != nil {
-			return err
-		}
-		if _, err := tx.AddRelationship(set, u); err != nil {
-			return err
-		}
-
-		_, err = tx.AddRelationship(u, operand)
+		_, err = tx.AddRelationship(set, u)
 		return err
 	})
 	if err != nil {
@@ -4239,27 +4504,9 @@ func (c *CompositeSetRegistry) RemoveOperand(set, u NodeID) error {
 		return ErrOperandNotInCompositeSet
 	}
 
-	operand, hasOperand, err := singleChildTarget(c.graph, u)
+	operand, hasOperand, operationTag, operandTag, err := operandDescriptorAxes(c.graph, u, c.allAdditiveOp, c.allSubtractiveOp, c.allScalarOperand, c.allSetOperand)
 	if err != nil {
 		return err
-	}
-
-	additive, err := exactlyOneTag(c.graph, u, c.allAdditiveOp, c.allSubtractiveOp)
-	if err != nil {
-		return err
-	}
-	operationTag := c.allAdditiveOp
-	if !additive {
-		operationTag = c.allSubtractiveOp
-	}
-
-	expand, err := exactlyOneTag(c.graph, u, c.allSetOperand, c.allScalarOperand)
-	if err != nil {
-		return err
-	}
-	operandTag := c.allScalarOperand
-	if expand {
-		operandTag = c.allSetOperand
 	}
 
 	return c.graph.Transact(func(tx *Txn) error {
@@ -4267,20 +4514,7 @@ func (c *CompositeSetRegistry) RemoveOperand(set, u NodeID) error {
 			return err
 		}
 
-		if hasOperand {
-			if _, err := tx.RemoveRelationship(u, operand); err != nil {
-				return err
-			}
-		}
-
-		if _, err := tx.RemoveRelationship(operationTag, u); err != nil {
-			return err
-		}
-		if _, err := tx.RemoveRelationship(operandTag, u); err != nil {
-			return err
-		}
-
-		return tx.DeleteNode(u)
+		return deleteOperandDescriptorTx(tx, operand, hasOperand, operationTag, operandTag, u)
 	})
 }
 
@@ -4311,17 +4545,10 @@ func (c *CompositeSetRegistry) Operands(set NodeID) ([]NodeID, error) {
 }
 
 // OperandTarget returns descriptor u's operand, i.e. u's single outgoing
-// relationship target.
+// relationship target. Shared logic with CompositeSetLogRegistry.OperandTarget
+// -- see operandTargetGeneric.
 func (c *CompositeSetRegistry) OperandTarget(u NodeID) (operand NodeID, err error) {
-	operand, found, err := singleChildTarget(c.graph, u)
-	if err != nil {
-		return 0, err
-	}
-	if !found {
-		return 0, ErrInvalidOperandDescriptor
-	}
-
-	return operand, nil
+	return operandTargetGeneric(c.graph, u)
 }
 
 // OperandIsAdditive reports whether descriptor u is tagged additive
@@ -4431,62 +4658,10 @@ func (c *CompositeSetRegistry) evaluate(set NodeID, visited map[NodeID]struct{})
 }
 
 // resolveOperand returns the set of NodeIDs descriptor u currently
-// contributes: the singleton {operand} for a scalar-axis descriptor, or
-// operand's own resolved membership (via resolveSetOperand) for a
-// set-axis descriptor.
+// contributes, dispatched via resolveOperandGeneric. Shared logic with
+// CompositeSetLogRegistry.resolveOperand.
 func (c *CompositeSetRegistry) resolveOperand(u NodeID, visited map[NodeID]struct{}) ([]NodeID, error) {
-	operand, found, err := singleChildTarget(c.graph, u)
-	if err != nil {
-		return nil, err
-	}
-	if !found {
-		return nil, ErrInvalidOperandDescriptor
-	}
-
-	expand, err := exactlyOneTag(c.graph, u, c.allSetOperand, c.allScalarOperand)
-	if err != nil {
-		return nil, err
-	}
-
-	if !expand {
-		return []NodeID{operand}, nil
-	}
-
-	return c.resolveSetOperand(operand, visited)
-}
-
-// resolveSetOperand resolves operand's own current membership, dispatched
-// by whichever of the currently-implemented Set representations operand
-// actually carries (theorystate.md section 83): a plain Set (delegated to
-// the embedded SetRegistry) or another CompositeSet (resolved
-// recursively). CompositeSetLogRegistry is designed in theory
-// (theorystate.md section 82) but not yet implemented, so it is not yet a
-// case here.
-//
-// A plain Set operand is always a leaf and cannot participate in a cycle
-// (theorystate.md section 83), so only the composite-kind branch tracks
-// visited: operand is added to it for the duration of the recursive call
-// and removed again immediately afterward (via defer), so that visited
-// reflects only the current resolution path -- see evaluate's doc comment
-// for why a path-scoped check, rather than a global ever-visited set, is
-// required for correctness on a DAG of shared composite operands.
-func (c *CompositeSetRegistry) resolveSetOperand(operand NodeID, visited map[NodeID]struct{}) ([]NodeID, error) {
-	switch {
-	case c.sets.IsSet(operand):
-		return c.sets.Members(operand)
-
-	case c.IsCompositeSet(operand):
-		if _, seen := visited[operand]; seen {
-			return nil, ErrCompositeSetCycle
-		}
-		visited[operand] = struct{}{}
-		defer delete(visited, operand)
-
-		return c.evaluate(operand, visited)
-
-	default:
-		return nil, ErrInvalidSetOperand
-	}
+	return resolveOperandGeneric(c.graph, c.allScalarOperand, c.allSetOperand, c.sets, c, c.logs, u, visited)
 }
 
 // DeleteCompositeSet deletes set from the underlying graph, additionally
@@ -4515,5 +4690,556 @@ func (c *CompositeSetRegistry) DeleteCompositeSet(set NodeID) error {
 		}
 
 		return tx.DeleteNode(set)
+	})
+}
+
+// CompositeSetLogRegistry implements the append-only log-based composite
+// Set representation of theorystate.md section 82: an ordered log of
+// Set-mutating operations, whose current membership is the *fold* of
+// that log, not an insertion-ordered collection in its own right (see
+// that section for why this structure was deliberately renamed away from
+// an earlier "OrderedCompositeSet" working name that wrongly implied the
+// latter).
+//
+// A CompositeSetLog is represented as an ordinary List (ListRegistry),
+// reused and reinterpreted: the tagged node carries both
+// (AllLists,node) and (AllCompositeSetLogs,node) simultaneously --
+// theorystate.md section 10c's precedent for one identity carrying more
+// than one simultaneous interpretation, applied here to reuse
+// ListRegistry's ordering machinery wholesale rather than reimplementing
+// it. AllCompositeSetLogs participates in theorystate.md section 79's
+// three-way Set-representation mutual exclusivity; AllLists does not,
+// since it is plumbing this representation happens to be built from, not
+// a Set-representation tag of its own.
+//
+// Each logged operation is one list element, whose *value* (via the
+// ordinary, opaque ListRegistry/CapsuleRegistry value slot -- this
+// registry does not reach into or specialize any List/Capsule internal)
+// is a freshly minted operand-descriptor node U, exactly the same shape
+// used by CompositeSetRegistry (theorystate.md section 80): U -> operand,
+// tagged along the same two orthogonal axes (operation kind: additive/
+// subtractive; operand kind: scalar/set, always explicit, never inferred
+// from operand's own tags).
+//
+// Evaluate folds log's operations head to tail, in list order -- unlike
+// CompositeSetRegistry.Evaluate's order-insensitive union-then-difference,
+// order here is semantically load-bearing: a later operation mentioning a
+// given element supersedes an earlier one.
+//
+//	accumulator := ∅
+//	for each capsule's U, in list order:
+//	    resolved := resolve(U)          // per U's operand-kind axis
+//	    if U tagged additive:    accumulator := accumulator ∪ resolved
+//	    if U tagged subtractive: accumulator := accumulator \ resolved
+//	return accumulator
+//
+// Contains(log,value) exploits a proven property of this fold
+// (theorystate.md section 82): value's final membership is decided
+// entirely by the *last* operation in the log whose currently-resolved
+// operand mentions value, so Contains scans backward and can stop at the
+// first (i.e. most recent) such operation, using the cheapest membership
+// check available for that operand's own kind rather than always fully
+// resolving it -- see operandMentions's doc comment for exactly what is
+// and is not cheaper, and Contains's own doc comment for why this
+// optimization is real but not complete.
+//
+// Resolving a set-expansion operand dispatches, per theorystate.md
+// section 83, to whichever currently-implemented Set representation the
+// operand actually carries: a plain Set (delegated to sets), a
+// CompositeSet (delegated to composites, resolved recursively), or
+// another CompositeSetLog (resolved recursively via this same type).
+// Cycle detection (theorystate.md section 83) tracks composite-kind
+// (CompositeSet or CompositeSetLog) NodeIDs on the current resolution
+// path, shared across both representations via one visited set, so a
+// cycle crossing between them is still caught.
+//
+// Like every other Evaluate/Members in this file, Evaluate and Contains
+// are never cached -- recomputed fresh from the Graph on every call, for
+// the reasons given throughout (theorystate.md sections 9a/35).
+//
+// A capsule created via this registry's own AppendOperation always
+// carries a well-formed operand descriptor as its value. A capsule
+// created by bypassing this registry and calling the underlying
+// ListRegistry.Append directly produces a capsule whose value has no
+// descriptor tags at all; Evaluate/Contains fail loudly
+// (ErrInvalidOperandDescriptor) on encountering such a capsule rather
+// than guessing a default operation kind, matching this codebase's
+// existing fail-loud-not-silently-repair discipline.
+//
+// CompositeSetLogRegistry depends on an existing *CompositeSetRegistry
+// (to resolve CompositeSet-kind operands, and as the source of the
+// shared *SetRegistry used to resolve plain-Set operands -- see
+// NewCompositeSetLogRegistry); a *CompositeSetRegistry, in turn, must be
+// told about a CompositeSetLogRegistry after the fact (via
+// CompositeSetRegistry.SetLogs) to resolve CompositeSetLog-kind operands
+// itself, since the two types mutually reference each other and Go
+// cannot construct two such values in a single mutually-referential
+// step. See CompositeSetRegistry.SetLogs's doc comment for the required
+// construction order.
+type CompositeSetLogRegistry struct {
+	graph               *Graph
+	lists               *ListRegistry
+	sets                *SetRegistry
+	composites          *CompositeSetRegistry
+	allCompositeSetLogs NodeID
+	allAdditiveOp       NodeID
+	allSubtractiveOp    NodeID
+	allScalarOperand    NodeID
+	allSetOperand       NodeID
+}
+
+// NewCompositeSetLogRegistry creates a CompositeSetLogRegistry over
+// graph. lists is used to store and traverse the log itself (each logged
+// operation is one list element, in append order); composites is used
+// both to resolve set-expansion operands that turn out to be
+// CompositeSets (theorystate.md section 83's dispatcher) and as the
+// source of the SetRegistry used to resolve plain-Set operands (via
+// composites.sets, avoiding a second, independently-passed SetRegistry
+// that could otherwise silently disagree with the one composites itself
+// dispatches through) -- composites must already be constructed over the
+// same graph. allCompositeSetLogs tags CompositeSetLog-kind nodes
+// (alongside lists' own AllLists tag -- see the CompositeSetLogRegistry
+// doc comment); allAdditiveOp/allSubtractiveOp and allScalarOperand/
+// allSetOperand tag a logged operation's descriptor exactly as they do
+// for CompositeSetRegistry (theorystate.md section 80) -- the same
+// bootstrapped tag NodeIDs are expected to be passed to both
+// constructors. All five tag NodeIDs must already exist -- typically via
+// NameRegistry.BootstrapNames(FoundationalNames).
+//
+// This CompositeSetLogRegistry can immediately resolve CompositeSet and
+// plain Set operands, but cannot yet resolve CompositeSetLog operands
+// (including recursive self-reference) until composites is told about it
+// via composites.SetLogs(this registry) -- see that method's doc comment
+// for why this second wiring step is required.
+func NewCompositeSetLogRegistry(graph *Graph, lists *ListRegistry, composites *CompositeSetRegistry, allCompositeSetLogs, allAdditiveOp, allSubtractiveOp, allScalarOperand, allSetOperand NodeID) (*CompositeSetLogRegistry, error) {
+	for _, tag := range []NodeID{allCompositeSetLogs, allAdditiveOp, allSubtractiveOp, allScalarOperand, allSetOperand} {
+		if !graph.NodeExists(tag) {
+			return nil, ErrNodeNotFound
+		}
+	}
+
+	return &CompositeSetLogRegistry{
+		graph:               graph,
+		lists:               lists,
+		sets:                composites.sets,
+		composites:          composites,
+		allCompositeSetLogs: allCompositeSetLogs,
+		allAdditiveOp:       allAdditiveOp,
+		allSubtractiveOp:    allSubtractiveOp,
+		allScalarOperand:    allScalarOperand,
+		allSetOperand:       allSetOperand,
+	}, nil
+}
+
+// IsCompositeSetLog reports whether id is currently tagged
+// (AllCompositeSetLogs, id).
+func (c *CompositeSetLogRegistry) IsCompositeSetLog(id NodeID) bool {
+	return c.graph.HasRelationship(c.allCompositeSetLogs, id)
+}
+
+// NewCompositeSetLog creates a fresh NodeID and tags it both
+// (AllLists, id) and (AllCompositeSetLogs, id), entirely inside one
+// Graph.Transact call. This deliberately does not call
+// ListRegistry.NewList (which would tag AllLists in its own, separate
+// Graph.Transact call): minting the node and applying both tags together
+// here means there is no intermediate state where id is tagged AllLists
+// but not yet AllCompositeSetLogs. The new log starts empty: no
+// operations, no head, no tail.
+func (c *CompositeSetLogRegistry) NewCompositeSetLog() (NodeID, error) {
+	var id NodeID
+
+	err := c.graph.Transact(func(tx *Txn) error {
+		var err error
+		id, err = createTaggedNodeTx(tx, c.lists.allLists)
+		if err != nil {
+			return err
+		}
+
+		return tagNodeTx(tx, c.allCompositeSetLogs, id)
+	})
+	if err != nil {
+		return 0, err
+	}
+
+	return id, nil
+}
+
+// AppendOperation appends a new operation to the tail of log, recorded as
+// a freshly minted operand-descriptor node U (theorystate.md section 80)
+// used as the new list element's value: log -> capsule -> U -> operand,
+// with U tagged along both axes described in the CompositeSetLogRegistry
+// doc comment. Entirely inside one Graph.Transact call, composing
+// buildOperandDescriptorTx (minting and tagging U) with
+// ListRegistry.appendTx (wiring U in as the new tail element's value).
+//
+// additive/expand mean exactly what they do for
+// CompositeSetRegistry.AddOperand (see its doc comment). If expand is
+// true, operand must already carry one of the currently-recognized
+// Set-representation tags -- checked here, at write time, before U is
+// created at all -- returning ErrInvalidSetOperand otherwise.
+//
+// log must already be tagged (AllCompositeSetLogs, log); operand must
+// already exist. Per theorystate.md section 85, no existing identical
+// descriptor is searched for or reused, exactly like AddOperand.
+func (c *CompositeSetLogRegistry) AppendOperation(log, operand NodeID, additive, expand bool) (u, capsule NodeID, err error) {
+	if !c.graph.NodeExists(log) {
+		return 0, 0, ErrNodeNotFound
+	}
+	if !c.IsCompositeSetLog(log) {
+		return 0, 0, ErrNotCompositeSetLog
+	}
+	if !c.graph.NodeExists(operand) {
+		return 0, 0, ErrNodeNotFound
+	}
+	if expand && !operandCarriesKnownSetTag(c.sets, c.composites, c, operand) {
+		return 0, 0, ErrInvalidSetOperand
+	}
+
+	err = c.graph.Transact(func(tx *Txn) error {
+		var err error
+		u, err = buildOperandDescriptorTx(tx, c.allAdditiveOp, c.allSubtractiveOp, c.allScalarOperand, c.allSetOperand, operand, additive, expand)
+		if err != nil {
+			return err
+		}
+
+		capsule, err = c.lists.appendTx(tx, log, u)
+		return err
+	})
+	if err != nil {
+		return 0, 0, err
+	}
+
+	return u, capsule, nil
+}
+
+// RemoveOperation removes capsule -- and its descriptor value u -- from
+// log entirely.
+//
+// capsule is first unlinked from log via
+// ListRegistry.RemoveWithoutDeletingCapsule (always succeeds once
+// capsule is confirmed to be an element of log), then reclaimed via
+// CapsuleRegistry.DeleteCapsule, whose own atomic teardown clears
+// capsule's value-slot edge into u as part of removing capsule itself.
+// Only once that succeeds are u's own edges (its operand target and both
+// axis tags) cleared and u itself deleted -- both always succeed at that
+// point, since capsule's value edge into u was u's only remaining
+// relationship.
+//
+// If DeleteCapsule fails (ErrCapsuleNotEmpty, e.g. because some
+// out-of-band mutation gave one of capsule's role slots an unexpected
+// extra reference), this method returns ErrCapsuleNotEmpty without
+// touching u at all: capsule is left unlinked from log but otherwise
+// fully intact, still holding u as its value, exactly as
+// RemoveWithoutDeletingCapsule already leaves an ordinary capsule in the
+// analogous ListRegistry case.
+//
+// capsule must currently be an element of log (checked via the
+// (log,capsule) containment edge, returning ErrCapsuleNotInList
+// otherwise); log must already be tagged (AllCompositeSetLogs, log).
+func (c *CompositeSetLogRegistry) RemoveOperation(log, capsule NodeID) error {
+	if !c.graph.NodeExists(log) {
+		return ErrNodeNotFound
+	}
+	if !c.IsCompositeSetLog(log) {
+		return ErrNotCompositeSetLog
+	}
+	if !c.graph.HasRelationship(log, capsule) {
+		return ErrCapsuleNotInList
+	}
+
+	u, hasValue, err := c.lists.capsules.Value(capsule)
+	if err != nil {
+		return err
+	}
+	if !hasValue {
+		return ErrInvalidOperandDescriptor
+	}
+
+	operand, hasOperand, operationTag, operandTag, err := operandDescriptorAxes(c.graph, u, c.allAdditiveOp, c.allSubtractiveOp, c.allScalarOperand, c.allSetOperand)
+	if err != nil {
+		return err
+	}
+
+	if err := c.lists.RemoveWithoutDeletingCapsule(log, capsule); err != nil {
+		return err
+	}
+
+	if err := c.lists.capsules.DeleteCapsule(capsule); err != nil {
+		return err
+	}
+
+	err = c.graph.Transact(func(tx *Txn) error {
+		return clearOperandDescriptorEdgesTx(tx, operand, hasOperand, operationTag, operandTag, u)
+	})
+	if err != nil {
+		return err
+	}
+
+	return c.graph.DeleteNode(u)
+}
+
+// Operations returns log's current operand-descriptor nodes (each
+// logged operation's U, per theorystate.md section 80), in log order
+// (head to tail) -- unlike CompositeSetRegistry.Operands, this order is
+// semantically meaningful for a CompositeSetLog (theorystate.md section
+// 82's fold is order-sensitive). Use OperandTarget/OperandIsAdditive/
+// OperandIsSetOperand to inspect each one.
+func (c *CompositeSetLogRegistry) Operations(log NodeID) ([]NodeID, error) {
+	if !c.graph.NodeExists(log) {
+		return nil, ErrNodeNotFound
+	}
+	if !c.IsCompositeSetLog(log) {
+		return nil, ErrNotCompositeSetLog
+	}
+
+	return c.lists.Elements(log)
+}
+
+// OperandTarget returns descriptor u's operand, i.e. u's single outgoing
+// relationship target. Shared logic with CompositeSetRegistry.OperandTarget
+// -- see operandTargetGeneric.
+func (c *CompositeSetLogRegistry) OperandTarget(u NodeID) (operand NodeID, err error) {
+	return operandTargetGeneric(c.graph, u)
+}
+
+// OperandIsAdditive reports whether descriptor u is tagged additive
+// (true, contributes via union) or subtractive (false, contributes via
+// set-difference).
+func (c *CompositeSetLogRegistry) OperandIsAdditive(u NodeID) (bool, error) {
+	return exactlyOneTag(c.graph, u, c.allAdditiveOp, c.allSubtractiveOp)
+}
+
+// OperandIsSetOperand reports whether descriptor u is tagged as a
+// set-expansion operand (true) or a scalar operand (false).
+func (c *CompositeSetLogRegistry) OperandIsSetOperand(u NodeID) (bool, error) {
+	return exactlyOneTag(c.graph, u, c.allSetOperand, c.allScalarOperand)
+}
+
+// Evaluate computes log's current membership by folding its logged
+// operations left-to-right (head to tail) per theorystate.md section 82
+// -- see the CompositeSetLogRegistry doc comment for the exact fold and
+// for why order is semantically load-bearing here, unlike
+// CompositeSetRegistry.Evaluate's order-insensitive union-then-difference.
+//
+// log must already be tagged (AllCompositeSetLogs, log). If evaluating
+// log requires expanding a nested composite-kind operand (CompositeSet or
+// CompositeSetLog) and that expansion would revisit a composite-kind node
+// already on the current resolution path, ErrCompositeSetCycle is
+// returned (theorystate.md section 83).
+func (c *CompositeSetLogRegistry) Evaluate(log NodeID) ([]NodeID, error) {
+	if !c.graph.NodeExists(log) {
+		return nil, ErrNodeNotFound
+	}
+	if !c.IsCompositeSetLog(log) {
+		return nil, ErrNotCompositeSetLog
+	}
+
+	return c.evaluate(log, map[NodeID]struct{}{log: {}})
+}
+
+// evaluate is Evaluate's recursive core, assuming log has already been
+// confirmed to exist, to be tagged CompositeSetLog-kind, and to already
+// be recorded in visited. See CompositeSetRegistry.evaluate's doc
+// comment for why visited is path-scoped, not a global ever-visited set
+// -- the same reasoning applies identically here, now shared across both
+// representations (theorystate.md section 83).
+func (c *CompositeSetLogRegistry) evaluate(log NodeID, visited map[NodeID]struct{}) ([]NodeID, error) {
+	operations, err := c.lists.Elements(log)
+	if err != nil {
+		return nil, err
+	}
+
+	result := make(map[NodeID]struct{})
+
+	for _, u := range operations {
+		additive, err := exactlyOneTag(c.graph, u, c.allAdditiveOp, c.allSubtractiveOp)
+		if err != nil {
+			return nil, err
+		}
+
+		resolved, err := c.resolveOperand(u, visited)
+		if err != nil {
+			return nil, err
+		}
+
+		if additive {
+			for _, id := range resolved {
+				result[id] = struct{}{}
+			}
+		} else {
+			for _, id := range resolved {
+				delete(result, id)
+			}
+		}
+	}
+
+	out := make([]NodeID, 0, len(result))
+	for id := range result {
+		out = append(out, id)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+
+	return out, nil
+}
+
+// resolveOperand returns the set of NodeIDs descriptor u currently
+// contributes -- shared logic with CompositeSetRegistry.resolveOperand,
+// see resolveOperandGeneric.
+func (c *CompositeSetLogRegistry) resolveOperand(u NodeID, visited map[NodeID]struct{}) ([]NodeID, error) {
+	return resolveOperandGeneric(c.graph, c.allScalarOperand, c.allSetOperand, c.sets, c.composites, c, u, visited)
+}
+
+// Contains reports whether value currently belongs to log's evaluated
+// membership, without necessarily folding the entire log.
+//
+// Per theorystate.md section 82's proven property, this scans log
+// backward (tail to head): the *last* operation whose currently-resolved
+// operand mentions value entirely determines value's final membership
+// (additive -> present, subtractive -> absent), since every later
+// operation, by definition of "last mentioning operation", does not
+// itself resolve to something containing value, so no later union can
+// reintroduce it and no later subtraction can remove it again. This lets
+// Contains stop at the first (i.e. most recent) qualifying operation
+// using the cheapest membership check available for that operand's kind
+// (see operandMentions) -- a real optimization in the common case, but
+// not a complete one: an operand resolving through a nested CompositeSet
+// or CompositeSetLog still requires fully resolving that operand (there
+// is no cheaper partial check available for those), and the worst case
+// (value absent entirely, or only mentioned at the head) still walks the
+// whole log. See theorystate.md section 82 for why no cache is kept to
+// avoid this cost, consistent with every other Evaluate/Contains in this
+// file.
+func (c *CompositeSetLogRegistry) Contains(log, value NodeID) (bool, error) {
+	if !c.graph.NodeExists(log) {
+		return false, ErrNodeNotFound
+	}
+	if !c.IsCompositeSetLog(log) {
+		return false, ErrNotCompositeSetLog
+	}
+	if !c.graph.NodeExists(value) {
+		return false, ErrNodeNotFound
+	}
+
+	return c.contains(log, value, map[NodeID]struct{}{log: {}})
+}
+
+// contains is Contains's recursive core, assuming log and value have
+// already been confirmed to exist, log to be tagged CompositeSetLog-kind,
+// and log to already be recorded in visited.
+func (c *CompositeSetLogRegistry) contains(log, value NodeID, visited map[NodeID]struct{}) (bool, error) {
+	operations, err := c.lists.Elements(log)
+	if err != nil {
+		return false, err
+	}
+
+	for i := len(operations) - 1; i >= 0; i-- {
+		u := operations[i]
+
+		operand, err := operandTargetGeneric(c.graph, u)
+		if err != nil {
+			return false, err
+		}
+
+		expand, err := exactlyOneTag(c.graph, u, c.allSetOperand, c.allScalarOperand)
+		if err != nil {
+			return false, err
+		}
+
+		mentions, err := c.operandMentions(operand, expand, value, visited)
+		if err != nil {
+			return false, err
+		}
+		if !mentions {
+			continue
+		}
+
+		return exactlyOneTag(c.graph, u, c.allAdditiveOp, c.allSubtractiveOp)
+	}
+
+	return false, nil
+}
+
+// operandMentions reports whether operand's contribution -- the
+// singleton {operand} for a scalar-axis descriptor (expand == false), or
+// operand's own current resolved membership for a set-axis descriptor
+// (expand == true) -- includes value, using the cheapest check available
+// for operand's own kind (theorystate.md section 82): direct equality
+// for a scalar operand, SetRegistry.Contains (an O(1) relationship
+// check) for a plain Set operand, and full recursive resolution (no
+// cheaper check exists for either composite representation) for a
+// nested CompositeSet or CompositeSetLog operand.
+func (c *CompositeSetLogRegistry) operandMentions(operand NodeID, expand bool, value NodeID, visited map[NodeID]struct{}) (bool, error) {
+	if !expand {
+		return operand == value, nil
+	}
+
+	switch {
+	case c.sets.IsSet(operand):
+		return c.sets.Contains(operand, value)
+
+	case c.composites.IsCompositeSet(operand):
+		if _, seen := visited[operand]; seen {
+			return false, ErrCompositeSetCycle
+		}
+		visited[operand] = struct{}{}
+		defer delete(visited, operand)
+
+		resolved, err := c.composites.evaluate(operand, visited)
+		if err != nil {
+			return false, err
+		}
+		for _, id := range resolved {
+			if id == value {
+				return true, nil
+			}
+		}
+		return false, nil
+
+	case c.IsCompositeSetLog(operand):
+		if _, seen := visited[operand]; seen {
+			return false, ErrCompositeSetCycle
+		}
+		visited[operand] = struct{}{}
+		defer delete(visited, operand)
+
+		return c.contains(operand, value, visited)
+
+	default:
+		return false, ErrInvalidSetOperand
+	}
+}
+
+// DeleteCompositeSetLog deletes log from the underlying graph,
+// additionally removing both of its tags -- (AllCompositeSetLogs,log)
+// and (AllLists,log) -- as part of the same transaction, mirroring
+// ListRegistry.DeleteList/SetRegistry.DeleteSet/
+// CompositeSetRegistry.DeleteCompositeSet: each tag is itself an
+// ordinary primitive relationship *into* log, and therefore itself
+// counts toward log's relationship count, so both must be removed before
+// Graph.DeleteNode can succeed, not after.
+//
+// Per theorystate.md section 18, deletion is deliberately "delete only
+// if empty": DeleteCompositeSetLog refuses with ErrNodeNotEmpty if log
+// still has any logged operations, or is itself referenced elsewhere.
+// Callers must RemoveOperation every logged operation first.
+//
+// log must currently be tagged (AllCompositeSetLogs, log).
+func (c *CompositeSetLogRegistry) DeleteCompositeSetLog(log NodeID) error {
+	if !c.graph.NodeExists(log) {
+		return ErrNodeNotFound
+	}
+	if !c.IsCompositeSetLog(log) {
+		return ErrNotCompositeSetLog
+	}
+
+	return c.graph.Transact(func(tx *Txn) error {
+		if _, err := tx.RemoveRelationship(c.allCompositeSetLogs, log); err != nil {
+			return err
+		}
+		if _, err := tx.RemoveRelationship(c.lists.allLists, log); err != nil {
+			return err
+		}
+
+		return tx.DeleteNode(log)
 	})
 }
