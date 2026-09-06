@@ -90,10 +90,12 @@ After that:
   ahead of Sets (theorystate.md section 9 / section 32), which were
   at the time still fully open. The minimal Set interpretation is now
   decided and implemented as SetRegistry (item 17 below;
-  theorystate.md section 79); Domains remain later still, and likely
-  still want the composite Set representations
-  (theorystate.md sections 80-83, designed but not yet implemented)
-  settled first, since the theory frames a Domain as a constrained Set.
+  theorystate.md section 79); the composite Set representations
+  (theorystate.md sections 80-83) are now also implemented as
+  CompositeSetRegistry and CompositeSetLogRegistry (items 18-19 below).
+  Domains remain later still and unstarted; the theory frames a Domain
+  as a constrained Set, and every Set representation it might want to
+  build on is now available.
 
   The ElementCapsule primitive (CapsuleRegistry, item 10) is implemented:
   list -> ElementCapsule does not by itself make every list child a capsule;
@@ -777,13 +779,123 @@ NodeID-keyed structure outside the primitive graph.
  TestCompositeSetEvaluateDetectsMalformedDescriptor, and
  TestSetRegistryTagAsSetRejectsCompositeSetConflict.
 
+19. Added CompositeSetLogRegistry, implementing the append-only,
+ order-sensitive composite Set representation of theorystate.md section
+ 82: the tagged node is dual-tagged (AllLists, node) and
+ (AllCompositeSetLogs, node) -- an ordinary List, reused and
+ reinterpreted rather than reimplemented, per theorystate.md section
+ 10c's precedent for one identity carrying more than one simultaneous
+ interpretation. NewCompositeSetLog mints the node and applies both tags
+ inside one Graph.Transact call, so there is never an observable
+ intermediate state carrying only one of the two. Each logged operation
+ is a list element whose value is an operand-descriptor node U, exactly
+ the same shape CompositeSetRegistry already uses (theorystate.md
+ section 80). AppendOperation, RemoveOperation, Operations,
+ OperandTarget, OperandIsAdditive, OperandIsSetOperand, Evaluate,
+ Contains, and DeleteCompositeSetLog are provided.
+
+ Evaluate implements theorystate.md section 82's order-sensitive
+ left-to-right fold (unlike CompositeSetRegistry.Evaluate's
+ order-insensitive union-then-difference): a later operation mentioning
+ a given element supersedes an earlier one, regardless of which axis
+ either operation is tagged with. Contains implements the backward-scan
+ optimization theorystate.md section 82 proves is sound: it walks the
+ log tail-to-head and stops at the first (i.e. most recent) operation
+ whose operand currently mentions the queried value, using the cheapest
+ membership check available for that operand's own kind (direct equality
+ for a scalar operand, SetRegistry.Contains for a plain Set operand, and
+ full recursive resolution -- no cheaper check exists -- for a nested
+ CompositeSet or CompositeSetLog operand). Neither Evaluate nor Contains
+ is ever cached, for the same reason given throughout this file.
+
+ Cross-representation dispatch and cycle detection (theorystate.md
+ section 83) are now fully bidirectional across all three Set
+ representations. This requires CompositeSetRegistry and
+ CompositeSetLogRegistry to each be able to resolve the other's kind,
+ which is a genuine mutual dependency Go cannot construct in one step;
+ resolved by having CompositeSetLogRegistry take an existing
+ *CompositeSetRegistry as a constructor argument (immediately gaining
+ the ability to resolve CompositeSet-kind and its own kind, recursively),
+ and adding a new CompositeSetRegistry.SetLogs(logs) method, called
+ after both registries exist, to complete the wiring in the other
+ direction. A CompositeSetRegistry that never has SetLogs called
+ continues to work for every other operand kind; a CompositeSetLog-kind
+ operand it encounters is simply reported via the existing
+ ErrInvalidSetOperand, exactly as any other unrecognized tag would be.
+ The shared visited-set cycle tracking (theorystate.md section 83) now
+ spans both composite representations, so a cycle alternating between a
+ CompositeSet and a CompositeSetLog is still caught by either one's
+ Evaluate.
+
+ Per this file's own "add foundational names only when starting the
+ corresponding representation" discipline, NameAllCompositeSetLogs was
+ added to FoundationalNames now that this representation is actually
+ being implemented. theorystate.md section 79's Set-representation
+ mutual-exclusivity rule now covers all three tags (AllSets,
+ AllCompositeSets, AllCompositeSetLogs): NewSetRegistry's otherSetTags
+ and SetRegistry.TagAsSet's check needed no code change to support this
+ (they were already generic over however many tags are passed), only an
+ additional tag NodeID supplied by callers wiring up a
+ CompositeSetLogRegistry alongside SetRegistry.
+
+ DRY: per theorystate.md section 80's own anticipation ("expected to
+ share one internal build/validate/resolve implementation... once both
+ are implemented"), the operand-descriptor build/inspect/teardown/resolve
+ logic previously living only inside CompositeSetRegistry was factored
+ out into shared free functions -- buildOperandDescriptorTx,
+ operandDescriptorAxes, clearOperandDescriptorEdgesTx,
+ deleteOperandDescriptorTx, operandTargetGeneric, resolveOperandGeneric,
+ resolveSetOperandGeneric, and operandCarriesKnownSetTag -- now used by
+ both CompositeSetRegistry (AddOperand, RemoveOperand, OperandTarget,
+ resolveOperand) and CompositeSetLogRegistry. This is a pure refactor of
+ CompositeSetRegistry's existing methods; no behavior change, and all of
+ item 18's existing tests continue to pass against it unmodified.
+ Separately, ListRegistry.Append was split into a new tx-composable
+ appendTx (mirroring the existing newCapsuleTx/setPrevTx/setNextTx
+ pattern), so CompositeSetLogRegistry.AppendOperation can mint its
+ descriptor and append it to the log inside one atomic transaction
+ instead of two separate ones.
+
+ RemoveOperation's teardown order is more constrained than
+ CompositeSetRegistry.RemoveOperand's: a CompositeSetLog's descriptor U
+ has an incoming edge from its owning capsule's value slot (unlike a
+ CompositeSetRegistry descriptor, whose only incoming edge is the direct
+ containment edge from its composite set, removed in the same step as
+ everything else). RemoveOperation therefore first unlinks and reclaims
+ the capsule via ListRegistry.RemoveWithoutDeletingCapsule +
+ CapsuleRegistry.DeleteCapsule (whose own atomic teardown clears the
+ value-slot-to-U edge as part of deleting the capsule), and only once
+ that succeeds -- leaving U with no remaining incoming edges -- clears
+ U's own outgoing/tag edges and deletes U itself in a second transaction.
+ If DeleteCapsule fails (ErrCapsuleNotEmpty), RemoveOperation stops there
+ without touching U at all, leaving the capsule unlinked but otherwise
+ intact, exactly mirroring ListRegistry.Remove's own best-effort second
+ step.
+
+ Covered by TestFoundationalNamesIncludesAllCompositeSetLogs,
+ TestNewCompositeSetLogRegistryRequiresExistingTags,
+ TestNewCompositeSetLogTagsBothAllListsAndAllCompositeSetLogs,
+ TestCompositeSetLogAppendOperationScalarAdditive,
+ TestCompositeSetLogEvaluateOrderSensitiveFold,
+ TestCompositeSetLogAppendOperationRequiresKnownSetTagWhenExpand,
+ TestCompositeSetLogEvaluateResolvesSetOperand,
+ TestCompositeSetLogEvaluateResolvesCompositeSetOperand,
+ TestCompositeSetLogEvaluateResolvesNestedCompositeSetLogOperand,
+ TestCompositeSetRegistryResolvesCompositeSetLogOperand,
+ TestCompositeSetRegistryWithoutSetLogsRejectsCompositeSetLogOperand,
+ TestCompositeSetLogEvaluateDetectsCycle,
+ TestCompositeSetLogEvaluateDetectsCrossRepresentationCycle,
+ TestCompositeSetLogContainsMatchesEvaluate,
+ TestCompositeSetLogContainsRequiresExistingValue,
+ TestCompositeSetLogRemoveOperationDeletesDescriptorAndCapsule,
+ TestCompositeSetLogRemoveOperationRequiresOperationInLog,
+ TestCompositeSetLogDeleteCompositeSetLogSucceedsWhenEmpty,
+ TestCompositeSetLogDeleteCompositeSetLogFailsIfNotEmpty,
+ TestCompositeSetLogOperationsRequireCompositeSetLogTag,
+ TestCompositeSetLogEvaluateDetectsMalformedDescriptor, and
+ TestSetRegistryTagAsSetRejectsCompositeSetLogConflict.
+
 Currently unaddressed yet:
-- SetRegistry's and CompositeSetRegistry's mutual-exclusivity enforcement
-  (theorystate.md section 79) only covers the two Set representations
-  that exist so far (AllSets, AllCompositeSets); CompositeSetLogRegistry
-  (theorystate.md section 82) remains unimplemented. Whichever registry
-  implements it must be added to NewSetRegistry's otherSetTags and to an
-  analogous check wherever CompositeSetLogRegistry itself tags nodes.
 - No commit-time interception exists to prevent a raw
   Graph.AddRelationship from creating a second child on an
   already-tagged Pointer node in the first place; PointerRegistry can

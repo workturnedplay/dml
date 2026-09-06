@@ -201,10 +201,10 @@ canonical; illustrative only.
 Minimal interpretation: `(A,B),(A,C),(A,D)` ⇒ B,C,D are members of A.
 `(AllSets,A)` is now DECIDED as required, not optional (§79, revising
 this section's original "optionally" -- see §79 for why an explicit tag
-was chosen over §9a's original untagged-by-default framing). This minimal
-interpretation is implemented as `SetRegistry` (§79). Composite Set forms
-(§9b) and Domains (§9c) remain open; see §80–§85 for their current,
-fully-specified-but-deferred design.
+was chosen over §9a's original untagged-by-default framing). This minimal interpretation is implemented as `SetRegistry` (§79).
+Composite Set forms (§9b) are now implemented (§81, §82, both validated
+by `wtw`); Domains (§9c) remain open — see §80–§85 for the composite
+forms' design and §9c for Domains' unstarted status.
 
 **§9a — Elaboration on the minimal interpretation (merged from
 THEORY_NOTES_FROM_CONVERSATION.md §4).** Under `(X,Y) ⇒ Y is a member of
@@ -247,12 +247,11 @@ role-bearing intermediary nodes whenever the same underlying Set/Domain
 must participate in different roles (e.g. a composite Set referring to
 other Sets as additive or subtractive operands, with the same Set node
 usable in different roles across different composite structures) — the
-same construction §75 later names generally. Ordered add/subtract
-operations over composite Sets are now **DECIDED** as unordered
-union-then-difference for the plain composite form and as an
+same construction §75 later names generally. Ordered add/subtract operations over composite Sets are now **DECIDED** as
+unordered union-then-difference for the plain composite form and as an
 order-sensitive fold for the log-based form — see §80–§83, which formalize
-and supersede this section's diagram with a concrete (still
-unimplemented) representation.
+and supersede this section's diagram with a concrete, now fully
+implemented representation.
 
 **§9c — Domains (explored, not decided; merged from
 THEORY_NOTES_FROM_CONVERSATION.md §6).** A Domain was explored as
@@ -1480,8 +1479,9 @@ out-of-band mutation to violate.
 
 ## 80. Operand descriptors — shared mechanism for composite Set forms (§81, §82)
 
-**DECIDED (design), implementation deferred.** Both composite Set
-representations below need to record, per operand: (1) whether the
+**DECIDED (design); implemented, shared by both consumers.** Both
+composite Set representations below need to record, per operand: (1)
+whether the
 operand participates additively or subtractively, and (2) whether the
 operand is a bare scalar member or a nested Set whose own membership
 should be expanded in. This section records the shared mechanism and the
@@ -1534,11 +1534,13 @@ identities — chosen deliberately so a future third operation kind costs
 one new tag on axis 1 alone, not a re-multiplication across axis 2.
 
 `CompositeSetRegistry` (§81) and `CompositeSetLogRegistry` (§82) share
-this exact descriptor shape and are expected to share one internal
-build/validate/resolve implementation for `U`, factored out once both are
-implemented — the same DRY extraction precedent as `subjectMetadataBase`
-(`implementation_state.md` item 9), not attempted before there are two
-real call sites to justify it (§7).
+this exact descriptor shape and now share one internal build/inspect/
+teardown/resolve implementation for `U` (`buildOperandDescriptorTx`,
+`operandDescriptorAxes`, `operandTargetGeneric`, `resolveOperandGeneric`,
+`resolveSetOperandGeneric`, `operandCarriesKnownSetTag`), factored out
+once both were implemented — the same DRY extraction precedent as
+`subjectMetadataBase` (`implementation_state.md` item 9), which likewise
+waited for two real call sites before extracting (§7).
 
 ## 81. CompositeSetRegistry — unordered composite Sets (TENTATIVE design; implemented)
 
@@ -1569,7 +1571,22 @@ with §9a/§35's reasoning that a cached derived-membership view cannot be
 kept honestly in sync without invalidation machinery that doesn't exist
 and should not be built ahead of an actual need. Cycle detection: §83.
 
-## 82. CompositeSetLogRegistry — append-only Set-mutation logs (TENTATIVE, deferred)
+**Implementation note (validated by `wtw`).** Resolving a
+`CompositeSetLog`-kind operand (§82) requires `CompositeSetRegistry` to
+be told about the sibling registry after construction, via
+`CompositeSetRegistry.SetLogs` — the two types mutually reference each
+other (each must be able to resolve the other's kind), which Go cannot
+construct in one mutually-referential step. A `CompositeSetRegistry`
+that has not had `SetLogs` called treats a `CompositeSetLog`-kind operand
+exactly like any node carrying no recognized Set-representation tag
+(`ErrInvalidSetOperand`), rather than panicking or silently skipping it.
+
+## 82. CompositeSetLogRegistry — append-only Set-mutation logs (TENTATIVE design; implemented)
+
+Now implemented as `CompositeSetLogRegistry` and validated by `wtw` (per
+§33's discipline, the representation's *shape* stays tagged TENTATIVE
+since it hasn't been exercised long enough to call DECIDED; only its
+*existence in code* has changed, exactly as for §81's revision).
 
 **Reframing this structure is built on, worth stating explicitly since
 it's easy to mis-name (this section was itself renamed once for exactly
@@ -1646,6 +1663,17 @@ default operation kind — matching this codebase's existing
 fail-loud-not-silently-repair discipline (`ErrTooManyPointerTargets`,
 `ErrNameBoundToDeletedNode`).
 
+**Implementation note (validated by `wtw`).** `CompositeSetLogRegistry`
+implements this representation exactly as specified above:
+`NewCompositeSetLog` mints a node and applies both tags
+(`AllLists`/`AllCompositeSetLogs`) inside one `Graph.Transact` call, so
+there is no observable intermediate state carrying only one of the two;
+`AppendOperation`/`RemoveOperation` compose the shared operand-descriptor
+helpers (§80) with `ListRegistry`'s existing tx-composable list
+operations rather than duplicating either; and `Contains` implements the
+backward-scan optimization described above, falling back to full
+resolution only for nested composite-kind operands, exactly as predicted.
+
 ## 83. Cross-representation dispatch and cycle detection for composite Sets (TENTATIVE, deferred)
 
 Both §81 and §82 allow an operand to point at any of the three Set
@@ -1682,15 +1710,23 @@ limit would be an arbitrary restriction on top of that, and the cycle
 detection above already rejects the only case — a genuine cycle — that
 would otherwise fail to terminate.
 
-**Implementation note (validated by `wtw`).** `CompositeSetRegistry`
-implements this dispatch and cycle detection exactly as specified above:
-the visited set is scoped to the *current resolution path* (added
-immediately before, and removed immediately after, each recursive
-descent — not a global ever-visited set), so a DAG where the same
-composite Set is legitimately reached via two different, non-cyclic
-branches is not mistaken for a cycle. Only `CompositeSetRegistry` and
-`SetRegistry` are dispatch targets so far; `CompositeSetLogRegistry`
-remains unimplemented (§82), so the dispatcher has only two cases today.
+**Implementation note (validated by `wtw`).** `CompositeSetRegistry` and
+`CompositeSetLogRegistry` both implement this dispatch and cycle
+detection exactly as specified above: the visited set is scoped to the
+*current resolution path* (added immediately before, and removed
+immediately after, each recursive descent -- not a global ever-visited
+set), so a DAG where the same composite-kind node is legitimately reached
+via two different, non-cyclic branches is not mistaken for a cycle, and a
+cycle crossing between the two composite representations is still
+caught. All three representations (`SetRegistry`, `CompositeSetRegistry`,
+`CompositeSetLogRegistry`) are now dispatch targets. The dispatch is
+bidirectional but requires one explicit wiring step:
+`CompositeSetRegistry` only gains the ability to resolve
+`CompositeSetLog`-kind operands after `CompositeSetRegistry.SetLogs` is
+called (see §81's implementation note) — `CompositeSetLogRegistry`
+itself can resolve `CompositeSet`-kind (and its own kind, recursively)
+operands immediately upon construction, since it takes an existing
+`*CompositeSetRegistry` as a constructor argument.
 
 ## 84. Declined: concurrent/bidirectional Contains search (REJECTED FOR NOW, explored and found not to transfer)
 
@@ -1819,6 +1855,10 @@ kept current as sections above resolve or split further.)*
   within each axis, for the unordered composite form (§81); an
   order-sensitive left-to-right fold, where a later operation supersedes
   an earlier mention of the same element, for the log-based form (§82).
+- Both composite Set representations (§81, §82) are implemented, with
+  full bidirectional cross-representation dispatch (§83) between them and
+  with plain Sets; a node may carry at most one of the three
+  Set-representation tags, now enforced for all three (§79).
 
 ### TENTATIVE
 - Monotonically increasing NodeIDs; serialized first implementation.
@@ -1830,11 +1870,10 @@ kept current as sections above resolve or split further.)*
 - Real-ID + capability-model permissions (current lean, §70) — untested
   against real-ID + access-control.
 - Selective, opt-in, tag-gated content-addressed versioning (§66).
-- CompositeSetLogRegistry's exact shape (§82) — designed and
-  DECIDED-in-shape, not yet implemented. CompositeSetRegistry (§81) is
-  now implemented as `CompositeSetRegistry`, validated by `wtw`; its
-  operand-descriptor shape (§80) is shared and expected to be reused once
-  CompositeSetLogRegistry is built.
+- Both composite Set representations' exact shapes (§81, §82) — designed
+  and DECIDED-in-shape, now implemented as `CompositeSetRegistry` and
+  `CompositeSetLogRegistry` respectively, validated by `wtw`, sharing one
+  operand-descriptor implementation (§80) as anticipated.
 
 ### OPEN
 - Exact Set/Pointer/List definitions; exact primitive storage; whether a
