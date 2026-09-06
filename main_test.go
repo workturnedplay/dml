@@ -3354,7 +3354,7 @@ func TestCapsuleRegistryDeleteCapsuleFailsIfSlotHasExtraParent(t *testing.T) {
 
 	// An unrelated node referencing the value slot for its own reasons
 	// -- ordinary permitted graph structure (a node may have any number
-	// of parents, theorystate_v0.6.md section 2.8) that
+	// of parents, theorystate.md section 2.8) that
 	// DeleteCapsule must not silently delete out from under.
 	if _, err := g.AddRelationship(metadata, valueSlot); err != nil {
 		t.Fatalf("AddRelationship(metadata, valueSlot): %v", err)
@@ -6058,7 +6058,7 @@ func TestSetMembersReturnsAllDirectChildren(t *testing.T) {
 }
 
 // TestSetMembersDoesNotRecurseIntoNestedSet pins down
-// theorystate_v0.6.md section 9a/79: a Set containing another Set as a
+// theorystate.md section 9a/79: a Set containing another Set as a
 // member does not, by itself, imply recursive membership expansion.
 func TestSetMembersDoesNotRecurseIntoNestedSet(t *testing.T) {
 	g, sets := newSetTestFixture(t)
@@ -6190,7 +6190,7 @@ func TestSetDeleteSetFailsIfNotEmpty(t *testing.T) {
 // TestSetDeleteSetFailsIfReferencedElsewhere covers the case where set
 // has no members of its own but is itself referenced by some other node
 // -- Graph.DeleteNode requires both outgoing and incoming relationships
-// to be empty (theorystate_v0.6.md section 18), so an incoming reference
+// to be empty (theorystate.md section 18), so an incoming reference
 // alone is enough to block deletion.
 func TestSetDeleteSetFailsIfReferencedElsewhere(t *testing.T) {
 	g, sets := newSetTestFixture(t)

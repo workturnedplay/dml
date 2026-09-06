@@ -9,7 +9,7 @@ Current implementation:
 - RootGraph implemented and tested.
 - PointerRegistry implemented and tested, enforcing the Pointer invariant
   (at most one target) for nodes tagged (AllPointers, P), per
-  theorystate_v0.6.md section 10 / 10b. Its multi-step operations run
+  theorystate.md section 10 / 10b. Its multi-step operations run
   inside Graph.Transact.
 - Named nodes use an external name -> NodeID registry. Its
   CreateNamedNode also runs inside Graph.Transact.
@@ -24,7 +24,7 @@ Completed milestones:
 
 Current next task:
 - The Pointer processor is now implemented across all four
-  representations described in theorystate_v0.6.md section 10 / 10b
+  representations described in theorystate.md section 10 / 10b
   (this bullet list replaces a
   previously stale version of itself that still claimed only
   Representation A existed after B and C had already been completed --
@@ -38,16 +38,16 @@ Current next task:
     PointerMetadataRegistry, tagged via AllPointerMetadata /
     AllPointerMetadataSubjectSlot. Deliberately kept with its known
     exclusion-based limitation -- see its doc comment and
-    theorystate_v0.6.md section 10a -- rather than patched, since a
+    theorystate.md section 10a -- rather than patched, since a
     stricter-than-necessary lower layer is useful for testing higher-layer
     reactions (section 73).
   - Representation D (corrected metadata structure, tag-based target
     lookup): PointerMetadataRegistryD, adding
     AllPointerMetadataTargetSlot. This is the construction
-    theorystate_v0.6.md section 10a should have described
+    theorystate.md section 10a should have described
     from the start; see that section for why Representation C's
     exclusion-based approach doesn't generalize safely (item 8).
-- Open: whether a commit-time interception mechanism (theorystate_v0.6.md
+- Open: whether a commit-time interception mechanism (theorystate.md
   section 73) should eventually replace the re-check-every-call approach
   used by every registry above; not needed yet since there is exactly one
   writer and no concurrent mutation.
@@ -65,16 +65,16 @@ After that:
   constructed with (no branching on tag identity), and generic
   (Tag,X) membership querying is already covered by the existing
   Graph.FindOutgoing(tag) -- no further abstraction is needed for any of
-  this. See theorystate_v0.6.md section 76 for the formal writeup. This
+  this. See theorystate.md section 76 for the formal writeup. This
   bullet is corrected here because it had gone stale without being
   updated when that work landed.
-- Ordered Lists (theorystate_v0.6.md section 11 / 11a) were implemented
-  ahead of Sets (theorystate_v0.6.md section 9 / section 32), which were
+- Ordered Lists (theorystate.md section 11 / 11a) were implemented
+  ahead of Sets (theorystate.md section 9 / section 32), which were
   at the time still fully open. The minimal Set interpretation is now
   decided and implemented as SetRegistry (item 17 below;
-  theorystate_v0.6.md section 79); Domains remain later still, and likely
+  theorystate.md section 79); Domains remain later still, and likely
   still want the composite Set representations
-  (theorystate_v0.6.md sections 80-83, designed but not yet implemented)
+  (theorystate.md sections 80-83, designed but not yet implemented)
   settled first, since the theory frames a Domain as a constrained Set.
 
   The ElementCapsule primitive (CapsuleRegistry, item 10) is implemented:
@@ -97,7 +97,7 @@ After that:
   permitted.
 
   Ordered Lists are therefore feature-complete for the primitives currently
-  scoped, but their final semantic contract remains OPEN in theorystate_v0.6.md.
+  scoped, but their final semantic contract remains OPEN in theorystate.md.
 - Do not prematurely implement Set/List semantics in the primitive layer;
   they remain higher-layer constructions, per the same discipline that kept
   Pointer semantics entirely out of Graph.
@@ -165,7 +165,7 @@ its own delete). Expect the same shape of problem to recur for any future
 NodeID-keyed structure outside the primitive graph.
 
 4. PointerRegistry implements Representation A (direct child) of the
- Pointer processor described in theorystate_v0.6.md section 10 / 10b:
+ Pointer processor described in theorystate.md section 10 / 10b:
  (AllPointers, P) tags P as
  Pointer-kind, and P's target, if any, is enforced to be at most one
  direct child of P. Two ways to obtain a tagged Pointer node are
@@ -187,7 +187,7 @@ NodeID-keyed structure outside the primitive graph.
  accepted, pre-existing gap shared with NameRegistry.CreateNamedNode.
  Graph.Transact provides failure-atomicity only, not concurrency
  isolation -- true first-class multi-primitive-operation transactions as
- a graph concept remain theorystate_v0.6.md section 14/45, both still
+ a graph concept remain theorystate.md section 14/45, both still
  OPEN. Covered by
  TestNewPointerRegistryRequiresExistingAllPointers,
  TestPointerRegistryNewPointerStartsEmpty,
@@ -230,11 +230,11 @@ NodeID-keyed structure outside the primitive graph.
  now run their multi-step sequences through Graph.Transact.
  Txn deliberately provides failure-atomicity only, not isolation from
  concurrent access -- nothing currently runs concurrently
- (theorystate_v0.6.md section 19), so this was not attempted. Txn also
+ (theorystate.md section 19), so this was not attempted. Txn also
  does not support undoing DeleteNode (would require resurrecting a
  specific NodeID outside the normal monotonic counter -- deferred until
  an actual caller needs it) and is not designed to nest
- (theorystate_v0.6.md section 45, still OPEN). Covered by
+ (theorystate.md section 45, still OPEN). Covered by
  TestTransactCommitsMutationsOnSuccess,
  TestTransactRollsBackCreateNodeOnLaterFailure,
  TestTransactRollsBackRelationshipsInLIFOOrder,
@@ -254,13 +254,13 @@ NodeID-keyed structure outside the primitive graph.
 7. PointerRegistry generalized (doc-only, no code change) to cover Representation B via a second instance tagged AllSubPointers; PointerMetadataRegistry added implementing Representation C, using a subject-slot indirection node discovered during design — a naive M->subject/M->target two-edge scheme cannot represent self-targeting since the two edges would collapse into one relationship; singleChildTarget extracted from PointerRegistry.currentTarget as shared DRY logic used by both registries.
 
 
-8. Fixed a real design bug in Representation C / theorystate_v0.6.md
+8. Fixed a real design bug in Representation C / theorystate.md
  section 10a, found during review: identifying "the target" as
  literally "whichever child of M isn't the tagged subject-slot"
  (exclusion) silently assumes M can never have any other child, ever --
  contradicting the construction's own stated purpose of letting M grow
  structure later without disturbing what's already there.
- theorystate_v0.6.md section 10a records the correction (its original
+ theorystate.md section 10a records the correction (its original
  "M -> P, M -> I" sketch had an even sharper version of the same bug:
  those two relationships collapse into one whenever target == subject,
  since primitive relationships are unique pairs). Added PointerMetadataRegistryD
@@ -324,7 +324,7 @@ NodeID-keyed structure outside the primitive graph.
  its own tagging into a single Transact call.
 
  Added CapsuleRegistry, implementing the ElementCapsule primitive of
- Ordered Lists (theorystate_v0.6.md section 11 / 11a): AllElementCapsules
+ Ordered Lists (theorystate.md section 11 / 11a): AllElementCapsules
  tags capsule-kind
  nodes (renamed from the theory docs' illustrative "AllCapsules" to
  avoid implying a more generic capsule concept); each capsule's prev,
@@ -333,7 +333,7 @@ NodeID-keyed structure outside the primitive graph.
  AllElementCapsuleValueSlot / AllElementCapsuleNextSlot) -- Pointer
  Representation B applied three times, reusing PointerRegistry
  unmodified rather than reimplementing "at most one target" a third
- time (theorystate_v0.6.md section 76). Roles are discovered by tag via
+ time (theorystate.md section 76). Roles are discovered by tag via
  findUniqueTaggedChild, not by position or exclusion, matching the
  discipline established for PointerMetadataRegistryD. NewCapsule wires
  the capsule's own tag and all three slots inside one Graph.Transact
@@ -357,7 +357,7 @@ NodeID-keyed structure outside the primitive graph.
  capsule X is currently both head and tail.
 
 11. Added ListRegistry, implementing Ordered Lists
- (theorystate_v0.6.md section 11 / 11a) on top of CapsuleRegistry
+ (theorystate.md section 11 / 11a) on top of CapsuleRegistry
  (item 10). A list is an ordinary
  node tagged (AllLists, list). List membership is the ordinary
  (list, capsule) containment edge combined with the capsule's own
@@ -424,7 +424,7 @@ NodeID-keyed structure outside the primitive graph.
  Graph.DeleteNode can succeed (not after, the way NameRegistry cleans up
  its purely-external bookkeeping) -- Transact's rollback is what makes
  this safe if DeleteNode then fails with ErrNodeNotEmpty. Per
- theorystate_v0.6.md section 18, this is deliberately "delete only if
+ theorystate.md section 18, this is deliberately "delete only if
  empty," not cascade; callers must Remove every element first.
 
  Covered by TestListRemoveMiddleElement, TestListRemoveHeadUpdatesHead,
@@ -440,7 +440,7 @@ NodeID-keyed structure outside the primitive graph.
 
 13. Added value-membership queries -- CapsuleRegistry.CapsulesWithValue,
  ListRegistry.OccurrencesOf, and ListRegistry.Contains -- resolving what
- item 12 above and theorystate_v0.6.md section 11 had flagged as a
+ item 12 above and theorystate.md section 11 had flagged as a
  possible later
  "Set-like index" addition. No new node, tag, or index structure turned
  out to be needed: CapsulesWithValue is a pure reverse lookup from a
@@ -454,7 +454,7 @@ NodeID-keyed structure outside the primitive graph.
  in review as wrong, not merely stricter than necessary: a role-slot node
  is ordinary graph structure, and nothing prevents some future unrelated
  construct from also pointing at it (a node may have any number of
- parents, theorystate_v0.6.md section 2.5/3), which must not be
+ parents, theorystate.md section 2.5/3), which must not be
  confused with a second owning capsule or make the lookup fail.
  findUniqueTaggedParent already has exactly the right semantics -- ignore
  any number of non-capsule-tagged parents, only object if two distinct
@@ -505,7 +505,7 @@ NodeID-keyed structure outside the primitive graph.
  already have zero relationships left, before any Graph.DeleteNode call
  is made at all. Only once all four are confirmed empty are the four
  deletes performed, grouped last and in sequence -- see
- theorystate_v0.6.md section 78 for the generalized principle.
+ theorystate.md section 78 for the generalized principle.
 
  ListRegistry.RemoveAndDelete composes Remove and DeleteCapsule as two
  separate, sequential Graph.Transact calls, not one joint transaction:
@@ -516,7 +516,7 @@ NodeID-keyed structure outside the primitive graph.
  -- a capsule that legitimately cannot be deleted still ends up fully,
  successfully removed from the list. This is a new, separate method, not
  a change to Remove's existing behavior: Remove's own guarantee that it
- never deletes or untags capsule (item 12, theorystate_v0.6.md section
+ never deletes or untags capsule (item 12, theorystate.md section
  10c) is unchanged for existing callers.
 
  Also clarified and pinned by a new test
@@ -528,7 +528,7 @@ NodeID-keyed structure outside the primitive graph.
  AllElementCapsuleValueSlot / AllElementCapsuleNextSlot), never with the
  separate, generic AllPointers tag -- so IsPointer here checks precisely
  the role tag itself, inherited unmodified from PointerRegistry
- (theorystate_v0.6.md section 76). Worth naming and testing directly,
+ (theorystate.md section 76). Worth naming and testing directly,
  since PointerRegistry's generic naming (allPointers field, IsPointer
  method) makes it easy to assume a second, independent generic tag is
  also involved when it never is.
@@ -567,7 +567,7 @@ NodeID-keyed structure outside the primitive graph.
  rollback undoes every earlier step in the same call, including any
  DeleteNode calls that had already succeeded earlier in that sequence.
  All existing DeleteCapsule tests continue to pass unmodified against
- this simplified implementation. See theorystate_v0.6.md section 78
+ this simplified implementation. See theorystate.md section 78
  (corrected this session) for the full writeup, including the specific
  caveat that this safety is tied to the current toy allocator's
  never-reuse property and would not automatically transfer to a NodeID
@@ -622,30 +622,30 @@ NodeID-keyed structure outside the primitive graph.
  local Go toolchain, while the project's go.mod remains at Go 1.27.
 
 17. Added SetRegistry, implementing the minimal Set interpretation of
- theorystate_v0.6.md section 9 / 9a (formalized as section 79):
+ theorystate.md section 9 / 9a (formalized as section 79):
  (AllSets, S) tags S as Set-kind, and S's direct children are exactly its
  members -- no intermediary node is needed, unlike every other structure
  in this file, because primitive relationships are already unique pairs
- (theorystate_v0.6.md section 2.6, ruling out duplicate membership by
+ (theorystate.md section 2.6, ruling out duplicate membership by
  construction) and Sets carry no order (section 5) needing an
  occurrence-identity node (section 75) the way List elements do. IsSet /
  NewSet / TagAsSet / Add / Remove / Contains / Members / Size / DeleteSet
  are provided; DeleteSet mirrors ListRegistry.DeleteList's "remove the tag
  as part of the same transaction, then delete only if empty" shape.
- Self-membership is permitted (theorystate_v0.6.md section 2.8).
+ Self-membership is permitted (theorystate.md section 2.8).
  Members() deliberately does not recurse into a member that happens to
- itself be tagged Set-kind (theorystate_v0.6.md section 9a) -- recursive
+ itself be tagged Set-kind (theorystate.md section 9a) -- recursive
  expansion is reserved for the separate, still-deferred
- CompositeSetRegistry / CompositeSetLogRegistry designs (theorystate_v0.6.md
+ CompositeSetRegistry / CompositeSetLogRegistry designs (theorystate.md
  sections 80-83), which additionally required resolving a real design flaw
  found during review before being written up: an operand's intent to be
  expanded-as-a-set versus kept-as-a-scalar-member must be recorded
  explicitly per operand (a fresh, per-relationship descriptor node, the
- same theorystate_v0.6.md section 75 occurrence-identity pattern used
+ same theorystate.md section 75 occurrence-identity pattern used
  elsewhere), never inferred from the operand node's own tags -- inferring
  it was found to silently make "add a Set as a literal member of another
  Set" (explicitly permitted by section 9a) inexpressible. See
- theorystate_v0.6.md sections 79-85 for the full write-up, including the
+ theorystate.md sections 79-85 for the full write-up, including the
  two composite representations' designs, why a cached derived-membership
  view is not being built, and an explored-and-declined concurrent-lookup
  optimization.
@@ -675,23 +675,23 @@ NodeID-keyed structure outside the primitive graph.
  TestSetOperationsRequireSetTag, and TestSetOperationsRequireExistingSetNode.
 
 Currently unaddressed yet:
-- SetRegistry does not yet enforce theorystate_v0.6.md section 79's
+- SetRegistry does not yet enforce theorystate.md section 79's
   mutual-exclusivity rule (at most one of AllSets / AllCompositeSets /
   AllCompositeSetLogs per node), since neither of the other two tags
   exists in this codebase yet. This must be added -- here, and in
   whichever of CompositeSetRegistry / CompositeSetLogRegistry
-  (theorystate_v0.6.md sections 80-83) is implemented first -- once either
+  (theorystate.md sections 80-83) is implemented first -- once either
   actually exists.
 - No commit-time interception exists to prevent a raw
   Graph.AddRelationship from creating a second child on an
   already-tagged Pointer node in the first place; PointerRegistry can
   only detect the violation after the fact, on its next call for that
-  node (see item 4 above and theorystate_v0.6.md section 73). This is a
+  node (see item 4 above and theorystate.md section 73). This is a
   different concern from item 6's Txn: Txn makes a registry's own
   multi-step sequence atomic against its own later failure; it does
   nothing to stop an unrelated caller from bypassing the registry
   entirely via the raw Graph. Whether/when a real interception mechanism
-  (theorystate_v0.6.md section 73) is worth building is open.
+  (theorystate.md section 73) is worth building is open.
 - Txn does not support nesting one Graph.Transact call inside another
   (Txn.DeleteNode is supported -- see item 15). Nesting is not needed by
   any current caller; add support if and when one actually needs it.

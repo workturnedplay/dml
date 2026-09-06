@@ -1,4 +1,4 @@
-# Theory State v0.6 (Coalesced)
+# Theory State (Coalesced)
 
 **Status:** Exploratory / theory state linked to an active implementation
 **Purpose:** Single source of truth, merging v0.1–v0.5 and subsequent session

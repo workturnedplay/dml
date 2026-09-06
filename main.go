@@ -320,19 +320,19 @@ func (g *Graph) nodeExists(id NodeID) bool {
 //
 // Txn deliberately does NOT provide isolation from concurrent access.
 // The toy implementation is single-threaded/serialized
-// (theorystate_v0.6.md section 19); nothing can observe a Txn's
+// (theorystate.md section 19); nothing can observe a Txn's
 // intermediate state mid-sequence today because nothing else runs
 // between two statements in the same synchronous call. Should real
 // concurrency be introduced later, Txn as written here would need real
 // locking/isolation on top -- that is a separate, still-open problem
-// (theorystate_v0.6.md section 19), not one Txn tries to solve.
+// (theorystate.md section 19), not one Txn tries to solve.
 //
 // Txn also does NOT provide durability/crash-atomicity: there is no
 // persistence layer yet, so a process crash mid-transaction is not a
 // concern this version needs to handle.
 //
 // Txn is intentionally not a staged/copy-on-write view of the graph
-// (theorystate_v0.6.md section 15's "transaction overlay" idea). Each Txn
+// (theorystate.md section 15's "transaction overlay" idea). Each Txn
 // method applies its mutation directly to the real underlying Graph and
 // simply records how to undo it; this is significantly simpler than a
 // full overlay and is sufficient because, per the isolation point above,
@@ -359,13 +359,13 @@ func (g *Graph) nodeExists(id NodeID) bool {
 // Read operations are not wrapped, since every current caller already
 // holds a reference to the underlying Graph (or NameRegistry/
 // PointerRegistry wrapping one) for reads; add read-passthrough methods
-// here if and when a caller actually needs them (theorystate_v0.6.md
+// here if and when a caller actually needs them (theorystate.md
 // section 7's construct-only-what's-needed discipline).
 //
 // Nesting one Graph.Transact call inside another is not currently
 // supported or used by anything in this file: an inner Txn has its own
 // independent undo log and knows nothing about an enclosing one. Genuine
-// nested-transaction semantics are theorystate_v0.6.md section 45, still
+// nested-transaction semantics are theorystate.md section 45, still
 // OPEN; do not rely on nesting until that is deliberately designed.
 type Txn struct {
 	graph *Graph
@@ -780,7 +780,7 @@ func (r *NameRegistry) BootstrapNames(names []string) (map[string]NodeID, error)
 // special meaning comes entirely from higher-level relationships and
 // processors that interpret them — never from the primitive Graph or the
 // NameRegistry itself. See THEORY_NOTES_FROM_CONVERSATION.md and
-// theorystate_v0.6.md for the semantics each name is intended to support.
+// theorystate.md for the semantics each name is intended to support.
 const (
 	// NameAllPointers tags a node as Pointer-kind via the relationship
 	// (AllPointers, P), for Representation A (direct child): P's own
@@ -818,7 +818,7 @@ const (
 	NameAllPointerMetadataTargetSlot = "AllPointerMetadataTargetSlot"
 
 	// NameAllElementCapsules tags a node as an ElementCapsule
-	// (THEORY_NOTES_FROM_CONVERSATION.md section 11 / theorystate_v0.6.md
+	// (THEORY_NOTES_FROM_CONVERSATION.md section 11 / theorystate.md
 	// section 11): a freshly-minted NodeID representing one particular
 	// list-element occurrence, rather than the value itself. Named
 	// AllElementCapsules (not the theory docs' illustrative "AllCapsules")
@@ -837,7 +837,7 @@ const (
 	NameAllElementCapsuleNextSlot  = "AllElementCapsuleNextSlot"
 
 	// NameAllLists tags a node as a List (THEORY_NOTES_FROM_CONVERSATION.md
-	// section 11 / theorystate_v0.6.md section 11). See ListRegistry.
+	// section 11 / theorystate.md section 11). See ListRegistry.
 	NameAllLists = "AllLists"
 
 	// NameAllHeads and NameAllTails each tag a capsule as currently being
@@ -855,7 +855,7 @@ const (
 	NameAllTails = "AllTails"
 
 	// NameAllSets tags a node as Set-kind via the relationship
-	// (AllSets, S) (theorystate_v0.6.md section 9 / 9a / 79): S's direct
+	// (AllSets, S) (theorystate.md section 9 / 9a / 79): S's direct
 	// children are exactly its members, with no intermediary node needed
 	// -- see SetRegistry for why Sets do not need one, unlike every
 	// intermediary-node-based structure elsewhere in this file.
@@ -1363,7 +1363,7 @@ func singleChildTargetRemoveTx(tx txOps, graph *Graph, node NodeID) (removed boo
 // hasTarget is false when node's only children, if any, are exactly the
 // excluded set. If more than one non-excluded child remains,
 // ErrTooManyPointerTargets is returned rather than arbitrarily picking
-// one -- see the PointerRegistry doc comment for why (theorystate_v0.6.md
+// one -- see the PointerRegistry doc comment for why (theorystate.md
 // section 74: out-of-band mutation can violate this at any time, and
 // every caller re-derives fresh rather than caching).
 func singleChildTarget(g *Graph, node NodeID, exclude ...NodeID) (target NodeID, hasTarget bool, err error) {
@@ -1396,7 +1396,7 @@ outer:
 // (tag, P).
 //
 // This same type and logic serves two of the three Pointer
-// representations described in theorystate_v0.6.md section 10 / 10b,
+// representations described in theorystate.md section 10 / 10b,
 // distinguished only by which tag
 // NodeID the caller passes to NewPointerRegistry -- there is no
 // per-representation code path:
@@ -1414,13 +1414,13 @@ outer:
 // untouched; see PointerMetadataRegistry instead.
 //
 // This implements Representation A (and, via reuse, B) from
-// theorystate_v0.6.md section 10 / 10b: a Pointer's target, if any, is
+// theorystate.md section 10 / 10b: a Pointer's target, if any, is
 // simply P's single direct
 // child in the underlying Graph. The tag itself -- (AllPointers, P) -- is
 // ordinary graph structure, exactly like any other name-style tag. Like
 // NameRegistry and RootGraph, PointerRegistry adds nothing to the
 // primitive Graph; it is purely an interpretation/enforcement layer above
-// it (theorystate_v0.6.md sections 10 and 73).
+// it (theorystate.md sections 10 and 73).
 //
 // PointerRegistry does not, and structurally cannot, prevent every path
 // to invariant violation: a caller can always bypass this layer and call
@@ -1434,12 +1434,12 @@ outer:
 // rather than silently repairing or silently trusting stale expectations.
 // This mirrors the fail-loud-not-silently-repair discipline already used
 // for ErrNameBoundToDeletedNode in NameRegistry, and is the practical
-// mitigation for the general gap recorded in theorystate_v0.6.md section
+// mitigation for the general gap recorded in theorystate.md section
 // 74: external structure built on top of the primitive Graph can go
 // stale the instant a primitive mutation happens elsewhere, and nothing
 // below this layer will ever notify it. A durable commit-time
 // interception mechanism that could reject such a mutation before it
-// lands (theorystate_v0.6.md section 73) does not exist yet; until it
+// lands (theorystate.md section 73) does not exist yet; until it
 // does, "always re-check, never cache" is the deliberate accepted
 // boundary of this registry.
 //
@@ -1451,7 +1451,7 @@ outer:
 // doc comment for exactly what this does and does not guarantee -- in
 // particular, it is failure-atomicity, not isolation from concurrent
 // access; true multi-primitive-operation transactional grouping as a
-// first-class graph concept is still theorystate_v0.6.md section 14/45,
+// first-class graph concept is still theorystate.md section 14/45,
 // OPEN. What exists here is the minimum needed to stop PointerRegistry's
 // own multi-step operations from corrupting state on failure, not a
 // general transaction feature.
@@ -1539,7 +1539,7 @@ func (p *PointerRegistry) Target(id NodeID) (target NodeID, hasTarget bool, err 
 // decision about data this registry did not create.
 //
 // Self-targeting, i.e. SetTarget(P, P), is allowed: self-relationships
-// are permitted at the primitive layer (theorystate_v0.6.md section 2.8)
+// are permitted at the primitive layer (theorystate.md section 2.8)
 // and nothing about the Pointer invariant rules it out.
 func (p *PointerRegistry) SetTarget(id, target NodeID) error {
 	current, hasTarget, err := p.currentTarget(id)
@@ -1818,7 +1818,7 @@ func (b *subjectMetadataBase) HasMetadata(subject NodeID) (bool, error) {
 }
 
 // PointerMetadataRegistry implements Representation C (metadata
-// structure) of the Pointer processor, theorystate_v0.6.md section 10's
+// structure) of the Pointer processor, theorystate.md section 10's
 // generalized metadata construction (see also section 10b).
 //
 // Unlike PointerRegistry (Representations A and B), Representation C
@@ -1836,12 +1836,12 @@ func (b *subjectMetadataBase) HasMetadata(subject NodeID) (bool, error) {
 // pointing directly at the subject (M -> subject): a naive two-edge
 // scheme (M -> subject, M -> target) cannot represent target == subject.
 // Because primitive relationships are unique pairs
-// (theorystate_v0.6.md section 2.4/2.6), "M -> subject" and
+// (theorystate.md section 2.4/2.6), "M -> subject" and
 // "M -> target" would collapse into the identical single physical
 // relationship whenever target == subject, making self-targeting
 // indistinguishable from an empty target. A freshly-minted S node for the
 // subject-slot (the role/occurrence-identity pattern named in
-// theorystate_v0.6.md section 75 -- the same move as ElementCapsule nodes
+// theorystate.md section 75 -- the same move as ElementCapsule nodes
 // in the Ordered List
 // design) means M's two children -- S and the target -- can never
 // collide, since S is never equal to any subject value.
@@ -1867,7 +1867,7 @@ func (b *subjectMetadataBase) HasMetadata(subject NodeID) (bool, error) {
 // nothing about the actual target changed. This is really the same
 // mistake as Representation A's "at most one child, period" -- just
 // shifted up one level -- and it also matches
-// theorystate_v0.6.md section 10a's discussion of the original "M -> P, M
+// theorystate.md section 10a's discussion of the original "M -> P, M
 // -> I" sketch, which has an even sharper version of the same bug (those
 // two relationships collapse into one whenever target == subject, since
 // primitive relationships are unique pairs). PointerMetadataRegistryD
@@ -1876,7 +1876,7 @@ func (b *subjectMetadataBase) HasMetadata(subject NodeID) (bool, error) {
 // patched or deleted: it is useful as a deliberately stricter
 // representation for testing how higher-level code should react when a
 // lower layer refuses something Representation D would allow
-// (theorystate_v0.6.md section 73).
+// (theorystate.md section 73).
 type PointerMetadataRegistry struct {
 	subjectMetadataBase
 }
@@ -1962,7 +1962,7 @@ func (m *PointerMetadataRegistry) SetTarget(subject, target NodeID) error {
 
 // RemoveTarget clears subject's target, if any. The metadata/slot nodes
 // themselves are left in place (no cascade deletion, consistent with
-// theorystate_v0.6.md section 18's rejection of
+// theorystate.md section 18's rejection of
 // deleteNodeAndRelationships); an empty metadata node is a valid,
 // meaningful state, exactly like an empty Pointer in Representation A.
 func (m *PointerMetadataRegistry) RemoveTarget(subject NodeID) (removed bool, err error) {
@@ -1991,14 +1991,14 @@ func (m *PointerMetadataRegistry) RemoveTarget(subject NodeID) (removed bool, er
 
 // PointerMetadataRegistryD implements Representation D, a corrected
 // generalization of Representation C (PointerMetadataRegistry) /
-// theorystate_v0.6.md section 10a's original "M -> P, M -> I" sketch.
+// theorystate.md section 10a's original "M -> P, M -> I" sketch.
 //
 // Representation C and that original sketch share a real bug: they each
 // identify one of M's two children *by exclusion* -- "whichever
 // child isn't the subject/subject-slot must be the target/information
 // node" (or, in the even earlier sketch, "M -> P" and "M -> I"
 // collapse into the same relationship whenever target == subject, since
-// primitive relationships are unique pairs -- theorystate_v0.6.md section
+// primitive relationships are unique pairs -- theorystate.md section
 // 2.4/2.6). Both are really the same underlying mistake as Representation
 // A's "at most one child, no room for anything else": M is implicitly
 // assumed to have *exactly* the relevant children and nothing more, which
@@ -2022,7 +2022,7 @@ func (m *PointerMetadataRegistry) RemoveTarget(subject NodeID) (removed bool, er
 // can carry any number of additional, unrelated children -- tagged or
 // not, now or added later -- without ever disturbing subject or target
 // discovery. This is the same occurrence/role-identity pattern already
-// named in theorystate_v0.6.md section 75, applied twice over instead of
+// named in theorystate.md section 75, applied twice over instead of
 // once.
 //
 // Representation C (PointerMetadataRegistry) is kept, not deleted, even
@@ -2031,7 +2031,7 @@ func (m *PointerMetadataRegistry) RemoveTarget(subject NodeID) (removed bool, er
 // named rather than accidental, and deliberately keeping the more
 // restrictive representation available is useful for testing how
 // higher-level code should react when a lower layer is stricter than
-// necessary (theorystate_v0.6.md section 73's commit-time interception
+// necessary (theorystate.md section 73's commit-time interception
 // question -- should such a restriction be enforced, ignored, or merely
 // reported?). Do not add further logic to C to "fix" it; add it here to
 // D instead.
@@ -2169,7 +2169,7 @@ func (m *PointerMetadataRegistryD) SetTarget(subject, target NodeID) error {
 
 // RemoveTarget clears subject's target, if any. The metadata/subject-
 // slot/target-slot nodes themselves are left in place (no cascade
-// deletion, consistent with theorystate_v0.6.md section 18's rejection of
+// deletion, consistent with theorystate.md section 18's rejection of
 // deleteNodeAndRelationships); an empty target-slot -- or no target-slot
 // at all -- is a valid, meaningful state.
 func (m *PointerMetadataRegistryD) RemoveTarget(subject NodeID) (removed bool, err error) {
@@ -2205,16 +2205,16 @@ func (m *PointerMetadataRegistryD) RemoveTarget(subject NodeID) (removed bool, e
 }
 
 // CapsuleRegistry implements the ElementCapsule primitive of Ordered
-// Lists (theorystate_v0.6.md section 11 / 11a): each list-element
+// Lists (theorystate.md section 11 / 11a): each list-element
 // *occurrence* gets its own freshly-minted
 // NodeID (the capsule) rather than reusing the value's own NodeID, so the
 // same value can occur multiple times in a list through different
-// capsules (theorystate_v0.6.md section 75's occurrence/role-identity
+// capsules (theorystate.md section 75's occurrence/role-identity
 // pattern).
 //
 // A capsule's previous, value, and next roles are each represented by a
 // dedicated intermediary slot node -- exactly Pointer Representation B
-// (theorystate_v0.6.md section 10 / 10b), applied three times under
+// (theorystate.md section 10 / 10b), applied three times under
 // three different tags:
 //
 //	(AllElementCapsules, capsule)
@@ -2225,7 +2225,7 @@ func (m *PointerMetadataRegistryD) RemoveTarget(subject NodeID) (removed bool, e
 // Each slot's own target is enforced to be at most one using the exact
 // same PointerRegistry type already used for Representations A and B;
 // CapsuleRegistry embeds three PointerRegistry instances -- one per role,
-// distinguished only by tag, per theorystate_v0.6.md section 76's
+// distinguished only by tag, per theorystate.md section 76's
 // tag-parameterization discipline -- rather than reimplementing "at most
 // one target" a third time.
 //
@@ -2519,13 +2519,13 @@ func (c *CapsuleRegistry) SetValue(capsule, value NodeID) error {
 // value -> valueSlot -> capsule backward, starting from
 // Graph.FindIncoming(value) (an indexed map lookup, not a scan of any
 // list). This is the realization behind ListRegistry.Contains/
-// OccurrencesOf below: theorystate_v0.6.md section 11's open question
+// OccurrencesOf below: theorystate.md section 11's open question
 // about adding "a Set-like index atop a List... for doesElementExist(X)"
 // turns out not to need any new node, tag, or index structure at all --
 // the ElementCapsule/value-slot wiring already built for ordinary list
 // traversal already has everything a reverse lookup needs, exactly
 // because each list-element occurrence already has its own
-// freshly-minted, uniquely-tagged identity (theorystate_v0.6.md section
+// freshly-minted, uniquely-tagged identity (theorystate.md section
 // 75). The only thing missing was asking the question from the value's
 // side instead of the list's side -- the same realization already
 // implicit in how InsertAfter/Remove check list membership via a direct
@@ -2547,7 +2547,7 @@ func (c *CapsuleRegistry) SetValue(capsule, value NodeID) error {
 // (AllElementCapsuleValueSlot, slot), never a second, independent
 // (AllPointers, slot) fact -- a value slot is never tagged both ways.
 // IsPointer is still the method's name, inherited unmodified from
-// PointerRegistry per theorystate_v0.6.md section 76's
+// PointerRegistry per theorystate.md section 76's
 // tag-parameterization discipline (one type, no branching on which tag
 // it holds), which makes it easy to misread this call as depending on
 // two independent tags when only one ever exists.
@@ -2564,7 +2564,7 @@ func (c *CapsuleRegistry) SetValue(capsule, value NodeID) error {
 // additional, unrelated parents over time (some future metadata
 // structure referencing the slot node itself, for its own reasons --
 // nothing in this file prevents that, since a node may have any number
-// of parents, theorystate_v0.6.md section 2.8) without that
+// of parents, theorystate.md section 2.8) without that
 // being confused for a second owning capsule. ErrAmbiguousPointerMetadata
 // (the same error findUniqueTaggedParent/findUniqueTaggedChild already
 // return elsewhere in this file for an analogous ambiguity) is returned
@@ -2729,7 +2729,7 @@ func (c *CapsuleRegistry) RemoveNext(capsule NodeID) (removed bool, err error) {
 // had already succeeded earlier in the sequence -- exactly like it
 // already does for every other multi-step operation in this file. No
 // separate pre-verification pass is needed before deleting anything;
-// see theorystate_v0.6.md section 78 for why an earlier version of this
+// see theorystate.md section 78 for why an earlier version of this
 // method needed one; and why it no longer does.
 //
 // Every relationship this removes is one CapsuleRegistry itself is
@@ -2826,7 +2826,7 @@ func (c *CapsuleRegistry) DeleteCapsule(capsule NodeID) error {
 	})
 }
 
-// ListRegistry implements Ordered Lists (theorystate_v0.6.md section 11
+// ListRegistry implements Ordered Lists (theorystate.md section 11
 // / 11a) on top of CapsuleRegistry.
 //
 // A list is an ordinary node tagged (AllLists, list). List membership --
@@ -2863,7 +2863,7 @@ func (c *CapsuleRegistry) DeleteCapsule(capsule NodeID) error {
 //
 // Two removal paths are available: RemoveWithoutDeletingCapsule unlinks
 // capsule from list only, leaving it standalone and intact (no cascading
-// node deletion, consistent with theorystate_v0.6.md section 18's
+// node deletion, consistent with theorystate.md section 18's
 // rejection of automatic cascade delete); Remove does the same unlinking
 // and then additionally reclaims capsule via CapsuleRegistry.DeleteCapsule
 // whenever nothing else still references it. DeleteList removes a list
@@ -3340,7 +3340,7 @@ func (l *ListRegistry) Elements(list NodeID) ([]NodeID, error) {
 //
 // This exists because a value may legitimately occur more than once in
 // the same list, each occurrence via its own capsule
-// (theorystate_v0.6.md section 75's occurrence-identity distinction) --
+// (theorystate.md section 75's occurrence-identity distinction) --
 // Contains below only
 // needs to know whether at least one occurrence exists, but some callers
 // legitimately need all of them (e.g. removing every occurrence of a
@@ -3379,7 +3379,7 @@ func (l *ListRegistry) OccurrencesOf(list, value NodeID) ([]NodeID, error) {
 // once, which capsule is returned is unspecified -- see OccurrencesOf
 // to find every occurrence.
 //
-// Built directly on OccurrencesOf: per theorystate_v0.6.md section 11's
+// Built directly on OccurrencesOf: per theorystate.md section 11's
 // note that a Set-like membership index "may be added later" for this
 // exact query, no new node, tag, or index structure turned out to be
 // necessary -- see the CapsuleRegistry.CapsulesWithValue doc comment for
@@ -3411,10 +3411,10 @@ func (l *ListRegistry) Contains(list, value NodeID) (capsule NodeID, found bool,
 // than one carrying stale links into a list it is no longer part of.
 //
 // This does not delete capsule itself, or its role-slot nodes -- no
-// cascade deletion, consistent with theorystate_v0.6.md section 18's
+// cascade deletion, consistent with theorystate.md section 18's
 // rejection of deleteNodeAndRelationships. capsule keeps its
 // AllElementCapsules tag and its value: list membership is a separate
-// concern from capsule-kind or value identity (theorystate_v0.6.md
+// concern from capsule-kind or value identity (theorystate.md
 // section 10c -- the same node identity can participate in multiple
 // interpretations without changing its primitive facts).
 //
@@ -3514,7 +3514,7 @@ func (l *ListRegistry) RemoveWithoutDeletingCapsule(list, capsule NodeID) error 
 // then additionally attempts to delete capsule and its three role-slot
 // nodes via CapsuleRegistry.DeleteCapsule -- this is the list structure
 // cleaning up after itself: a capsule exists only to represent one
-// occurrence of a value within a list (theorystate_v0.6.md section 75),
+// occurrence of a value within a list (theorystate.md section 75),
 // so once it is removed from its (only) list and nothing else has taken
 // an interest in it, there is no reason to leave it behind as an orphan.
 //
@@ -3537,7 +3537,7 @@ func (l *ListRegistry) RemoveWithoutDeletingCapsule(list, capsule NodeID) error 
 // These are deliberately two separate Graph.Transact calls (one inside
 // RemoveWithoutDeletingCapsule, one inside DeleteCapsule), not a single
 // joint transaction spanning both. Under this codebase's current
-// single-threaded, serialized execution model (theorystate_v0.6.md
+// single-threaded, serialized execution model (theorystate.md
 // section 19), nothing can run between them, so there is no observable
 // intermediate state to protect against -- and keeping them separate is
 // what lets a capsule that legitimately cannot be deleted still be
@@ -3578,7 +3578,7 @@ func (l *ListRegistry) Remove(list, capsule NodeID) (deleted bool, err error) {
 // this call -- rather than leaving a list untagged but still present
 // with orphaned element capsules.
 //
-// Per theorystate_v0.6.md section 18, deletion is deliberately "delete
+// Per theorystate.md section 18, deletion is deliberately "delete
 // only if empty," not cascade: DeleteList refuses (ErrNodeNotEmpty,
 // resolvable by clearing and retrying -- unlike RootGraph's
 // ErrCannotDeleteRoot, this is not structurally permanent) if list
@@ -3605,7 +3605,7 @@ func (l *ListRegistry) DeleteList(list NodeID) error {
 		// tx.DeleteNode is used here (not a direct l.graph.DeleteNode
 		// call) purely for consistency with every other multi-step
 		// registry operation's txOps discipline in this file, now that
-		// Txn.DeleteNode exists (theorystate_v0.6.md section 78). This
+		// Txn.DeleteNode exists (theorystate.md section 78). This
 		// is the last step in the sequence, so behavior is unchanged
 		// either way: DeleteNode either succeeds outright or fails
 		// without mutating anything, in which case returning its error
@@ -3618,7 +3618,7 @@ func (l *ListRegistry) DeleteList(list NodeID) error {
 }
 
 // SetRegistry implements the minimal Set interpretation of
-// theorystate_v0.6.md section 9 / 9a (formalized further in section 79):
+// theorystate.md section 9 / 9a (formalized further in section 79):
 // (AllSets, S) tags S as Set-kind, and S's direct children in the
 // underlying Graph are exactly its members.
 //
@@ -3627,11 +3627,11 @@ func (l *ListRegistry) DeleteList(list NodeID) error {
 // PointerMetadataRegistry(D)'s subject/target slots), a Set needs no
 // intermediary node at all. Two properties specific to Sets, neither of
 // which holds for those other structures, make this safe:
-//   - Sets carry no order (theorystate_v0.6.md section 5), so there is no
+//   - Sets carry no order (theorystate.md section 5), so there is no
 //     positional/sequencing information any intermediary node would need
 //     to carry.
 //   - Primitive relationships are already unique pairs
-//     (theorystate_v0.6.md section 2.6): (S, X) cannot exist more than
+//     (theorystate.md section 2.6): (S, X) cannot exist more than
 //     once, so duplicate membership is structurally impossible without any
 //     registry-level enforcement at all.
 //
@@ -3648,24 +3648,24 @@ func (l *ListRegistry) DeleteList(list NodeID) error {
 // detect or reject.
 //
 // Self-membership (Add(S, S)) is permitted, matching
-// theorystate_v0.6.md sections 2.8 and 9a.
+// theorystate.md sections 2.8 and 9a.
 //
 // A Set containing another Set as a member does NOT, by itself, imply
-// recursive membership expansion (theorystate_v0.6.md section 9a):
+// recursive membership expansion (theorystate.md section 9a):
 // Members(S) returns S's own direct children only, and never expands into
 // a member that happens to itself be tagged Set-kind. Recursive,
 // operand-based expansion is a separate, higher-level structure -- see
-// theorystate_v0.6.md sections 80-83 for the deferred (not yet
+// theorystate.md sections 80-83 for the deferred (not yet
 // implemented) CompositeSetRegistry / CompositeSetLogRegistry designs that
 // provide it, and for why expansion intent must be recorded explicitly per
 // operand rather than inferred from an operand's own tags.
 //
-// theorystate_v0.6.md section 79 additionally decides that a node may
+// theorystate.md section 79 additionally decides that a node may
 // carry at most one of the three Set-representation tags (AllSets,
 // AllCompositeSets, AllCompositeSetLogs) -- never more than one at a time.
 // SetRegistry does not yet enforce this mutual exclusivity in code, since
 // neither of the other two tags exists in this codebase yet
-// (theorystate_v0.6.md section 76a's "add a foundational name only once
+// (theorystate.md section 76a's "add a foundational name only once
 // its representation is actually being implemented" discipline). This
 // must be revisited here -- and in whichever of CompositeSetRegistry /
 // CompositeSetLogRegistry is implemented first -- once either exists.
@@ -3738,7 +3738,7 @@ func (s *SetRegistry) TagAsSet(id NodeID) error {
 //
 // added reports whether member was newly added. Adding an
 // already-present member -- including self-membership, Add(set, set),
-// which is permitted (theorystate_v0.6.md section 2.8) -- is an
+// which is permitted (theorystate.md section 2.8) -- is an
 // idempotent no-op reporting added == false on the repeat call.
 func (s *SetRegistry) Add(set, member NodeID) (added bool, err error) {
 	if !s.graph.NodeExists(set) {
@@ -3838,7 +3838,7 @@ func (s *SetRegistry) Size(set NodeID) (int, error) {
 // set's relationship count, so it must be removed before Graph.DeleteNode
 // can succeed, not after.
 //
-// Per theorystate_v0.6.md section 18, deletion is deliberately "delete
+// Per theorystate.md section 18, deletion is deliberately "delete
 // only if empty," not cascade: DeleteSet refuses with ErrNodeNotEmpty
 // (resolvable by removing every member and retrying) if set currently has
 // any members, or is itself currently a member of some other Set or
