@@ -58,7 +58,11 @@ func checkFile(path string, target, buf []byte) bool {
 		return false
 	}
 	// Explicit cleanup via defer guarantees fd release regardless of read success
-	defer f.Close()
+	defer func() {
+		if cerr := f.Close(); cerr != nil {
+			fmt.Fprintf(os.Stderr, "ERROR: Failed to close %s: %v\n", cleanPath, cerr)
+		}
+	}()
 
 	n, err := io.ReadFull(f, buf)
 	// io.ErrUnexpectedEOF and io.EOF are acceptable here if the file size < 1024 bytes.
