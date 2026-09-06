@@ -5636,7 +5636,7 @@ func newSetTestFixture(t *testing.T) (*Graph, *SetRegistry) {
 		t.Fatalf("BootstrapNames(): %v", err)
 	}
 
-	sets, err := NewSetRegistry(&g, ids[NameAllSets])
+	sets, err := NewSetRegistry(&g, ids[NameAllSets], ids[NameAllCompositeSets])
 	if err != nil {
 		t.Fatalf("NewSetRegistry(): %v", err)
 	}
@@ -6295,5 +6295,561 @@ func TestSetOperationsRequireExistingSetNode(t *testing.T) {
 
 	if err := sets.DeleteSet(nonexistent); !errors.Is(err, ErrNodeNotFound) {
 		t.Fatalf("DeleteSet() error = %v, want %v", err, ErrNodeNotFound)
+	}
+}
+
+// TestSetRegistryTagAsSetRejectsCompositeSetConflict pins down
+// theorystate.md section 79's mutual-exclusivity rule, now enforced now
+// that a second Set-representation tag (AllCompositeSets) exists:
+// SetRegistry.TagAsSet must refuse to add the AllSets tag to a node
+// already tagged AllCompositeSets.
+func TestSetRegistryTagAsSetRejectsCompositeSetConflict(t *testing.T) {
+	_, sets, composites := newCompositeSetTestFixture(t)
+
+	composite, err := composites.NewCompositeSet()
+	if err != nil {
+		t.Fatalf("NewCompositeSet(): %v", err)
+	}
+
+	err = sets.TagAsSet(composite)
+	if !errors.Is(err, ErrSetRepresentationConflict) {
+		t.Fatalf("TagAsSet() error = %v, want %v", err, ErrSetRepresentationConflict)
+	}
+
+	if sets.IsSet(composite) {
+		t.Fatal("node was tagged AllSets despite already being AllCompositeSets-tagged")
+	}
+}
+
+// newCompositeSetTestFixture creates a fresh Graph, SetRegistry, and
+// CompositeSetRegistry with every relevant name already bootstrapped, for
+// use by CompositeSetRegistry tests.
+func newCompositeSetTestFixture(t *testing.T) (*Graph, *SetRegistry, *CompositeSetRegistry) {
+	t.Helper()
+
+	var g Graph
+	names := NewNameRegistry(&g)
+
+	ids, err := names.BootstrapNames(FoundationalNames)
+	if err != nil {
+		t.Fatalf("BootstrapNames(): %v", err)
+	}
+
+	sets, err := NewSetRegistry(&g, ids[NameAllSets], ids[NameAllCompositeSets])
+	if err != nil {
+		t.Fatalf("NewSetRegistry(): %v", err)
+	}
+
+	composites, err := NewCompositeSetRegistry(
+		&g,
+		sets,
+		ids[NameAllCompositeSets],
+		ids[NameAllAdditiveOp],
+		ids[NameAllSubtractiveOp],
+		ids[NameAllScalarOperand],
+		ids[NameAllSetOperand],
+	)
+	if err != nil {
+		t.Fatalf("NewCompositeSetRegistry(): %v", err)
+	}
+
+	return &g, sets, composites
+}
+
+func TestFoundationalNamesIncludesCompositeSetNames(t *testing.T) {
+	want := []string{
+		NameAllCompositeSets,
+		NameAllAdditiveOp,
+		NameAllSubtractiveOp,
+		NameAllScalarOperand,
+		NameAllSetOperand,
+	}
+
+	for _, name := range want {
+		found := false
+		for _, got := range FoundationalNames {
+			if got == name {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("FoundationalNames %v does not include %q", FoundationalNames, name)
+		}
+	}
+}
+
+func TestNewCompositeSetRegistryRequiresExistingTags(t *testing.T) {
+	var g Graph
+
+	existing, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode(): %v", err)
+	}
+
+	sets, err := NewSetRegistry(&g, existing)
+	if err != nil {
+		t.Fatalf("NewSetRegistry(): %v", err)
+	}
+
+	const nonexistent NodeID = 999999
+
+	if _, err := NewCompositeSetRegistry(&g, sets, nonexistent, existing, existing, existing, existing); !errors.Is(err, ErrNodeNotFound) {
+		t.Fatalf("NewCompositeSetRegistry() error = %v, want %v", err, ErrNodeNotFound)
+	}
+	if _, err := NewCompositeSetRegistry(&g, sets, existing, nonexistent, existing, existing, existing); !errors.Is(err, ErrNodeNotFound) {
+		t.Fatalf("NewCompositeSetRegistry() error = %v, want %v", err, ErrNodeNotFound)
+	}
+	if _, err := NewCompositeSetRegistry(&g, sets, existing, existing, nonexistent, existing, existing); !errors.Is(err, ErrNodeNotFound) {
+		t.Fatalf("NewCompositeSetRegistry() error = %v, want %v", err, ErrNodeNotFound)
+	}
+	if _, err := NewCompositeSetRegistry(&g, sets, existing, existing, existing, nonexistent, existing); !errors.Is(err, ErrNodeNotFound) {
+		t.Fatalf("NewCompositeSetRegistry() error = %v, want %v", err, ErrNodeNotFound)
+	}
+	if _, err := NewCompositeSetRegistry(&g, sets, existing, existing, existing, existing, nonexistent); !errors.Is(err, ErrNodeNotFound) {
+		t.Fatalf("NewCompositeSetRegistry() error = %v, want %v", err, ErrNodeNotFound)
+	}
+}
+
+func TestNewCompositeSetStartsEmpty(t *testing.T) {
+	g, _, composites := newCompositeSetTestFixture(t)
+
+	set, err := composites.NewCompositeSet()
+	if err != nil {
+		t.Fatalf("NewCompositeSet(): %v", err)
+	}
+
+	if !g.NodeExists(set) {
+		t.Fatalf("NewCompositeSet() returned NodeID %d that does not exist", set)
+	}
+	if !composites.IsCompositeSet(set) {
+		t.Fatalf("NewCompositeSet() did not tag %d as a composite set", set)
+	}
+
+	operands, err := composites.Operands(set)
+	if err != nil {
+		t.Fatalf("Operands(): %v", err)
+	}
+	if len(operands) != 0 {
+		t.Fatalf("Operands() = %v, want empty", operands)
+	}
+
+	members, err := composites.Evaluate(set)
+	if err != nil {
+		t.Fatalf("Evaluate(): %v", err)
+	}
+	if len(members) != 0 {
+		t.Fatalf("Evaluate() = %v, want empty", members)
+	}
+}
+
+func TestCompositeSetAddOperandScalarAdditive(t *testing.T) {
+	g, _, composites := newCompositeSetTestFixture(t)
+
+	set, err := composites.NewCompositeSet()
+	if err != nil {
+		t.Fatalf("NewCompositeSet(): %v", err)
+	}
+
+	x, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for x: %v", err)
+	}
+
+	u, err := composites.AddOperand(set, x, true, false)
+	if err != nil {
+		t.Fatalf("AddOperand(x, additive, scalar): %v", err)
+	}
+
+	target, err := composites.OperandTarget(u)
+	if err != nil {
+		t.Fatalf("OperandTarget(u): %v", err)
+	}
+	if target != x {
+		t.Fatalf("OperandTarget(u) = %d, want %d", target, x)
+	}
+
+	isAdditive, err := composites.OperandIsAdditive(u)
+	if err != nil {
+		t.Fatalf("OperandIsAdditive(u): %v", err)
+	}
+	if !isAdditive {
+		t.Fatal("OperandIsAdditive(u) = false, want true")
+	}
+
+	isSetOperand, err := composites.OperandIsSetOperand(u)
+	if err != nil {
+		t.Fatalf("OperandIsSetOperand(u): %v", err)
+	}
+	if isSetOperand {
+		t.Fatal("OperandIsSetOperand(u) = true, want false")
+	}
+
+	got, err := composites.Evaluate(set)
+	if err != nil {
+		t.Fatalf("Evaluate(): %v", err)
+	}
+	want := []NodeID{x}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("Evaluate() = %v, want %v", got, want)
+	}
+}
+
+func TestCompositeSetEvaluateUnionThenDifference(t *testing.T) {
+	g, sets, composites := newCompositeSetTestFixture(t)
+
+	setA, err := sets.NewSet()
+	if err != nil {
+		t.Fatalf("NewSet() for setA: %v", err)
+	}
+	a1, err := g.CreateNode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	a2, err := g.CreateNode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sets.Add(setA, a1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sets.Add(setA, a2); err != nil {
+		t.Fatal(err)
+	}
+
+	x, err := g.CreateNode()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	composite, err := composites.NewCompositeSet()
+	if err != nil {
+		t.Fatalf("NewCompositeSet(): %v", err)
+	}
+
+	// composite = (setA expanded ∪ {x}) \ {a2}
+	if _, err := composites.AddOperand(composite, setA, true, true); err != nil {
+		t.Fatalf("AddOperand(setA, additive, set): %v", err)
+	}
+	if _, err := composites.AddOperand(composite, x, true, false); err != nil {
+		t.Fatalf("AddOperand(x, additive, scalar): %v", err)
+	}
+	if _, err := composites.AddOperand(composite, a2, false, false); err != nil {
+		t.Fatalf("AddOperand(a2, subtractive, scalar): %v", err)
+	}
+
+	got, err := composites.Evaluate(composite)
+	if err != nil {
+		t.Fatalf("Evaluate(): %v", err)
+	}
+
+	want := sortedNodeIDs([]NodeID{a1, x})
+	got = sortedNodeIDs(got)
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("Evaluate() = %v, want %v", got, want)
+	}
+}
+
+func TestCompositeSetAddOperandRequiresKnownSetTagWhenSetOperand(t *testing.T) {
+	g, _, composites := newCompositeSetTestFixture(t)
+
+	set, err := composites.NewCompositeSet()
+	if err != nil {
+		t.Fatalf("NewCompositeSet(): %v", err)
+	}
+
+	notASet, err := g.CreateNode()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = composites.AddOperand(set, notASet, true, true)
+	if !errors.Is(err, ErrInvalidSetOperand) {
+		t.Fatalf("AddOperand() error = %v, want %v", err, ErrInvalidSetOperand)
+	}
+}
+
+func TestCompositeSetEvaluateResolvesNestedCompositeSetOperand(t *testing.T) {
+	g, _, composites := newCompositeSetTestFixture(t)
+
+	inner, err := composites.NewCompositeSet()
+	if err != nil {
+		t.Fatalf("NewCompositeSet() for inner: %v", err)
+	}
+
+	x, err := g.CreateNode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := composites.AddOperand(inner, x, true, false); err != nil {
+		t.Fatalf("AddOperand(inner, x): %v", err)
+	}
+
+	outer, err := composites.NewCompositeSet()
+	if err != nil {
+		t.Fatalf("NewCompositeSet() for outer: %v", err)
+	}
+	if _, err := composites.AddOperand(outer, inner, true, true); err != nil {
+		t.Fatalf("AddOperand(outer, inner, additive, set): %v", err)
+	}
+
+	got, err := composites.Evaluate(outer)
+	if err != nil {
+		t.Fatalf("Evaluate(outer): %v", err)
+	}
+	want := []NodeID{x}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("Evaluate(outer) = %v, want %v", got, want)
+	}
+}
+
+func TestCompositeSetEvaluateDetectsCycle(t *testing.T) {
+	_, _, composites := newCompositeSetTestFixture(t)
+
+	c1, err := composites.NewCompositeSet()
+	if err != nil {
+		t.Fatalf("NewCompositeSet() for c1: %v", err)
+	}
+	c2, err := composites.NewCompositeSet()
+	if err != nil {
+		t.Fatalf("NewCompositeSet() for c2: %v", err)
+	}
+
+	if _, err := composites.AddOperand(c1, c2, true, true); err != nil {
+		t.Fatalf("AddOperand(c1, c2): %v", err)
+	}
+	if _, err := composites.AddOperand(c2, c1, true, true); err != nil {
+		t.Fatalf("AddOperand(c2, c1): %v", err)
+	}
+
+	_, err = composites.Evaluate(c1)
+	if !errors.Is(err, ErrCompositeSetCycle) {
+		t.Fatalf("Evaluate(c1) error = %v, want %v", err, ErrCompositeSetCycle)
+	}
+}
+
+// TestCompositeSetEvaluateAllowsDiamondSharedOperand pins down that
+// cycle-detection visited tracking is path-scoped (theorystate.md
+// section 83), not a global ever-visited set: reaching the same
+// composite-kind node via two different, non-cyclic branches must not be
+// mistaken for a cycle.
+//
+//	top -> branchA -> shared -> x
+//	top -> branchB -> shared -> x   (same "shared", not a cycle)
+func TestCompositeSetEvaluateAllowsDiamondSharedOperand(t *testing.T) {
+	g, _, composites := newCompositeSetTestFixture(t)
+
+	shared, err := composites.NewCompositeSet()
+	if err != nil {
+		t.Fatalf("NewCompositeSet() for shared: %v", err)
+	}
+	x, err := g.CreateNode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := composites.AddOperand(shared, x, true, false); err != nil {
+		t.Fatalf("AddOperand(shared, x): %v", err)
+	}
+
+	branchA, err := composites.NewCompositeSet()
+	if err != nil {
+		t.Fatalf("NewCompositeSet() for branchA: %v", err)
+	}
+	if _, err := composites.AddOperand(branchA, shared, true, true); err != nil {
+		t.Fatalf("AddOperand(branchA, shared): %v", err)
+	}
+
+	branchB, err := composites.NewCompositeSet()
+	if err != nil {
+		t.Fatalf("NewCompositeSet() for branchB: %v", err)
+	}
+	if _, err := composites.AddOperand(branchB, shared, true, true); err != nil {
+		t.Fatalf("AddOperand(branchB, shared): %v", err)
+	}
+
+	top, err := composites.NewCompositeSet()
+	if err != nil {
+		t.Fatalf("NewCompositeSet() for top: %v", err)
+	}
+	if _, err := composites.AddOperand(top, branchA, true, true); err != nil {
+		t.Fatalf("AddOperand(top, branchA): %v", err)
+	}
+	if _, err := composites.AddOperand(top, branchB, true, true); err != nil {
+		t.Fatalf("AddOperand(top, branchB): %v", err)
+	}
+
+	got, err := composites.Evaluate(top)
+	if err != nil {
+		t.Fatalf("Evaluate(top): %v", err)
+	}
+	want := []NodeID{x}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("Evaluate(top) = %v, want %v", got, want)
+	}
+}
+
+func TestCompositeSetRemoveOperandDeletesDescriptor(t *testing.T) {
+	g, _, composites := newCompositeSetTestFixture(t)
+
+	set, err := composites.NewCompositeSet()
+	if err != nil {
+		t.Fatalf("NewCompositeSet(): %v", err)
+	}
+	x, err := g.CreateNode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	u, err := composites.AddOperand(set, x, true, false)
+	if err != nil {
+		t.Fatalf("AddOperand(): %v", err)
+	}
+
+	if err := composites.RemoveOperand(set, u); err != nil {
+		t.Fatalf("RemoveOperand(): %v", err)
+	}
+
+	if g.NodeExists(u) {
+		t.Fatalf("descriptor %d still exists after RemoveOperand()", u)
+	}
+
+	got, err := composites.Evaluate(set)
+	if err != nil {
+		t.Fatalf("Evaluate(): %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("Evaluate() = %v, want empty after RemoveOperand()", got)
+	}
+
+	if !g.NodeExists(x) {
+		t.Fatal("RemoveOperand() incorrectly deleted the operand target")
+	}
+}
+
+func TestCompositeSetRemoveOperandRequiresOperandInSet(t *testing.T) {
+	g, _, composites := newCompositeSetTestFixture(t)
+
+	setA, err := composites.NewCompositeSet()
+	if err != nil {
+		t.Fatal(err)
+	}
+	setB, err := composites.NewCompositeSet()
+	if err != nil {
+		t.Fatal(err)
+	}
+	x, err := g.CreateNode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	u, err := composites.AddOperand(setA, x, true, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = composites.RemoveOperand(setB, u)
+	if !errors.Is(err, ErrOperandNotInCompositeSet) {
+		t.Fatalf("RemoveOperand() error = %v, want %v", err, ErrOperandNotInCompositeSet)
+	}
+}
+
+func TestCompositeSetDeleteCompositeSetSucceedsWhenEmpty(t *testing.T) {
+	g, _, composites := newCompositeSetTestFixture(t)
+
+	set, err := composites.NewCompositeSet()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := composites.DeleteCompositeSet(set); err != nil {
+		t.Fatalf("DeleteCompositeSet(): %v", err)
+	}
+	if g.NodeExists(set) {
+		t.Fatalf("composite set %d still exists after successful DeleteCompositeSet()", set)
+	}
+}
+
+func TestCompositeSetDeleteCompositeSetFailsIfNotEmpty(t *testing.T) {
+	g, _, composites := newCompositeSetTestFixture(t)
+
+	set, err := composites.NewCompositeSet()
+	if err != nil {
+		t.Fatal(err)
+	}
+	x, err := g.CreateNode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := composites.AddOperand(set, x, true, false); err != nil {
+		t.Fatal(err)
+	}
+
+	err = composites.DeleteCompositeSet(set)
+	if !errors.Is(err, ErrNodeNotEmpty) {
+		t.Fatalf("DeleteCompositeSet() error = %v, want %v", err, ErrNodeNotEmpty)
+	}
+	if !g.NodeExists(set) {
+		t.Fatal("composite set disappeared despite a failed DeleteCompositeSet()")
+	}
+	if !composites.IsCompositeSet(set) {
+		t.Fatal("composite set lost its tag despite a failed DeleteCompositeSet()")
+	}
+}
+
+func TestCompositeSetOperationsRequireCompositeSetTag(t *testing.T) {
+	g, _, composites := newCompositeSetTestFixture(t)
+
+	notAComposite, err := g.CreateNode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	x, err := g.CreateNode()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := composites.AddOperand(notAComposite, x, true, false); !errors.Is(err, ErrNotCompositeSet) {
+		t.Fatalf("AddOperand() error = %v, want %v", err, ErrNotCompositeSet)
+	}
+	if _, err := composites.Operands(notAComposite); !errors.Is(err, ErrNotCompositeSet) {
+		t.Fatalf("Operands() error = %v, want %v", err, ErrNotCompositeSet)
+	}
+	if _, err := composites.Evaluate(notAComposite); !errors.Is(err, ErrNotCompositeSet) {
+		t.Fatalf("Evaluate() error = %v, want %v", err, ErrNotCompositeSet)
+	}
+	if err := composites.DeleteCompositeSet(notAComposite); !errors.Is(err, ErrNotCompositeSet) {
+		t.Fatalf("DeleteCompositeSet() error = %v, want %v", err, ErrNotCompositeSet)
+	}
+	if err := composites.RemoveOperand(notAComposite, x); !errors.Is(err, ErrNotCompositeSet) {
+		t.Fatalf("RemoveOperand() error = %v, want %v", err, ErrNotCompositeSet)
+	}
+}
+
+// TestCompositeSetEvaluateDetectsMalformedDescriptor covers an
+// out-of-band mutation giving a descriptor node both operation-kind tags
+// at once, which exactlyOneTag must reject rather than guess.
+func TestCompositeSetEvaluateDetectsMalformedDescriptor(t *testing.T) {
+	g, _, composites := newCompositeSetTestFixture(t)
+
+	set, err := composites.NewCompositeSet()
+	if err != nil {
+		t.Fatal(err)
+	}
+	x, err := g.CreateNode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	u, err := composites.AddOperand(set, x, true, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Bypass AddOperand entirely, simulating an out-of-band mutation that
+	// gives u a second, conflicting operation-kind tag.
+	if _, err := g.AddRelationship(composites.allSubtractiveOp, u); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = composites.Evaluate(set)
+	if !errors.Is(err, ErrInvalidOperandDescriptor) {
+		t.Fatalf("Evaluate() error = %v, want %v", err, ErrInvalidOperandDescriptor)
 	}
 }

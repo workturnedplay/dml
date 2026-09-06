@@ -1443,11 +1443,13 @@ explicitly per operand rather than inferred from an operand's own tags.
 three Set-representation tags — `AllSets`, `AllCompositeSets` (§81),
 `AllCompositeSetLogs` (§82) — never more than one at a time. This mirrors
 the existing precedent that no node is tagged both `AllPointers` and
-`AllPointerMetadata`. Enforcement is expected to be added once a second
-Set-representation tag actually exists in the implementation (§76a's
-"add a foundational name only once its representation is actually being
-implemented" discipline currently means only `AllSets` is bootstrapped;
-`SetRegistry` therefore cannot yet check against tags that don't exist).
+`AllPointerMetadata`. Enforcement is now implemented for the two
+representations that exist so far: `SetRegistry.TagAsSet` refuses to tag
+a node already carrying `AllCompositeSets`, checked against the tag
+NodeIDs supplied to `NewSetRegistry`. `AllCompositeSetLogs` remains
+unbootstrapped per §76a's "add a foundational name only once its
+representation is actually being implemented" discipline; whichever
+registry implements it must be added to this same check.
 
 Validated by `wtw`'s `SetRegistry`: `IsSet`, `NewSet`, `TagAsSet`, `Add`,
 `Remove`, `Contains`, `Members`, `Size`, `DeleteSet` (delete-only-if-empty,
@@ -1520,10 +1522,13 @@ implemented — the same DRY extraction precedent as `subjectMetadataBase`
 (`implementation_state.md` item 9), not attempted before there are two
 real call sites to justify it (§7).
 
-## 81. CompositeSetRegistry — unordered composite Sets (TENTATIVE, deferred)
+## 81. CompositeSetRegistry — unordered composite Sets (TENTATIVE design; implemented)
 
-Formalizes and supersedes §9b's obsolete diagram with a concrete,
-decided-in-shape representation, not yet implemented. `(AllCompositeSets,C)`
+Formalizes and supersedes §9b's obsolete diagram with a concrete
+representation, now implemented as `CompositeSetRegistry` and validated
+by `wtw` (the representation's *shape* stays tagged TENTATIVE per §33's
+discipline, since it hasn't been exercised long enough to call DECIDED;
+only its *existence in code* has changed). `(AllCompositeSets,C)`
 tags `C`; `C`'s direct children are `U`-descriptor nodes (§80), each
 identifying one operand and how it participates.
 
@@ -1658,6 +1663,16 @@ terminates in a number of steps bounded by the graph's own size; a depth
 limit would be an arbitrary restriction on top of that, and the cycle
 detection above already rejects the only case — a genuine cycle — that
 would otherwise fail to terminate.
+
+**Implementation note (validated by `wtw`).** `CompositeSetRegistry`
+implements this dispatch and cycle detection exactly as specified above:
+the visited set is scoped to the *current resolution path* (added
+immediately before, and removed immediately after, each recursive
+descent — not a global ever-visited set), so a DAG where the same
+composite Set is legitimately reached via two different, non-cyclic
+branches is not mistaken for a cycle. Only `CompositeSetRegistry` and
+`SetRegistry` are dispatch targets so far; `CompositeSetLogRegistry`
+remains unimplemented (§82), so the dispatcher has only two cases today.
 
 ## 84. Declined: concurrent/bidirectional Contains search (REJECTED FOR NOW, explored and found not to transfer)
 
@@ -1797,8 +1812,11 @@ kept current as sections above resolve or split further.)*
 - Real-ID + capability-model permissions (current lean, §70) — untested
   against real-ID + access-control.
 - Selective, opt-in, tag-gated content-addressed versioning (§66).
-- CompositeSetRegistry and CompositeSetLogRegistry's exact shapes
-  (§80–§83) — designed and DECIDED-in-shape, not yet implemented.
+- CompositeSetLogRegistry's exact shape (§82) — designed and
+  DECIDED-in-shape, not yet implemented. CompositeSetRegistry (§81) is
+  now implemented as `CompositeSetRegistry`, validated by `wtw`; its
+  operand-descriptor shape (§80) is shared and expected to be reused once
+  CompositeSetLogRegistry is built.
 
 ### OPEN
 - Exact Set/Pointer/List definitions; exact primitive storage; whether a

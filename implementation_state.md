@@ -674,14 +674,98 @@ NodeID-keyed structure outside the primitive graph.
  TestSetDeleteSetFailsIfNotEmpty, TestSetDeleteSetFailsIfReferencedElsewhere,
  TestSetOperationsRequireSetTag, and TestSetOperationsRequireExistingSetNode.
 
+18. Added CompositeSetRegistry, implementing the unordered composite Set
+ representation of theorystate.md sections 80/81: (AllCompositeSets, C)
+ tags C as CompositeSet-kind, and C's direct children are freshly-minted
+ operand-descriptor nodes U (theorystate.md section 75's occurrence/role-
+ identity pattern) rather than members directly -- C -> U -> operand,
+ with U tagged along two independent axes (operation kind: AllAdditiveOp/
+ AllSubtractiveOp; operand kind: AllScalarOperand/AllSetOperand, recorded
+ explicitly per theorystate.md section 80's correction rather than
+ inferred from operand's own tags). NewCompositeSet, AddOperand,
+ RemoveOperand, Operands, OperandTarget, OperandIsAdditive,
+ OperandIsSetOperand, Evaluate, and DeleteCompositeSet are provided.
+ AddOperand always mints a fresh descriptor unconditionally, per
+ theorystate.md section 85 -- no existing identical descriptor is
+ searched for or reused.
+
+ Evaluate implements theorystate.md section 81's fold (union of every
+ additive operand's resolved membership, minus the union of every
+ subtractive operand's resolved membership) and is never cached, for the
+ same reason SetRegistry.Members is never cached. Resolving a
+ set-expansion operand dispatches, per theorystate.md section 83, to
+ whichever currently-implemented Set representation the operand actually
+ carries -- a plain Set (via the embedded SetRegistry) or another
+ CompositeSet (resolved recursively); CompositeSetLogRegistry
+ (theorystate.md section 82) remains unimplemented, so the dispatcher
+ does not yet need a third case.
+
+ Cycle detection (theorystate.md section 83) tracks composite-kind
+ NodeIDs on the *current resolution path*, not every composite-kind node
+ ever seen during one Evaluate call -- a real design point caught during
+ review, not a detail: a naive "ever visited" set would incorrectly
+ reject a DAG where the same composite Set is legitimately reached via
+ two different, non-cyclic branches (a shared sub-expression).
+ resolveSetOperand adds a composite operand to the visited set
+ immediately before recursing into it and removes it again immediately
+ afterward (via defer), matching a standard depth-first on-stack cycle
+ check; a genuine cycle is reported via the new ErrCompositeSetCycle.
+ TestCompositeSetEvaluateAllowsDiamondSharedOperand pins this down
+ directly.
+
+ A small shared helper, exactlyOneTag, checks that a node carries exactly
+ one of two mutually exclusive tags (used for both of a descriptor's
+ independent axes), returning the new ErrInvalidOperandDescriptor if a
+ descriptor has neither or both -- reachable only through an out-of-band
+ mutation, since AddOperand always wires exactly one tag per axis.
+ createTaggedNodeTx was refactored to share its single-relationship-add
+ step with a new tagNodeTx helper, used directly by AddOperand to apply a
+ descriptor's two tags without duplicating the same tx.AddRelationship
+ call.
+
+ theorystate.md section 79's Set-representation mutual-exclusivity rule
+ (a node may carry at most one of AllSets / AllCompositeSets /
+ AllCompositeSetLogs) is now enforced, resolving the gap flagged below at
+ the time SetRegistry was added: NewSetRegistry now accepts the tag
+ NodeIDs of every other currently-implemented Set representation
+ (currently just AllCompositeSets), and SetRegistry.TagAsSet refuses
+ (ErrSetRepresentationConflict) to tag a node already carrying one of
+ them. NewSet/NewCompositeSet do not need an equivalent check: both
+ always tag a freshly created node, which cannot already carry any other
+ representation's tag. CompositeSetRegistry does not yet provide a
+ TagAsCompositeSet analogous to TagAsSet (retagging an arbitrary existing
+ node as a composite set is not yet a need any caller has); if one is
+ added later it must apply the same check.
+
+ NameAllCompositeSets, NameAllAdditiveOp, NameAllSubtractiveOp,
+ NameAllScalarOperand, and NameAllSetOperand were added to
+ FoundationalNames now that this representation is actually being
+ implemented, per this file's own "add foundational names only when
+ starting the corresponding representation" discipline.
+
+ Covered by TestFoundationalNamesIncludesCompositeSetNames,
+ TestNewCompositeSetRegistryRequiresExistingTags,
+ TestNewCompositeSetStartsEmpty, TestCompositeSetAddOperandScalarAdditive,
+ TestCompositeSetEvaluateUnionThenDifference,
+ TestCompositeSetAddOperandRequiresKnownSetTagWhenSetOperand,
+ TestCompositeSetEvaluateResolvesNestedCompositeSetOperand,
+ TestCompositeSetEvaluateDetectsCycle,
+ TestCompositeSetEvaluateAllowsDiamondSharedOperand,
+ TestCompositeSetRemoveOperandDeletesDescriptor,
+ TestCompositeSetRemoveOperandRequiresOperandInSet,
+ TestCompositeSetDeleteCompositeSetSucceedsWhenEmpty,
+ TestCompositeSetDeleteCompositeSetFailsIfNotEmpty,
+ TestCompositeSetOperationsRequireCompositeSetTag,
+ TestCompositeSetEvaluateDetectsMalformedDescriptor, and
+ TestSetRegistryTagAsSetRejectsCompositeSetConflict.
+
 Currently unaddressed yet:
-- SetRegistry does not yet enforce theorystate.md section 79's
-  mutual-exclusivity rule (at most one of AllSets / AllCompositeSets /
-  AllCompositeSetLogs per node), since neither of the other two tags
-  exists in this codebase yet. This must be added -- here, and in
-  whichever of CompositeSetRegistry / CompositeSetLogRegistry
-  (theorystate.md sections 80-83) is implemented first -- once either
-  actually exists.
+- SetRegistry's and CompositeSetRegistry's mutual-exclusivity enforcement
+  (theorystate.md section 79) only covers the two Set representations
+  that exist so far (AllSets, AllCompositeSets); CompositeSetLogRegistry
+  (theorystate.md section 82) remains unimplemented. Whichever registry
+  implements it must be added to NewSetRegistry's otherSetTags and to an
+  analogous check wherever CompositeSetLogRegistry itself tags nodes.
 - No commit-time interception exists to prevent a raw
   Graph.AddRelationship from creating a second child on an
   already-tagged Pointer node in the first place; PointerRegistry can
