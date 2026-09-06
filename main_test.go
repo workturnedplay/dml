@@ -3103,12 +3103,12 @@ func TestCapsuleSetPrevAndNextLinkCapsules(t *testing.T) {
 		t.Fatalf("NewCapsule(v2): %v", err)
 	}
 
-	if err := capsules.SetNext(c1, c2); err != nil {
-		t.Fatalf("SetNext(c1, c2): %v", err)
+	if err2 := capsules.SetNext(c1, c2); err2 != nil {
+		t.Fatalf("SetNext(c1, c2): %v", err2)
 	}
 
-	if err := capsules.SetPrev(c2, c1); err != nil {
-		t.Fatalf("SetPrev(c2, c1): %v", err)
+	if err3 := capsules.SetPrev(c2, c1); err3 != nil {
+		t.Fatalf("SetPrev(c2, c1): %v", err3)
 	}
 
 	next, hasNext, err := capsules.Next(c1)
@@ -3151,8 +3151,8 @@ func TestCapsuleRemovePrevAndNext(t *testing.T) {
 		t.Fatalf("NewCapsule(v2): %v", err)
 	}
 
-	if err := capsules.SetNext(c1, c2); err != nil {
-		t.Fatalf("SetNext(c1, c2): %v", err)
+	if err2 := capsules.SetNext(c1, c2); err2 != nil {
+		t.Fatalf("SetNext(c1, c2): %v", err2)
 	}
 
 	removed, err := capsules.RemoveNext(c1)
@@ -3311,8 +3311,8 @@ func TestCapsuleRegistryDeleteCapsuleFailsIfPrevOrNextSet(t *testing.T) {
 		t.Fatalf("NewCapsule(v2): %v", err)
 	}
 
-	if err := capsules.SetNext(c1, c2); err != nil {
-		t.Fatalf("SetNext(c1, c2): %v", err)
+	if err2 := capsules.SetNext(c1, c2); err2 != nil {
+		t.Fatalf("SetNext(c1, c2): %v", err2)
 	}
 
 	err = capsules.DeleteCapsule(c1)
@@ -3360,8 +3360,8 @@ func TestCapsuleRegistryDeleteCapsuleFailsIfSlotHasExtraParent(t *testing.T) {
 	// -- ordinary permitted graph structure (a node may have any number
 	// of parents, theorystate.md section 2.8) that
 	// DeleteCapsule must not silently delete out from under.
-	if _, err := g.AddRelationship(metadata, valueSlot); err != nil {
-		t.Fatalf("AddRelationship(metadata, valueSlot): %v", err)
+	if _, err2 := g.AddRelationship(metadata, valueSlot); err2 != nil {
+		t.Fatalf("AddRelationship(metadata, valueSlot): %v", err2)
 	}
 
 	err = capsules.DeleteCapsule(capsule)
@@ -3497,8 +3497,8 @@ func TestCapsulesWithValueFindsAllOccurrences(t *testing.T) {
 	}
 
 	// A capsule holding an unrelated value must not show up.
-	if _, err := capsules.NewCapsule(other); err != nil {
-		t.Fatalf("NewCapsule(other): %v", err)
+	if _, err2 := capsules.NewCapsule(other); err2 != nil {
+		t.Fatalf("NewCapsule(other): %v", err2)
 	}
 
 	got, err := capsules.CapsulesWithValue(value)
@@ -3534,8 +3534,8 @@ func TestCapsulesWithValueIgnoresUnrelatedEdges(t *testing.T) {
 
 	// A plain, non-value-slot relationship pointing at value from
 	// elsewhere in the graph (e.g. some other structure's target).
-	if _, err := g.AddRelationship(unrelated, value); err != nil {
-		t.Fatalf("AddRelationship(unrelated, value): %v", err)
+	if _, err2 := g.AddRelationship(unrelated, value); err2 != nil {
+		t.Fatalf("AddRelationship(unrelated, value): %v", err2)
 	}
 
 	got, err := capsules.CapsulesWithValue(value)
@@ -3586,8 +3586,8 @@ func TestCapsulesWithValueIgnoresUnrelatedParentsOfSlot(t *testing.T) {
 	// capsule -- ordinary permitted graph structure that ownership
 	// discovery must ignore rather than error on or mistake for the
 	// owner.
-	if _, err := g.AddRelationship(metadata, slot); err != nil {
-		t.Fatalf("AddRelationship(metadata, slot): %v", err)
+	if _, err2 := g.AddRelationship(metadata, slot); err2 != nil {
+		t.Fatalf("AddRelationship(metadata, slot): %v", err2)
 	}
 
 	got, err := capsules.CapsulesWithValue(value)
@@ -3640,8 +3640,8 @@ func TestCapsulesWithValueDetectsAmbiguousCapsuleOwnership(t *testing.T) {
 
 	// Bypass CapsuleRegistry entirely, simulating an out-of-band mutation
 	// that wires a second, distinct capsule to the same value slot.
-	if _, err := g.AddRelationship(otherCapsule, slot); err != nil {
-		t.Fatalf("AddRelationship(otherCapsule, slot): %v", err)
+	if _, err2 := g.AddRelationship(otherCapsule, slot); err2 != nil {
+		t.Fatalf("AddRelationship(otherCapsule, slot): %v", err2)
 	}
 
 	_, err = capsules.CapsulesWithValue(value)
@@ -3749,14 +3749,14 @@ func TestNewListTagsListAndStartsEmpty(t *testing.T) {
 		t.Fatalf("NewList() did not tag %d as a list", list)
 	}
 
-	if _, hasHead, err := lists.Head(list); err != nil {
-		t.Fatalf("Head(%d): %v", list, err)
+	if _, hasHead, err2 := lists.Head(list); err2 != nil {
+		t.Fatalf("Head(%d): %v", list, err2)
 	} else if hasHead {
 		t.Fatalf("fresh list %d unexpectedly has a head", list)
 	}
 
-	if _, hasTail, err := lists.Tail(list); err != nil {
-		t.Fatalf("Tail(%d): %v", list, err)
+	if _, hasTail, err3 := lists.Tail(list); err3 != nil {
+		t.Fatalf("Tail(%d): %v", list, err3)
 	} else if hasTail {
 		t.Fatalf("fresh list %d unexpectedly has a tail", list)
 	}

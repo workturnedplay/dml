@@ -17,6 +17,7 @@ severity:
 issues:
   max-issues-per-linter: 0
   max-same-issues: 0
+  uniq-by-line: false
   new: false
 
 linters:
@@ -57,9 +58,9 @@ linters:
   exclusions:
     presets:
       - comments                # Excludes missing comment warnings for exported fields/types
-      - std-error-handling      # Excludes unhandled errors on common functions like fmt.Println or os.Close
+      #- std-error-handling      # Excludes unhandled errors on common functions like fmt.Println or os.Close
       - common-false-positives  # Excludes noisy gosec rules on variables/subprocesses
-      - legacy                  # Excludes other v1-specific default exclusion rules
+      #- legacy                  # Excludes other v1-specific default exclusion rules
       
   settings:
     
