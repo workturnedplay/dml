@@ -2658,6 +2658,74 @@ func TestPointerMetadataRegistrySetTargetRequiresExistingTarget(t *testing.T) {
 	}
 }
 
+// TestPointerMetadataRegistryDetectsOutOfBandInvariantViolation covers
+// Representation C's own "at most one target, found by excluding the
+// subject-slot" invariant being violated out of band -- the counterpart
+// to TestPointerRegistryDetectsOutOfBandInvariantViolation for
+// Representation A/B, which this registry did not previously have.
+func TestPointerMetadataRegistryDetectsOutOfBandInvariantViolation(t *testing.T) {
+	g, metadata := newPointerMetadataTestFixture(t)
+
+	subject, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for subject: %v", err)
+	}
+
+	x, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for x: %v", err)
+	}
+
+	if err2 := metadata.SetTarget(subject, x); err2 != nil {
+		t.Fatalf("SetTarget(subject, x): %v", err2)
+	}
+
+	m, err := metadata.EnsureMetadata(subject)
+	if err != nil {
+		t.Fatalf("EnsureMetadata(subject): %v", err)
+	}
+
+	y, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for y: %v", err)
+	}
+
+	// Bypass PointerMetadataRegistry entirely, simulating a caller bug
+	// that gives M a second non-subject-slot child directly through the
+	// primitive Graph. M now has two children besides its subject-slot:
+	// its original target x and this new, unrelated y.
+	if _, err3 := g.AddRelationship(m, y); err3 != nil {
+		t.Fatalf("AddRelationship(m, y) via raw Graph: %v", err3)
+	}
+
+	if _, _, err4 := metadata.Target(subject); !errors.Is(err4, ErrTooManyPointerTargets) {
+		t.Fatalf("Target() error = %v, want %v", err4, ErrTooManyPointerTargets)
+	}
+
+	z, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for z: %v", err)
+	}
+
+	if err5 := metadata.SetTarget(subject, z); !errors.Is(err5, ErrTooManyPointerTargets) {
+		t.Fatalf("SetTarget() error = %v, want %v", err5, ErrTooManyPointerTargets)
+	}
+
+	if _, err6 := metadata.RemoveTarget(subject); !errors.Is(err6, ErrTooManyPointerTargets) {
+		t.Fatalf("RemoveTarget() error = %v, want %v", err6, ErrTooManyPointerTargets)
+	}
+
+	// Confirm none of the failed calls above mutated anything: M should
+	// still have exactly its subject-slot child, x, and y.
+	outgoing, err := g.FindOutgoing(m)
+	if err != nil {
+		t.Fatalf("FindOutgoing(m): %v", err)
+	}
+	if len(outgoing) != 3 {
+		t.Fatalf("FindOutgoing(m) = %v, want the original 3 relationships untouched", outgoing)
+	}
+}
+
 func newPointerMetadataDTestFixture(t *testing.T) (*Graph, *PointerMetadataRegistryD) {
 	t.Helper()
 
@@ -2888,6 +2956,79 @@ func TestPointerMetadataRegistryDSetTargetRequiresExistingTarget(t *testing.T) {
 	err = metadata.SetTarget(subject, nonexistent)
 	if !errors.Is(err, ErrNodeNotFound) {
 		t.Fatalf("SetTarget() error = %v, want %v", err, ErrNodeNotFound)
+	}
+}
+
+// TestPointerMetadataRegistryDDetectsOutOfBandInvariantViolation covers
+// Representation D's own "at most one target" invariant being violated
+// out of band. Unlike Representation C, D's subject is discovered
+// entirely by tag (never by exclusion), so the count-based invariant to
+// violate here lives on the target-slot U2 itself, not on M directly.
+func TestPointerMetadataRegistryDDetectsOutOfBandInvariantViolation(t *testing.T) {
+	g, metadata := newPointerMetadataDTestFixture(t)
+
+	subject, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for subject: %v", err)
+	}
+
+	x, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for x: %v", err)
+	}
+
+	if err2 := metadata.SetTarget(subject, x); err2 != nil {
+		t.Fatalf("SetTarget(subject, x): %v", err2)
+	}
+
+	m, err := metadata.EnsureMetadata(subject)
+	if err != nil {
+		t.Fatalf("EnsureMetadata(subject): %v", err)
+	}
+
+	slot, found, err := metadata.targetSlot(m)
+	if err != nil || !found {
+		t.Fatalf("targetSlot(m): found=%v err=%v", found, err)
+	}
+
+	y, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for y: %v", err)
+	}
+
+	// Bypass PointerMetadataRegistryD entirely, simulating a caller bug
+	// that gives the target-slot U2 a second target directly through the
+	// primitive Graph.
+	if _, err3 := g.AddRelationship(slot, y); err3 != nil {
+		t.Fatalf("AddRelationship(slot, y) via raw Graph: %v", err3)
+	}
+
+	if _, _, err4 := metadata.Target(subject); !errors.Is(err4, ErrTooManyPointerTargets) {
+		t.Fatalf("Target() error = %v, want %v", err4, ErrTooManyPointerTargets)
+	}
+
+	z, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for z: %v", err)
+	}
+
+	if err5 := metadata.SetTarget(subject, z); !errors.Is(err5, ErrTooManyPointerTargets) {
+		t.Fatalf("SetTarget() error = %v, want %v", err5, ErrTooManyPointerTargets)
+	}
+
+	if _, err6 := metadata.RemoveTarget(subject); !errors.Is(err6, ErrTooManyPointerTargets) {
+		t.Fatalf("RemoveTarget() error = %v, want %v", err6, ErrTooManyPointerTargets)
+	}
+
+	// Confirm none of the failed calls above mutated anything: the
+	// target-slot should still have exactly its original two children,
+	// x and y.
+	outgoing, err := g.FindOutgoing(slot)
+	if err != nil {
+		t.Fatalf("FindOutgoing(slot): %v", err)
+	}
+	if len(outgoing) != 2 {
+		t.Fatalf("FindOutgoing(slot) = %v, want the original 2 relationships (x and y) untouched", outgoing)
 	}
 }
 
@@ -5422,6 +5563,96 @@ func TestAdversarialRoleSlotWithExtraChildFailsLoudly(t *testing.T) {
 	_, _, err = capsules.Next(capsule)
 	if !errors.Is(err, ErrTooManyPointerTargets) {
 		t.Fatalf("Next() error = %v, want %v", err, ErrTooManyPointerTargets)
+	}
+}
+
+// TestAdversarialCapsuleMultipleRoleViolationsEachDetectedIndependently
+// combines three different out-of-band single-role violations (already
+// individually covered by TestAdversarialRoleSlotWithExtraChildFailsLoudly,
+// TestAdversarialSharedRoleSlotFailsLoudly, and
+// TestAdversarialMissingRoleTagMakesCapsuleUndiscoverable) onto the same
+// capsule at once, confirming each role's own accessor still reports its
+// own specific violation independently. This documents a real,
+// deliberately-not-yet-closed gap: there is currently no single "is this
+// capsule well-formed" check -- only three separate per-role queries,
+// each of which must be called individually to discover a problem with
+// that particular role.
+func TestAdversarialCapsuleMultipleRoleViolationsEachDetectedIndependently(t *testing.T) {
+	g, capsules := newCapsuleTestFixture(t)
+
+	value, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for value: %v", err)
+	}
+
+	capsule, err := capsules.NewCapsule(value)
+	if err != nil {
+		t.Fatalf("NewCapsule(): %v", err)
+	}
+
+	// Corrupt the prev slot: give it a second target directly through the
+	// primitive Graph, violating the underlying PointerRegistry's "at
+	// most one target" invariant.
+	prevSlot, found, err := capsules.slotFor(capsule, capsules.prevSlots.allPointers)
+	if err != nil || !found {
+		t.Fatalf("slotFor(prev): found=%v err=%v", found, err)
+	}
+	prevTarget, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for prevTarget: %v", err)
+	}
+	prevExtra, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for prevExtra: %v", err)
+	}
+	if _, err2 := g.AddRelationship(prevSlot, prevTarget); err2 != nil {
+		t.Fatalf("AddRelationship(prevSlot, prevTarget): %v", err2)
+	}
+	if _, err3 := g.AddRelationship(prevSlot, prevExtra); err3 != nil {
+		t.Fatalf("AddRelationship(prevSlot, prevExtra): %v", err3)
+	}
+
+	// Corrupt the value slot: wire a second, distinct capsule to the same
+	// value slot, making its owning capsule ambiguous.
+	valueSlot, found, err := capsules.slotFor(capsule, capsules.valueSlots.allPointers)
+	if err != nil || !found {
+		t.Fatalf("slotFor(value): found=%v err=%v", found, err)
+	}
+	otherValue, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for otherValue: %v", err)
+	}
+	otherCapsule, err := capsules.NewCapsule(otherValue)
+	if err != nil {
+		t.Fatalf("NewCapsule(otherValue): %v", err)
+	}
+	if _, err4 := g.AddRelationship(otherCapsule, valueSlot); err4 != nil {
+		t.Fatalf("AddRelationship(otherCapsule, valueSlot): %v", err4)
+	}
+
+	// Corrupt the next slot: remove its own role tag entirely, making it
+	// undiscoverable as a role slot at all.
+	nextSlot, found, err := capsules.slotFor(capsule, capsules.nextSlots.allPointers)
+	if err != nil || !found {
+		t.Fatalf("slotFor(next): found=%v err=%v", found, err)
+	}
+	if _, err5 := g.RemoveRelationship(capsules.nextSlots.allPointers, nextSlot); err5 != nil {
+		t.Fatalf("RemoveRelationship(nextSlots tag, nextSlot): %v", err5)
+	}
+
+	// Each role's own accessor must independently report its own specific
+	// violation -- there is no single call that reports all three at
+	// once, which is exactly the gap this test documents.
+	if _, _, err6 := capsules.Prev(capsule); !errors.Is(err6, ErrTooManyPointerTargets) {
+		t.Fatalf("Prev() error = %v, want %v", err6, ErrTooManyPointerTargets)
+	}
+
+	if _, _, err7 := capsules.Value(capsule); !errors.Is(err7, ErrAmbiguousPointerMetadata) {
+		t.Fatalf("Value() error = %v, want %v", err7, ErrAmbiguousPointerMetadata)
+	}
+
+	if _, _, err8 := capsules.Next(capsule); !errors.Is(err8, ErrNotCapsule) {
+		t.Fatalf("Next() error = %v, want %v", err8, ErrNotCapsule)
 	}
 }
 
