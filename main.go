@@ -1548,6 +1548,25 @@ type txOps interface {
 	DeleteNode(id NodeID) error
 }
 
+// wrapTxOpsErr wraps an error returned directly from a txOps interface
+// method call (CreateNode/AddRelationship/RemoveRelationship/DeleteNode)
+// before it is returned from one of this file's tx-composable helper
+// functions. This exists purely to satisfy static analysis (wrapcheck),
+// which cannot see through the txOps interface to know that its only two
+// implementations (*Graph, *Txn) return nothing but this package's own
+// sentinel errors (ErrNodeNotFound, ErrNodeNotEmpty, ErrNodeIDExhausted).
+// Wrapping with %w preserves full errors.Is/errors.As compatibility --
+// every existing errors.Is check against those sentinels continues to
+// work unchanged -- so this adds no behavior, only a satisfied linter.
+// A nil err must stay nil: fmt.Errorf("%w", nil) would otherwise turn a
+// successful call into a non-nil error.
+func wrapTxOpsErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("%w", err)
+}
+
 // tagNodeTx adds the tagging relationship (tag, id) against tx. This is
 // the single-relationship-add step shared by createTaggedNodeTx below and
 // by any caller that needs to apply more than one tag to a single node --
@@ -1555,7 +1574,7 @@ type txOps interface {
 // two independent axis tags on the same freshly created node.
 func tagNodeTx(tx txOps, tag, id NodeID) error {
 	_, err := tx.AddRelationship(tag, id)
-	return err
+	return wrapTxOpsErr(err)
 }
 
 // createTaggedNodeTx creates a fresh node and tags it via (tag, id),
@@ -1567,7 +1586,7 @@ func tagNodeTx(tx txOps, tag, id NodeID) error {
 func createTaggedNodeTx(tx txOps, tag NodeID) (NodeID, error) {
 	id, err := tx.CreateNode()
 	if err != nil {
-		return 0, err
+		return 0, wrapTxOpsErr(err)
 	}
 
 	if err := tagNodeTx(tx, tag, id); err != nil {
@@ -1598,12 +1617,12 @@ func newPointerTx(tx txOps, allPointers NodeID) (NodeID, error) {
 func setPointerTargetTx(tx txOps, id, current NodeID, hasCurrent bool, target NodeID) error {
 	if hasCurrent {
 		if _, err := tx.RemoveRelationship(id, current); err != nil {
-			return err
+			return wrapTxOpsErr(err)
 		}
 	}
 
 	_, err := tx.AddRelationship(id, target)
-	return err
+	return wrapTxOpsErr(err)
 }
 
 // singleChildTargetSetTx sets node's single "target" child -- under the
@@ -1659,7 +1678,8 @@ func singleChildTargetRemoveTx(tx txOps, graph *Graph, node NodeID) (removed boo
 		return false, nil
 	}
 
-	return tx.RemoveRelationship(node, current)
+	removed, err = tx.RemoveRelationship(node, current)
+	return removed, wrapTxOpsErr(err)
 }
 
 // singleChildTarget returns the single relevant child of node in the
@@ -2874,7 +2894,7 @@ func buildCapsuleTx(tx txOps, allElementCapsules, allPrevSlot, allValueSlot, all
 		return 0, err
 	}
 	if _, err2 := tx.AddRelationship(capsule, prevSlot); err2 != nil {
-		return 0, err2
+		return 0, wrapTxOpsErr(err2)
 	}
 
 	valueSlot, err := newPointerTx(tx, allValueSlot)
@@ -2882,10 +2902,10 @@ func buildCapsuleTx(tx txOps, allElementCapsules, allPrevSlot, allValueSlot, all
 		return 0, err
 	}
 	if _, err3 := tx.AddRelationship(capsule, valueSlot); err3 != nil {
-		return 0, err3
+		return 0, wrapTxOpsErr(err3)
 	}
 	if _, err4 := tx.AddRelationship(valueSlot, value); err4 != nil {
-		return 0, err4
+		return 0, wrapTxOpsErr(err4)
 	}
 
 	nextSlot, err := newPointerTx(tx, allNextSlot)
@@ -2895,7 +2915,7 @@ func buildCapsuleTx(tx txOps, allElementCapsules, allPrevSlot, allValueSlot, all
 
 	_, err = tx.AddRelationship(capsule, nextSlot)
 	if err != nil {
-		return 0, err
+		return 0, wrapTxOpsErr(err)
 	}
 
 	return capsule, nil
@@ -3589,7 +3609,7 @@ func (l *ListRegistry) appendTx(tx txOps, list, value NodeID) (NodeID, error) {
 	}
 
 	if _, err2 := tx.AddRelationship(list, capsule); err2 != nil {
-		return 0, err2
+		return 0, wrapTxOpsErr(err2)
 	}
 
 	if hasTail {
@@ -3600,16 +3620,16 @@ func (l *ListRegistry) appendTx(tx txOps, list, value NodeID) (NodeID, error) {
 			return 0, err4
 		}
 		if _, err5 := tx.RemoveRelationship(l.allTails, oldTail); err5 != nil {
-			return 0, err5
+			return 0, wrapTxOpsErr(err5)
 		}
 	} else {
 		if _, err6 := tx.AddRelationship(l.allHeads, capsule); err6 != nil {
-			return 0, err6
+			return 0, wrapTxOpsErr(err6)
 		}
 	}
 
 	_, err = tx.AddRelationship(l.allTails, capsule)
-	return capsule, err
+	return capsule, wrapTxOpsErr(err)
 }
 
 // Prepend creates a fresh capsule holding value and links it as the new
@@ -4528,7 +4548,7 @@ func buildOperandDescriptorTx(tx txOps, additiveTag, subtractiveTag, scalarTag, 
 
 	u, err = tx.CreateNode()
 	if err != nil {
-		return 0, err
+		return 0, wrapTxOpsErr(err)
 	}
 	if err2 := tagNodeTx(tx, operationTag, u); err2 != nil {
 		return 0, err2
@@ -4538,7 +4558,7 @@ func buildOperandDescriptorTx(tx txOps, additiveTag, subtractiveTag, scalarTag, 
 	}
 
 	_, err = tx.AddRelationship(u, operand)
-	return u, err
+	return u, wrapTxOpsErr(err)
 }
 
 // clearOperandDescriptorEdgesTx removes descriptor u's own edge to its
@@ -4552,16 +4572,16 @@ func buildOperandDescriptorTx(tx txOps, additiveTag, subtractiveTag, scalarTag, 
 func clearOperandDescriptorEdgesTx(tx txOps, operand NodeID, hasOperand bool, operationTag, operandTag, u NodeID) error {
 	if hasOperand {
 		if _, err := tx.RemoveRelationship(u, operand); err != nil {
-			return err
+			return wrapTxOpsErr(err)
 		}
 	}
 
 	if _, err := tx.RemoveRelationship(operationTag, u); err != nil {
-		return err
+		return wrapTxOpsErr(err)
 	}
 
 	_, err := tx.RemoveRelationship(operandTag, u)
-	return err
+	return wrapTxOpsErr(err)
 }
 
 // deleteOperandDescriptorTx clears descriptor u's own edges (see
@@ -4577,7 +4597,7 @@ func deleteOperandDescriptorTx(tx txOps, operand NodeID, hasOperand bool, operat
 		return err
 	}
 
-	return tx.DeleteNode(u)
+	return wrapTxOpsErr(tx.DeleteNode(u))
 }
 
 // operandTargetGeneric returns descriptor u's operand, i.e. u's single
