@@ -4165,6 +4165,60 @@ func TestListInsertAfterRequiresCapsuleInList(t *testing.T) {
 	}
 }
 
+// TestListRegistryCheckerCatchesInvalidStructureAtCommitTime demonstrates
+// the ListRegistry Checker (registered by NewListRegistry) catching an
+// invalid list structure immediately, at commit time, rather than only
+// the next time something calls Elements(). Unlike the many existing
+// out-of-band adversarial tests elsewhere in this file, this simulates
+// the corruption through Graph.Transact directly (via raw tx calls),
+// since only mutations made through Transact are visible to any
+// Checker at all -- a raw, non-transactional Graph.AddRelationship call
+// (what those other tests use) bypasses every Checker entirely, exactly
+// as documented on the Checker type itself.
+func TestListRegistryCheckerCatchesInvalidStructureAtCommitTime(t *testing.T) {
+	g, _, lists := newListTestFixture(t)
+
+	list, err := lists.NewList()
+	if err != nil {
+		t.Fatalf("NewList(): %v", err)
+	}
+
+	bogus, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for bogus: %v", err)
+	}
+
+	// Simulate a hypothetical buggy composed operation that tags a
+	// non-capsule node as list's head and links it in as a child,
+	// entirely through one Graph.Transact call.
+	err = g.Transact(func(tx *Txn) error {
+		if _, err2 := tx.AddRelationship(list, bogus); err2 != nil {
+			return err2
+		}
+		_, err2 := tx.AddRelationship(lists.allHeads, bogus)
+		return err2
+	})
+
+	if !errors.Is(err, ErrInvalidListStructure) {
+		t.Fatalf("Transact() error = %v, want %v", err, ErrInvalidListStructure)
+	}
+
+	// Confirm the whole changeset was rolled back: bogus must not be
+	// linked into list nor tagged as head.
+	if g.HasRelationship(list, bogus) {
+		t.Fatal("list still contains bogus after the Checker declined the commit")
+	}
+	if g.HasRelationship(lists.allHeads, bogus) {
+		t.Fatal("bogus is still tagged AllHeads after the Checker declined the commit")
+	}
+
+	if _, hasHead, err3 := lists.Head(list); err3 != nil {
+		t.Fatalf("Head(list): %v", err3)
+	} else if hasHead {
+		t.Fatal("list unexpectedly has a head after the Checker declined the commit")
+	}
+}
+
 func TestListOperationsRequireListTag(t *testing.T) {
 	g, _, lists := newListTestFixture(t)
 
@@ -7067,6 +7121,64 @@ func TestCompositeSetOperationsRequireCompositeSetTag(t *testing.T) {
 	}
 }
 
+// TestCompositeSetRegistryCheckerCatchesMalformedDescriptorAtCommitTime
+// demonstrates the CompositeSetRegistry operand-descriptor Checker
+// (registered by NewCompositeSetRegistry) catching a malformed
+// descriptor immediately, at commit time, rather than only the next time
+// something calls Evaluate(). As with the analogous ListRegistry test
+// above, this simulates the malformed wiring through Graph.Transact
+// directly, since only Transact-mediated mutations are visible to any
+// Checker.
+func TestCompositeSetRegistryCheckerCatchesMalformedDescriptorAtCommitTime(t *testing.T) {
+	g, _, composites := newCompositeSetTestFixture(t)
+
+	set, err := composites.NewCompositeSet()
+	if err != nil {
+		t.Fatalf("NewCompositeSet(): %v", err)
+	}
+
+	x, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for x: %v", err)
+	}
+
+	// Simulate a hypothetical buggy composed operation that wires a
+	// descriptor with both operation-kind tags at once, entirely through
+	// one Graph.Transact call.
+	err = g.Transact(func(tx *Txn) error {
+		u, err2 := tx.CreateNode()
+		if err2 != nil {
+			return err2
+		}
+		if _, err2 = tx.AddRelationship(composites.allAdditiveOp, u); err2 != nil {
+			return err2
+		}
+		if _, err2 = tx.AddRelationship(composites.allSubtractiveOp, u); err2 != nil {
+			return err2
+		}
+		if _, err2 = tx.AddRelationship(composites.allScalarOperand, u); err2 != nil {
+			return err2
+		}
+		if _, err2 = tx.AddRelationship(u, x); err2 != nil {
+			return err2
+		}
+		_, err2 = tx.AddRelationship(set, u)
+		return err2
+	})
+
+	if !errors.Is(err, ErrInvalidOperandDescriptor) {
+		t.Fatalf("Transact() error = %v, want %v", err, ErrInvalidOperandDescriptor)
+	}
+
+	operands, err := composites.Operands(set)
+	if err != nil {
+		t.Fatalf("Operands(set): %v", err)
+	}
+	if len(operands) != 0 {
+		t.Fatalf("Operands(set) = %v, want empty after the Checker declined the commit", operands)
+	}
+}
+
 // TestCompositeSetEvaluateDetectsMalformedDescriptor covers an
 // out-of-band mutation giving a descriptor node both operation-kind tags
 // at once, which exactlyOneTag must reject rather than guess.
@@ -7923,6 +8035,98 @@ func TestCompositeSetLogEvaluateDetectsMalformedDescriptor(t *testing.T) {
 	_, err = logs.Evaluate(log)
 	if !errors.Is(err, ErrInvalidOperandDescriptor) {
 		t.Fatalf("Evaluate() error = %v, want %v", err, ErrInvalidOperandDescriptor)
+	}
+}
+
+// TestCompositeSetLogRegistrySharesListStructureChecker demonstrates that
+// CompositeSetLogRegistry, despite registering no Checker of its own
+// (see NewCompositeSetLogRegistry's doc comment), still gets its
+// underlying List structure validated eagerly at commit time -- for
+// free, via the ListRegistry Checker registered when this fixture's
+// ListRegistry was itself constructed. A CompositeSetLog is dual-tagged
+// (AllLists,node) and (AllCompositeSetLogs,node), and the ListRegistry
+// Checker fires on any touched node carrying AllLists regardless of
+// which registry happened to touch it.
+func TestCompositeSetLogRegistrySharesListStructureChecker(t *testing.T) {
+	g, _, _, logs := newCompositeSetLogTestFixture(t)
+
+	log, err := logs.NewCompositeSetLog()
+	if err != nil {
+		t.Fatalf("NewCompositeSetLog(): %v", err)
+	}
+
+	bogus, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for bogus: %v", err)
+	}
+
+	err = g.Transact(func(tx *Txn) error {
+		if _, err2 := tx.AddRelationship(log, bogus); err2 != nil {
+			return err2
+		}
+		_, err2 := tx.AddRelationship(logs.lists.allHeads, bogus)
+		return err2
+	})
+
+	if !errors.Is(err, ErrInvalidListStructure) {
+		t.Fatalf("Transact() error = %v, want %v", err, ErrInvalidListStructure)
+	}
+}
+
+// TestCompositeSetLogRegistrySharesOperandDescriptorChecker demonstrates
+// that CompositeSetLogRegistry's own logged-operation descriptors are
+// also validated eagerly at commit time, again with no Checker of
+// CompositeSetLogRegistry's own -- this time via the operand-descriptor
+// Checker registered by NewCompositeSetRegistry, which is keyed on the
+// shared axis tags themselves (theorystate.md section 80) rather than on
+// AllCompositeSets, specifically so it also reaches descriptors that are
+// never children of a composite-set node at all, as is always the case
+// for a CompositeSetLog's descriptors (they are list-capsule values
+// instead). Appending a pre-existing, already-malformed descriptor as an
+// ordinary ListRegistry value -- not going through AppendOperation at
+// all -- still touches that descriptor as part of wiring the new
+// capsule's value slot, which is enough for the shared Checker to fire.
+func TestCompositeSetLogRegistrySharesOperandDescriptorChecker(t *testing.T) {
+	g, _, composites, logs := newCompositeSetLogTestFixture(t)
+
+	log, err := logs.NewCompositeSetLog()
+	if err != nil {
+		t.Fatalf("NewCompositeSetLog(): %v", err)
+	}
+
+	x, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for x: %v", err)
+	}
+
+	u, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for u: %v", err)
+	}
+	if _, err2 := g.AddRelationship(composites.allAdditiveOp, u); err2 != nil {
+		t.Fatalf("AddRelationship(allAdditiveOp, u): %v", err2)
+	}
+	if _, err3 := g.AddRelationship(composites.allSubtractiveOp, u); err3 != nil {
+		t.Fatalf("AddRelationship(allSubtractiveOp, u): %v", err3)
+	}
+	if _, err4 := g.AddRelationship(composites.allScalarOperand, u); err4 != nil {
+		t.Fatalf("AddRelationship(allScalarOperand, u): %v", err4)
+	}
+	if _, err5 := g.AddRelationship(u, x); err5 != nil {
+		t.Fatalf("AddRelationship(u, x): %v", err5)
+	}
+
+	_, err = logs.lists.Append(log, u)
+	if !errors.Is(err, ErrInvalidOperandDescriptor) {
+		t.Fatalf("Append() error = %v, want %v", err, ErrInvalidOperandDescriptor)
+	}
+
+	elements, err := logs.lists.Elements(log)
+	if err != nil {
+		t.Fatalf("Elements(log): %v", err)
+	}
+	if len(elements) != 0 {
+		t.Fatalf("Elements(log) = %v, want empty after the Checker declined the commit", elements)
 	}
 }
 

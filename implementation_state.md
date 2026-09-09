@@ -895,17 +895,85 @@ NodeID-keyed structure outside the primitive graph.
  TestCompositeSetLogEvaluateDetectsMalformedDescriptor, and
  TestSetRegistryTagAsSetRejectsCompositeSetLogConflict.
 
+20. Added the commit-time invariant checking mechanism theorystate.md
+ sections 73/77 had left open, resolving the first "Currently unaddressed
+ yet" bullet below (now moved out of that section). Checker is a new
+ type ({Name string; Tags []NodeID; Check func(g *Graph, touched
+ map[NodeID]struct{}) error}), registered via the new
+ Graph.RegisterChecker and consulted by Graph.Transact via the new
+ runCheckers/checkerRelevant, immediately after a transaction's fn
+ succeeds and before Transact reports success to its own caller: if a
+ relevant Checker declines, its error is treated exactly like an error
+ fn itself returned, and the whole transaction is rolled back via the
+ same existing mechanism. Txn gained a touched map[NodeID]struct{} field
+ (populated by CreateNode/AddRelationship/RemoveRelationship/DeleteNode,
+ mirroring undo's own "only record what actually changed" discipline),
+ handed to runCheckers as the relevance-filtering input.
+
+ Per design discussion, this deliberately does NOT give Txn a staged/
+ overlay view: a Checker's Check function runs against the real,
+ already-mutated Graph, exactly as every other read in this file already
+ does, since nothing else can observe the intermediate state under the
+ current single-threaded execution model (theorystate.md section 19) --
+ an overlay would only be required once real concurrent access exists.
+ This also means every Checker's own validation logic is, without
+ exception, a thin adapter around a check that already existed and was
+ already independently tested: singleChildTarget for PointerRegistry and
+ PointerMetadataRegistryD, singleChildTarget-with-exclusion for
+ PointerMetadataRegistry, validateStructure for ListRegistry, and
+ exactlyOneTag/operandTargetGeneric for CompositeSetRegistry's two
+ Checkers. No new invariant-checking logic was written from scratch
+ except CapsuleRegistry.wellFormed (below).
+
+ PointerRegistry, PointerMetadataRegistry, PointerMetadataRegistryD,
+ CapsuleRegistry, ListRegistry, and CompositeSetRegistry's constructors
+ each now register their own Checker(s) as part of construction --
+ simply constructing a registry wires up its commit-time enforcement, no
+ separate opt-in step needed. SetRegistry registers none (a Set has no
+ invariant beyond its own tag). CompositeSetRegistry registers two: one
+ keyed on AllCompositeSets that walks a touched composite set's current
+ children (mirroring Evaluate()'s own defensive walk, catching a stray
+ non-descriptor child added out of band), and one keyed on the four
+ shared operand-descriptor axis tags themselves (theorystate.md section
+ 80) rather than on AllCompositeSets, which is what lets it also cover
+ CompositeSetLogRegistry's own descriptors -- those are list-capsule
+ values, never children of a composite-set node, so the first Checker's
+ parent-based walk could never reach them, but the axis-tag-keyed one
+ fires on them directly since CompositeSetLogRegistry is required to
+ reuse the same tag NodeIDs. CompositeSetLogRegistry therefore registers
+ no Checker of its own at all -- its List structure and its descriptor
+ shape are both already covered by Checkers registered when its required
+ *ListRegistry/*CompositeSetRegistry constructor arguments were
+ themselves constructed. Covered by
+ TestCompositeSetLogRegistrySharesListStructureChecker and
+ TestCompositeSetLogRegistrySharesOperandDescriptorChecker.
+
+ Added CapsuleRegistry.wellFormed, the one genuinely new piece of
+ validation logic this feature needed: previously there was no single
+ function answering "is this capsule well-formed, full stop" -- only
+ three separate slotFor/Value/Prev/Next-style calls, each surfacing a
+ problem with its own specific role independently (see
+ TestAdversarialCapsuleMultipleRoleViolationsEachDetectedIndependently,
+ added the prior session specifically to document this gap). wellFormed
+ bundles checking all three role slots' presence, ownership, and
+ cardinality into one call, backing CapsuleRegistry's own Checker.
+ DeleteCapsule does not use it: DeleteCapsule's all-or-nothing teardown
+ already gets an equivalent guarantee for free by attempting the real
+ deletes and relying on Transact's existing rollback if one fails, so a
+ pre-check there would be redundant, not a missed reuse opportunity.
+
+ Covered by TestListRegistryCheckerCatchesInvalidStructureAtCommitTime,
+ TestCompositeSetRegistryCheckerCatchesMalformedDescriptorAtCommitTime,
+ TestCompositeSetLogRegistrySharesListStructureChecker, and
+ TestCompositeSetLogRegistrySharesOperandDescriptorChecker -- each
+ simulates its violation through a raw Graph.Transact call rather than a
+ direct, non-transactional Graph mutation, since Checkers only ever run
+ for mutations made through Transact; the many existing out-of-band
+ adversarial tests elsewhere in this file, which do mutate directly, are
+ unaffected by this feature and continue to be caught only lazily, on
+ next read, exactly as before.
+
 Currently unaddressed yet:
-- No commit-time interception exists to prevent a raw
-  Graph.AddRelationship from creating a second child on an
-  already-tagged Pointer node in the first place; PointerRegistry can
-  only detect the violation after the fact, on its next call for that
-  node (see item 4 above and theorystate.md section 73). This is a
-  different concern from item 6's Txn: Txn makes a registry's own
-  multi-step sequence atomic against its own later failure; it does
-  nothing to stop an unrelated caller from bypassing the registry
-  entirely via the raw Graph. Whether/when a real interception mechanism
-  (theorystate.md section 73) is worth building is open.
 - Txn does not support nesting one Graph.Transact call inside another
   (Txn.DeleteNode is supported -- see item 15). Nesting is not needed by
   any current caller; add support if and when one actually needs it.

@@ -1710,6 +1710,29 @@ limit would be an arbitrary restriction on top of that, and the cycle
 detection above already rejects the only case — a genuine cycle — that
 would otherwise fail to terminate.
 
+**§77 resolution note (session finding, validated by `wtw`).** §77 left
+open whether commit-time checking should operate per-changeset, and
+worried this would require `Txn` to grow a staged/overlay mode in
+tension with its documented non-staged design. Both concerns are now
+resolved, and the resolution is simpler than either: checking is scoped
+to one `Graph.Transact` call (its own natural, already-existing
+atomicity boundary -- see §14's "successful committed transition"
+framing), and no overlay is needed at all, because a `Checker` (the new
+type implementing this) runs against the real, already-mutated `Graph`
+directly, exactly like every other read in this document's design
+already does. This is sound rather than merely convenient specifically
+*because* §19's single-threaded premise still holds: nothing can observe
+the mutated-but-not-yet-checked state, since nothing runs between the
+mutation completing and the Checker running, in the same synchronous
+call. §77's relevance-filtering idea (tag-based, mirroring §76) is
+implemented as `Checker.Tags` plus `Graph.checkerRelevant`; its
+attributable-decline requirement is implemented via wrapping a declined
+`Checker`'s own `Name` into the returned error. `Txn.undo`'s existing
+log gained a parallel `touched` set (not a replacement of the undo
+closures) to serve as the relevance filter's input, rather than the
+overlay-backing role §77 originally imagined for it. See
+`implementation_state.md` item 20 for the concrete implementation.
+
 **Implementation note (validated by `wtw`).** `CompositeSetRegistry` and
 `CompositeSetLogRegistry` both implement this dispatch and cycle
 detection exactly as specified above: the visited set is scoped to the
@@ -1859,6 +1882,13 @@ kept current as sections above resolve or split further.)*
   full bidirectional cross-representation dispatch (§83) between them and
   with plain Sets; a node may carry at most one of the three
   Set-representation tags, now enforced for all three (§79).
+- Commit-time invariant checking (§73, refined by §77) is implemented as
+  `Checker`/`Graph.RegisterChecker`/`Graph.Transact`'s post-`fn` checking
+  pass: scoped to one `Graph.Transact` call (not a grouped, nested
+  changeset -- see §77's resolution note), running against the real,
+  already-mutated `Graph` rather than a staged overlay, with every
+  existing registry's own already-tested validation logic reused as the
+  Checker body rather than new logic being written.
 
 ### TENTATIVE
 - Monotonically increasing NodeIDs; serialized first implementation.
@@ -1893,10 +1923,12 @@ kept current as sections above resolve or split further.)*
   question only now (§61).
 - Nested transaction semantics (§45); exact cross-graph teardown protocol
   (§43); rebase algorithm (§24); processor execution semantics.
-- Whether commit-time validation should operate on grouped changesets
-  rather than single operations, requiring `Txn` to gain a staged/overlay
-  mode in tension with its current deliberately-non-staged design (§77,
-  extends §73).
+- Nested transaction semantics remain OPEN (§45): the current commit-time
+  Checker mechanism (§73/§77, DECIDED and implemented below) deliberately
+  scopes checking to one top-level `Graph.Transact` call rather than
+  requiring nesting to express a changeset boundary, since no current
+  caller needs to fail and retry only an inner piece of a larger composed
+  operation while leaving its other already-applied steps standing.
 - Domain / DomainSet exact representation (§9c) — now unblocked in
   principle by §79's decided minimal Set representation, but not yet
   designed.

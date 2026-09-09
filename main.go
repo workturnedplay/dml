@@ -19,6 +19,7 @@ package dml
 
 import (
 	"errors"
+	"fmt"
 	"sort"
 )
 
@@ -54,6 +55,12 @@ type Graph struct {
 
 	// incoming[B][A] means the primitive relationship (A, B) exists.
 	incoming map[NodeID]map[NodeID]struct{}
+
+	// checkers holds every Checker registered via RegisterChecker, run by
+	// Transact immediately after a transaction's mutations succeed, and
+	// before Transact reports that success to its own caller. See the
+	// Checker type below (theorystate.md sections 73/77).
+	checkers []Checker
 }
 
 // CreateNode creates a new node and returns its NodeID.
@@ -372,16 +379,56 @@ func (g *Graph) nodeExists(id NodeID) bool {
 type Txn struct {
 	graph *Graph
 	undo  []func()
+
+	// touched records every NodeID this Txn's mutations have involved so
+	// far -- as an endpoint of an added or removed relationship, or as a
+	// created or deleted node -- so Graph.Transact can hand it to any
+	// relevant Checker once fn returns successfully. See the Checker
+	// type and the touch helper below. A relationship add/remove that
+	// turned out to be a no-op (already existed / never existed) is
+	// deliberately not recorded here, mirroring undo's own "only record
+	// what actually changed" discipline.
+	touched map[NodeID]struct{}
+}
+
+// touch records every one of ids as having been involved in this Txn's
+// mutations so far. See the touched field doc comment above.
+func (tx *Txn) touch(ids ...NodeID) {
+	if tx.touched == nil {
+		tx.touched = make(map[NodeID]struct{}, len(ids))
+	}
+
+	for _, id := range ids {
+		tx.touched[id] = struct{}{}
+	}
 }
 
 // Transact runs fn against a fresh Txn wrapping g. If fn returns a
 // non-nil error, every mutation fn performed through tx is undone, in
 // reverse order, and that same error is returned. If fn panics, the same
 // undo happens before the panic is re-raised, so a panicking caller does
-// not leave g in a partially mutated state either. If fn returns nil,
-// Transact simply returns nil; because every Txn method already applies
-// its mutation directly to g as it happens, there is no separate "commit"
-// step -- succeeding is simply not rolling back.
+// not leave g in a partially mutated state either.
+//
+// If fn returns nil, Transact does not yet report success: it first runs
+// every registered Checker that could plausibly be relevant to what fn
+// touched (see the Checker type and runCheckers below). If a relevant
+// Checker declines, its error is treated exactly like an error returned
+// by fn itself -- every mutation fn performed is undone, in reverse
+// order, and the Checker's (wrapped) error is returned instead of nil.
+// Only once every relevant Checker has approved does Transact return
+// nil.
+//
+// Because every Txn method already applies its mutation directly to g as
+// it happens, there is still no separate "staged" commit step -- a
+// Checker runs against the real, already-mutated Graph, never a partial
+// or overlay view. This is sound, not merely convenient, under the
+// current single-threaded execution model (theorystate.md section 19):
+// nothing else can observe the already-mutated-but-not-yet-checked
+// intermediate state, since nothing else runs between the mutation
+// completing and Check running, in the same synchronous call. See the
+// Checker type's own doc comment for the fuller reasoning, including why
+// a staged/overlay view (theorystate.md section 77's original proposal)
+// is deferred rather than needed here.
 func (g *Graph) Transact(fn func(tx *Txn) error) (err error) {
 	tx := &Txn{graph: g}
 
@@ -395,9 +442,15 @@ func (g *Graph) Transact(fn func(tx *Txn) error) (err error) {
 	err = fn(tx)
 	if err != nil {
 		tx.rollback()
+		return err
 	}
 
-	return err
+	if err2 := g.runCheckers(tx.touched); err2 != nil {
+		tx.rollback()
+		return err2
+	}
+
+	return nil
 }
 
 // rollback undoes every mutation recorded on tx so far, in reverse
@@ -423,6 +476,8 @@ func (tx *Txn) CreateNode() (NodeID, error) {
 	if err != nil {
 		return 0, err
 	}
+
+	tx.touch(id)
 
 	tx.undo = append(tx.undo, func() {
 		// By the time this runs (see rollback's LIFO ordering), any
@@ -456,6 +511,8 @@ func (tx *Txn) AddRelationship(a, b NodeID) (created bool, err error) {
 	}
 
 	if created {
+		tx.touch(a, b)
+
 		tx.undo = append(tx.undo, func() {
 			// Best-effort: deliberately swallowed, mirroring
 			// Txn.CreateNode's undo closure above.
@@ -479,6 +536,8 @@ func (tx *Txn) RemoveRelationship(a, b NodeID) (removed bool, err error) {
 	}
 
 	if removed {
+		tx.touch(a, b)
+
 		tx.undo = append(tx.undo, func() {
 			// Best-effort: deliberately swallowed, mirroring
 			// Txn.CreateNode's undo closure above.
@@ -515,11 +574,149 @@ func (tx *Txn) DeleteNode(id NodeID) error {
 		return err
 	}
 
+	tx.touch(id)
+
 	tx.undo = append(tx.undo, func() {
 		tx.graph.resurrectNode(id)
 	})
 
 	return nil
+}
+
+// Checker validates one domain-specific invariant against the graph
+// immediately after a Graph.Transact call's mutations have been fully
+// applied, before Transact reports success to its own caller. This is
+// the commit-time counterpart to the "always re-derive and re-check on
+// read, never cache" discipline every registry in this file otherwise
+// relies on (see e.g. the PointerRegistry doc comment): a Checker lets a
+// violated invariant be caught and rolled back immediately, at the
+// moment it is introduced, rather than only the next time some
+// registry's own method happens to read the affected node
+// (theorystate.md sections 73/77).
+//
+// A Checker's Check function runs against the real Graph, already fully
+// mutated by the just-completed Transact call -- never a staged or
+// partial view. This is sound, not merely convenient, under the current
+// single-threaded execution model (theorystate.md section 19): nothing
+// else can observe the already-mutated-but-not-yet-checked intermediate
+// state, since nothing else runs between the mutation completing and
+// Check running, in the same synchronous call. Building a staged/overlay
+// view instead (theorystate.md section 77's original proposal) would
+// only actually be required once real concurrent access exists; until
+// then, "mutate for real, check for real, roll back exactly like any
+// other failure if declined" is strictly simpler, and rests entirely on
+// machinery that already exists and is already tested (Graph.Transact's
+// existing rollback, including Txn.DeleteNode's resurrection,
+// theorystate.md section 78).
+//
+// Checkers only run for mutations made through Graph.Transact. A raw,
+// direct Graph.AddRelationship/RemoveRelationship/DeleteNode call --
+// exactly the kind every existing out-of-band adversarial test in this
+// file already uses -- has no commit boundary at all and therefore
+// bypasses every Checker entirely, same as it already bypasses every
+// registry's own enforcement. Checkers narrow, but do not close, that
+// gap; they exist to catch a violation introduced by a composed,
+// multi-step operation going through Transact, not to retroactively
+// police arbitrary direct Graph mutations.
+type Checker struct {
+	// Name identifies this Checker in a declined commit's returned
+	// error, so a caller can tell which specific invariant was violated
+	// rather than receiving a generic failure (theorystate.md section
+	// 77's "declines should be attributable, not generic" requirement).
+	Name string
+
+	// Tags lists every tag NodeID this Checker's invariant is defined in
+	// terms of. Used only as a coarse, conservative relevance filter
+	// (see Graph.checkerRelevant) to decide whether this Checker is
+	// worth invoking at all for a given transaction's changeset -- never
+	// consulted by Check itself, which remains free to interpret its own
+	// tags however its own invariant actually requires.
+	Tags []NodeID
+
+	// Check reports whether this Checker's invariant currently holds.
+	// touched lists every NodeID the just-completed transaction's
+	// mutations involved (as an endpoint of an added or removed
+	// relationship, or as a created or deleted node); Check is expected
+	// to use touched to narrow down which of its own tagged nodes, if
+	// any, actually need re-validating, rather than re-scanning the
+	// whole graph on every single commit.
+	Check func(g *Graph, touched map[NodeID]struct{}) error
+}
+
+// RegisterChecker adds c to the set of Checkers Transact consults after
+// every future transaction whose changeset could plausibly be relevant
+// to it (see Checker.Tags and checkerRelevant). Checkers are consulted
+// in registration order; there is currently no way to unregister one,
+// per the same construct-only-what-is-actually-needed discipline used
+// throughout this file (theorystate.md section 7) -- nothing in this
+// codebase currently needs to remove a Checker once registered.
+//
+// Every registry constructor in this file that has a real invariant to
+// enforce (PointerRegistry, PointerMetadataRegistry,
+// PointerMetadataRegistryD, CapsuleRegistry, ListRegistry,
+// CompositeSetRegistry) registers its own Checker here as part of
+// construction, so simply constructing a registry is what wires its
+// invariant into commit-time enforcement -- no separate opt-in step is
+// needed. SetRegistry registers none, since a Set has no invariant
+// beyond its own tag (see the SetRegistry doc comment). Note also that
+// operand-descriptor shape (theorystate.md section 80) is checked by a
+// Checker registered inside NewCompositeSetRegistry that is keyed on the
+// shared axis tags themselves, not on AllCompositeSets -- this is what
+// lets it also cover CompositeSetLogRegistry's own descriptors (see that
+// Checker's own comment for why), so CompositeSetLogRegistry registers
+// no Checker of its own at all: its underlying List's structure and its
+// logged operations' descriptor shape are both already covered by
+// Checkers registered when its required *ListRegistry and
+// *CompositeSetRegistry constructor arguments were themselves
+// constructed.
+func (g *Graph) RegisterChecker(c Checker) {
+	g.checkers = append(g.checkers, c)
+}
+
+// runCheckers consults every registered Checker whose Tags make it
+// plausibly relevant to touched (see checkerRelevant), in registration
+// order, returning the first error any relevant Checker reports, wrapped
+// with that Checker's Name for attribution. touched being empty (a
+// transaction that made no effective mutations at all) or no Checkers
+// being registered on g are both treated as trivially passing, without
+// iterating any further.
+func (g *Graph) runCheckers(touched map[NodeID]struct{}) error {
+	if len(touched) == 0 || len(g.checkers) == 0 {
+		return nil
+	}
+
+	for _, checker := range g.checkers {
+		if !g.checkerRelevant(checker, touched) {
+			continue
+		}
+
+		if err := checker.Check(g, touched); err != nil {
+			return fmt.Errorf("%s: %w", checker.Name, err)
+		}
+	}
+
+	return nil
+}
+
+// checkerRelevant reports whether checker's invariant could plausibly
+// have been affected by touched, using checker.Tags as a coarse,
+// conservative filter: checker is considered relevant the moment any
+// touched node currently carries any of checker's tags. This is
+// deliberately conservative (it can report true when Check would in fact
+// find nothing wrong) rather than precise -- precision is Check's own
+// responsibility, per the Checker doc comment; this filter exists only
+// to avoid invoking every registered Checker on every single commit
+// regardless of relevance.
+func (g *Graph) checkerRelevant(checker Checker, touched map[NodeID]struct{}) bool {
+	for _, tag := range checker.Tags {
+		for node := range touched {
+			if g.HasRelationship(tag, node) {
+				return true
+			}
+		}
+	}
+
+	return false
 }
 
 var (
@@ -1590,10 +1787,49 @@ type PointerRegistry struct {
 // has no dependency on NameRegistry or on names at all -- exactly like
 // RootGraph takes its root as a plain NodeID rather than a name, keeping
 // this layer decoupled from the bootstrap-naming concern.
+//
+// This also registers a Checker (see Graph.RegisterChecker) enforcing
+// the "at most one target" invariant at commit time, for any node
+// tagged (allPointers, node) touched by a future Graph.Transact call --
+// the eager, commit-time counterpart to this registry's existing
+// always-re-derive-on-read discipline (see the PointerRegistry doc
+// comment above). Since this same type is reused unmodified across
+// Representations A and B (and, via CapsuleRegistry, for each of a
+// capsule's three role-slot tags), constructing any PointerRegistry
+// instance -- under any tag -- wires up commit-time enforcement for
+// that specific tag, with no additional per-representation code.
 func NewPointerRegistry(graph *Graph, allPointers NodeID) (*PointerRegistry, error) {
 	if !graph.NodeExists(allPointers) {
 		return nil, ErrNodeNotFound
 	}
+
+	// Registers a Checker (see Graph.RegisterChecker) enforcing the "at
+	// most one target" invariant at commit time, for any node tagged
+	// (allPointers, node) touched by a future Graph.Transact call -- the
+	// eager, commit-time counterpart to this registry's existing
+	// always-re-derive-on-read discipline (see the PointerRegistry doc
+	// comment above). Since this same type is reused unmodified across
+	// Representations A and B (and, via CapsuleRegistry, for each of a
+	// capsule's three role-slot tags), constructing any PointerRegistry
+	// instance -- under any tag -- wires up commit-time enforcement for
+	// that specific tag, with no additional per-representation code.
+	graph.RegisterChecker(Checker{
+		Name: fmt.Sprintf("PointerRegistry(tag=%d)", allPointers),
+		Tags: []NodeID{allPointers},
+		Check: func(g *Graph, touched map[NodeID]struct{}) error {
+			for node := range touched {
+				if !g.HasRelationship(allPointers, node) {
+					continue
+				}
+
+				if _, _, err := singleChildTarget(g, node); err != nil {
+					return err
+				}
+			}
+
+			return nil
+		},
+	})
 
 	return &PointerRegistry{
 		graph:       graph,
@@ -2045,6 +2281,45 @@ func NewPointerMetadataRegistry(graph *Graph, allPointerMetadata, allSubjectSlot
 		return nil, ErrNodeNotFound
 	}
 
+	// Registers a Checker (see Graph.RegisterChecker) enforcing this
+	// representation's own "at most one target, excluding the
+	// subject-slot" invariant at commit time, mirroring
+	// NewPointerRegistry's identical eager/lazy pairing -- see that
+	// constructor's doc comment for the full reasoning. A node touched
+	// by a transaction that has no discoverable subject-slot at all is
+	// skipped rather than treated as a violation: that shape can only
+	// arise from a separate out-of-band mutation removing the
+	// subject-slot after the fact (ensureMetadataWithSubjectSlot always
+	// creates M and its subject-slot together), and is not this
+	// Checker's invariant to enforce -- it exists to catch a violated
+	// target count, which cannot even be evaluated without first
+	// knowing which child to exclude as the subject-slot.
+	graph.RegisterChecker(Checker{
+		Name: fmt.Sprintf("PointerMetadataRegistry(tag=%d)", allPointerMetadata),
+		Tags: []NodeID{allPointerMetadata},
+		Check: func(g *Graph, touched map[NodeID]struct{}) error {
+			for node := range touched {
+				if !g.HasRelationship(allPointerMetadata, node) {
+					continue
+				}
+
+				slot, found, err := findUniqueTaggedChild(g, node, allSubjectSlots)
+				if err != nil {
+					return err
+				}
+				if !found {
+					continue
+				}
+
+				if _, _, err = singleChildTarget(g, node, slot); err != nil {
+					return err
+				}
+			}
+
+			return nil
+		},
+	})
+
 	return &PointerMetadataRegistry{
 		subjectMetadataBase: subjectMetadataBase{
 			graph:              graph,
@@ -2213,6 +2488,32 @@ func NewPointerMetadataRegistryD(graph *Graph, allPointerMetadata, allSubjectSlo
 	if !graph.NodeExists(allTargetSlots) {
 		return nil, ErrNodeNotFound
 	}
+
+	// Registers a Checker (see Graph.RegisterChecker) enforcing this
+	// representation's own "at most one target" invariant at commit
+	// time. Unlike Representation C, D's target lives on its own
+	// independently-tagged target-slot node (U2), discovered entirely by
+	// tag rather than by exclusion, so the invariant to check here is
+	// simply "does a node tagged allTargetSlots have at most one child"
+	// -- no exclusion set needed, mirroring the reasoning in
+	// NewPointerRegistry's identical Checker.
+	graph.RegisterChecker(Checker{
+		Name: fmt.Sprintf("PointerMetadataRegistryD(tag=%d)", allPointerMetadata),
+		Tags: []NodeID{allTargetSlots},
+		Check: func(g *Graph, touched map[NodeID]struct{}) error {
+			for node := range touched {
+				if !g.HasRelationship(allTargetSlots, node) {
+					continue
+				}
+
+				if _, _, err := singleChildTarget(g, node); err != nil {
+					return err
+				}
+			}
+
+			return nil
+		},
+	})
 
 	return &PointerMetadataRegistryD{
 		subjectMetadataBase: subjectMetadataBase{
@@ -2427,13 +2728,42 @@ func NewCapsuleRegistry(graph *Graph, allElementCapsules, allPrevSlot, allValueS
 		return nil, err
 	}
 
-	return &CapsuleRegistry{
+	c := &CapsuleRegistry{
 		graph:              graph,
 		allElementCapsules: allElementCapsules,
 		prevSlots:          prevSlots,
 		valueSlots:         valueSlots,
 		nextSlots:          nextSlots,
-	}, nil
+	}
+
+	// Registered against c itself (rather than against the individual
+	// tag NodeIDs, the way the simpler registries above do), since this
+	// Checker's Check closure needs c.wellFormed -- which needs the
+	// fully assembled CapsuleRegistry, not just the three underlying
+	// PointerRegistry instances, to also check per-slot ownership, not
+	// merely per-slot cardinality. c is fully initialized above before
+	// this closure is ever invoked; capturing it by reference here is
+	// safe because Check only ever runs later, during some future
+	// Graph.Transact call, never during this constructor itself.
+	graph.RegisterChecker(Checker{
+		Name: fmt.Sprintf("CapsuleRegistry(tag=%d)", allElementCapsules),
+		Tags: []NodeID{allElementCapsules},
+		Check: func(g *Graph, touched map[NodeID]struct{}) error {
+			for node := range touched {
+				if !g.HasRelationship(allElementCapsules, node) {
+					continue
+				}
+
+				if err2 := c.wellFormed(node); err2 != nil {
+					return err2
+				}
+			}
+
+			return nil
+		},
+	})
+
+	return c, nil
 }
 
 // IsCapsule reports whether id is currently tagged
@@ -2472,6 +2802,48 @@ func (c *CapsuleRegistry) slotFor(capsule, tag NodeID) (slot NodeID, found bool,
 	}
 
 	return slot, true, nil
+}
+
+// wellFormed reports whether capsule currently has exactly the fixed
+// shape buildCapsuleTx itself establishes: all three role slots (prev,
+// value, next) present and uniquely owned by capsule (via slotFor), and
+// each slot's own "at most one target" Pointer invariant intact (via the
+// underlying PointerRegistry.Target for that role).
+//
+// This bundles into one comprehensive verdict what was previously only
+// answerable by making three separate slotFor/Value/Prev/Next-style
+// calls and noticing if any of them failed -- there was no single
+// function to ask "is this capsule well-formed, full stop" before this.
+// It exists primarily to back the Checker registered by
+// NewCapsuleRegistry (see Graph.RegisterChecker) for eager, commit-time
+// enforcement.
+//
+// DeleteCapsule deliberately does not call this: DeleteCapsule's own
+// all-or-nothing teardown already gets an equivalent guarantee for free
+// by attempting the real deletes directly and relying on Transact's
+// existing rollback if any of them turns out to fail (see DeleteCapsule's
+// own doc comment) -- a pre-check here would only be redundant work for
+// that specific caller, not a missed reuse opportunity.
+func (c *CapsuleRegistry) wellFormed(capsule NodeID) error {
+	if !c.IsCapsule(capsule) {
+		return ErrNotCapsule
+	}
+
+	for _, slots := range []*PointerRegistry{c.prevSlots, c.valueSlots, c.nextSlots} {
+		slot, found, err := c.slotFor(capsule, slots.allPointers)
+		if err != nil {
+			return err
+		}
+		if !found {
+			return ErrNotCapsule
+		}
+
+		if _, _, err = slots.Target(slot); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 // buildCapsuleTx creates a fresh capsule NodeID, tags it via
@@ -3041,13 +3413,55 @@ func NewListRegistry(graph *Graph, capsules *CapsuleRegistry, allLists, allHeads
 		return nil, ErrNodeNotFound
 	}
 
-	return &ListRegistry{
+	l := &ListRegistry{
 		graph:    graph,
 		capsules: capsules,
 		allLists: allLists,
 		allHeads: allHeads,
 		allTails: allTails,
-	}, nil
+	}
+
+	// Registered against l itself so this Checker's Check closure can
+	// call l.validateStructure -- the exact same structural check
+	// Elements() already runs lazily on read (see that method and
+	// validateStructure's own doc comment), now additionally run eagerly
+	// at commit time for any touched node currently tagged (allLists,
+	// node).
+	//
+	// This Checker only ever runs for mutations made through
+	// Graph.Transact (see the Checker doc comment). Every legitimate
+	// ListRegistry mutation already touches the list node itself within
+	// that same transaction (Append/Prepend/InsertAfter/
+	// RemoveWithoutDeletingCapsule each add or remove a (list,capsule)
+	// relationship), so Tags: []NodeID{allLists} is sufficient for every
+	// call path this registry itself exposes -- it is not a narrower
+	// version of some broader relevance rule this Checker is missing.
+	// A raw, direct Graph.AddRelationship/RemoveRelationship call
+	// bypassing Transact entirely -- exactly what every existing
+	// out-of-band adversarial test in this file already does -- still
+	// bypasses this Checker the same way it already bypasses every other
+	// one; validateStructure's existing lazy, on-read enforcement (via
+	// Elements) remains the backstop for that case, unaffected by this
+	// addition.
+	graph.RegisterChecker(Checker{
+		Name: fmt.Sprintf("ListRegistry(tag=%d)", allLists),
+		Tags: []NodeID{allLists},
+		Check: func(g *Graph, touched map[NodeID]struct{}) error {
+			for node := range touched {
+				if !g.HasRelationship(allLists, node) {
+					continue
+				}
+
+				if err := l.validateStructure(node); err != nil {
+					return err
+				}
+			}
+
+			return nil
+		},
+	})
+
+	return l, nil
 }
 
 // IsList reports whether id is currently tagged (AllLists, id).
@@ -4375,6 +4789,95 @@ func NewCompositeSetRegistry(graph *Graph, sets *SetRegistry, allCompositeSets, 
 		}
 	}
 
+	// Registers two Checkers (see Graph.RegisterChecker), covering two
+	// genuinely different things that can go wrong with a composite Set:
+	//
+	// The first, keyed on allCompositeSets, walks every current child of
+	// a touched composite-set node and validates each as a well-formed
+	// operand descriptor -- mirroring exactly what Evaluate() already
+	// does defensively on every read (see evaluate's own descriptor loop
+	// via resolveOperand/exactlyOneTag). This specifically catches a
+	// stray, non-descriptor child added directly to a composite set by
+	// some out-of-band mutation, which the second Checker below would
+	// not reach, since that stray child would carry none of the axis
+	// tags the second Checker keys on.
+	//
+	// The second, keyed on the four operand-descriptor axis tags
+	// themselves (theorystate.md section 80) rather than on
+	// allCompositeSets, validates any individually touched node that
+	// carries at least one of those tags directly, regardless of which
+	// parent structure (if any) it currently belongs to. This is what
+	// makes descriptor-shape enforcement genuinely shared with
+	// CompositeSetLogRegistry (theorystate.md section 82): that
+	// registry's own logged-operation descriptors are list-capsule
+	// values, never children of an allCompositeSets-tagged node, so the
+	// first Checker's parent-based walk could never reach them -- but
+	// since CompositeSetLogRegistry is required to reuse these exact
+	// same four axis-tag NodeIDs (see NewCompositeSetLogRegistry), this
+	// second Checker fires on its descriptors too, the moment they are
+	// touched, with no Checker of CompositeSetLogRegistry's own needed
+	// at all.
+	graph.RegisterChecker(Checker{
+		Name: fmt.Sprintf("CompositeSetRegistry(tag=%d)", allCompositeSets),
+		Tags: []NodeID{allCompositeSets},
+		Check: func(g *Graph, touched map[NodeID]struct{}) error {
+			for node := range touched {
+				if !g.HasRelationship(allCompositeSets, node) {
+					continue
+				}
+
+				outgoing, err := g.FindOutgoing(node)
+				if err != nil {
+					return err
+				}
+
+				for _, rel := range outgoing {
+					u := rel.To
+
+					if _, err = exactlyOneTag(g, u, allAdditiveOp, allSubtractiveOp); err != nil {
+						return err
+					}
+					if _, err = exactlyOneTag(g, u, allScalarOperand, allSetOperand); err != nil {
+						return err
+					}
+					if _, err = operandTargetGeneric(g, u); err != nil {
+						return err
+					}
+				}
+			}
+
+			return nil
+		},
+	})
+
+	graph.RegisterChecker(Checker{
+		Name: fmt.Sprintf("OperandDescriptor(tags=%d,%d,%d,%d)", allAdditiveOp, allSubtractiveOp, allScalarOperand, allSetOperand),
+		Tags: []NodeID{allAdditiveOp, allSubtractiveOp, allScalarOperand, allSetOperand},
+		Check: func(g *Graph, touched map[NodeID]struct{}) error {
+			for node := range touched {
+				isDescriptor := g.HasRelationship(allAdditiveOp, node) ||
+					g.HasRelationship(allSubtractiveOp, node) ||
+					g.HasRelationship(allScalarOperand, node) ||
+					g.HasRelationship(allSetOperand, node)
+				if !isDescriptor {
+					continue
+				}
+
+				if _, err := exactlyOneTag(g, node, allAdditiveOp, allSubtractiveOp); err != nil {
+					return err
+				}
+				if _, err := exactlyOneTag(g, node, allScalarOperand, allSetOperand); err != nil {
+					return err
+				}
+				if _, err := operandTargetGeneric(g, node); err != nil {
+					return err
+				}
+			}
+
+			return nil
+		},
+	})
+
 	return &CompositeSetRegistry{
 		graph:            graph,
 		sets:             sets,
@@ -4799,7 +5302,15 @@ type CompositeSetLogRegistry struct {
 }
 
 // NewCompositeSetLogRegistry creates a CompositeSetLogRegistry over
-// graph. lists is used to store and traverse the log itself (each logged
+// graph. This registers no Checker of its own (see Graph.RegisterChecker
+// and NewCompositeSetRegistry's own two Checkers' doc comment): its
+// underlying List's structure is already covered by the ListRegistry
+// Checker registered when lists was itself constructed, and its logged
+// operations' descriptor shape is already covered by the
+// operand-descriptor Checker registered when composites was itself
+// constructed, since both required arguments below must already exist.
+//
+// lists is used to store and traverse the log itself (each logged
 // operation is one list element, in append order); composites is used
 // both to resolve set-expansion operands that turn out to be
 // CompositeSets (theorystate.md section 83's dispatcher) and as the
