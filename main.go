@@ -4563,12 +4563,8 @@ func buildOperandDescriptorTx(tx txOps, additiveTag, subtractiveTag, scalarTag, 
 
 // clearOperandDescriptorEdgesTx removes descriptor u's own edge to its
 // operand (if any) and both of its axis tags, against tx, without
-// deleting u itself. Factored out from deleteOperandDescriptorTx so
-// CompositeSetLogRegistry.RemoveOperation can clear u's own edges in an
-// earlier step, deferring u's deletion to a later step once u's one
-// remaining incoming edge (from its owning capsule's value slot) has
-// also been cleared -- see RemoveOperation's doc comment for why that
-// ordering is required there.
+// deleting u itself. Factored out as the shared "clear one descriptor's
+// edges" step used by deleteOperandDescriptorTx below.
 func clearOperandDescriptorEdgesTx(tx txOps, operand NodeID, hasOperand bool, operationTag, operandTag, u NodeID) error {
 	if hasOperand {
 		if _, err := tx.RemoveRelationship(u, operand); err != nil {
@@ -5461,10 +5457,18 @@ func (c *CompositeSetLogRegistry) AppendOperation(log, operand NodeID, additive,
 // capsule is confirmed to be an element of log), then reclaimed via
 // CapsuleRegistry.DeleteCapsule, whose own atomic teardown clears
 // capsule's value-slot edge into u as part of removing capsule itself.
-// Only once that succeeds are u's own edges (its operand target and both
-// axis tags) cleared and u itself deleted -- both always succeed at that
-// point, since capsule's value edge into u was u's only remaining
-// relationship.
+// Only once that succeeds does u have no remaining incoming edges at
+// all; u's own edges (its operand target and both axis tags) are then
+// cleared and u itself deleted together, inside one Graph.Transact call,
+// via the same deleteOperandDescriptorTx helper
+// CompositeSetRegistry.RemoveOperand already uses for the identically-
+// shaped final step of its own teardown. Doing this as one Transact call
+// (rather than clearing u's edges in one Transact and then deleting u
+// via a separate, non-transactional Graph.DeleteNode call, as an earlier
+// version of this method did) means a failure at either step -- e.g. an
+// out-of-band mutation unexpectedly giving u a new relationship in the
+// meantime -- rolls back cleanly instead of potentially leaving u
+// half-cleared with no way to undo it.
 //
 // If DeleteCapsule fails (ErrCapsuleNotEmpty, e.g. because some
 // out-of-band mutation gave one of capsule's role slots an unexpected
@@ -5509,14 +5513,9 @@ func (c *CompositeSetLogRegistry) RemoveOperation(log, capsule NodeID) error {
 		return err3
 	}
 
-	err = c.graph.Transact(func(tx *Txn) error {
-		return clearOperandDescriptorEdgesTx(tx, operand, hasOperand, operationTag, operandTag, u)
+	return c.graph.Transact(func(tx *Txn) error {
+		return deleteOperandDescriptorTx(tx, operand, hasOperand, operationTag, operandTag, u)
 	})
-	if err != nil {
-		return err
-	}
-
-	return c.graph.DeleteNode(u)
 }
 
 // Operations returns log's current operand-descriptor nodes (each

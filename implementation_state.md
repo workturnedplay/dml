@@ -973,6 +973,30 @@ NodeID-keyed structure outside the primitive graph.
  unaffected by this feature and continue to be caught only lazily, on
  next read, exactly as before.
 
+21. Corrected a real, if narrow, atomicity gap found during review in
+ item 19's CompositeSetLogRegistry.RemoveOperation: after unlinking and
+ reclaiming the capsule (ListRegistry.RemoveWithoutDeletingCapsule +
+ CapsuleRegistry.DeleteCapsule), the final step -- clearing descriptor
+ U's own remaining edges and deleting U itself -- was split across a
+ Graph.Transact call (clearing U's edges only) followed by a separate,
+ non-transactional Graph.DeleteNode(U) call. This meant a failure in
+ that final raw DeleteNode call (e.g. some future code path having
+ given U an unexpected new relationship in the meantime) could leave U
+ with its edges already cleared but not yet deleted, with no rollback
+ available for that half state. Fixed by combining both steps into one
+ Graph.Transact call using the existing deleteOperandDescriptorTx helper
+ -- the same helper CompositeSetRegistry.RemoveOperand already uses for
+ its own, identically-shaped final teardown step -- rather than manually
+ inlining clearOperandDescriptorEdgesTx followed by a raw delete. This
+ also removes a small amount of duplicated logic: by the time this final
+ step runs, DeleteCapsule has already cleared U's one previously-
+ problematic incoming edge (from its owning capsule's value slot), so
+ nothing about CompositeSetLogRegistry's teardown actually requires
+ splitting the clear and delete steps apart anymore. No test behavior
+ changed -- TestCompositeSetLogRemoveOperationDeletesDescriptorAndCapsule
+ and TestCompositeSetLogRemoveOperationRequiresOperationInLog continue to
+ pass unmodified against the corrected implementation.
+
 Currently unaddressed yet:
 - Txn does not support nesting one Graph.Transact call inside another
   (Txn.DeleteNode is supported -- see item 15). Nesting is not needed by
