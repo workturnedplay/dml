@@ -203,7 +203,7 @@ Minimal interpretation: `(A,B),(A,C),(A,D)` ⇒ B,C,D are members of A.
 this section's original "optionally" -- see §79 for why an explicit tag
 was chosen over §9a's original untagged-by-default framing). This minimal interpretation is implemented as `SetRegistry` (§79).
 Composite Set forms (§9b) are now implemented (§81, §82, both validated
-by `wtw`); Domains (§9c) remain open — see §80–§85 for the composite
+by `dml`); Domains (§9c) remain open — see §80–§85 for the composite
 forms' design and §9c for Domains' unstarted status.
 
 **§9a — Elaboration on the minimal interpretation (merged from
@@ -275,7 +275,7 @@ enforcement is a higher-layer job. See §68 for the generalized mechanism
 this implies.
 
 **§10a — Metadata role-identification must use per-role tags, not
-exclusion (correction, validated by `wtw`).**
+exclusion (correction, validated by `dml`).**
 THEORY_NOTES_FROM_CONVERSATION.md section 7C / this section's Pointer
 summary both rely on
 a metadata node M distinguishing "the subject" and "the target" among M's
@@ -319,7 +319,7 @@ construction, not merely a pointer trick (§75).
 **§10b — The three (four) Pointer representations, side by side (merged
 from THEORY_NOTES_FROM_CONVERSATION.md §7 and §9).** They need not be
 mutually exclusive — different representations can carry different
-traversal/query costs, and `wtw` implements all of them side by side
+traversal/query costs, and `dml` implements all of them side by side
 over the same primitive Graph:
 
 *Representation A — direct child:*
@@ -424,7 +424,7 @@ implementation nevertheless has a concrete explored representation and
 implementation-level validation rules; those rules are recorded separately
 below and must not be mistaken for a final semantic commitment.
 
-**Resolved (session finding, validated by `wtw`): no separate Set-like
+**Resolved (session finding, validated by `dml`): no separate Set-like
 index structure is needed for `doesElementExist(X)`-style membership
 queries.** The original framing above assumed a value-membership query
 would need new index structure layered atop the list. It doesn't. Every
@@ -464,7 +464,7 @@ allPrevElementCapsules -> UPrev
 allElementsOfElementCapsules -> UValue
 allNextElementCapsules -> UNext
 ```
-(`wtw`'s actual bootstrapped tag names are `AllElementCapsulePrevSlot` /
+(`dml`'s actual bootstrapped tag names are `AllElementCapsulePrevSlot` /
 `AllElementCapsuleValueSlot` / `AllElementCapsuleNextSlot`, and
 `AllElementCapsules` rather than the illustrative `AllCapsules` used
 above, to avoid implying a more generic capsule concept — see
@@ -525,7 +525,7 @@ ROOT as virtual/overlay node: `ROOT → every existing NodeID`, without
 necessarily storing all edges physically. Exact semantics OPEN in general —
 **resolved into two distinct concepts for the distributed case, see §57.**
 
-**§12a — ROOT irreflexivity (DECIDED, validated by `wtw` implementation).**
+**§12a — ROOT irreflexivity (DECIDED, validated by `dml` implementation).**
 ROOT's virtual outgoing relationship excludes ROOT itself: `ROOT → X` is
 visible for every existing `X != ROOT`, never for `X = ROOT`. A primitive
 `(ROOT,ROOT)` fact may still exist in underlying storage (it's an ordinary
@@ -583,7 +583,7 @@ part of the foundation — rejected as bug-hiding. "Delete only if empty"
 is the safe baseline.
 
 **§18a — Structural protection is a distinct failure mode from
-non-emptiness (DECIDED, validated by `wtw`).** A layer refusing deletion
+non-emptiness (DECIDED, validated by `dml`).** A layer refusing deletion
 because relationships still exist (the rule above) and a layer refusing to
 delete a structurally load-bearing identity (e.g. ROOT) are two different
 reasons and must surface as two different errors. Collapsing them into one
@@ -1165,7 +1165,7 @@ invariants, consistent with §7's "construct, don't add new primitives."
 
 ## 74. External bookkeeping can silently outlive the NodeID it describes
 
-**Cross-cutting principle, found via `wtw`'s NameRegistry.** Any metadata
+**Cross-cutting principle, found via `dml`'s NameRegistry.** Any metadata
 living *outside* the primitive graph but keyed by NodeID — name registries,
 mirror-row bookkeeping (§47/§60), orchestrator persistence (§25) — can go
 stale the instant `deleteNode` succeeds, because §18 only guarantees the
@@ -1174,7 +1174,7 @@ still referencing that ID. This is the same shape of problem already known
 from cross-graph mirror-row cleanup (§43) — it just surfaces first in the
 single-graph case, where there's no network partition to blame it on.
 
-**Resolution pattern (validated by `wtw`).** Don't teach the primitive
+**Resolution pattern (validated by `dml`).** Don't teach the primitive
 graph about the external structure — that would violate §7. Instead, the
 external structure's own layer gets a coordinating delete operation that
 performs the primitive delete and its own cleanup together, and only
@@ -1210,7 +1210,7 @@ future structures can recognize the pattern rather than re-deriving it.
 ## 76. Tag identity is bootstrapped, not hardcoded; interpreters are
 parameterized by tag, not branching on it
 
-**DECIDED, validated by `wtw` as already-built, not proposed.** A question
+**DECIDED, validated by `dml` as already-built, not proposed.** A question
 raised externally (session discussion with GPT-5.6 Luna) asked whether the
 system should take "the next step" of giving foundational tag names
 (`AllPointers`, `AllLists`, etc.) real NodeID identity via the same
@@ -1226,7 +1226,7 @@ facts, identically to how ROOT's NodeID participates in `RootGraph`.
 weaker form is easy to reach for).** A naive reading of "bootstrap the tag,
 then use it" still leaves room for an interpreter that hardcodes each
 bootstrapped ID and branches on it internally, e.g. `if tag == allPointersID
-{...} else if tag == allListsID {...}`. This is not what `wtw` does and is
+{...} else if tag == allListsID {...}`. This is not what `dml` does and is
 not the discipline this section decides. Instead, a single interpreter type
 is *parameterized by* whichever tag NodeID it's constructed with, and
 contains no branching on tag identity at all — see `PointerRegistry`, which
@@ -1291,7 +1291,7 @@ operation individually** — and records the real design tension this
 creates with `Txn`'s current implementation, rather than resolving it.
 
 **Motivation — single-operation validation is provably too strict already.**
-`ensureMetadataWithSubjectSlot` in the current `wtw` code performs a
+`ensureMetadataWithSubjectSlot` in the current `dml` code performs a
 sequence — create a slot node, tag it, create a metadata node, tag it,
 link them — as several separate `AddRelationship`/`CreateNode` calls. A
 hypothetical checker enforcing "every node tagged
@@ -1382,7 +1382,7 @@ initially believed and why it was wrong, rather than silently
 disappearing).** An earlier pass at this section claimed `Txn` could not
 undo a `Graph.DeleteNode` call once it succeeded, and on that basis
 required any multi-node composite delete (an ElementCapsule and its
-three role-slot nodes, in the `wtw` implementation) to prove -- read-only,
+three role-slot nodes, in the `dml` implementation) to prove -- read-only,
 ahead of time -- that every node involved was already fully empty before
 deleting any of them.
 
@@ -1468,7 +1468,7 @@ unbootstrapped per §76a's "add a foundational name only once its
 representation is actually being implemented" discipline; whichever
 registry implements it must be added to this same check.
 
-Validated by `wtw`'s `SetRegistry`: `IsSet`, `NewSet`, `TagAsSet`, `Add`,
+Validated by `dml`'s `SetRegistry`: `IsSet`, `NewSet`, `TagAsSet`, `Add`,
 `Remove`, `Contains`, `Members`, `Size`, `DeleteSet` (delete-only-if-empty,
 mirroring `ListRegistry.DeleteList`'s "remove the tag inside the same
 transaction, then delete" shape, §18). Because a Set imposes no
@@ -1546,7 +1546,7 @@ waited for two real call sites before extracting (§7).
 
 Formalizes and supersedes §9b's obsolete diagram with a concrete
 representation, now implemented as `CompositeSetRegistry` and validated
-by `wtw` (the representation's *shape* stays tagged TENTATIVE per §33's
+by `dml` (the representation's *shape* stays tagged TENTATIVE per §33's
 discipline, since it hasn't been exercised long enough to call DECIDED;
 only its *existence in code* has changed). `(AllCompositeSets,C)`
 tags `C`; `C`'s direct children are `U`-descriptor nodes (§80), each
@@ -1571,7 +1571,7 @@ with §9a/§35's reasoning that a cached derived-membership view cannot be
 kept honestly in sync without invalidation machinery that doesn't exist
 and should not be built ahead of an actual need. Cycle detection: §83.
 
-**Implementation note (validated by `wtw`).** Resolving a
+**Implementation note (validated by `dml`).** Resolving a
 `CompositeSetLog`-kind operand (§82) requires `CompositeSetRegistry` to
 be told about the sibling registry after construction, via
 `CompositeSetRegistry.SetLogs` — the two types mutually reference each
@@ -1583,7 +1583,7 @@ exactly like any node carrying no recognized Set-representation tag
 
 ## 82. CompositeSetLogRegistry — append-only Set-mutation logs (TENTATIVE design; implemented)
 
-Now implemented as `CompositeSetLogRegistry` and validated by `wtw` (per
+Now implemented as `CompositeSetLogRegistry` and validated by `dml` (per
 §33's discipline, the representation's *shape* stays tagged TENTATIVE
 since it hasn't been exercised long enough to call DECIDED; only its
 *existence in code* has changed, exactly as for §81's revision).
@@ -1663,7 +1663,7 @@ default operation kind — matching this codebase's existing
 fail-loud-not-silently-repair discipline (`ErrTooManyPointerTargets`,
 `ErrNameBoundToDeletedNode`).
 
-**Implementation note (validated by `wtw`).** `CompositeSetLogRegistry`
+**Implementation note (validated by `dml`).** `CompositeSetLogRegistry`
 implements this representation exactly as specified above:
 `NewCompositeSetLog` mints a node and applies both tags
 (`AllLists`/`AllCompositeSetLogs`) inside one `Graph.Transact` call, so
@@ -1710,7 +1710,7 @@ limit would be an arbitrary restriction on top of that, and the cycle
 detection above already rejects the only case — a genuine cycle — that
 would otherwise fail to terminate.
 
-**§77 resolution note (session finding, validated by `wtw`).** §77 left
+**§77 resolution note (session finding, validated by `dml`).** §77 left
 open whether commit-time checking should operate per-changeset, and
 worried this would require `Txn` to grow a staged/overlay mode in
 tension with its documented non-staged design. Both concerns are now
@@ -1733,7 +1733,7 @@ closures) to serve as the relevance filter's input, rather than the
 overlay-backing role §77 originally imagined for it. See
 `implementation_state.md` item 20 for the concrete implementation.
 
-**Implementation note (validated by `wtw`).** `CompositeSetRegistry` and
+**Implementation note (validated by `dml`).** `CompositeSetRegistry` and
 `CompositeSetLogRegistry` both implement this dispatch and cycle
 detection exactly as specified above: the visited set is scoped to the
 *current resolution path* (added immediately before, and removed
@@ -1902,7 +1902,7 @@ kept current as sections above resolve or split further.)*
 - Selective, opt-in, tag-gated content-addressed versioning (§66).
 - Both composite Set representations' exact shapes (§81, §82) — designed
   and DECIDED-in-shape, now implemented as `CompositeSetRegistry` and
-  `CompositeSetLogRegistry` respectively, validated by `wtw`, sharing one
+  `CompositeSetLogRegistry` respectively, validated by `dml`, sharing one
   operand-descriptor implementation (§80) as anticipated.
 
 ### OPEN
