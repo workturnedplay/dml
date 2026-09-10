@@ -6117,20 +6117,41 @@ func (b *DomainPointerRegistryB) subPointer(anchor NodeID) (u NodeID, found bool
 // call the underlying PointerRegistry.NewPointer and wire the edge
 // themselves. anchor must already exist; it need not be otherwise
 // tagged in any particular way, consistent with Representation B leaving
-// P's own children unconstrained (theorystate.md section 10b).
+// P's other direct children unconstrained (theorystate.md section 10b).
+//
+// Calling this more than once for the same anchor is an idempotent
+// no-op: if anchor already has a discoverable sub-pointer node (see
+// subPointer), NewDomainPointer leaves it untouched and returns nil
+// rather than minting a second one. This closes a real gap found on
+// review, not merely a hypothetical one -- without this check, a second
+// call gave anchor two children both tagged via the underlying
+// PointerRegistry's own tag, which made every subsequent subPointer
+// lookup (and therefore Target/SetTarget/RemoveTarget) fail with
+// ErrAmbiguousPointerMetadata from then on. This matches the
+// idempotency discipline already followed by
+// PointerRegistry.TagAsPointer and NameRegistry.EnsureNamedNode
+// elsewhere in this file.
 func (b *DomainPointerRegistryB) NewDomainPointer(anchor NodeID) error {
 	if !b.graph.NodeExists(anchor) {
 		return ErrNodeNotFound
 	}
 
+	_, found, err := b.subPointer(anchor)
+	if err != nil {
+		return err
+	}
+	if found {
+		return nil
+	}
+
 	return b.graph.Transact(func(tx *Txn) error {
-		u, err := newPointerTx(tx, b.pointers.allPointers)
-		if err != nil {
-			return err
+		u, err2 := newPointerTx(tx, b.pointers.allPointers)
+		if err2 != nil {
+			return err2
 		}
 
-		_, err = tx.AddRelationship(anchor, u)
-		return err
+		_, err2 = tx.AddRelationship(anchor, u)
+		return err2
 	})
 }
 

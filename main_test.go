@@ -8370,6 +8370,47 @@ func TestDomainPointerRegistryBNewDomainPointerAndTargetWithNoDomain(t *testing.
 	}
 }
 
+// TestDomainPointerRegistryBNewDomainPointerIsIdempotent covers a real
+// gap found on review: NewDomainPointer previously minted a fresh
+// sub-pointer node unconditionally on every call, so calling it twice
+// for the same anchor silently gave that anchor two children both
+// tagged via the underlying PointerRegistry's own tag, making every
+// subsequent subPointer-based lookup (Target/SetTarget/RemoveTarget)
+// fail with ErrAmbiguousPointerMetadata. NewDomainPointer must instead
+// be idempotent: a second call for the same anchor is a no-op, and the
+// pointer's existing target survives untouched.
+func TestDomainPointerRegistryBNewDomainPointerIsIdempotent(t *testing.T) {
+	fx := newDomainPointerTestFixture(t)
+
+	p, err := fx.graph.CreateNode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err2 := fx.domainB.NewDomainPointer(p); err2 != nil {
+		t.Fatalf("first NewDomainPointer(p): %v", err2)
+	}
+
+	x, err := fx.graph.CreateNode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err3 := fx.domainB.SetTarget(p, x); err3 != nil {
+		t.Fatalf("SetTarget(p, x): %v", err3)
+	}
+
+	if err4 := fx.domainB.NewDomainPointer(p); err4 != nil {
+		t.Fatalf("second NewDomainPointer(p): %v", err4)
+	}
+
+	target, hasTarget, err := fx.domainB.Target(p)
+	if err != nil {
+		t.Fatalf("Target(p) after second NewDomainPointer(): %v", err)
+	}
+	if !hasTarget || target != x {
+		t.Fatalf("Target(p) = (%d,%v), want (%d,true) -- unaffected by the idempotent second NewDomainPointer() call", target, hasTarget, x)
+	}
+}
+
 func TestDomainPointerRegistryBSetDomainEnforcesMembership(t *testing.T) {
 	fx := newDomainPointerTestFixture(t)
 

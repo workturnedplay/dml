@@ -1095,6 +1095,22 @@ NodeID-keyed structure outside the primitive graph.
  TestDomainPointerRegistryDCheckerCatchesOutOfBandTargetChange, and
  TestDomainPointerRegistryDCheckerCatchesOutOfBandDomainChange.
 
+23. Fixed a real correctness bug found on review in
+ DomainPointerRegistryB.NewDomainPointer: it previously minted a fresh
+ sub-pointer node U and wired (anchor, U) unconditionally on every call,
+ with no check for whether anchor already had one. Calling it twice for
+ the same anchor therefore silently gave anchor two children both tagged
+ via the underlying PointerRegistry's own tag, which made every
+ subsequent subPointer-based lookup (Target/SetTarget/RemoveTarget) fail
+ with ErrAmbiguousPointerMetadata from then on -- a real, reachable
+ out-of-band-looking invariant violation caused entirely through this
+ registry's own public API, not merely a hypothetical one. NewDomainPointer
+ now checks for an existing sub-pointer first (via the existing subPointer
+ lookup) and is a no-op if one is already present, matching the
+ idempotency discipline already followed by PointerRegistry.TagAsPointer
+ and NameRegistry.EnsureNamedNode elsewhere in this file. Covered by
+ TestDomainPointerRegistryBNewDomainPointerIsIdempotent.
+
 Currently unaddressed yet:
 - Txn does not support nesting one Graph.Transact call inside another
   (Txn.DeleteNode is supported -- see item 15). Nesting is not needed by
