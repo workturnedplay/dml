@@ -253,19 +253,38 @@ order-sensitive fold for the log-based form — see §80–§83, which formalize
 and supersede this section's diagram with a concrete, now fully
 implemented representation.
 
-**§9c — Domains (explored, not decided; merged from
-THEORY_NOTES_FROM_CONVERSATION.md §6).** A Domain was explored as
-essentially a constrained Set: membership determines which nodes are
-legal targets for some operation. The interesting use is as a constraint
-mechanism for Pointers (§10c) and other structures, not as a
-fundamentally different primitive storage concept. `DomainSets` were
-explored as a way of combining multiple Domains into one effective
-allowed-membership universe — a possible higher-level construction, not
-a current primitive. Exact Domain/DomainSet representation remains OPEN
-(§22's list); Domains likely want Sets settled first, since a Domain is
-framed as a constrained Set. The minimal Set representation this section
-wanted settled is now DECIDED and implemented (§79); Domain design itself
-remains unstarted.
+**§9c — Domains and DomainSets (DECIDED design, not yet implemented —
+see §10c for the Pointer-side wiring, §86 for a known accepted gap).** A
+Domain is not a new primitive kind of thing and does not get its own tag.
+A Domain is simply *any node that already carries one of the three
+existing Set-representation tags* — `AllSets`, `AllCompositeSets`, or
+`AllCompositeSetLogs` (§79) — referenced from a domain-constraining
+relationship (§10c). "Being a domain" is a role a node plays from
+wherever it is referenced that way, exactly the discipline §80 already
+established for composite-Set operands (a node's own identity is a
+different fact from what a specific relationship means it as here) —
+applied here one level up, to the concept of a Domain itself rather than
+to an operand within one.
+
+This also resolves what THEORY_NOTES_FROM_CONVERSATION.md §6's original
+"DomainSets... combining multiple Domains into one effective
+allowed-membership universe" was gesturing at, without requiring any new
+structure: since a `CompositeSetRegistry` operand may already be any of
+the three Set representations, a "DomainSet" is simply an ordinary
+`CompositeSet` whose operands happen to be used in the domain role — e.g.
+domain = (A ∪ B) \ C is already expressible today, with zero new code, by
+building a `CompositeSet` over domain-eligible operands A, B, C. §9c's
+original framing of DomainSets as a distinct structure needing its own
+design is superseded: it was already built, under a different name,
+before this need was identified.
+
+Domain membership is checked via a single generic dispatcher over the
+three representations (the `Contains`-flavored counterpart to §83's
+`resolveSetOperandGeneric`), not via any Domain-specific storage or query
+method. This requires `CompositeSetRegistry` to gain a `Contains` method
+symmetric with `CompositeSetLogRegistry`'s existing one (a real, small,
+independently-worthwhile gap noticed while designing this — see
+implementation_state.md).
 
 ## 10. Pointers
 
@@ -363,15 +382,81 @@ C/D's slot tags do), which is what lets a node carry many primitive
 children while a particular processor still considers its own narrower
 structure valid.
 
-**§10c — Domain Pointers (explored; merged from
-THEORY_NOTES_FROM_CONVERSATION.md §8).** A normal Pointer can potentially
-also be interpreted as a Domain Pointer via `(AllDomainPointers,P)`, with
-additional domain information associated with P so a processor can
-enforce that the pointer's target belongs to the permitted domain (§9c).
-This illustrates a broader property already implicit elsewhere in this
-document: the same node identity can participate in multiple
-higher-level interpretations at once without changing its primitive
-facts (the same point §68 later makes precise for the cross-graph case).
+**§10c — Domain Pointers (DECIDED design, not yet implemented).** A
+pointer becomes domain-constrained by carrying one additional
+freshly-minted slot child — reusing the same occurrence/role-identity
+pattern as every other slot in this document (§75) and the same "wrap an
+existing PointerRegistry under a new tag" reuse discipline already used
+three times over for ElementCapsule's prev/value/next roles (§11):
+
+```text
+anchor -> U3                (AllDomainSlot, U3)
+U3 -> domainNode
+```
+
+where `anchor` is P itself for Representation B, or the metadata node M
+for Representation D, and `domainNode` is any node domain-eligible per
+§9c. U3's own "at most one domain" cardinality is enforced by a
+`PointerRegistry` instance constructed under the new `AllDomainSlot` tag,
+exactly like every other slot in this document — no new
+cardinality-checking logic is written for it.
+
+**Representation choice: B and D only, not A or C.** A domain slot
+requires its anchor to be free to carry an additional, unrelated tagged
+child without that child being mistaken for the pointer's own target or
+subject:
+
+- Representation A fails this: `singleChildTarget(P)` with zero
+  exclusions treats every child of P as a target candidate, so a
+  domain-slot child on P would immediately look like a second target
+  (`ErrTooManyPointerTargets`).
+- Representation C fails this for the same reason, one level up: its
+  target discovery excludes only the subject-slot by construction (a
+  single, fixed exclusion); a domain-slot child on M would be seen as a
+  second, non-excluded child of M, breaking target discovery the same
+  way A breaks. Representation C is deliberately kept as-is regardless
+  (§10a) — this is one more reason not to extend it, not a new
+  limitation.
+- Representations B and D both work, for the same underlying reason: B's
+  "at most one target" invariant is enforced on U (the intermediary node
+  under `AllSubPointers`), never on P itself — P's other children were
+  never fully consumed by the representation in the first place (see the
+  Representation B doc comment: "leaving P's other direct children free
+  for unrelated information"). D's subject and target are both
+  discovered entirely by tag, with no exclusion list at all, which is
+  precisely what makes D safe to extend with any number of additional
+  tagged children (§10a).
+
+`AllDomainSlot` is a single shared tag, reused by both B and D
+(distinguished only by which anchor node — P or M — the slot is attached
+to), following §76's tag-parameterization discipline: one
+`PointerRegistry` instance under one tag, no branching on which
+representation is in use.
+
+There is deliberately no separate `(AllDomainPointers, P)`-style tag
+marking a pointer as domain-constrained (superseding
+THEORY_NOTES_FROM_CONVERSATION.md §8's original sketch, which proposed
+exactly such a tag). The presence of a discoverable `AllDomainSlot` child
+on the anchor is itself sufficient signal — a separate marker tag would
+be redundant information that could drift out of sync with the slot's
+actual presence, the same reasoning that already governs every other
+slot in this document (a target-slot's existence is never separately
+flagged either).
+
+**Enforcement.** A `Checker` (§73) keyed on the pointer's own target tag
+(`AllSubPointers` for B, `AllPointerMetadataTargetSlot` for D) — not on
+`AllDomainSlot` itself — fires whenever a pointer's target changes: it
+looks up the domain slot, if any, resolves the domain node's current
+membership via §9c's generic dispatcher, and rejects the transaction (a
+new `ErrTargetOutsideDomain`) if the new target is not a current member.
+Each domain-pointer wrapper's own `SetTarget` also checks this at write
+time, before committing, for the same "fail loud immediately, don't wait
+for the Checker to catch it" reasoning used everywhere else in this
+document.
+
+See §86 for a real, deliberately-accepted gap in this enforcement: domain
+legality can be invalidated by a mutation to the domain node itself,
+which the Checker above cannot see.
 
 ## 11. Ordered Lists
 
@@ -1826,6 +1911,63 @@ open here, per §7's construct-only-what's-needed discipline: not worth
 designing further until a real caller needs more than the direct approach
 already gives.
 
+## 86. Domain Pointer staleness — an accepted gap, not yet closed
+
+**Accepted limitation (DECIDED to defer; option 2 below is the recorded
+future direction, not a promise of when).** Every commit-time invariant
+in this document through §80–83 is *local*: the Checker enforcing it can
+tell whether the invariant holds by looking only at the nodes a
+transaction actually touched. Domain Pointer legality (§10c) is the
+first invariant here that is not local in that sense — it depends on the
+*domain node's own current membership*, which can change through a
+transaction that touches the domain node and some ordinary member,
+without touching the pointer, its target-slot, or its domain-slot at
+all:
+
+```text
+sets.Remove(domainSet, target)   // touches domainSet and target only
+```
+
+This can silently turn a previously-legal domain pointer into an illegal
+one, with no Checker firing, because neither the pointer's target-slot
+nor its domain-slot was part of that transaction's changeset. This is
+the single-graph counterpart to §68's cross-graph observation that a
+schema-asserting claim about another node is "a claim as of last
+observation, not a verified fact" — the same epistemic gap, arising here
+without any network or second graph involved at all.
+
+Three options were considered:
+
+1. **Accept the gap (chosen, for now).** `SetTarget` validates against
+   the domain at write time, and the §10c Checker catches any out-of-band
+   structural mutation to the slot/target nodes themselves — but a
+   domain pointer can still go stale if the domain's own membership
+   changes later, out from under it, with nothing surfacing that
+   staleness until (or unless) something re-reads the domain relationship
+   directly. This is the cheapest option and consistent with this
+   document's practice elsewhere of naming a real, known gap rather than
+   building unrequested machinery to close it (the same reasoning that
+   keeps Representation C deliberately unfixed, §10a).
+2. **Reverse-index domain → referencing pointers (deferred, likely
+   eventual direction).** So that a mutation to a domain node can look up
+   and re-validate every pointer that references it in the domain role,
+   rejecting *that* transaction if it would strand an existing pointer
+   outside its own domain. This is real, permanent bookkeeping cost (a
+   new index, kept in sync on every domain-pointer creation/deletion) for
+   a case with no current caller yet — deferred per this document's
+   construct-only-what-is-needed discipline (§7), but flagged here as the
+   option most likely to eventually be built, once an actual caller needs
+   domain pointers to stay provably valid across arbitrary domain
+   mutations, rather than being designed from scratch at that point.
+3. **Re-validate lazily on every `Target()` read (rejected as the
+   default).** Would turn a pointer's own `Target()` accessor into
+   something that can fail for reasons entirely outside the pointer's own
+   structure — a larger, more surprising behavioral change than either
+   option above, and not adopted.
+
+Option 1 stands as the current implementation choice; option 2 is the
+recorded direction for closing this gap later.
+
 ---
 
 ## PART D — STATUS SUMMARY (consolidated)
@@ -1889,6 +2031,14 @@ kept current as sections above resolve or split further.)*
   already-mutated `Graph` rather than a staged overlay, with every
   existing registry's own already-tested validation logic reused as the
   Checker body rather than new logic being written.
+- A Domain is any node already carrying one of the three
+  Set-representation tags, referenced in the domain role from a
+  Pointer's new domain slot (`AllDomainSlot`) rather than tagged in its
+  own right; a "DomainSet" needs no separate structure and is simply an
+  ordinary `CompositeSet` used in that role (§9c). Domain Pointers attach
+  the domain slot to Representation B or D only, never A or C, and are
+  enforced via a `Checker` keyed on the pointer's own existing target
+  tag (§10c) -- design DECIDED, not yet implemented.
 
 ### TENTATIVE
 - Monotonically increasing NodeIDs; serialized first implementation.
@@ -1929,9 +2079,12 @@ kept current as sections above resolve or split further.)*
   requiring nesting to express a changeset boundary, since no current
   caller needs to fail and retry only an inner piece of a larger composed
   operation while leaving its other already-applied steps standing.
-- Domain / DomainSet exact representation (§9c) — now unblocked in
-  principle by §79's decided minimal Set representation, but not yet
-  designed.
+- Domain Pointer staleness (§86): whether to build the deferred
+  reverse-index fix (option 2) that would let a domain-node mutation
+  re-validate every pointer referencing it, versus continuing to accept
+  the gap indefinitely.
+- Domain / Domain Pointer implementation itself (§9c/§10c design is now
+  DECIDED; not yet implemented in code).
 - Generalized "find the bridging node(s) given both path endpoints" query
   for arbitrary, not-necessarily-tag-shaped paths (§85).
 
