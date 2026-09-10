@@ -443,16 +443,30 @@ actual presence, the same reasoning that already governs every other
 slot in this document (a target-slot's existence is never separately
 flagged either).
 
-**Enforcement.** A `Checker` (§73) keyed on the pointer's own target tag
-(`AllSubPointers` for B, `AllPointerMetadataTargetSlot` for D) — not on
-`AllDomainSlot` itself — fires whenever a pointer's target changes: it
-looks up the domain slot, if any, resolves the domain node's current
-membership via §9c's generic dispatcher, and rejects the transaction (a
-new `ErrTargetOutsideDomain`) if the new target is not a current member.
-Each domain-pointer wrapper's own `SetTarget` also checks this at write
-time, before committing, for the same "fail loud immediately, don't wait
-for the Checker to catch it" reasoning used everywhere else in this
-document.
+**Enforcement.** Both representations validate at write time, in each
+domain-pointer wrapper's own `SetTarget`/`SetDomain`, for the same "fail
+loud immediately, don't wait for a Checker to catch it" reasoning used
+everywhere else in this document. Representation D additionally
+registers a commit-time `Checker` (§73), keyed on
+`AllPointerMetadataTargetSlot` and `AllDomainSlot` together: for either
+tag touched, it reverse-discovers the owning metadata node M (M is
+self-identifying via its own `AllPointerMetadata` tag, found via the
+same `findUniqueTaggedParent` lookup already used one hop further out
+for subject discovery) and re-validates M's current target against M's
+current domain.
+
+Representation B does not get an equivalent Checker, discovered while
+implementing this rather than anticipated when this section was
+originally drafted: its anchor P carries no self-identifying tag in the
+general case (P may be any caller-managed node, tagged however its own
+caller's domain requires or not tagged at all), so reverse-discovering P
+from a touched sub-pointer or domain-slot node would need either an
+untagged single-parent lookup (already rejected elsewhere in this
+project as unsafe, `implementation_state.md` item 13) or a new tag
+applied to every domain-constrained P purely to support this one
+Checker. Deferred, since no current caller needs it (§7) -- this is a
+real, narrower enforcement guarantee for B than for D, recorded here
+rather than silently glossed over.
 
 See §86 for a real, deliberately-accepted gap in this enforcement: domain
 legality can be invalidated by a mutation to the domain node itself,
@@ -2036,9 +2050,12 @@ kept current as sections above resolve or split further.)*
   Pointer's new domain slot (`AllDomainSlot`) rather than tagged in its
   own right; a "DomainSet" needs no separate structure and is simply an
   ordinary `CompositeSet` used in that role (§9c). Domain Pointers attach
-  the domain slot to Representation B or D only, never A or C, and are
-  enforced via a `Checker` keyed on the pointer's own existing target
-  tag (§10c) -- design DECIDED, not yet implemented.
+  the domain slot to Representation B or D only, never A or C; D is
+  enforced via both write-time validation and a commit-time `Checker`
+  keyed on its own existing target-slot tag plus the domain-slot tag,
+  while B is write-time-only for now, since B's anchor carries no
+  self-identifying tag a `Checker` could reverse-discover it from (§10c,
+  implemented as `DomainPointerRegistryB`/`DomainPointerRegistryD`).
 
 ### TENTATIVE
 - Monotonically increasing NodeIDs; serialized first implementation.
@@ -2083,8 +2100,11 @@ kept current as sections above resolve or split further.)*
   reverse-index fix (option 2) that would let a domain-node mutation
   re-validate every pointer referencing it, versus continuing to accept
   the gap indefinitely.
-- Domain / Domain Pointer implementation itself (§9c/§10c design is now
-  DECIDED; not yet implemented in code).
+- Whether Domain Pointers should ever be supported on a variant of
+  Representation B whose anchor carries a self-identifying tag (making a
+  commit-time Checker possible there too, symmetric with Representation
+  D) -- not pursued now since no current caller needs it
+  (implementation_state.md item 22).
 - Generalized "find the bridging node(s) given both path endpoints" query
   for arbitrary, not-necessarily-tag-shaped paths (§85).
 

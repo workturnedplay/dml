@@ -7210,6 +7210,75 @@ func TestCompositeSetEvaluateDetectsMalformedDescriptor(t *testing.T) {
 	}
 }
 
+func TestCompositeSetContainsReflectsMembership(t *testing.T) {
+	g, _, composites := newCompositeSetTestFixture(t)
+
+	set, err := composites.NewCompositeSet()
+	if err != nil {
+		t.Fatalf("NewCompositeSet(): %v", err)
+	}
+
+	x, err := g.CreateNode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err2 := composites.AddOperand(set, x, true, false); err2 != nil {
+		t.Fatalf("AddOperand(): %v", err2)
+	}
+
+	found, err := composites.Contains(set, x)
+	if err != nil {
+		t.Fatalf("Contains(set, x): %v", err)
+	}
+	if !found {
+		t.Fatal("Contains(set, x) = false, want true")
+	}
+
+	y, err := g.CreateNode()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	found, err = composites.Contains(set, y)
+	if err != nil {
+		t.Fatalf("Contains(set, y): %v", err)
+	}
+	if found {
+		t.Fatal("Contains(set, y) = true, want false")
+	}
+}
+
+func TestCompositeSetContainsRequiresCompositeSetTag(t *testing.T) {
+	g, _, composites := newCompositeSetTestFixture(t)
+
+	notAComposite, err := g.CreateNode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	x, err := g.CreateNode()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := composites.Contains(notAComposite, x); !errors.Is(err, ErrNotCompositeSet) {
+		t.Fatalf("Contains() error = %v, want %v", err, ErrNotCompositeSet)
+	}
+}
+
+func TestCompositeSetContainsRequiresExistingValue(t *testing.T) {
+	_, _, composites := newCompositeSetTestFixture(t)
+
+	set, err := composites.NewCompositeSet()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const nonexistent NodeID = 999999
+	if _, err := composites.Contains(set, nonexistent); !errors.Is(err, ErrNodeNotFound) {
+		t.Fatalf("Contains() error = %v, want %v", err, ErrNodeNotFound)
+	}
+}
+
 // newCompositeSetLogTestFixture creates a fresh Graph plus every registry
 // needed to exercise CompositeSetLogRegistry, with full bidirectional
 // cross-representation dispatch already wired via
@@ -8149,5 +8218,644 @@ func TestSetRegistryTagAsSetRejectsCompositeSetLogConflict(t *testing.T) {
 
 	if sets.IsSet(log) {
 		t.Fatal("node was tagged AllSets despite already being AllCompositeSetLogs-tagged")
+	}
+}
+
+func TestFoundationalNamesIncludesAllDomainSlot(t *testing.T) {
+	for _, name := range FoundationalNames {
+		if name == NameAllDomainSlot {
+			return
+		}
+	}
+
+	t.Fatalf("FoundationalNames %v does not include %q", FoundationalNames, NameAllDomainSlot)
+}
+
+// newDomainPointerTestFixture creates a fresh Graph plus every registry
+// needed to exercise both DomainPointerRegistryB and
+// DomainPointerRegistryD against one shared graph: SetRegistry,
+// CompositeSetRegistry, CompositeSetLogRegistry (fully wired via
+// SetLogs), a plain PointerRegistry for Representation B usage
+// (AllSubPointers), PointerMetadataRegistryD, and a single shared
+// domainSlots PointerRegistry (AllDomainSlot) passed to both domain
+// wrappers, per domainConstraint's doc comment.
+func newDomainPointerTestFixture(t *testing.T) (*Graph, *SetRegistry, *CompositeSetRegistry, *CompositeSetLogRegistry, *DomainPointerRegistryB, *DomainPointerRegistryD) {
+	t.Helper()
+
+	var g Graph
+	names := NewNameRegistry(&g)
+
+	ids, err := names.BootstrapNames(FoundationalNames)
+	if err != nil {
+		t.Fatalf("BootstrapNames(): %v", err)
+	}
+
+	sets, err := NewSetRegistry(&g, ids[NameAllSets], ids[NameAllCompositeSets], ids[NameAllCompositeSetLogs])
+	if err != nil {
+		t.Fatalf("NewSetRegistry(): %v", err)
+	}
+
+	composites, err := NewCompositeSetRegistry(
+		&g,
+		sets,
+		ids[NameAllCompositeSets],
+		ids[NameAllAdditiveOp],
+		ids[NameAllSubtractiveOp],
+		ids[NameAllScalarOperand],
+		ids[NameAllSetOperand],
+	)
+	if err != nil {
+		t.Fatalf("NewCompositeSetRegistry(): %v", err)
+	}
+
+	capsules, err := NewCapsuleRegistry(
+		&g,
+		ids[NameAllElementCapsules],
+		ids[NameAllElementCapsulePrevSlot],
+		ids[NameAllElementCapsuleValueSlot],
+		ids[NameAllElementCapsuleNextSlot],
+	)
+	if err != nil {
+		t.Fatalf("NewCapsuleRegistry(): %v", err)
+	}
+
+	lists, err := NewListRegistry(&g, capsules, ids[NameAllLists], ids[NameAllHeads], ids[NameAllTails])
+	if err != nil {
+		t.Fatalf("NewListRegistry(): %v", err)
+	}
+
+	logs, err := NewCompositeSetLogRegistry(
+		&g,
+		lists,
+		composites,
+		ids[NameAllCompositeSetLogs],
+		ids[NameAllAdditiveOp],
+		ids[NameAllSubtractiveOp],
+		ids[NameAllScalarOperand],
+		ids[NameAllSetOperand],
+	)
+	if err != nil {
+		t.Fatalf("NewCompositeSetLogRegistry(): %v", err)
+	}
+	composites.SetLogs(logs)
+
+	subPointers, err := NewPointerRegistry(&g, ids[NameAllSubPointers])
+	if err != nil {
+		t.Fatalf("NewPointerRegistry(AllSubPointers): %v", err)
+	}
+
+	metadata, err := NewPointerMetadataRegistryD(&g, ids[NameAllPointerMetadata], ids[NameAllPointerMetadataSubjectSlot], ids[NameAllPointerMetadataTargetSlot])
+	if err != nil {
+		t.Fatalf("NewPointerMetadataRegistryD(): %v", err)
+	}
+
+	domainSlots, err := NewPointerRegistry(&g, ids[NameAllDomainSlot])
+	if err != nil {
+		t.Fatalf("NewPointerRegistry(AllDomainSlot): %v", err)
+	}
+
+	domainB := NewDomainPointerRegistryB(&g, subPointers, domainSlots, sets, composites, logs)
+	domainD := NewDomainPointerRegistryD(&g, metadata, domainSlots, sets, composites, logs)
+
+	return &g, sets, composites, logs, domainB, domainD
+}
+
+func TestDomainPointerRegistryBNewDomainPointerAndTargetWithNoDomain(t *testing.T) {
+	g, _, _, _, domainB, _ := newDomainPointerTestFixture(t)
+
+	p, err := g.CreateNode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err2 := domainB.NewDomainPointer(p); err2 != nil {
+		t.Fatalf("NewDomainPointer(p): %v", err2)
+	}
+
+	x, err := g.CreateNode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err3 := domainB.SetTarget(p, x); err3 != nil {
+		t.Fatalf("SetTarget(p, x) with no domain set: %v", err3)
+	}
+
+	target, hasTarget, err := domainB.Target(p)
+	if err != nil {
+		t.Fatalf("Target(p): %v", err)
+	}
+	if !hasTarget || target != x {
+		t.Fatalf("Target(p) = (%d,%v), want (%d,true)", target, hasTarget, x)
+	}
+}
+
+func TestDomainPointerRegistryBSetDomainEnforcesMembership(t *testing.T) {
+	g, sets, _, _, domainB, _ := newDomainPointerTestFixture(t)
+
+	p, err := g.CreateNode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err2 := domainB.NewDomainPointer(p); err2 != nil {
+		t.Fatalf("NewDomainPointer(p): %v", err2)
+	}
+
+	domainSet, err := sets.NewSet()
+	if err != nil {
+		t.Fatalf("NewSet() for domain: %v", err)
+	}
+	allowed, err := g.CreateNode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err3 := sets.Add(domainSet, allowed); err3 != nil {
+		t.Fatal(err3)
+	}
+
+	if err4 := domainB.SetDomain(p, domainSet); err4 != nil {
+		t.Fatalf("SetDomain(p, domainSet): %v", err4)
+	}
+
+	if err5 := domainB.SetTarget(p, allowed); err5 != nil {
+		t.Fatalf("SetTarget(p, allowed) within domain: %v", err5)
+	}
+
+	disallowed, err := g.CreateNode()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = domainB.SetTarget(p, disallowed)
+	if !errors.Is(err, ErrTargetOutsideDomain) {
+		t.Fatalf("SetTarget(p, disallowed) error = %v, want %v", err, ErrTargetOutsideDomain)
+	}
+
+	target, hasTarget, err := domainB.Target(p)
+	if err != nil {
+		t.Fatalf("Target(p): %v", err)
+	}
+	if !hasTarget || target != allowed {
+		t.Fatalf("Target(p) = (%d,%v), want (%d,true) -- unaffected by the rejected SetTarget", target, hasTarget, allowed)
+	}
+}
+
+func TestDomainPointerRegistryBSetDomainRejectsNonSetTaggedNode(t *testing.T) {
+	g, _, _, _, domainB, _ := newDomainPointerTestFixture(t)
+
+	p, err := g.CreateNode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err2 := domainB.NewDomainPointer(p); err2 != nil {
+		t.Fatalf("NewDomainPointer(p): %v", err2)
+	}
+
+	notASet, err := g.CreateNode()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = domainB.SetDomain(p, notASet)
+	if !errors.Is(err, ErrInvalidSetOperand) {
+		t.Fatalf("SetDomain(p, notASet) error = %v, want %v", err, ErrInvalidSetOperand)
+	}
+}
+
+func TestDomainPointerRegistryBSetDomainRejectsWhenCurrentTargetOutsideNewDomain(t *testing.T) {
+	g, sets, _, _, domainB, _ := newDomainPointerTestFixture(t)
+
+	p, err := g.CreateNode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err2 := domainB.NewDomainPointer(p); err2 != nil {
+		t.Fatalf("NewDomainPointer(p): %v", err2)
+	}
+
+	x, err := g.CreateNode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err3 := domainB.SetTarget(p, x); err3 != nil {
+		t.Fatalf("SetTarget(p, x): %v", err3)
+	}
+
+	domainSet, err := sets.NewSet()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// domainSet deliberately does not contain x.
+
+	err = domainB.SetDomain(p, domainSet)
+	if !errors.Is(err, ErrTargetOutsideDomain) {
+		t.Fatalf("SetDomain(p, domainSet) error = %v, want %v", err, ErrTargetOutsideDomain)
+	}
+
+	_, hasDomain, err := domainB.Domain(p)
+	if err != nil {
+		t.Fatalf("Domain(p): %v", err)
+	}
+	if hasDomain {
+		t.Fatal("Domain(p) reports a domain despite the rejected SetDomain")
+	}
+}
+
+func TestDomainPointerRegistryBRemoveDomainAllowsAnyTargetAgain(t *testing.T) {
+	g, sets, _, _, domainB, _ := newDomainPointerTestFixture(t)
+
+	p, err := g.CreateNode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err2 := domainB.NewDomainPointer(p); err2 != nil {
+		t.Fatalf("NewDomainPointer(p): %v", err2)
+	}
+
+	domainSet, err := sets.NewSet()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err3 := domainB.SetDomain(p, domainSet); err3 != nil {
+		t.Fatalf("SetDomain(p, domainSet): %v", err3)
+	}
+
+	outside, err := g.CreateNode()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err4 := domainB.SetTarget(p, outside); !errors.Is(err4, ErrTargetOutsideDomain) {
+		t.Fatalf("SetTarget(p, outside) before RemoveDomain error = %v, want %v", err4, ErrTargetOutsideDomain)
+	}
+
+	removed, err := domainB.RemoveDomain(p)
+	if err != nil {
+		t.Fatalf("RemoveDomain(p): %v", err)
+	}
+	if !removed {
+		t.Fatal("RemoveDomain() reported that nothing was removed")
+	}
+
+	if err5 := domainB.SetTarget(p, outside); err5 != nil {
+		t.Fatalf("SetTarget(p, outside) after RemoveDomain: %v", err5)
+	}
+}
+
+func TestDomainPointerRegistryBSetTargetRequiresExistingSubPointer(t *testing.T) {
+	g, _, _, _, domainB, _ := newDomainPointerTestFixture(t)
+
+	p, err := g.CreateNode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Deliberately not calling NewDomainPointer(p).
+
+	x, err := g.CreateNode()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = domainB.SetTarget(p, x)
+	if !errors.Is(err, ErrNotPointer) {
+		t.Fatalf("SetTarget(p, x) without a sub-pointer error = %v, want %v", err, ErrNotPointer)
+	}
+}
+
+func TestDomainPointerRegistryDTargetWithNoDomainAllowsAnyTarget(t *testing.T) {
+	g, _, _, _, _, domainD := newDomainPointerTestFixture(t)
+
+	subject, err := g.CreateNode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	x, err := g.CreateNode()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err2 := domainD.SetTarget(subject, x); err2 != nil {
+		t.Fatalf("SetTarget(subject, x) with no domain: %v", err2)
+	}
+
+	target, hasTarget, err := domainD.Target(subject)
+	if err != nil {
+		t.Fatalf("Target(subject): %v", err)
+	}
+	if !hasTarget || target != x {
+		t.Fatalf("Target(subject) = (%d,%v), want (%d,true)", target, hasTarget, x)
+	}
+}
+
+func TestDomainPointerRegistryDSetDomainEnforcesMembership(t *testing.T) {
+	g, sets, _, _, _, domainD := newDomainPointerTestFixture(t)
+
+	subject, err := g.CreateNode()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	domainSet, err := sets.NewSet()
+	if err != nil {
+		t.Fatal(err)
+	}
+	allowed, err := g.CreateNode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err2 := sets.Add(domainSet, allowed); err2 != nil {
+		t.Fatal(err2)
+	}
+
+	if err3 := domainD.SetDomain(subject, domainSet); err3 != nil {
+		t.Fatalf("SetDomain(subject, domainSet): %v", err3)
+	}
+
+	if err4 := domainD.SetTarget(subject, allowed); err4 != nil {
+		t.Fatalf("SetTarget(subject, allowed): %v", err4)
+	}
+
+	disallowed, err := g.CreateNode()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = domainD.SetTarget(subject, disallowed)
+	if !errors.Is(err, ErrTargetOutsideDomain) {
+		t.Fatalf("SetTarget(subject, disallowed) error = %v, want %v", err, ErrTargetOutsideDomain)
+	}
+}
+
+func TestDomainPointerRegistryDSetDomainRejectsNonSetTaggedNode(t *testing.T) {
+	g, _, _, _, _, domainD := newDomainPointerTestFixture(t)
+
+	subject, err := g.CreateNode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	notASet, err := g.CreateNode()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = domainD.SetDomain(subject, notASet)
+	if !errors.Is(err, ErrInvalidSetOperand) {
+		t.Fatalf("SetDomain(subject, notASet) error = %v, want %v", err, ErrInvalidSetOperand)
+	}
+}
+
+func TestDomainPointerRegistryDSetDomainRejectsWhenCurrentTargetOutsideNewDomain(t *testing.T) {
+	g, sets, _, _, _, domainD := newDomainPointerTestFixture(t)
+
+	subject, err := g.CreateNode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	x, err := g.CreateNode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err2 := domainD.SetTarget(subject, x); err2 != nil {
+		t.Fatalf("SetTarget(subject, x): %v", err2)
+	}
+
+	domainSet, err := sets.NewSet()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// domainSet deliberately does not contain x.
+
+	err = domainD.SetDomain(subject, domainSet)
+	if !errors.Is(err, ErrTargetOutsideDomain) {
+		t.Fatalf("SetDomain(subject, domainSet) error = %v, want %v", err, ErrTargetOutsideDomain)
+	}
+
+	_, hasDomain, err := domainD.Domain(subject)
+	if err != nil {
+		t.Fatalf("Domain(subject): %v", err)
+	}
+	if hasDomain {
+		t.Fatal("Domain(subject) reports a domain despite the rejected SetDomain")
+	}
+}
+
+func TestDomainPointerRegistryDRemoveDomainAllowsAnyTargetAgain(t *testing.T) {
+	g, sets, _, _, _, domainD := newDomainPointerTestFixture(t)
+
+	subject, err := g.CreateNode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	domainSet, err := sets.NewSet()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err2 := domainD.SetDomain(subject, domainSet); err2 != nil {
+		t.Fatalf("SetDomain(subject, domainSet): %v", err2)
+	}
+
+	outside, err := g.CreateNode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err3 := domainD.SetTarget(subject, outside); !errors.Is(err3, ErrTargetOutsideDomain) {
+		t.Fatalf("SetTarget(subject, outside) before RemoveDomain error = %v, want %v", err3, ErrTargetOutsideDomain)
+	}
+
+	removed, err := domainD.RemoveDomain(subject)
+	if err != nil {
+		t.Fatalf("RemoveDomain(subject): %v", err)
+	}
+	if !removed {
+		t.Fatal("RemoveDomain() reported that nothing was removed")
+	}
+
+	if err4 := domainD.SetTarget(subject, outside); err4 != nil {
+		t.Fatalf("SetTarget(subject, outside) after RemoveDomain: %v", err4)
+	}
+}
+
+func TestDomainPointerRegistryDDomainViaCompositeSet(t *testing.T) {
+	g, _, composites, _, _, domainD := newDomainPointerTestFixture(t)
+
+	subject, err := g.CreateNode()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	domainComposite, err := composites.NewCompositeSet()
+	if err != nil {
+		t.Fatalf("NewCompositeSet(): %v", err)
+	}
+	allowed, err := g.CreateNode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err2 := composites.AddOperand(domainComposite, allowed, true, false); err2 != nil {
+		t.Fatalf("AddOperand(): %v", err2)
+	}
+
+	if err3 := domainD.SetDomain(subject, domainComposite); err3 != nil {
+		t.Fatalf("SetDomain(subject, domainComposite): %v", err3)
+	}
+
+	if err4 := domainD.SetTarget(subject, allowed); err4 != nil {
+		t.Fatalf("SetTarget(subject, allowed): %v", err4)
+	}
+
+	disallowed, err := g.CreateNode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = domainD.SetTarget(subject, disallowed)
+	if !errors.Is(err, ErrTargetOutsideDomain) {
+		t.Fatalf("SetTarget(subject, disallowed) error = %v, want %v", err, ErrTargetOutsideDomain)
+	}
+}
+
+func TestDomainPointerRegistryDDomainViaCompositeSetLog(t *testing.T) {
+	g, _, _, logs, _, domainD := newDomainPointerTestFixture(t)
+
+	subject, err := g.CreateNode()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	domainLog, err := logs.NewCompositeSetLog()
+	if err != nil {
+		t.Fatalf("NewCompositeSetLog(): %v", err)
+	}
+	allowed, err := g.CreateNode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err2 := logs.AppendOperation(domainLog, allowed, true, false); err2 != nil {
+		t.Fatalf("AppendOperation(): %v", err2)
+	}
+
+	if err3 := domainD.SetDomain(subject, domainLog); err3 != nil {
+		t.Fatalf("SetDomain(subject, domainLog): %v", err3)
+	}
+
+	if err4 := domainD.SetTarget(subject, allowed); err4 != nil {
+		t.Fatalf("SetTarget(subject, allowed): %v", err4)
+	}
+
+	disallowed, err := g.CreateNode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = domainD.SetTarget(subject, disallowed)
+	if !errors.Is(err, ErrTargetOutsideDomain) {
+		t.Fatalf("SetTarget(subject, disallowed) error = %v, want %v", err, ErrTargetOutsideDomain)
+	}
+}
+
+// TestDomainPointerRegistryDCheckerCatchesOutOfBandTargetChange
+// demonstrates the Checker registered by NewDomainPointerRegistryD
+// catching a domain violation introduced by bypassing
+// DomainPointerRegistryD entirely and mutating the underlying
+// PointerMetadataRegistryD directly. This still goes through
+// Graph.Transact internally (see PointerMetadataRegistryD.SetTarget), so
+// the Checker still sees and rejects it -- the counterpart to
+// DomainPointerRegistryB's documented lack of an equivalent Checker.
+func TestDomainPointerRegistryDCheckerCatchesOutOfBandTargetChange(t *testing.T) {
+	g, sets, _, _, _, domainD := newDomainPointerTestFixture(t)
+
+	subject, err := g.CreateNode()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	domainSet, err := sets.NewSet()
+	if err != nil {
+		t.Fatal(err)
+	}
+	allowed, err := g.CreateNode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err2 := sets.Add(domainSet, allowed); err2 != nil {
+		t.Fatal(err2)
+	}
+	if err3 := domainD.SetDomain(subject, domainSet); err3 != nil {
+		t.Fatalf("SetDomain(subject, domainSet): %v", err3)
+	}
+
+	disallowed, err := g.CreateNode()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = domainD.metadata.SetTarget(subject, disallowed)
+	if !errors.Is(err, ErrTargetOutsideDomain) {
+		t.Fatalf("bypassing SetTarget() error = %v, want %v", err, ErrTargetOutsideDomain)
+	}
+
+	target, hasTarget, err := domainD.Target(subject)
+	if err != nil {
+		t.Fatalf("Target(subject): %v", err)
+	}
+	if hasTarget {
+		t.Fatalf("Target(subject) = (%d,true), want no target after the Checker declined the bypassing commit", target)
+	}
+}
+
+// TestDomainPointerRegistryDCheckerCatchesOutOfBandDomainChange covers
+// the other trigger direction: bypassing DomainPointerRegistryD.SetDomain
+// and reassigning the domain slot's target directly through the shared
+// domainSlots PointerRegistry, to a domain that no longer contains the
+// pointer's current target.
+func TestDomainPointerRegistryDCheckerCatchesOutOfBandDomainChange(t *testing.T) {
+	g, sets, _, _, _, domainD := newDomainPointerTestFixture(t)
+
+	subject, err := g.CreateNode()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	firstDomain, err := sets.NewSet()
+	if err != nil {
+		t.Fatal(err)
+	}
+	x, err := g.CreateNode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err2 := sets.Add(firstDomain, x); err2 != nil {
+		t.Fatal(err2)
+	}
+	if err3 := domainD.SetDomain(subject, firstDomain); err3 != nil {
+		t.Fatalf("SetDomain(subject, firstDomain): %v", err3)
+	}
+	if err4 := domainD.SetTarget(subject, x); err4 != nil {
+		t.Fatalf("SetTarget(subject, x): %v", err4)
+	}
+
+	secondDomain, err := sets.NewSet()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// secondDomain deliberately does not contain x.
+
+	m, _, found, err := domainD.metadata.locate(subject)
+	if err != nil || !found {
+		t.Fatalf("locate(subject): found=%v err=%v", found, err)
+	}
+
+	slot, found, err := domainD.domainSlotFor(m)
+	if err != nil || !found {
+		t.Fatalf("domainSlotFor(m): found=%v err=%v", found, err)
+	}
+
+	err = domainD.domainSlots.SetTarget(slot, secondDomain)
+	if !errors.Is(err, ErrTargetOutsideDomain) {
+		t.Fatalf("bypassing SetDomain() error = %v, want %v", err, ErrTargetOutsideDomain)
+	}
+
+	domain, hasDomain, err := domainD.Domain(subject)
+	if err != nil {
+		t.Fatalf("Domain(subject): %v", err)
+	}
+	if !hasDomain || domain != firstDomain {
+		t.Fatalf("Domain(subject) = (%d,%v), want (%d,true) -- unaffected by the declined bypass", domain, hasDomain, firstDomain)
 	}
 }

@@ -93,9 +93,9 @@ After that:
   theorystate.md section 79); the composite Set representations
   (theorystate.md sections 80-83) are now also implemented as
   CompositeSetRegistry and CompositeSetLogRegistry (items 18-19 below).
-  Domains remain later still and unstarted; the theory frames a Domain
-  as a constrained Set, and every Set representation it might want to
-  build on is now available.
+  Domains and Domain Pointers (theorystate.md sections 9c/10c) are now
+  implemented -- see item 22 -- closing out this paragraph's own
+  "remain later still and unstarted" note.
 
   The ElementCapsule primitive (CapsuleRegistry, item 10) is implemented:
   list -> ElementCapsule does not by itself make every list child a capsule;
@@ -997,7 +997,109 @@ NodeID-keyed structure outside the primitive graph.
  and TestCompositeSetLogRemoveOperationRequiresOperationInLog continue to
  pass unmodified against the corrected implementation.
 
+22. Added Domain Pointers (theorystate.md sections 9c/10c, design decided
+ in a prior session; this session implements it), plus a small
+ independently-useful gap noticed while designing it.
+
+ CompositeSetRegistry gained a Contains(set, value) method, symmetric
+ with SetRegistry.Contains and CompositeSetLogRegistry.Contains -- a
+ thin wrapper around the existing Evaluate/evaluate, with no
+ backward-scan optimization (unlike CompositeSetLogRegistry.Contains),
+ since CompositeSetRegistry's union-then-difference fold is not
+ order-sensitive.
+
+ A Domain (theorystate.md section 9c) is not a new tagged concept: any
+ node already carrying one of the three Set-representation tags (AllSets,
+ AllCompositeSets, AllCompositeSetLogs) is domain-eligible, dispatched
+ generically via the new domainContainsGeneric function -- the
+ Contains-flavored counterpart to the existing resolveSetOperandGeneric,
+ needing no visited-set threading of its own since each representation's
+ own Contains already handles its own recursion/cycle detection.
+
+ Domain Pointers (theorystate.md section 10c) attach a domain slot,
+ tagged via the new NameAllDomainSlot foundational name, to a pointer's
+ anchor node -- P for Representation B, the metadata node M for
+ Representation D -- reusing PointerRegistry under this new tag a fourth
+ time for the slot's own "at most one domain" cardinality, exactly like
+ CapsuleRegistry's three role slots. Representations A and C cannot
+ safely carry a domain slot (both discover their own target via
+ zero-exclusion or single-exclusion child scans that an extra tagged
+ child would immediately violate); only B and D are supported, sharing a
+ new domainConstraint struct for the domain-slot lookup/create/remove/
+ validate logic common to both, split from each representation's own
+ target-discovery exactly the way subjectMetadataBase already splits
+ PointerMetadataRegistry(D)'s shared subject-side logic from their
+ differing target-side logic.
+
+ DomainPointerRegistryD wraps an existing PointerMetadataRegistryD and
+ registers its own commit-time Checker: M is self-identifying via its
+ own AllPointerMetadata tag, so the Checker can reverse-discover M from
+ either a touched target-slot or domain-slot node (via
+ findUniqueTaggedParent, the same lookup locateBySubjectSlot already uses
+ one hop further out) and re-validate M's current target against M's
+ current domain, catching a caller bypassing DomainPointerRegistryD and
+ mutating the underlying PointerMetadataRegistryD or the shared
+ domain-slot PointerRegistry directly.
+
+ DomainPointerRegistryB wraps an existing Representation B
+ PointerRegistry and deliberately registers no Checker of its own,
+ discovered as a real, non-obvious gap while implementing rather than
+ anticipated when this feature was designed: its anchor P carries no
+ self-identifying tag in the general case (P may be any caller-managed
+ node), so reverse-discovering P from a touched sub-pointer or
+ domain-slot node would require either an untagged "find the one
+ parent" lookup -- the exact anti-pattern item 13 already rejected for
+ CapsulesWithValue -- or a new bookkeeping tag added purely to support
+ this one Checker. Since no current caller needs Representation B
+ domain pointers yet, this is deferred rather than built ahead of an
+ actual need (theorystate.md section 7); domain enforcement for B is
+ write-time only (SetTarget/SetDomain), documented as a known, narrower
+ gap than D's in DomainPointerRegistryB's own doc comment and in
+ theorystate.md section 10c. DomainPointerRegistryB additionally
+ provides NewDomainPointer, discovering/minting its sub-pointer node U
+ via the underlying PointerRegistry's own tag rather than requiring
+ callers to separately track U alongside P.
+
+ Both wrapper types validate a proposed SetDomain against the pointer's
+ current target, and a proposed SetTarget against the pointer's current
+ domain, symmetrically -- a domain that would immediately strand the
+ existing target is rejected via the same ErrTargetOutsideDomain used
+ for an out-of-domain SetTarget, and the domain slot is left unchanged.
+
+ See theorystate.md section 86 for the one gap intentionally not closed
+ by either representation's Checker: a domain node's own membership
+ changing later, via a mutation that never touches the pointer or its
+ domain/target slots at all, is not detected by anything in this
+ session's implementation -- option 1 (accept the gap) from that
+ section's three recorded options, not option 2 (a reverse index from
+ domain to referencing pointers), which remains the recorded likely
+ future direction.
+
+ Covered by TestCompositeSetContainsReflectsMembership,
+ TestCompositeSetContainsRequiresCompositeSetTag,
+ TestCompositeSetContainsRequiresExistingValue,
+ TestFoundationalNamesIncludesAllDomainSlot,
+ TestDomainPointerRegistryBNewDomainPointerAndTargetWithNoDomain,
+ TestDomainPointerRegistryBSetDomainEnforcesMembership,
+ TestDomainPointerRegistryBSetDomainRejectsNonSetTaggedNode,
+ TestDomainPointerRegistryBSetDomainRejectsWhenCurrentTargetOutsideNewDomain,
+ TestDomainPointerRegistryBRemoveDomainAllowsAnyTargetAgain,
+ TestDomainPointerRegistryBSetTargetRequiresExistingSubPointer,
+ TestDomainPointerRegistryDTargetWithNoDomainAllowsAnyTarget,
+ TestDomainPointerRegistryDSetDomainEnforcesMembership,
+ TestDomainPointerRegistryDSetDomainRejectsNonSetTaggedNode,
+ TestDomainPointerRegistryDSetDomainRejectsWhenCurrentTargetOutsideNewDomain,
+ TestDomainPointerRegistryDRemoveDomainAllowsAnyTargetAgain,
+ TestDomainPointerRegistryDDomainViaCompositeSet,
+ TestDomainPointerRegistryDDomainViaCompositeSetLog,
+ TestDomainPointerRegistryDCheckerCatchesOutOfBandTargetChange, and
+ TestDomainPointerRegistryDCheckerCatchesOutOfBandDomainChange.
+
 Currently unaddressed yet:
 - Txn does not support nesting one Graph.Transact call inside another
   (Txn.DeleteNode is supported -- see item 15). Nesting is not needed by
   any current caller; add support if and when one actually needs it.
+- DomainPointerRegistryB's domain-membership invariant is enforced only
+  at write time, not at commit time, for the reasons item 22 records --
+  revisit if a future caller needs Representation B domain pointers to
+  be as defense-in-depth as Representation D's.

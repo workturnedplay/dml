@@ -1107,6 +1107,18 @@ const (
 	// precedent for one identity carrying more than one simultaneous
 	// interpretation). See CompositeSetLogRegistry.
 	NameAllCompositeSetLogs = "AllCompositeSetLogs"
+
+	// NameAllDomainSlot tags a Domain Pointer's domain-slot node
+	// (theorystate.md section 10c): a freshly-minted intermediary node,
+	// attached to the pointer's anchor (P for Representation B, the
+	// metadata node M for Representation D) exactly like every other
+	// slot in this file, whose own single child is the domain node
+	// itself. There is deliberately no separate tag marking a node as
+	// "a domain" -- any node already carrying one of the three
+	// Set-representation tags (AllSets, AllCompositeSets,
+	// AllCompositeSetLogs) is domain-eligible (theorystate.md section
+	// 9c). See DomainPointerRegistryB / DomainPointerRegistryD.
+	NameAllDomainSlot = "AllDomainSlot"
 )
 
 // FoundationalNames lists every name that setup code should bootstrap via
@@ -1134,6 +1146,7 @@ var FoundationalNames = []string{
 	NameAllScalarOperand,
 	NameAllSetOperand,
 	NameAllCompositeSetLogs,
+	NameAllDomainSlot,
 }
 
 // ErrCannotDeleteRoot is returned when deletion of ROOT is attempted
@@ -1494,6 +1507,15 @@ var (
 	// and/or CompositeSetLog, in any combination) referencing each other
 	// can cycle.
 	ErrCompositeSetCycle = errors.New("composite set operand graph contains a cycle")
+	// ErrTargetOutsideDomain is returned by DomainPointerRegistryB/D's
+	// SetTarget when the given target does not currently belong to the
+	// pointer's attached domain's resolved membership (theorystate.md
+	// section 9c/10c/86), and by their SetDomain when the pointer's
+	// current target does not belong to the proposed new domain. A
+	// domain is any node carrying one of the three Set-representation
+	// tags (AllSets, AllCompositeSets, AllCompositeSetLogs); see
+	// domainContainsGeneric.
+	ErrTargetOutsideDomain = errors.New("target does not belong to the pointer's domain")
 	// ErrCapsuleNotInList is returned by ListRegistry.InsertAfter when
 	// the given capsule is not currently an element of the given list
 	// (i.e. (list, capsule) does not exist).
@@ -4632,6 +4654,33 @@ func operandCarriesKnownSetTag(sets *SetRegistry, composites *CompositeSetRegist
 	return false
 }
 
+// domainContainsGeneric reports whether value currently belongs to
+// domain's resolved membership, dispatched by whichever of the three
+// currently-implemented Set representations domain carries
+// (theorystate.md section 9c): a plain Set (via sets.Contains), a
+// CompositeSet (via composites.Contains), or, if logs is non-nil (same
+// nil-tolerance as operandCarriesKnownSetTag/resolveSetOperandGeneric
+// above), a CompositeSetLog (via logs.Contains). Each representation's
+// own Contains method already handles its own internal recursion and
+// cycle detection (theorystate.md section 83), so unlike
+// resolveSetOperandGeneric, no visited-set threading is needed here --
+// there is nothing for this function itself to recurse into.
+func domainContainsGeneric(sets *SetRegistry, composites *CompositeSetRegistry, logs *CompositeSetLogRegistry, domain, value NodeID) (bool, error) {
+	switch {
+	case sets.IsSet(domain):
+		return sets.Contains(domain, value)
+
+	case composites.IsCompositeSet(domain):
+		return composites.Contains(domain, value)
+
+	case logs != nil && logs.IsCompositeSetLog(domain):
+		return logs.Contains(domain, value)
+
+	default:
+		return false, ErrInvalidSetOperand
+	}
+}
+
 // resolveSetOperandGeneric resolves operand's own current membership,
 // dispatched by whichever of the three currently-implemented Set
 // representations operand actually carries (theorystate.md section 83):
@@ -5111,6 +5160,42 @@ func (c *CompositeSetRegistry) Evaluate(set NodeID) ([]NodeID, error) {
 	}
 
 	return c.evaluate(set, map[NodeID]struct{}{set: {}})
+}
+
+// Contains reports whether value currently belongs to set's evaluated
+// membership -- a thin wrapper around Evaluate, added for symmetry with
+// SetRegistry.Contains and CompositeSetLogRegistry.Contains. Unlike
+// CompositeSetLogRegistry.Contains, this does not implement a
+// backward-scan optimization: CompositeSetRegistry's union-then-
+// difference fold (theorystate.md section 81) is not order-sensitive,
+// so there is no "most recent mention" to scan backward toward -- the
+// full Evaluate must run regardless.
+//
+// set must already be tagged (AllCompositeSets, set); value must already
+// exist. Like Evaluate, this is never cached.
+func (c *CompositeSetRegistry) Contains(set, value NodeID) (bool, error) {
+	if !c.graph.NodeExists(set) {
+		return false, ErrNodeNotFound
+	}
+	if !c.IsCompositeSet(set) {
+		return false, ErrNotCompositeSet
+	}
+	if !c.graph.NodeExists(value) {
+		return false, ErrNodeNotFound
+	}
+
+	members, err := c.evaluate(set, map[NodeID]struct{}{set: {}})
+	if err != nil {
+		return false, err
+	}
+
+	for _, id := range members {
+		if id == value {
+			return true, nil
+		}
+	}
+
+	return false, nil
 }
 
 // evaluate is Evaluate's recursive core, assuming set has already been
@@ -5782,4 +5867,540 @@ func (c *CompositeSetLogRegistry) DeleteCompositeSetLog(log NodeID) error {
 
 		return tx.DeleteNode(log)
 	})
+}
+
+// domainConstraint holds the shared domain-slot state and operations
+// used by both DomainPointerRegistryB (Representation B) and
+// DomainPointerRegistryD (Representation D) -- see theorystate.md
+// section 10c for why only Representations B and D can safely carry a
+// domain slot, and section 9c for why a "domain" is any node already
+// carrying one of the three Set-representation tags rather than a new
+// tagged concept of its own.
+//
+// Both representations attach the domain slot identically: a single
+// freshly-minted node U3, tagged AllDomainSlot, wired
+// anchor -> U3 -> domainNode. They differ only in which node serves as
+// "anchor" (P itself for B, the metadata node M for D) and in which
+// underlying Pointer representation ultimately enforces the pointer's
+// own target cardinality -- exactly the same split subjectMetadataBase
+// already makes between shared subject-side logic and each
+// representation's own target discovery (see that type's doc comment),
+// applied here to the domain-slot concept instead.
+//
+// domainSlots is expected to be a single, shared *PointerRegistry
+// instance -- constructed once via NewPointerRegistry(graph,
+// allDomainSlot) -- passed to every domainConstraint-embedding registry
+// in the same graph. Constructing a second, independent PointerRegistry
+// under the same tag would register a redundant (if harmless) duplicate
+// Checker for the identical cardinality invariant.
+type domainConstraint struct {
+	graph       *Graph
+	domainSlots *PointerRegistry
+	sets        *SetRegistry
+	composites  *CompositeSetRegistry
+	logs        *CompositeSetLogRegistry
+}
+
+// domainSlotFor returns anchor's domain-slot child (U3), if any, found
+// by tag rather than by position or exclusion, exactly like every other
+// slot lookup in this file.
+func (d *domainConstraint) domainSlotFor(anchor NodeID) (slot NodeID, found bool, err error) {
+	return findUniqueTaggedChild(d.graph, anchor, d.domainSlots.allPointers)
+}
+
+// Domain returns anchor's current domain node, if any. hasDomain is
+// false both when anchor has no domain slot at all and when it has one
+// with no domain node set yet.
+func (d *domainConstraint) Domain(anchor NodeID) (domain NodeID, hasDomain bool, err error) {
+	slot, found, err := d.domainSlotFor(anchor)
+	if err != nil || !found {
+		return 0, false, err
+	}
+
+	return d.domainSlots.Target(slot)
+}
+
+// SetDomain sets anchor's domain to domain, creating anchor's domain
+// slot first if it does not exist yet. domain must already carry one of
+// the three currently-recognized Set-representation tags
+// (theorystate.md section 9c) -- checked here, at write time, via the
+// same operandCarriesKnownSetTag helper composite-Set operands already
+// use for the identical check (theorystate.md section 80) -- returning
+// ErrInvalidSetOperand otherwise.
+//
+// This does NOT validate the new domain against anchor's current
+// target, if any: only the representation-specific wrapper
+// (DomainPointerRegistryB/D) knows how to discover anchor's current
+// target for its own representation, so that check is performed there,
+// before delegating to this method -- see DomainPointerRegistryB.
+// SetDomain / DomainPointerRegistryD.SetDomain.
+func (d *domainConstraint) SetDomain(anchor, domain NodeID) error {
+	if !d.graph.NodeExists(anchor) {
+		return ErrNodeNotFound
+	}
+	if !d.graph.NodeExists(domain) {
+		return ErrNodeNotFound
+	}
+	if !operandCarriesKnownSetTag(d.sets, d.composites, d.logs, domain) {
+		return ErrInvalidSetOperand
+	}
+
+	slot, found, err := d.domainSlotFor(anchor)
+	if err != nil {
+		return err
+	}
+
+	if !found {
+		return d.graph.Transact(func(tx *Txn) error {
+			newSlot, err2 := createTaggedNodeTx(tx, d.domainSlots.allPointers)
+			if err2 != nil {
+				return err2
+			}
+			if _, err3 := tx.AddRelationship(anchor, newSlot); err3 != nil {
+				return err3
+			}
+			_, err4 := tx.AddRelationship(newSlot, domain)
+			return err4
+		})
+	}
+
+	return d.domainSlots.SetTarget(slot, domain)
+}
+
+// RemoveDomain clears anchor's domain, if any. The domain-slot node
+// itself is left in place (no cascade deletion, consistent with
+// theorystate.md section 18); a domain-slot with no domain set is a
+// valid, meaningful "no constraint" state, exactly like an empty
+// Pointer elsewhere in this file.
+func (d *domainConstraint) RemoveDomain(anchor NodeID) (removed bool, err error) {
+	if !d.graph.NodeExists(anchor) {
+		return false, ErrNodeNotFound
+	}
+
+	slot, found, err := d.domainSlotFor(anchor)
+	if err != nil || !found {
+		return false, err
+	}
+
+	return d.domainSlots.RemoveTarget(slot)
+}
+
+// validateMembership reports whether target currently belongs to
+// domain's resolved membership, dispatched generically over whichever of
+// the three Set representations domain actually carries (see
+// domainContainsGeneric), returning ErrTargetOutsideDomain if not.
+func (d *domainConstraint) validateMembership(domain, target NodeID) error {
+	contains, err := domainContainsGeneric(d.sets, d.composites, d.logs, domain, target)
+	if err != nil {
+		return err
+	}
+	if !contains {
+		return ErrTargetOutsideDomain
+	}
+
+	return nil
+}
+
+// checkAllowed reports whether target is a legal value to set on anchor,
+// given whatever domain (if any) is currently attached via anchor's
+// domain slot. An anchor with no domain slot, or a slot with no domain
+// node set yet, always allows any target -- exactly like a Pointer with
+// no domain constraint at all.
+//
+// See theorystate.md section 86 for the known, accepted gap this check
+// does not close: this only validates against the domain's membership
+// as of this call. A domain's own membership changing afterward, via a
+// mutation that never touches anchor or its domain slot, is not
+// detected here or by any Checker -- SetDomain and SetTarget (on
+// whichever of DomainPointerRegistryB/D this is embedded in) are the
+// only two write paths that ever re-validate this relationship.
+func (d *domainConstraint) checkAllowed(anchor, target NodeID) error {
+	domain, hasDomain, err := d.Domain(anchor)
+	if err != nil {
+		return err
+	}
+	if !hasDomain {
+		return nil
+	}
+
+	return d.validateMembership(domain, target)
+}
+
+// DomainPointerRegistryB adds domain-constrained target enforcement on
+// top of an existing Representation B PointerRegistry instance
+// (theorystate.md section 10b), attaching the domain slot directly to
+// the anchor node P:
+//
+//	P -> U             (allPointers' own tag, U)   -- existing target slot
+//	P -> U3            (AllDomainSlot, U3)         -- new domain slot
+//	U3 -> domainNode
+//
+// pointers must be a genuine Representation B instance -- i.e.
+// constructed with an intermediary-node tag such as AllSubPointers,
+// never AllPointers itself (Representation A). This type cannot detect
+// that distinction from the tag alone, since PointerRegistry is
+// deliberately representation-agnostic (theorystate.md section 76);
+// wrapping a Representation A instance here is a caller error this type
+// has no way to reject, and would silently corrupt that pointer's own
+// "at most one target" invariant the first time a domain slot was
+// attached, per theorystate.md section 10c's explanation of why
+// Representation A cannot safely carry one.
+//
+// U itself, not P, is where PointerRegistry's own target-cardinality
+// invariant is enforced, so P is free to carry the additional domain
+// slot without disturbing it -- U is discovered generically from P via
+// the underlying PointerRegistry's own tag (see the subPointer method),
+// the same tag-based child lookup used throughout this file, rather than
+// requiring callers to separately track and pass U alongside P.
+//
+// Unlike DomainPointerRegistryD, this type registers no commit-time
+// Checker of its own for domain-membership enforcement. Representation
+// D's anchor (M) is self-identifying via its own AllPointerMetadata tag,
+// which is what lets its Checker reverse-discover M from a touched
+// target- or domain-slot node. Representation B's anchor P carries no
+// equivalent distinguishing tag in the general case -- P may be any
+// caller-managed node, tagged however the caller's own domain requires
+// or not tagged at all -- so reverse-discovering P from a touched U or
+// U3 would require either an untagged "find the one parent" lookup
+// (the exact anti-pattern already rejected elsewhere in this file, see
+// CapsulesWithValue's doc comment) or a new bookkeeping tag applied to
+// every domain-constrained P purely to support this one Checker. Given
+// no current caller needs Representation B domain pointers at all yet,
+// this is deferred rather than built ahead of an actual need
+// (theorystate.md section 7) -- domain-membership enforcement for B is
+// therefore write-time only, via SetTarget and SetDomain below; a caller
+// that bypasses this type and mutates the underlying PointerRegistry or
+// domain-slot PointerRegistry directly will not be caught until (or
+// unless) something later reads back through this type.
+type DomainPointerRegistryB struct {
+	domainConstraint
+	pointers *PointerRegistry
+}
+
+// NewDomainPointerRegistryB creates a DomainPointerRegistryB over graph,
+// domain-constraining targets set through pointers (a pre-constructed
+// Representation B PointerRegistry -- see the type's doc comment for why
+// Representation A must never be passed here). domainSlots is a
+// pre-constructed PointerRegistry for the shared AllDomainSlot tag (see
+// domainConstraint's doc comment for why it should be constructed once
+// and shared with any DomainPointerRegistryD in the same graph). logs
+// may be nil if no CompositeSetLogRegistry exists yet in the calling
+// program (see operandCarriesKnownSetTag's identical nil-tolerance) --
+// a domain pointed at a CompositeSetLog-kind node is then rejected via
+// ErrInvalidSetOperand exactly like any other unrecognized domain kind,
+// until logs is available.
+func NewDomainPointerRegistryB(graph *Graph, pointers, domainSlots *PointerRegistry, sets *SetRegistry, composites *CompositeSetRegistry, logs *CompositeSetLogRegistry) *DomainPointerRegistryB {
+	return &DomainPointerRegistryB{
+		domainConstraint: domainConstraint{
+			graph:       graph,
+			domainSlots: domainSlots,
+			sets:        sets,
+			composites:  composites,
+			logs:        logs,
+		},
+		pointers: pointers,
+	}
+}
+
+// subPointer returns anchor's Representation B sub-pointer node U -- the
+// single child of anchor tagged via the underlying PointerRegistry's own
+// tag -- found by tag, not by position, exactly like every other slot
+// lookup in this file.
+func (b *DomainPointerRegistryB) subPointer(anchor NodeID) (u NodeID, found bool, err error) {
+	return findUniqueTaggedChild(b.graph, anchor, b.pointers.allPointers)
+}
+
+// NewDomainPointer mints a fresh sub-pointer node U, tags it via the
+// underlying PointerRegistry's own tag, and wires (anchor, U) --
+// completing Representation B's structural pattern for
+// DomainPointerRegistryB's own use, so callers do not need to separately
+// call the underlying PointerRegistry.NewPointer and wire the edge
+// themselves. anchor must already exist; it need not be otherwise
+// tagged in any particular way, consistent with Representation B leaving
+// P's own children unconstrained (theorystate.md section 10b).
+func (b *DomainPointerRegistryB) NewDomainPointer(anchor NodeID) error {
+	if !b.graph.NodeExists(anchor) {
+		return ErrNodeNotFound
+	}
+
+	return b.graph.Transact(func(tx *Txn) error {
+		u, err := newPointerTx(tx, b.pointers.allPointers)
+		if err != nil {
+			return err
+		}
+
+		_, err = tx.AddRelationship(anchor, u)
+		return err
+	})
+}
+
+// Target returns anchor's current target via its sub-pointer node U, if
+// any. hasTarget is false both when anchor has no discoverable U at all
+// and when U exists but has no target set yet.
+func (b *DomainPointerRegistryB) Target(anchor NodeID) (target NodeID, hasTarget bool, err error) {
+	u, found, err := b.subPointer(anchor)
+	if err != nil || !found {
+		return 0, false, err
+	}
+
+	return b.pointers.Target(u)
+}
+
+// SetTarget sets anchor's target to target, first validating target
+// against anchor's currently attached domain, if any (see
+// domainConstraint.checkAllowed). anchor must already have a
+// discoverable sub-pointer node U (see NewDomainPointer); otherwise this
+// returns ErrNotPointer, mirroring the underlying PointerRegistry's own
+// error for an untagged node.
+func (b *DomainPointerRegistryB) SetTarget(anchor, target NodeID) error {
+	if !b.graph.NodeExists(target) {
+		return ErrNodeNotFound
+	}
+
+	if err := b.checkAllowed(anchor, target); err != nil {
+		return err
+	}
+
+	u, found, err := b.subPointer(anchor)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return ErrNotPointer
+	}
+
+	return b.pointers.SetTarget(u, target)
+}
+
+// RemoveTarget clears anchor's target, if any, via its sub-pointer node
+// U.
+func (b *DomainPointerRegistryB) RemoveTarget(anchor NodeID) (removed bool, err error) {
+	u, found, err := b.subPointer(anchor)
+	if err != nil || !found {
+		return false, err
+	}
+
+	return b.pointers.RemoveTarget(u)
+}
+
+// SetDomain sets anchor's domain to domain, additionally validating that
+// anchor's current target (if any) still belongs to domain before
+// committing -- symmetric with SetTarget's own validation against the
+// current domain. See domainConstraint.SetDomain for the shared
+// creation/validation logic this delegates to.
+func (b *DomainPointerRegistryB) SetDomain(anchor, domain NodeID) error {
+	target, hasTarget, err := b.Target(anchor)
+	if err != nil {
+		return err
+	}
+
+	if hasTarget {
+		if err2 := b.validateMembership(domain, target); err2 != nil {
+			return err2
+		}
+	}
+
+	return b.domainConstraint.SetDomain(anchor, domain)
+}
+
+// DomainPointerRegistryD adds domain-constrained target enforcement on
+// top of an existing PointerMetadataRegistryD instance (Representation
+// D, theorystate.md section 10a), attaching the domain slot to the
+// metadata node M as a third, independently-tagged sibling of the
+// subject-slot and target-slot:
+//
+//	M -> U1            (AllPointerMetadataSubjectSlot, U1) -> subject
+//	M -> U2            (AllPointerMetadataTargetSlot, U2)  -> target
+//	M -> U3            (AllDomainSlot, U3)                 -> domainNode
+//
+// This is safe for exactly the reason theorystate.md section 10c gives
+// for Representation D generally: M's subject and target are both
+// discovered entirely by tag, with no exclusion list at all, so M
+// remains free to carry any number of additional tagged children --
+// including U3 -- without disturbing either discovery.
+//
+// Unlike DomainPointerRegistryB, this type registers a commit-time
+// Checker (see NewDomainPointerRegistryD) in addition to write-time
+// enforcement in SetTarget/SetDomain below: M is self-identifying via
+// its own AllPointerMetadata tag, which lets the Checker reverse-
+// discover M from either a touched target-slot or a touched domain-slot
+// node, using the exact same findUniqueTaggedParent lookup
+// locateBySubjectSlot already uses one hop further out. See
+// DomainPointerRegistryB's doc comment for why this reverse-discovery
+// path is not available in the general Representation B case.
+type DomainPointerRegistryD struct {
+	domainConstraint
+	metadata *PointerMetadataRegistryD
+}
+
+// NewDomainPointerRegistryD creates a DomainPointerRegistryD over graph,
+// domain-constraining targets set through metadata (a pre-constructed
+// PointerMetadataRegistryD). domainSlots, sets, composites, and logs are
+// exactly as for NewDomainPointerRegistryB -- domainSlots in particular
+// should be the same shared instance passed there, if both exist in the
+// same graph.
+//
+// This additionally registers a Checker (see Graph.RegisterChecker)
+// enforcing domain-membership at commit time for any node tagged
+// metadata's own target-slot tag or the shared AllDomainSlot tag: for
+// each such touched node, it reverse-discovers the owning metadata node
+// M (via findUniqueTaggedParent against metadata's own AllPointerMetadata
+// tag -- the same lookup locateBySubjectSlot already performs one hop
+// further out, applied here directly against a slot rather than via a
+// subject), then re-validates M's current target against M's current
+// domain, catching a caller bypassing this type and mutating the
+// underlying PointerMetadataRegistryD or the shared domainSlots registry
+// directly through either one.
+func NewDomainPointerRegistryD(graph *Graph, metadata *PointerMetadataRegistryD, domainSlots *PointerRegistry, sets *SetRegistry, composites *CompositeSetRegistry, logs *CompositeSetLogRegistry) *DomainPointerRegistryD {
+	d := &DomainPointerRegistryD{
+		domainConstraint: domainConstraint{
+			graph:       graph,
+			domainSlots: domainSlots,
+			sets:        sets,
+			composites:  composites,
+			logs:        logs,
+		},
+		metadata: metadata,
+	}
+
+	graph.RegisterChecker(Checker{
+		Name: fmt.Sprintf("DomainPointerRegistryD(tag=%d)", domainSlots.allPointers),
+		Tags: []NodeID{metadata.allTargetSlots, domainSlots.allPointers},
+		Check: func(g *Graph, touched map[NodeID]struct{}) error {
+			anchors := make(map[NodeID]struct{})
+
+			for node := range touched {
+				if !g.HasRelationship(metadata.allTargetSlots, node) && !g.HasRelationship(domainSlots.allPointers, node) {
+					continue
+				}
+
+				m, found, err := findUniqueTaggedParent(g, node, metadata.allPointerMetadata)
+				if err != nil {
+					return err
+				}
+				if found {
+					anchors[m] = struct{}{}
+				}
+			}
+
+			for m := range anchors {
+				slot, found, err := metadata.targetSlot(m)
+				if err != nil {
+					return err
+				}
+				if !found {
+					continue
+				}
+
+				target, hasTarget, err := singleChildTarget(g, slot)
+				if err != nil {
+					return err
+				}
+				if !hasTarget {
+					continue
+				}
+
+				if err := d.checkAllowed(m, target); err != nil {
+					return err
+				}
+			}
+
+			return nil
+		},
+	})
+
+	return d
+}
+
+// Target returns subject's current target, delegating directly to the
+// underlying PointerMetadataRegistryD.
+func (d *DomainPointerRegistryD) Target(subject NodeID) (target NodeID, hasTarget bool, err error) {
+	return d.metadata.Target(subject)
+}
+
+// SetTarget sets subject's target to target, first validating target
+// against subject's currently attached domain, if any (see
+// domainConstraint.checkAllowed), before delegating to the underlying
+// PointerMetadataRegistryD.SetTarget.
+//
+// A subject with no metadata node at all yet cannot possibly have a
+// domain attached, so this skips the domain check entirely in that case
+// rather than forcing metadata into existence merely to discover there
+// is nothing to check -- exactly the same "read-only, don't create"
+// discipline PointerMetadataRegistryD.Target itself already follows.
+func (d *DomainPointerRegistryD) SetTarget(subject, target NodeID) error {
+	if !d.graph.NodeExists(target) {
+		return ErrNodeNotFound
+	}
+
+	m, _, found, err := d.metadata.locate(subject)
+	if err != nil {
+		return err
+	}
+	if found {
+		if err2 := d.checkAllowed(m, target); err2 != nil {
+			return err2
+		}
+	}
+
+	return d.metadata.SetTarget(subject, target)
+}
+
+// RemoveTarget clears subject's target, if any, delegating directly to
+// the underlying PointerMetadataRegistryD.
+func (d *DomainPointerRegistryD) RemoveTarget(subject NodeID) (removed bool, err error) {
+	return d.metadata.RemoveTarget(subject)
+}
+
+// Domain returns subject's current domain node, if any, resolving
+// subject's metadata node M first via the underlying
+// PointerMetadataRegistryD's own subject-side lookup. hasDomain is false
+// if subject has no metadata node at all yet, in addition to
+// domainConstraint.Domain's own "no domain slot" and "no domain set"
+// cases.
+func (d *DomainPointerRegistryD) Domain(subject NodeID) (domain NodeID, hasDomain bool, err error) {
+	m, _, found, err := d.metadata.locate(subject)
+	if err != nil || !found {
+		return 0, false, err
+	}
+
+	return d.domainConstraint.Domain(m)
+}
+
+// SetDomain sets subject's domain to domain, creating subject's metadata
+// node first if it does not exist yet, and additionally validating that
+// subject's current target (if any) still belongs to domain before
+// committing -- symmetric with SetTarget's own validation against the
+// current domain.
+func (d *DomainPointerRegistryD) SetDomain(subject, domain NodeID) error {
+	m, err := d.metadata.EnsureMetadata(subject)
+	if err != nil {
+		return err
+	}
+
+	target, hasTarget, err := d.metadata.Target(subject)
+	if err != nil {
+		return err
+	}
+
+	if hasTarget {
+		if err2 := d.validateMembership(domain, target); err2 != nil {
+			return err2
+		}
+	}
+
+	return d.domainConstraint.SetDomain(m, domain)
+}
+
+// RemoveDomain clears subject's domain, if any, resolving subject's
+// metadata node M first. removed is false if subject has no metadata
+// node at all yet, in addition to domainConstraint.RemoveDomain's own
+// "no domain slot" case.
+func (d *DomainPointerRegistryD) RemoveDomain(subject NodeID) (removed bool, err error) {
+	m, _, found, err := d.metadata.locate(subject)
+	if err != nil || !found {
+		return false, err
+	}
+
+	return d.domainConstraint.RemoveDomain(m)
 }
