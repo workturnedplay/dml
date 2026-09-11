@@ -8985,19 +8985,19 @@ func TestCrossRoleNodeParticipatesInMultipleStructuresSimultaneously(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := fx.sets.Add(s, m1); err != nil {
-		t.Fatalf("Add(s, m1): %v", err)
+	if _, err2 := fx.sets.Add(s, m1); err2 != nil {
+		t.Fatalf("Add(s, m1): %v", err2)
 	}
-	if _, err := fx.sets.Add(s, m2); err != nil {
-		t.Fatalf("Add(s, m2): %v", err)
+	if _, err3 := fx.sets.Add(s, m2); err3 != nil {
+		t.Fatalf("Add(s, m2): %v", err3)
 	}
 
 	list, err := fx.lists.NewList()
 	if err != nil {
 		t.Fatalf("NewList(): %v", err)
 	}
-	if _, err := fx.lists.Append(list, s); err != nil {
-		t.Fatalf("Append(list, s): %v", err)
+	if _, err4 := fx.lists.Append(list, s); err4 != nil {
+		t.Fatalf("Append(list, s): %v", err4)
 	}
 
 	// S must still behave as an ordinary Set: being a list element
@@ -9024,8 +9024,8 @@ func TestCrossRoleNodeParticipatesInMultipleStructuresSimultaneously(t *testing.
 	if err != nil {
 		t.Fatalf("NewCompositeSet(): %v", err)
 	}
-	if _, err := fx.composites.AddOperand(composite, s, true, true); err != nil {
-		t.Fatalf("AddOperand(composite, s, additive, expand): %v", err)
+	if _, err5 := fx.composites.AddOperand(composite, s, true, true); err5 != nil {
+		t.Fatalf("AddOperand(composite, s, additive, expand): %v", err5)
 	}
 
 	evaluated, err := fx.composites.Evaluate(composite)
@@ -9040,8 +9040,8 @@ func TestCrossRoleNodeParticipatesInMultipleStructuresSimultaneously(t *testing.
 	if err != nil {
 		t.Fatalf("NewPointer(): %v", err)
 	}
-	if err := fx.pointers.SetTarget(p, list); err != nil {
-		t.Fatalf("SetTarget(p, list): %v", err)
+	if err6 := fx.pointers.SetTarget(p, list); err6 != nil {
+		t.Fatalf("SetTarget(p, list): %v", err6)
 	}
 
 	target, hasTarget, err := fx.pointers.Target(p)
@@ -9054,8 +9054,8 @@ func TestCrossRoleNodeParticipatesInMultipleStructuresSimultaneously(t *testing.
 
 	// The list must still behave as an ordinary list despite also being
 	// a Pointer's target.
-	if _, hasHead, err := fx.lists.Head(list); err != nil {
-		t.Fatalf("Head(list) after list became a pointer target: %v", err)
+	if _, hasHead, err11 := fx.lists.Head(list); err11 != nil {
+		t.Fatalf("Head(list) after list became a pointer target: %v", err11)
 	} else if !hasHead {
 		t.Fatal("Head(list) unexpectedly empty after list became a pointer target")
 	}
@@ -9064,12 +9064,12 @@ func TestCrossRoleNodeParticipatesInMultipleStructuresSimultaneously(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := fx.domainD.SetDomain(subject, composite); err != nil {
-		t.Fatalf("SetDomain(subject, composite): %v", err)
+	if err7 := fx.domainD.SetDomain(subject, composite); err7 != nil {
+		t.Fatalf("SetDomain(subject, composite): %v", err7)
 	}
 
-	if err := fx.domainD.SetTarget(subject, m1); err != nil {
-		t.Fatalf("SetTarget(subject, m1) within domain: %v", err)
+	if err8 := fx.domainD.SetTarget(subject, m1); err8 != nil {
+		t.Fatalf("SetTarget(subject, m1) within domain: %v", err8)
 	}
 
 	outside, err := fx.graph.CreateNode()
@@ -9089,11 +9089,11 @@ func TestCrossRoleNodeParticipatesInMultipleStructuresSimultaneously(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := fx.sets.Add(s, m3); err != nil {
-		t.Fatalf("Add(s, m3): %v", err)
+	if _, err9 := fx.sets.Add(s, m3); err9 != nil {
+		t.Fatalf("Add(s, m3): %v", err9)
 	}
-	if err := fx.domainD.SetTarget(subject, m3); err != nil {
-		t.Fatalf("SetTarget(subject, m3) after S gained a new member live: %v", err)
+	if err10 := fx.domainD.SetTarget(subject, m3); err10 != nil {
+		t.Fatalf("SetTarget(subject, m3) after S gained a new member live: %v", err10)
 	}
 }
 
@@ -9135,53 +9135,53 @@ func TestCrossRoleDomainPointerDetectsCycleIntroducedThroughDomainItself(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := fx.sets.Add(s, x); err != nil {
-		t.Fatalf("Add(s, x): %v", err)
+	if _, err2 := fx.sets.Add(s, x); err2 != nil {
+		t.Fatalf("Add(s, x): %v", err2)
 	}
 
 	log1, err := fx.logs.NewCompositeSetLog()
 	if err != nil {
 		t.Fatalf("NewCompositeSetLog(): %v", err)
 	}
-	if _, _, err := fx.logs.AppendOperation(log1, s, true, true); err != nil {
-		t.Fatalf("AppendOperation(log1, s, additive, expand): %v", err)
+	if _, _, err3 := fx.logs.AppendOperation(log1, s, true, true); err3 != nil {
+		t.Fatalf("AppendOperation(log1, s, additive, expand): %v", err3)
 	}
 
 	composite, err := fx.composites.NewCompositeSet()
 	if err != nil {
 		t.Fatalf("NewCompositeSet(): %v", err)
 	}
-	if _, err := fx.composites.AddOperand(composite, log1, true, true); err != nil {
-		t.Fatalf("AddOperand(composite, log1, additive, expand): %v", err)
+	if _, err4 := fx.composites.AddOperand(composite, log1, true, true); err4 != nil {
+		t.Fatalf("AddOperand(composite, log1, additive, expand): %v", err4)
 	}
 
 	subject, err := fx.graph.CreateNode()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := fx.domainD.SetDomain(subject, composite); err != nil {
-		t.Fatalf("SetDomain(subject, composite): %v", err)
+	if err5 := fx.domainD.SetDomain(subject, composite); err5 != nil {
+		t.Fatalf("SetDomain(subject, composite): %v", err5)
 	}
 
 	// Before the cycle exists, x is legitimately reachable through
 	// composite -> log1 -> s, so this must succeed.
-	if err := fx.domainD.SetTarget(subject, x); err != nil {
-		t.Fatalf("SetTarget(subject, x) before cycle introduced: %v", err)
+	if err6 := fx.domainD.SetTarget(subject, x); err6 != nil {
+		t.Fatalf("SetTarget(subject, x) before cycle introduced: %v", err6)
 	}
 
 	// Introduce the cycle purely through the domain's own structure:
 	// log1 now also expands composite, which itself expands log1.
 	// Neither subject, its metadata, nor either slot is touched by this
 	// call.
-	if _, _, err := fx.logs.AppendOperation(log1, composite, true, true); err != nil {
-		t.Fatalf("AppendOperation(log1, composite, additive, expand): %v", err)
+	if _, _, err7 := fx.logs.AppendOperation(log1, composite, true, true); err7 != nil {
+		t.Fatalf("AppendOperation(log1, composite, additive, expand): %v", err7)
 	}
 
 	// A direct, independent confirmation that the underlying composite
 	// machinery itself now reports the cycle -- not something specific
 	// to the domain-pointer wrapper.
-	if _, err := fx.composites.Evaluate(composite); !errors.Is(err, ErrCompositeSetCycle) {
-		t.Fatalf("Evaluate(composite) after introducing cycle: error = %v, want %v", err, ErrCompositeSetCycle)
+	if _, err8 := fx.composites.Evaluate(composite); !errors.Is(err8, ErrCompositeSetCycle) {
+		t.Fatalf("Evaluate(composite) after introducing cycle: error = %v, want %v", err8, ErrCompositeSetCycle)
 	}
 
 	// The domain pointer's own SetTarget must surface the same cycle
@@ -9260,18 +9260,18 @@ func TestCrossRoleCorruptedLoggedOperandDoesNotCorruptSiblingStructures(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := fx.graph.AddRelationship(u2, extra); err != nil {
-		t.Fatalf("AddRelationship(u2, extra) [out-of-band corruption]: %v", err)
+	if _, err2 := fx.graph.AddRelationship(u2, extra); err2 != nil {
+		t.Fatalf("AddRelationship(u2, extra) [out-of-band corruption]: %v", err2)
 	}
 
 	// Evaluate/Contains must fail specifically because of u2's now-
 	// invalid shape, not because anything about the list itself is
 	// wrong.
-	if _, err := fx.logs.Evaluate(log); !errors.Is(err, ErrTooManyPointerTargets) {
-		t.Fatalf("Evaluate(log) after corrupting u2: error = %v, want %v", err, ErrTooManyPointerTargets)
+	if _, err3 := fx.logs.Evaluate(log); !errors.Is(err3, ErrTooManyPointerTargets) {
+		t.Fatalf("Evaluate(log) after corrupting u2: error = %v, want %v", err3, ErrTooManyPointerTargets)
 	}
-	if _, err := fx.logs.Contains(log, x1); !errors.Is(err, ErrTooManyPointerTargets) {
-		t.Fatalf("Contains(log, x1) after corrupting u2: error = %v, want %v (backward scan reaches the corrupted u2 first)", err, ErrTooManyPointerTargets)
+	if _, err4 := fx.logs.Contains(log, x1); !errors.Is(err4, ErrTooManyPointerTargets) {
+		t.Fatalf("Contains(log, x1) after corrupting u2: error = %v, want %v (backward scan reaches the corrupted u2 first)", err4, ErrTooManyPointerTargets)
 	}
 
 	// Operations() must still succeed: it is built on ListRegistry.Elements,
@@ -9314,8 +9314,8 @@ func TestCrossRoleCorruptedLoggedOperandDoesNotCorruptSiblingStructures(t *testi
 	if err != nil {
 		t.Fatalf("NewCompositeSet(): %v", err)
 	}
-	if _, err := fx.composites.AddOperand(unrelated, x1, true, false); err != nil {
-		t.Fatalf("AddOperand(unrelated, x1, additive, scalar): %v", err)
+	if _, err5 := fx.composites.AddOperand(unrelated, x1, true, false); err5 != nil {
+		t.Fatalf("AddOperand(unrelated, x1, additive, scalar): %v", err5)
 	}
 	got, err := fx.composites.Evaluate(unrelated)
 	if err != nil {
