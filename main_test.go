@@ -9096,3 +9096,232 @@ func TestCrossRoleNodeParticipatesInMultipleStructuresSimultaneously(t *testing.
 		t.Fatalf("SetTarget(subject, m3) after S gained a new member live: %v", err)
 	}
 }
+
+// TestCrossRoleDomainPointerDetectsCycleIntroducedThroughDomainItself is
+// the second cross-role test: it builds a Domain Pointer whose domain is
+// a CompositeSet that resolves through a CompositeSetLog, and confirms
+// that a cycle introduced later -- purely by mutating the domain
+// structure itself, never the pointer, its metadata, or either slot
+// directly -- surfaces through domain validation as ErrCompositeSetCycle
+// specifically, not as ErrTargetOutsideDomain or a silent false negative.
+// This exercises theorystate.md section 83's cross-representation cycle
+// detection through an integration point that was not previously tested
+// anywhere: a Domain Pointer's write-time validateMembership call
+// dispatching into that same cycle-detecting resolution path
+// (domainContainsGeneric -> CompositeSetRegistry.Contains -> evaluate ->
+// resolveSetOperandGeneric -> CompositeSetLogRegistry.evaluate ->
+// resolveSetOperandGeneric, back into the CompositeSet that started it).
+//
+// This is also a concrete instance of theorystate.md section 86's
+// documented gap: introducing the cycle here (via
+// logs.AppendOperation(log1, composite, ...)) touches only log1 and
+// composite. It never touches subject, subject's metadata node, the
+// domain slot, or the target slot -- so DomainPointerRegistryD's own
+// commit-time Checker (keyed on exactly those two tags) does not and
+// structurally cannot fire on this mutation. The cycle is only ever
+// discovered the next time something -- here, a subsequent SetTarget --
+// actually asks the domain to validate membership. Section 86 already
+// names this non-local-dependency gap for domain-membership changes in
+// general; this test pins down that a cycle is a legitimate, concrete
+// instance of exactly that same gap, not a separate untested case.
+func TestCrossRoleDomainPointerDetectsCycleIntroducedThroughDomainItself(t *testing.T) {
+	fx := newDomainPointerTestFixture(t)
+
+	s, err := fx.sets.NewSet()
+	if err != nil {
+		t.Fatalf("NewSet(): %v", err)
+	}
+	x, err := fx.graph.CreateNode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fx.sets.Add(s, x); err != nil {
+		t.Fatalf("Add(s, x): %v", err)
+	}
+
+	log1, err := fx.logs.NewCompositeSetLog()
+	if err != nil {
+		t.Fatalf("NewCompositeSetLog(): %v", err)
+	}
+	if _, _, err := fx.logs.AppendOperation(log1, s, true, true); err != nil {
+		t.Fatalf("AppendOperation(log1, s, additive, expand): %v", err)
+	}
+
+	composite, err := fx.composites.NewCompositeSet()
+	if err != nil {
+		t.Fatalf("NewCompositeSet(): %v", err)
+	}
+	if _, err := fx.composites.AddOperand(composite, log1, true, true); err != nil {
+		t.Fatalf("AddOperand(composite, log1, additive, expand): %v", err)
+	}
+
+	subject, err := fx.graph.CreateNode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fx.domainD.SetDomain(subject, composite); err != nil {
+		t.Fatalf("SetDomain(subject, composite): %v", err)
+	}
+
+	// Before the cycle exists, x is legitimately reachable through
+	// composite -> log1 -> s, so this must succeed.
+	if err := fx.domainD.SetTarget(subject, x); err != nil {
+		t.Fatalf("SetTarget(subject, x) before cycle introduced: %v", err)
+	}
+
+	// Introduce the cycle purely through the domain's own structure:
+	// log1 now also expands composite, which itself expands log1.
+	// Neither subject, its metadata, nor either slot is touched by this
+	// call.
+	if _, _, err := fx.logs.AppendOperation(log1, composite, true, true); err != nil {
+		t.Fatalf("AppendOperation(log1, composite, additive, expand): %v", err)
+	}
+
+	// A direct, independent confirmation that the underlying composite
+	// machinery itself now reports the cycle -- not something specific
+	// to the domain-pointer wrapper.
+	if _, err := fx.composites.Evaluate(composite); !errors.Is(err, ErrCompositeSetCycle) {
+		t.Fatalf("Evaluate(composite) after introducing cycle: error = %v, want %v", err, ErrCompositeSetCycle)
+	}
+
+	// The domain pointer's own SetTarget must surface the same cycle
+	// error, not silently succeed and not misreport it as
+	// ErrTargetOutsideDomain.
+	err = fx.domainD.SetTarget(subject, x)
+	if !errors.Is(err, ErrCompositeSetCycle) {
+		t.Fatalf("SetTarget(subject, x) after cycle introduced: error = %v, want %v", err, ErrCompositeSetCycle)
+	}
+
+	// Domain() itself must remain unaffected: it only reads the domain
+	// slot's stored target, never evaluates anything, so it must keep
+	// reporting composite regardless of composite's own current
+	// evaluability.
+	domain, hasDomain, err := fx.domainD.Domain(subject)
+	if err != nil {
+		t.Fatalf("Domain(subject) after cycle introduced: %v", err)
+	}
+	if !hasDomain || domain != composite {
+		t.Fatalf("Domain(subject) = (%d,%v), want (%d,true) -- Domain() must not itself evaluate membership", domain, hasDomain, composite)
+	}
+}
+
+// TestCrossRoleCorruptedLoggedOperandDoesNotCorruptSiblingStructures is
+// the third cross-role test, and the first deliberately built around
+// mid-composition corruption rather than composition alone: it appends
+// two operations to a CompositeSetLog, corrupts the second operation's
+// descriptor out-of-band (giving it two operand targets, violating the
+// shared operand-descriptor's own "exactly one operand" shape), and
+// confirms the resulting failure is scoped exactly to Evaluate/Contains
+// -- the two operations that must resolve every descriptor -- and does
+// not leak into or corrupt any of: the underlying List's own structural
+// validity, a completely unrelated CompositeSet sharing no structure
+// with the corrupted log, or the first (uncorrupted) logged operation.
+//
+// This is a direct exercise of theorystate.md section 7a's claim that a
+// fact's meaning belongs entirely to whichever processor interprets it:
+// corrupting a node in its role as an operand descriptor must not be
+// visible to ListRegistry, which interprets the exact same capsule chain
+// under a completely different, narrower contract (structural list
+// validity only, never descriptor shape) -- ListRegistry.Elements/Head/
+// Tail have no reason to know or care that a capsule's value happens to
+// also be a CompositeSetLog operand descriptor.
+func TestCrossRoleCorruptedLoggedOperandDoesNotCorruptSiblingStructures(t *testing.T) {
+	fx := newDomainPointerTestFixture(t)
+
+	log, err := fx.logs.NewCompositeSetLog()
+	if err != nil {
+		t.Fatalf("NewCompositeSetLog(): %v", err)
+	}
+
+	x1, err := fx.graph.CreateNode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	x2, err := fx.graph.CreateNode()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	u1, capsule1, err := fx.logs.AppendOperation(log, x1, true, false)
+	if err != nil {
+		t.Fatalf("AppendOperation(log, x1): %v", err)
+	}
+	u2, capsule2, err := fx.logs.AppendOperation(log, x2, true, false)
+	if err != nil {
+		t.Fatalf("AppendOperation(log, x2): %v", err)
+	}
+
+	// Corrupt only u2, entirely out-of-band: give it a second outgoing
+	// relationship, violating operandTargetGeneric/resolveOperandGeneric's
+	// shared "exactly one operand target" assumption for u2 specifically.
+	// u1, capsule1, capsule2, and log's own head/tail/next/prev structure
+	// are all left completely untouched by this.
+	extra, err := fx.graph.CreateNode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fx.graph.AddRelationship(u2, extra); err != nil {
+		t.Fatalf("AddRelationship(u2, extra) [out-of-band corruption]: %v", err)
+	}
+
+	// Evaluate/Contains must fail specifically because of u2's now-
+	// invalid shape, not because anything about the list itself is
+	// wrong.
+	if _, err := fx.logs.Evaluate(log); !errors.Is(err, ErrTooManyPointerTargets) {
+		t.Fatalf("Evaluate(log) after corrupting u2: error = %v, want %v", err, ErrTooManyPointerTargets)
+	}
+	if _, err := fx.logs.Contains(log, x1); !errors.Is(err, ErrTooManyPointerTargets) {
+		t.Fatalf("Contains(log, x1) after corrupting u2: error = %v, want %v (backward scan reaches the corrupted u2 first)", err, ErrTooManyPointerTargets)
+	}
+
+	// Operations() must still succeed: it is built on ListRegistry.Elements,
+	// which only cares about capsule/value-slot structure, never about
+	// what a value's own further relationships happen to mean under some
+	// other registry's interpretation.
+	ops, err := fx.logs.Operations(log)
+	if err != nil {
+		t.Fatalf("Operations(log) after corrupting u2: %v", err)
+	}
+	if want := []NodeID{u1, u2}; !reflect.DeepEqual(ops, want) {
+		t.Fatalf("Operations(log) = %v, want %v -- corrupting u2's shape must not disturb list-level ordering", ops, want)
+	}
+
+	// The underlying List's own head/tail must likewise be completely
+	// unaffected: ListRegistry never inspects a value's own outgoing
+	// relationships at all.
+	head, hasHead, err := fx.lists.Head(log)
+	if err != nil {
+		t.Fatalf("Head(log) after corrupting u2: %v", err)
+	}
+	if !hasHead || head != capsule1 {
+		t.Fatalf("Head(log) = (%d,%v), want (%d,true)", head, hasHead, capsule1)
+	}
+	tail, hasTail, err := fx.lists.Tail(log)
+	if err != nil {
+		t.Fatalf("Tail(log) after corrupting u2: %v", err)
+	}
+	if !hasTail || tail != capsule2 {
+		t.Fatalf("Tail(log) = (%d,%v), want (%d,true)", tail, hasTail, capsule2)
+	}
+
+	// u1's own shape is untouched, so a completely independent
+	// CompositeSet built from scratch -- sharing no node with log at all
+	// except reusing x1 as an ordinary scalar operand -- must evaluate
+	// normally, confirming the corruption did not leak into shared
+	// registry-level state (e.g. some cached axis lookup) rather than
+	// staying scoped to u2 itself.
+	unrelated, err := fx.composites.NewCompositeSet()
+	if err != nil {
+		t.Fatalf("NewCompositeSet(): %v", err)
+	}
+	if _, err := fx.composites.AddOperand(unrelated, x1, true, false); err != nil {
+		t.Fatalf("AddOperand(unrelated, x1, additive, scalar): %v", err)
+	}
+	got, err := fx.composites.Evaluate(unrelated)
+	if err != nil {
+		t.Fatalf("Evaluate(unrelated) after corrupting an unrelated log's operand: %v", err)
+	}
+	if want := []NodeID{x1}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("Evaluate(unrelated) = %v, want %v", got, want)
+	}
+}
