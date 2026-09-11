@@ -1979,8 +1979,175 @@ Three options were considered:
    structure — a larger, more surprising behavioral change than either
    option above, and not adopted.
 
-Option 1 stands as the current implementation choice; option 2 is the
-recorded direction for closing this gap later.
+Option 1 stands as the current implementation choice; option 2 is the recorded direction for closing this gap later.
+
+---
+
+## PART F — STORAGE BACKEND ABSTRACTION (new this session; mostly OPEN)
+
+This part records a design discussion, not yet implemented in any part,
+about whether `Graph`'s storage should be pluggable across more than one
+concrete backend (the toy in-memory maps used today; a networked,
+multi-writer store such as etcd; a networked, transactional store such as
+SpacetimeDB), and what that plurality does and does not force onto the
+rest of the design. Per §33's discipline, the three questions this
+raises — whether the storage surface should be an interface at all,
+whether a running program should be able to switch backends after it
+starts, and what happens to concurrency once a second backend exists —
+are kept separate below rather than treated as one problem, because they
+turn out to have very different levels of settledness.
+
+## 87. Extracting a storage interface from `Graph`'s existing public surface — DECIDED, pure refactor, no semantic change
+
+**SEMANTIC / REPRESENTATION separation.** Nothing above `Graph` in this
+file — `NameRegistry`, `PointerRegistry`, `PointerMetadataRegistry(D)`,
+`CapsuleRegistry`, `ListRegistry`, `SetRegistry`, `CompositeSetRegistry`,
+`CompositeSetLogRegistry`, `domainConstraint`/`DomainPointerRegistryB`/
+`DomainPointerRegistryD` — ever reaches into `Graph`'s private
+`nodes`/`outgoing`/`incoming` maps. Every one of them is already written
+entirely against `Graph`'s existing public method set: `CreateNode`,
+`NodeExists`, `AddRelationship`, `RemoveRelationship`, `HasRelationship`,
+`FindRelationship`, `FindOutgoing`, `FindIncoming`, `FindRelationships`,
+`DeleteNode`, plus `Transact`/`RegisterChecker`. This means an interface
+carved out of exactly that method set can be substituted for the
+concrete `*Graph` type everywhere above it with zero change to any
+registry's own logic — this is a pure decoupling refactor, not a new
+abstraction being invented, and costs nothing today: no new foundational
+name, no new tag, no behavioral change, every existing test continues to
+exercise the same code paths.
+
+**Why do this now, ahead of an actual second backend, when §7's
+discipline says construct only what has a current caller?** Because the
+"current caller" here is not a hypothetical etcd/SpacetimeDB backend — it
+is the ability to substitute a minimal in-memory fake for `*Graph` when
+testing a registry in isolation, and the ability to make the eventual
+§88/§89 questions below answerable in code without first tearing up a
+dozen struct field types. Both of those are real, present-tense benefits
+independent of whether a second backend is ever built at all.
+
+**§87a — Concrete surface to extract (TENTATIVE naming; not yet
+implemented).** The interface should cover exactly `Graph`'s current
+public method set, unchanged in signature: `CreateNode() (NodeID,
+error)`, `NodeExists(NodeID) bool`, `AddRelationship(a, b NodeID) (bool,
+error)`, `RemoveRelationship(a, b NodeID) (bool, error)`,
+`HasRelationship(a, b NodeID) bool`, `FindRelationship(from, to NodeID)
+(Relationship, bool, error)`, `FindOutgoing(NodeID) ([]Relationship,
+error)`, `FindIncoming(NodeID) ([]Relationship, error)`,
+`FindRelationships() []Relationship`, `DeleteNode(NodeID) error`.
+`Transact`/`RegisterChecker` are a separate concern from raw storage (see
+§89a) and should not be assumed to belong on the same interface without
+first resolving §89. The existing concrete type (today's `Graph`) would
+become one implementation of this interface — an in-memory one — under
+whatever name distinguishes it from the interface itself (e.g. the
+interface keeps the `Graph` name and the concrete type is renamed, or
+vice versa); this naming choice is deliberately left open until the
+refactor is actually written, since it has no bearing on the design
+questions below.
+
+## 88. Backend selection timing: fixed at construction vs. swappable at runtime — OPEN, leaning fixed-at-construction
+
+**OPEN.** Two options: (a) a program picks one backend when it
+constructs its `Graph`/storage-interface value, and that choice is fixed
+for the process's lifetime; (b) the backend can be changed while the
+program is running, with existing state migrated across.
+
+Leaning toward (a), for a reason with a direct precedent already recorded
+in this document: §61 faced an analogous "is this decided once and
+fixed, or does it need to be changed after the fact" question for
+NodeID width, and resolved it by separating the *philosophical* question
+(is this compatible with the layering at all) from the *cost* question
+(is it worth paying for by default) — here, (b) is not merely expensive,
+it is a materially different and harder problem than (a): migrating
+every existing node, relationship, and registered `Checker` from one
+backend's representation to another's, live, while possibly still
+serving reads, is closer in shape to Part C's still-unresolved
+cross-graph correspondence/first-contact material than it is to a simple
+interface swap. There is no current caller motivating (b) — no part of
+this project needs a running program to change its backing store
+mid-execution — so per §7 this is deferred rather than designed now, the
+same way §45 (nested transactions) and §63 (GraphID allocation) are
+named and left open rather than either solved or silently dropped.
+
+## 89. Concurrency is a per-backend contract, not a universal layer added uniformly on top of all three — DECIDED (design direction), not yet implemented
+
+**The premise this section corrects.** It would be a mistake to treat
+"add concurrency support" as one more layer sitting above the storage
+interface, applied identically regardless of which backend is
+underneath. `Txn`'s own doc comment states its rollback approach is sound
+specifically because "nothing else runs between two statements in the
+same synchronous call"; `Checker`'s own doc comment gives the identical
+justification for running checks against the real, already-mutated
+`Graph` rather than a staged overlay; and §19/§19a/§77's resolution note
+all name this single-threaded execution model as the explicit,
+load-bearing premise the current implementation rests on, deferred
+rather than solved. That premise is true of the in-memory backend today
+(modulo §89b below) precisely *because* nothing else can write to a
+private Go map except this process's own single call stack. It is false,
+by construction, for a backend like etcd or SpacetimeDB, whose entire
+purpose is that other writers — possibly on other machines — can act
+between any two operations this process performs. Concurrency is
+therefore not something the storage-interface layer needs to add on top
+of a backend; it is a property the backend either already has
+(networked, multi-writer stores) or explicitly does not (the current
+in-memory maps), and the design must not assume one mechanism transfers.
+
+**§89a — The contract, not the mechanism, is what the interface boundary
+should fix.** The right boundary is a *contract*, not a *mechanism*:
+whatever exposes atomic multi-step operations at the interface level
+should promise "either every operation in this batch becomes visible, or
+none do, and every `Checker` relevant to what changed has approved
+before this reports success" — without mandating the undo-log/rollback
+technique as part of that promise. Each backend earns the right to
+satisfy the contract its own way:
+
+- the in-memory backend keeps exactly what it has today (undo-log
+  rollback, `Checker`s run against the already-mutated graph);
+- an etcd-backed implementation would most naturally use etcd's own
+  compare-and-swap transaction primitive (submit conditioned on the read
+  revision not having moved, retry on conflict) — there is nothing to
+  "roll back" in the undo-log sense, because a losing transaction never
+  committed anything in the first place, and any `Checker` invariant
+  would need to be part of what the CAS condition itself guards, not a
+  step run afterward the way it is today;
+- a SpacetimeDB-backed implementation would most naturally delegate
+  directly to a reducer call, whose own commit/abort semantics already
+  provide the atomicity — reimplementing rollback on top would be
+  redundant machinery layered over machinery that already does the job.
+
+**§89b — A related but distinct, already-existing gap: the in-memory
+backend has no protection against concurrent goroutine misuse,
+independent of whether any second backend is ever added.** `Graph`'s
+`nodes`/`outgoing`/`incoming` maps are plain, unsynchronized Go maps;
+nothing today prevents two goroutines from calling into the same
+`*Graph` concurrently, which would be an ordinary data race, not merely
+an unsupported use case. This is a narrower, same-process version of the
+concern §19a already names for multiple processors sharing one graph. It
+is independent of §87/§88/§89's storage-backend question — it would
+exist even if no second backend were ever built — but is recorded here
+because it is the concrete, present-tense instance of "what happens when
+more than one writer touches this backend," which is the same underlying
+question the networked backends raise at a larger scale. **Not yet
+decided:** whether to guard the in-memory backend with a mutex (cheap,
+but changes `Transact`'s current lock-free reasoning), document the
+single-goroutine assumption as an explicit constraint on callers
+(cheapest, but pushes the burden outward, mirroring §19's existing
+"deadlock avoidance belongs to the relevant abstraction level" framing),
+or leave it as an unstated assumption the way it is today (rejected as
+the status quo once this is named explicitly, since an unstated
+assumption invites exactly the kind of bug this document otherwise
+insists on naming rather than leaving implicit, per its own stated
+practice throughout Part C and D).
+
+**What this section does not decide.** Whether either etcd or
+SpacetimeDB is ever actually implemented as a backend (no current
+caller, per §7); the concrete Go shape of the `Transact`-equivalent
+contract once more than one backend exists; whether `Checker`'s `Check`
+function signature needs to change once `Graph` sits behind an interface
+(see §87a — likely yes, from `func(g *Graph, ...)` to `func(g
+GraphReader, ...)` or similar, but this is a mechanical consequence of
+§87, not a new decision); and how (or whether) §88's runtime-swap
+question and this section's per-backend-concurrency question interact,
+should §88 ever be revisited.
 
 ---
 
@@ -2056,6 +2223,11 @@ kept current as sections above resolve or split further.)*
   while B is write-time-only for now, since B's anchor carries no
   self-identifying tag a `Checker` could reverse-discover it from (§10c,
   implemented as `DomainPointerRegistryB`/`DomainPointerRegistryD`).
+- A storage interface should be extracted matching `Graph`'s existing
+  public method surface, so every higher-level registry depends on an
+  interface rather than the concrete `Graph` type; this is a pure
+  refactor with no semantic effect, since no registry currently reaches
+  past that surface (§87).
 
 ### TENTATIVE
 - Monotonically increasing NodeIDs; serialized first implementation.
@@ -2071,6 +2243,9 @@ kept current as sections above resolve or split further.)*
   and DECIDED-in-shape, now implemented as `CompositeSetRegistry` and
   `CompositeSetLogRegistry` respectively, validated by `dml`, sharing one
   operand-descriptor implementation (§80) as anticipated.
+- The concrete Go shape/naming of the extracted storage interface (§87a),
+  and which of `Transact`/`RegisterChecker` belong on it versus a
+  separate layer (§89a's contract-not-mechanism framing).
 
 ### OPEN
 - Exact Set/Pointer/List definitions; exact primitive storage; whether a
@@ -2107,6 +2282,18 @@ kept current as sections above resolve or split further.)*
   (implementation_state.md item 22).
 - Generalized "find the bridging node(s) given both path endpoints" query
   for arbitrary, not-necessarily-tag-shaped paths (§85).
+- Backend selection timing: fixed at construction vs. runtime-swappable,
+  and if the latter is ever pursued, how existing state would be
+  migrated live between backends (§88).
+- Which concurrency-control mechanism each future non-memory backend
+  (etcd's compare-and-swap transactions, SpacetimeDB's reducers, or
+  otherwise) should use to satisfy the `Transact`/`Checker` contract,
+  since the current undo-log/rollback mechanism is sound only under the
+  in-memory backend's single-threaded premise (§89, §89a).
+- Whether to guard the current in-memory backend against concurrent
+  goroutine misuse with a mutex, document the single-goroutine assumption
+  explicitly as a caller-facing constraint, or leave it unaddressed
+  (§89b).
 
 ### REJECTED FOR NOW
 - Giving primitive relationships their own NodeIDs.
