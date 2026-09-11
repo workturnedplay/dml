@@ -40,7 +40,10 @@ Completed milestones:
 4. ROOT virtual overlay semantics
 5. Consolidation into main.go / main_test.go
 
-Current next task:
+Current status and remaining tasks (historical note: everything through
+the four Pointer representations immediately below is completed work,
+kept here as context for the genuinely open items further down, not an
+active task list):
 - The Pointer processor is now implemented across all four
   representations described in theorystate.md section 10 / 10b
   (this bullet list replaces a
@@ -1167,3 +1170,45 @@ Currently unaddressed yet:
   goroutine access (theorystate.md section 89b) -- unaffected by item
   24's interface extraction, since that extraction only changes which
   type callers reference, not Graph's own synchronization.
+
+Explored and declined (implementation-level; the theory-level
+counterpart of this list is theorystate.md's own DECIDED/TENTATIVE/OPEN/
+REJECTED discipline -- this section exists so an approach that was tried
+and abandoned during implementation has a home distinct from both the
+numbered changelog above and the "currently unaddressed" list, rather
+than being buried inside whichever changelog entry happened to also fix
+it):
+- Inferring a composite-Set operand's expand-vs-scalar intent from the
+  operand node's own tags, instead of recording it explicitly per
+  descriptor -- rejected before any code was written, since it makes
+  "add a Set as a literal, unexpanded member of another Set"
+  (theorystate.md section 9a) inexpressible. See theorystate.md section
+  80's "Rejected first attempt" and items 17/18 above.
+- An untagged, "the slot has exactly one parent, full stop" helper for
+  CapsulesWithValue's reverse ownership lookup -- caught in review as
+  unsafe, not merely stricter than necessary, since a role-slot node may
+  legitimately acquire unrelated parents later (theorystate.md section
+  2.8). findUniqueTaggedParent's existing tag-filtered semantics were
+  reused instead of adding a new helper or error type. See item 13.
+- A read-only nodeIsEmpty pre-verification pass ahead of
+  CapsuleRegistry.DeleteCapsule's multi-node teardown, built on the
+  since-corrected belief that Txn could not undo a successful
+  Graph.DeleteNode call. Removed once Txn.DeleteNode was added; see item
+  15 and theorystate.md section 78 for the corrected reasoning.
+- Concurrent/bidirectional forward+backward search for composite-Set
+  Contains queries, considered as an analogue of
+  CapsuleRegistry.CapsulesWithValue's reverse lookup -- found not to
+  structurally transfer (the reverse edge set is not narrowly scoped the
+  way a value-slot's incoming edges are) and would reintroduce
+  concurrency-control machinery this project has otherwise deferred. See
+  theorystate.md section 84.
+- Naming this project's log-based composite Set representation
+  "OrderedCompositeSet" -- renamed to CompositeSetLogRegistry once it was
+  recognized that the original name wrongly implied first-class
+  insertion-order preservation rather than a replayable operation history
+  whose *fold* determines membership. See theorystate.md section 82.
+- Splitting CompositeSetLogRegistry.RemoveOperation's final descriptor
+  teardown across two separate Graph.Transact calls (clear edges, then a
+  raw, non-transactional Graph.DeleteNode) -- corrected to one Transact
+  call via the shared deleteOperandDescriptorTx helper once the
+  atomicity gap this left was found in review. See item 21.

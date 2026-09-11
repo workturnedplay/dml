@@ -8239,9 +8239,13 @@ func TestFoundationalNamesIncludesAllDomainSlot(t *testing.T) {
 // access away.
 type domainPointerTestFixture struct {
 	graph      *Graph
+	names      *NameRegistry
 	sets       *SetRegistry
 	composites *CompositeSetRegistry
 	logs       *CompositeSetLogRegistry
+	capsules   *CapsuleRegistry
+	lists      *ListRegistry
+	pointers   *PointerRegistry
 	domainB    *DomainPointerRegistryB
 	domainD    *DomainPointerRegistryD
 }
@@ -8314,6 +8318,11 @@ func newDomainPointerTestFixture(t *testing.T) *domainPointerTestFixture {
 	}
 	composites.SetLogs(logs)
 
+	pointers, err := NewPointerRegistry(&g, ids[NameAllPointers])
+	if err != nil {
+		t.Fatalf("NewPointerRegistry(AllPointers): %v", err)
+	}
+
 	subPointers, err := NewPointerRegistry(&g, ids[NameAllSubPointers])
 	if err != nil {
 		t.Fatalf("NewPointerRegistry(AllSubPointers): %v", err)
@@ -8334,9 +8343,13 @@ func newDomainPointerTestFixture(t *testing.T) *domainPointerTestFixture {
 
 	return &domainPointerTestFixture{
 		graph:      &g,
+		names:      names,
 		sets:       sets,
 		composites: composites,
 		logs:       logs,
+		capsules:   capsules,
+		lists:      lists,
+		pointers:   pointers,
 		domainB:    domainB,
 		domainD:    domainD,
 	}
@@ -8920,5 +8933,166 @@ func TestDomainPointerRegistryDCheckerCatchesOutOfBandDomainChange(t *testing.T)
 	}
 	if !hasDomain || domain != firstDomain {
 		t.Fatalf("Domain(subject) = (%d,%v), want (%d,true) -- unaffected by the declined bypass", domain, hasDomain, firstDomain)
+	}
+}
+
+// TestCrossRoleNodeParticipatesInMultipleStructuresSimultaneously is the
+// first of a planned "cross-registry adversarial" test family: instead
+// of testing one registry in isolation, it builds a small cluster of
+// nodes that each simultaneously participate in several different
+// higher-level interpretations at once, and checks that no registry's
+// own assumptions leak into another registry's behavior merely because
+// they happen to share a node. This is a direct exercise of
+// theorystate.md section 7a's "a fact never acquires a universal
+// semantic meaning merely because one processor gives it meaning"
+// principle, and of section 9a/68's claim that the same node identity
+// can participate in many roles without the primitive graph needing to
+// know about any of them.
+//
+// The scenario built here:
+//   - S is a plain Set with two ordinary members (m1, m2).
+//   - L is a List; S itself (not S's members) is appended as L's sole
+//     element value, so S is simultaneously a Set and a List element
+//     value.
+//   - C is a CompositeSet with one additive, set-expansion operand
+//     targeting S, so S is simultaneously a Set, a List element value,
+//     and a CompositeSet operand target.
+//   - P is a Representation A Pointer whose target is L, so L is
+//     simultaneously a List and a Pointer target.
+//   - A Representation D Domain Pointer's domain is set to C, and its
+//     target is validated against C's evaluated membership (which
+//     resolves recursively through S), so C is simultaneously a
+//     CompositeSet and a Domain Pointer's domain.
+//
+// Each higher-level operation below is checked to behave exactly as it
+// would in isolation, and the final step confirms that adding a new
+// member to S -- multiply-interpreted as it now is -- is immediately
+// visible through every layer built on top of it, with nothing needing
+// to be explicitly re-synced (every Evaluate/Members in this file is
+// deliberately never cached; theorystate.md sections 9a/35/81).
+func TestCrossRoleNodeParticipatesInMultipleStructuresSimultaneously(t *testing.T) {
+	fx := newDomainPointerTestFixture(t)
+
+	s, err := fx.sets.NewSet()
+	if err != nil {
+		t.Fatalf("NewSet(): %v", err)
+	}
+	m1, err := fx.graph.CreateNode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	m2, err := fx.graph.CreateNode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fx.sets.Add(s, m1); err != nil {
+		t.Fatalf("Add(s, m1): %v", err)
+	}
+	if _, err := fx.sets.Add(s, m2); err != nil {
+		t.Fatalf("Add(s, m2): %v", err)
+	}
+
+	list, err := fx.lists.NewList()
+	if err != nil {
+		t.Fatalf("NewList(): %v", err)
+	}
+	if _, err := fx.lists.Append(list, s); err != nil {
+		t.Fatalf("Append(list, s): %v", err)
+	}
+
+	// S must still behave as an ordinary Set: being a list element
+	// value must not disturb its own membership.
+	members, err := fx.sets.Members(s)
+	if err != nil {
+		t.Fatalf("Members(s) after s became a list value: %v", err)
+	}
+	wantMembers := sortedNodeIDs([]NodeID{m1, m2})
+	if got := sortedNodeIDs(members); !reflect.DeepEqual(got, wantMembers) {
+		t.Fatalf("Members(s) = %v, want %v", got, wantMembers)
+	}
+
+	// The list must correctly report S as its sole element's value.
+	elements, err := fx.lists.Elements(list)
+	if err != nil {
+		t.Fatalf("Elements(list): %v", err)
+	}
+	if want := []NodeID{s}; !reflect.DeepEqual(elements, want) {
+		t.Fatalf("Elements(list) = %v, want %v", elements, want)
+	}
+
+	composite, err := fx.composites.NewCompositeSet()
+	if err != nil {
+		t.Fatalf("NewCompositeSet(): %v", err)
+	}
+	if _, err := fx.composites.AddOperand(composite, s, true, true); err != nil {
+		t.Fatalf("AddOperand(composite, s, additive, expand): %v", err)
+	}
+
+	evaluated, err := fx.composites.Evaluate(composite)
+	if err != nil {
+		t.Fatalf("Evaluate(composite): %v", err)
+	}
+	if got := sortedNodeIDs(evaluated); !reflect.DeepEqual(got, wantMembers) {
+		t.Fatalf("Evaluate(composite) = %v, want %v (S's own members, resolved through the operand)", got, wantMembers)
+	}
+
+	p, err := fx.pointers.NewPointer()
+	if err != nil {
+		t.Fatalf("NewPointer(): %v", err)
+	}
+	if err := fx.pointers.SetTarget(p, list); err != nil {
+		t.Fatalf("SetTarget(p, list): %v", err)
+	}
+
+	target, hasTarget, err := fx.pointers.Target(p)
+	if err != nil {
+		t.Fatalf("Target(p): %v", err)
+	}
+	if !hasTarget || target != list {
+		t.Fatalf("Target(p) = (%d,%v), want (%d,true) -- Pointer target unaffected by list's other roles", target, hasTarget, list)
+	}
+
+	// The list must still behave as an ordinary list despite also being
+	// a Pointer's target.
+	if _, hasHead, err := fx.lists.Head(list); err != nil {
+		t.Fatalf("Head(list) after list became a pointer target: %v", err)
+	} else if !hasHead {
+		t.Fatal("Head(list) unexpectedly empty after list became a pointer target")
+	}
+
+	subject, err := fx.graph.CreateNode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fx.domainD.SetDomain(subject, composite); err != nil {
+		t.Fatalf("SetDomain(subject, composite): %v", err)
+	}
+
+	if err := fx.domainD.SetTarget(subject, m1); err != nil {
+		t.Fatalf("SetTarget(subject, m1) within domain: %v", err)
+	}
+
+	outside, err := fx.graph.CreateNode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = fx.domainD.SetTarget(subject, outside)
+	if !errors.Is(err, ErrTargetOutsideDomain) {
+		t.Fatalf("SetTarget(subject, outside) error = %v, want %v", err, ErrTargetOutsideDomain)
+	}
+
+	// Adding a new member to S -- simultaneously a Set, a list value,
+	// and a CompositeSet operand target -- must be immediately visible
+	// through the CompositeSet's own Evaluate, and therefore through the
+	// domain pointer's own membership check, live.
+	m3, err := fx.graph.CreateNode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fx.sets.Add(s, m3); err != nil {
+		t.Fatalf("Add(s, m3): %v", err)
+	}
+	if err := fx.domainD.SetTarget(subject, m3); err != nil {
+		t.Fatalf("SetTarget(subject, m3) after S gained a new member live: %v", err)
 	}
 }

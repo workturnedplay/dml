@@ -812,13 +812,23 @@ Universe
 Everything richer (Pointers, Sets, Lists) is built above this and unknown
 to the primitive layer.
 
-## 32. Current most important single-graph open question
+## 32. Current most important single-graph open question (superseded — see note)
+
+**Superseded note (added this revision).** The question below was
+resolved by §79: the minimal Set interpretation is DECIDED and
+implemented as `SetRegistry`. This section is kept, unedited below, as a
+historical record of the question as originally posed, rather than
+silently deleted or silently rewritten to look as if it were never
+open — do not treat it as reflecting current status. See §79 for the
+actual decision and its representation.
 
 > Given only NodeID existence and directed (A,B), what is the smallest
 > rigorous higher-level abstraction that deserves to be called a Set?
 
 (12 sub-questions preserved from v0.1 — membership, self-containment,
-multiplicity, invariants, etc. — unchanged, still open.)
+multiplicity, invariants, etc. — unchanged, still open as originally
+posed; see §79 for how the top-level question itself was ultimately
+resolved.)
 
 ## 33. Design discipline
 
