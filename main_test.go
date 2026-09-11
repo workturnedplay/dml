@@ -9325,3 +9325,113 @@ func TestCrossRoleCorruptedLoggedOperandDoesNotCorruptSiblingStructures(t *testi
 		t.Fatalf("Evaluate(unrelated) = %v, want %v", got, want)
 	}
 }
+
+// TestCrossRoleSetRegistryConflictCheckExercisedWhileSetIsDomainAndOperand
+// is the fourth cross-role test: it deliberately attempts to corrupt a
+// node that is simultaneously playing two other structural roles at
+// once -- a Domain Pointer's domain (theorystate.md section 9c/10c) and
+// a set-expansion operand of an unrelated CompositeSet (theorystate.md
+// section 80/81) -- to confirm that theorystate.md section 79's
+// mutual-exclusivity rule (a node may carry at most one of the three
+// Set-representation tags) is still correctly enforced by
+// SetRegistry.TagAsSet even while the node is load-bearing for two other
+// registries at once, and that a declined TagAsSet call disturbs neither
+// of those other two roles.
+//
+// The scenario: c is a CompositeSet (AllCompositeSets) holding one
+// scalar additive operand, x. c is used, unmodified, in two independent
+// roles simultaneously: as subject's domain (via DomainPointerRegistryD,
+// so subject's target must belong to c's evaluated membership {x}), and
+// as an additive, set-expansion operand of an entirely separate outer
+// CompositeSet (so outer's own evaluated membership also resolves
+// through c to {x}). Attempting sets.TagAsSet(c) at that point must be
+// rejected with ErrSetRepresentationConflict (c already carries
+// AllCompositeSets), must leave c untagged AllSets, and must leave both
+// of c's other two roles working exactly as before: subject's domain
+// pointer still validates against c, and outer's Evaluate still resolves
+// through c, unaffected by the failed tagging attempt.
+func TestCrossRoleSetRegistryConflictCheckExercisedWhileSetIsDomainAndOperand(t *testing.T) {
+	fx := newDomainPointerTestFixture(t)
+
+	c, err := fx.composites.NewCompositeSet()
+	if err != nil {
+		t.Fatalf("NewCompositeSet() for c: %v", err)
+	}
+
+	x, err := fx.graph.CreateNode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err2 := fx.composites.AddOperand(c, x, true, false); err2 != nil {
+		t.Fatalf("AddOperand(c, x, additive, scalar): %v", err2)
+	}
+
+	subject, err := fx.graph.CreateNode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err3 := fx.domainD.SetDomain(subject, c); err3 != nil {
+		t.Fatalf("SetDomain(subject, c): %v", err3)
+	}
+	if err4 := fx.domainD.SetTarget(subject, x); err4 != nil {
+		t.Fatalf("SetTarget(subject, x) within domain c: %v", err4)
+	}
+
+	outer, err := fx.composites.NewCompositeSet()
+	if err != nil {
+		t.Fatalf("NewCompositeSet() for outer: %v", err)
+	}
+	if _, err5 := fx.composites.AddOperand(outer, c, true, true); err5 != nil {
+		t.Fatalf("AddOperand(outer, c, additive, expand): %v", err5)
+	}
+
+	evaluated, err := fx.composites.Evaluate(outer)
+	if err != nil {
+		t.Fatalf("Evaluate(outer) before corruption attempt: %v", err)
+	}
+	if want := []NodeID{x}; !reflect.DeepEqual(evaluated, want) {
+		t.Fatalf("Evaluate(outer) before corruption attempt = %v, want %v", evaluated, want)
+	}
+
+	// The actual corruption attempt: try to also tag c as a plain Set
+	// while it already carries AllCompositeSets and is simultaneously
+	// load-bearing as both a Domain and a CompositeSet operand.
+	err = fx.sets.TagAsSet(c)
+	if !errors.Is(err, ErrSetRepresentationConflict) {
+		t.Fatalf("TagAsSet(c) error = %v, want %v", err, ErrSetRepresentationConflict)
+	}
+
+	if fx.sets.IsSet(c) {
+		t.Fatal("c was tagged AllSets despite already being AllCompositeSets-tagged")
+	}
+
+	// c's role as outer's set-expansion operand must be completely
+	// unaffected by the declined TagAsSet call.
+	evaluated, err = fx.composites.Evaluate(outer)
+	if err != nil {
+		t.Fatalf("Evaluate(outer) after declined TagAsSet: %v", err)
+	}
+	if want := []NodeID{x}; !reflect.DeepEqual(evaluated, want) {
+		t.Fatalf("Evaluate(outer) after declined TagAsSet = %v, want %v", evaluated, want)
+	}
+
+	// c's role as subject's domain must likewise be completely
+	// unaffected: subject's existing target is still valid, and a target
+	// outside c's membership is still correctly rejected.
+	target, hasTarget, err := fx.domainD.Target(subject)
+	if err != nil {
+		t.Fatalf("Target(subject) after declined TagAsSet: %v", err)
+	}
+	if !hasTarget || target != x {
+		t.Fatalf("Target(subject) = (%d,%v), want (%d,true) after declined TagAsSet", target, hasTarget, x)
+	}
+
+	outside, err := fx.graph.CreateNode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = fx.domainD.SetTarget(subject, outside)
+	if !errors.Is(err, ErrTargetOutsideDomain) {
+		t.Fatalf("SetTarget(subject, outside) after declined TagAsSet: error = %v, want %v", err, ErrTargetOutsideDomain)
+	}
+}
