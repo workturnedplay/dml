@@ -1111,6 +1111,45 @@ NodeID-keyed structure outside the primitive graph.
  and NameRegistry.EnsureNamedNode elsewhere in this file. Covered by
  TestDomainPointerRegistryBNewDomainPointerIsIdempotent.
 
+24. Extracted GraphReader/GraphStore/GraphAPI interfaces (theorystate.md
+ section 87) from Graph's already-existing public method set, and
+ changed every registry's stored graph field, and every free helper
+ function that previously took graph *Graph, to take the narrowest of
+ these three interfaces its own logic actually needs: GraphReader for
+ read-only helpers -- singleChildTarget, findUniqueTaggedParent,
+ findUniqueTaggedChild, exactlyOneTag, locateBySubjectSlot,
+ operandDescriptorAxes, operandTargetGeneric, resolveOperandGeneric,
+ singleChildTargetSetTx/singleChildTargetRemoveTx's own graph parameter,
+ and every registered Checker's Check function -- and GraphAPI, adding
+ Transact/RegisterChecker, for every registry constructor and stored
+ field: NameRegistry, PointerRegistry, subjectMetadataBase (shared by
+ PointerMetadataRegistry/PointerMetadataRegistryD),
+ ensureMetadataWithSubjectSlot, CapsuleRegistry, ListRegistry,
+ SetRegistry, CompositeSetRegistry, CompositeSetLogRegistry, and
+ domainConstraint (shared by DomainPointerRegistryB/
+ DomainPointerRegistryD).
+
+ *Graph already satisfies GraphAPI without any change to Graph itself,
+ so this is a pure decoupling refactor: no registry's own logic changed,
+ no new foundational name was added, and every existing test continues
+ to pass unmodified, since every test fixture already constructed
+ registries by passing &g (a *Graph) where an interface value is now
+ expected, which Go accepts automatically without any test-side change.
+
+ RootGraph is a deliberate, documented exception, discovered while doing
+ this refactor rather than anticipated beforehand: its ROOT-overlay
+ FindOutgoing/FindRelationships need to enumerate every existing node,
+ which requires reaching into Graph's private nodes map directly -- no
+ GraphAPI method exposes "every node that exists" today. RootGraph
+ therefore still depends on the concrete *Graph type, not GraphAPI; see
+ GraphAPI's own doc comment for this noted gap. Txn similarly still
+ depends on the concrete *Graph type (via its unexported resurrectNode
+ method), which is correct and deliberate, not an oversight --
+ theorystate.md section 89a records that Txn's undo-log rollback
+ approach is specific to the in-memory backend's own mechanism for
+ satisfying the Transact contract, not a mechanism every future backend
+ is expected to reuse.
+
 Currently unaddressed yet:
 - Txn does not support nesting one Graph.Transact call inside another
   (Txn.DeleteNode is supported -- see item 15). Nesting is not needed by
@@ -1119,3 +1158,12 @@ Currently unaddressed yet:
   at write time, not at commit time, for the reasons item 22 records --
   revisit if a future caller needs Representation B domain pointers to
   be as defense-in-depth as Representation D's.
+- RootGraph still depends on the concrete *Graph type rather than
+  GraphAPI, since its ROOT-overlay node enumeration needs private map
+  access no GraphAPI method currently exposes (see GraphAPI's own doc
+  comment; theorystate.md section 87a). Revisit if a node-enumeration
+  method is ever added to GraphAPI.
+- The in-memory Graph still has no protection against concurrent
+  goroutine access (theorystate.md section 89b) -- unaffected by item
+  24's interface extraction, since that extraction only changes which
+  type callers reference, not Graph's own synchronization.

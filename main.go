@@ -310,6 +310,74 @@ func (g *Graph) nodeExists(id NodeID) bool {
 	return exists
 }
 
+// GraphReader is the read-only query surface shared by every storage
+// backend. It exists so that helper functions and Checkers which only
+// ever need to read graph state -- never create, tag, or delete
+// anything -- can depend on exactly that capability rather than a
+// concrete storage type, or the wider GraphStore/GraphAPI surfaces below
+// that also grant write access (theorystate.md section 87).
+type GraphReader interface {
+	NodeExists(id NodeID) bool
+	HasRelationship(a, b NodeID) bool
+	FindRelationship(from, to NodeID) (Relationship, bool, error)
+	FindOutgoing(from NodeID) ([]Relationship, error)
+	FindIncoming(to NodeID) ([]Relationship, error)
+	FindRelationships() []Relationship
+}
+
+// GraphStore is the complete primitive storage surface -- GraphReader's
+// queries plus the mutating operations -- matching Graph's public
+// method set exactly as it already existed before this interface was
+// introduced (theorystate.md section 87/87a). This is the boundary a
+// future non-in-memory backend (etcd, SpacetimeDB) would need to satisfy
+// to stand in for Graph at the storage layer; today Graph is the only
+// implementation.
+type GraphStore interface {
+	GraphReader
+	CreateNode() (NodeID, error)
+	AddRelationship(a, b NodeID) (created bool, err error)
+	RemoveRelationship(a, b NodeID) (removed bool, err error)
+	DeleteNode(id NodeID) error
+}
+
+// GraphAPI is GraphStore plus the transactional/commit-time-checking
+// machinery (Transact, RegisterChecker) every registry in this file
+// actually depends on. It is kept as a separate, wider interface from
+// GraphStore rather than folding Transact/RegisterChecker directly into
+// GraphStore, per theorystate.md section 87a/89a: those two methods'
+// atomicity contract is a separate design question from raw storage,
+// deliberately not yet resolved for any backend other than the
+// in-memory one Graph implements, and a future backend satisfying
+// GraphStore's storage contract is not thereby assumed to satisfy
+// GraphAPI's transactional contract the same way.
+//
+// Every registry constructor in this file (NewPointerRegistry,
+// NewCapsuleRegistry, NewListRegistry, and so on) takes a GraphAPI
+// rather than a concrete *Graph, so any future GraphAPI implementation
+// can be substituted with no change to registry logic. *Graph already
+// satisfies GraphAPI exactly as defined below, with no changes to Graph
+// itself -- this is a pure decoupling refactor (theorystate.md section
+// 87).
+//
+// RootGraph is a deliberate, documented exception: its ROOT overlay
+// needs to enumerate every existing node (FindOutgoing/FindRelationships
+// for the ROOT case), which requires reaching into Graph's private
+// nodes map directly, since no GraphAPI method exposes "every node that
+// exists." RootGraph therefore still depends on the concrete *Graph
+// type, not GraphAPI, until (or unless) a node-enumeration method is
+// added to this interface -- a real, newly-identified gap, named here
+// rather than silently worked around.
+type GraphAPI interface {
+	GraphStore
+	Transact(fn func(tx *Txn) error) error
+	RegisterChecker(c Checker)
+}
+
+// Compile-time assertion that *Graph satisfies GraphAPI, so any future
+// accidental signature drift between Graph's methods and this interface
+// is caught at build time rather than only at some call site far away.
+var _ GraphAPI = (*Graph)(nil)
+
 // Txn groups a sequence of primitive Graph mutations so that, if the
 // function passed to Graph.Transact returns a non-nil error or panics,
 // every mutation performed through tx during that call is undone, in
@@ -639,8 +707,11 @@ type Checker struct {
 	// relationship, or as a created or deleted node); Check is expected
 	// to use touched to narrow down which of its own tagged nodes, if
 	// any, actually need re-validating, rather than re-scanning the
-	// whole graph on every single commit.
-	Check func(g *Graph, touched map[NodeID]struct{}) error
+	// whole graph on every single commit. g is typed as GraphReader,
+	// not the concrete *Graph, since no Checker in this file ever needs
+	// to mutate anything -- only ever to validate (theorystate.md
+	// section 87).
+	Check func(g GraphReader, touched map[NodeID]struct{}) error
 }
 
 // RegisterChecker adds c to the set of Checkers Transact consults after
@@ -743,7 +814,7 @@ var (
 // Names are bootstrap metadata outside the primitive graph. The primitive
 // Graph does not know about names.
 type NameRegistry struct {
-	graph *Graph
+	graph GraphAPI
 
 	byName map[string]NodeID
 	byID   map[NodeID]string
@@ -752,7 +823,7 @@ type NameRegistry struct {
 // NewNameRegistry creates an empty name registry associated with graph.
 //
 // It does not create any nodes.
-func NewNameRegistry(graph *Graph) *NameRegistry {
+func NewNameRegistry(graph GraphAPI) *NameRegistry {
 	return &NameRegistry{
 		graph:  graph,
 		byName: make(map[string]NodeID),
@@ -1663,7 +1734,7 @@ func setPointerTargetTx(tx txOps, id, current NodeID, hasCurrent bool, target No
 // PointerRegistry.currentTarget performs, since callers here have
 // already located node via a tag-based lookup (e.g.
 // findUniqueTaggedChild) immediately beforehand.
-func singleChildTargetSetTx(tx txOps, graph *Graph, node, target NodeID) error {
+func singleChildTargetSetTx(tx txOps, graph GraphReader, node, target NodeID) error {
 	current, hasCurrent, err := singleChildTarget(graph, node)
 	if err != nil {
 		return err
@@ -1690,7 +1761,7 @@ func singleChildTargetSetTx(tx txOps, graph *Graph, node, target NodeID) error {
 // together with the neighbor-relinking steps around it.
 //
 // removed reports whether a target actually existed and was removed.
-func singleChildTargetRemoveTx(tx txOps, graph *Graph, node NodeID) (removed bool, err error) {
+func singleChildTargetRemoveTx(tx txOps, graph GraphReader, node NodeID) (removed bool, err error) {
 	current, hasCurrent, err := singleChildTarget(graph, node)
 	if err != nil {
 		return false, err
@@ -1725,7 +1796,7 @@ func singleChildTargetRemoveTx(tx txOps, graph *Graph, node NodeID) (removed boo
 // one -- see the PointerRegistry doc comment for why (theorystate.md
 // section 74: out-of-band mutation can violate this at any time, and
 // every caller re-derives fresh rather than caching).
-func singleChildTarget(g *Graph, node NodeID, exclude ...NodeID) (target NodeID, hasTarget bool, err error) {
+func singleChildTarget(g GraphReader, node NodeID, exclude ...NodeID) (target NodeID, hasTarget bool, err error) {
 	outgoing, err := g.FindOutgoing(node)
 	if err != nil {
 		return 0, false, err
@@ -1815,7 +1886,7 @@ outer:
 // own multi-step operations from corrupting state on failure, not a
 // general transaction feature.
 type PointerRegistry struct {
-	graph       *Graph
+	graph       GraphAPI
 	allPointers NodeID
 }
 
@@ -1840,7 +1911,7 @@ type PointerRegistry struct {
 // capsule's three role-slot tags), constructing any PointerRegistry
 // instance -- under any tag -- wires up commit-time enforcement for
 // that specific tag, with no additional per-representation code.
-func NewPointerRegistry(graph *Graph, allPointers NodeID) (*PointerRegistry, error) {
+func NewPointerRegistry(graph GraphAPI, allPointers NodeID) (*PointerRegistry, error) {
 	if !graph.NodeExists(allPointers) {
 		return nil, ErrNodeNotFound
 	}
@@ -1858,7 +1929,7 @@ func NewPointerRegistry(graph *Graph, allPointers NodeID) (*PointerRegistry, err
 	graph.RegisterChecker(Checker{
 		Name: fmt.Sprintf("PointerRegistry(tag=%d)", allPointers),
 		Tags: []NodeID{allPointers},
-		Check: func(g *Graph, touched map[NodeID]struct{}) error {
+		Check: func(g GraphReader, touched map[NodeID]struct{}) error {
 			for node := range touched {
 				if !g.HasRelationship(allPointers, node) {
 					continue
@@ -2042,7 +2113,7 @@ func (p *PointerRegistry) TagAsPointer(id NodeID) error {
 // parent exists. If more than one tagged parent exists -- only reachable
 // through an out-of-band Graph mutation -- ErrAmbiguousPointerMetadata is
 // returned instead of arbitrarily picking one.
-func findUniqueTaggedParent(g *Graph, node, tag NodeID) (parent NodeID, found bool, err error) {
+func findUniqueTaggedParent(g GraphReader, node, tag NodeID) (parent NodeID, found bool, err error) {
 	incoming, err := g.FindIncoming(node)
 	if err != nil {
 		return 0, false, err
@@ -2077,7 +2148,7 @@ func findUniqueTaggedParent(g *Graph, node, tag NodeID) (parent NodeID, found bo
 // more than one tagged child exists -- only reachable through an
 // out-of-band Graph mutation -- ErrAmbiguousPointerMetadata is returned
 // instead of arbitrarily picking one.
-func findUniqueTaggedChild(g *Graph, node, tag NodeID) (child NodeID, found bool, err error) {
+func findUniqueTaggedChild(g GraphReader, node, tag NodeID) (child NodeID, found bool, err error) {
 	outgoing, err := g.FindOutgoing(node)
 	if err != nil {
 		return 0, false, err
@@ -2109,7 +2180,7 @@ func findUniqueTaggedChild(g *Graph, node, tag NodeID) (child NodeID, found bool
 // since CompositeSetRegistry.AddOperand always wires a fresh descriptor
 // with exactly one tag per axis -- ErrInvalidOperandDescriptor is
 // returned instead of guessing.
-func exactlyOneTag(g *Graph, node, tagA, tagB NodeID) (isA bool, err error) {
+func exactlyOneTag(g GraphReader, node, tagA, tagB NodeID) (isA bool, err error) {
 	hasA := g.HasRelationship(tagA, node)
 	hasB := g.HasRelationship(tagB, node)
 
@@ -2129,7 +2200,7 @@ func exactlyOneTag(g *Graph, node, tagA, tagB NodeID) (isA bool, err error) {
 // PointerMetadataRegistryD (Representation D): both representations
 // identify the subject the same way, differing only in how they then
 // locate the target. node must exist.
-func locateBySubjectSlot(g *Graph, node, allPointerMetadata, allSubjectSlots NodeID) (metadata, subjectSlot NodeID, found bool, err error) {
+func locateBySubjectSlot(g GraphReader, node, allPointerMetadata, allSubjectSlots NodeID) (metadata, subjectSlot NodeID, found bool, err error) {
 	subjectSlot, found, err = findUniqueTaggedParent(g, node, allSubjectSlots)
 	if err != nil || !found {
 		return 0, 0, found, err
@@ -2150,7 +2221,7 @@ func locateBySubjectSlot(g *Graph, node, allPointerMetadata, allSubjectSlots Nod
 // identical subject-side structure and differ only in how the target
 // side is represented. Callers are responsible for checking that subject
 // itself exists before calling this.
-func ensureMetadataWithSubjectSlot(g *Graph, subject, allPointerMetadata, allSubjectSlots NodeID) (metadata, subjectSlot NodeID, err error) {
+func ensureMetadataWithSubjectSlot(g GraphAPI, subject, allPointerMetadata, allSubjectSlots NodeID) (metadata, subjectSlot NodeID, err error) {
 	var found bool
 	metadata, subjectSlot, found, err = locateBySubjectSlot(g, subject, allPointerMetadata, allSubjectSlots)
 	if err != nil {
@@ -2201,7 +2272,7 @@ func ensureMetadataWithSubjectSlot(g *Graph, subject, allPointerMetadata, allSub
 // allSubjectSlots) and methods are promoted and usable exactly as if
 // they were declared directly on the embedding type.
 type subjectMetadataBase struct {
-	graph              *Graph
+	graph              GraphAPI
 	allPointerMetadata NodeID
 	allSubjectSlots    NodeID
 }
@@ -2314,7 +2385,7 @@ type PointerMetadataRegistry struct {
 // unmodified from the embedded subjectMetadataBase, which is shared with
 // PointerMetadataRegistryD -- see subjectMetadataBase's doc comment for
 // why this subject-side logic is factored out rather than duplicated.
-func NewPointerMetadataRegistry(graph *Graph, allPointerMetadata, allSubjectSlots NodeID) (*PointerMetadataRegistry, error) {
+func NewPointerMetadataRegistry(graph GraphAPI, allPointerMetadata, allSubjectSlots NodeID) (*PointerMetadataRegistry, error) {
 	if !graph.NodeExists(allPointerMetadata) {
 		return nil, ErrNodeNotFound
 	}
@@ -2339,7 +2410,7 @@ func NewPointerMetadataRegistry(graph *Graph, allPointerMetadata, allSubjectSlot
 	graph.RegisterChecker(Checker{
 		Name: fmt.Sprintf("PointerMetadataRegistry(tag=%d)", allPointerMetadata),
 		Tags: []NodeID{allPointerMetadata},
-		Check: func(g *Graph, touched map[NodeID]struct{}) error {
+		Check: func(g GraphReader, touched map[NodeID]struct{}) error {
 			for node := range touched {
 				if !g.HasRelationship(allPointerMetadata, node) {
 					continue
@@ -2518,7 +2589,7 @@ type PointerMetadataRegistryD struct {
 // unmodified from the embedded subjectMetadataBase, which is shared with
 // PointerMetadataRegistry -- see subjectMetadataBase's doc comment for
 // why this subject-side logic is factored out rather than duplicated.
-func NewPointerMetadataRegistryD(graph *Graph, allPointerMetadata, allSubjectSlots, allTargetSlots NodeID) (*PointerMetadataRegistryD, error) {
+func NewPointerMetadataRegistryD(graph GraphAPI, allPointerMetadata, allSubjectSlots, allTargetSlots NodeID) (*PointerMetadataRegistryD, error) {
 	if !graph.NodeExists(allPointerMetadata) {
 		return nil, ErrNodeNotFound
 	}
@@ -2542,7 +2613,7 @@ func NewPointerMetadataRegistryD(graph *Graph, allPointerMetadata, allSubjectSlo
 	graph.RegisterChecker(Checker{
 		Name: fmt.Sprintf("PointerMetadataRegistryD(tag=%d)", allPointerMetadata),
 		Tags: []NodeID{allTargetSlots},
-		Check: func(g *Graph, touched map[NodeID]struct{}) error {
+		Check: func(g GraphReader, touched map[NodeID]struct{}) error {
 			for node := range touched {
 				if !g.HasRelationship(allTargetSlots, node) {
 					continue
@@ -2736,7 +2807,7 @@ func (m *PointerMetadataRegistryD) RemoveTarget(subject NodeID) (removed bool, e
 // (AllTAILs, X) are already two distinct relationships even when the same
 // capsule X is simultaneously both head and tail (a single-element list).
 type CapsuleRegistry struct {
-	graph              *Graph
+	graph              GraphAPI
 	allElementCapsules NodeID
 	prevSlots          *PointerRegistry
 	valueSlots         *PointerRegistry
@@ -2750,7 +2821,7 @@ type CapsuleRegistry struct {
 // NameRegistry.BootstrapNames(FoundationalNames). allPrevSlot,
 // allValueSlot, and allNextSlot's existence is checked by the embedded
 // NewPointerRegistry calls; allElementCapsules is checked here.
-func NewCapsuleRegistry(graph *Graph, allElementCapsules, allPrevSlot, allValueSlot, allNextSlot NodeID) (*CapsuleRegistry, error) {
+func NewCapsuleRegistry(graph GraphAPI, allElementCapsules, allPrevSlot, allValueSlot, allNextSlot NodeID) (*CapsuleRegistry, error) {
 	if !graph.NodeExists(allElementCapsules) {
 		return nil, ErrNodeNotFound
 	}
@@ -2790,7 +2861,7 @@ func NewCapsuleRegistry(graph *Graph, allElementCapsules, allPrevSlot, allValueS
 	graph.RegisterChecker(Checker{
 		Name: fmt.Sprintf("CapsuleRegistry(tag=%d)", allElementCapsules),
 		Tags: []NodeID{allElementCapsules},
-		Check: func(g *Graph, touched map[NodeID]struct{}) error {
+		Check: func(g GraphReader, touched map[NodeID]struct{}) error {
 			for node := range touched {
 				if !g.HasRelationship(allElementCapsules, node) {
 					continue
@@ -3429,7 +3500,7 @@ func (c *CapsuleRegistry) DeleteCapsule(capsule NodeID) error {
 // whenever nothing else still references it. DeleteList removes a list
 // itself once empty.
 type ListRegistry struct {
-	graph    *Graph
+	graph    GraphAPI
 	capsules *CapsuleRegistry
 	allLists NodeID
 	allHeads NodeID
@@ -3442,7 +3513,7 @@ type ListRegistry struct {
 // tag NodeIDs must already exist -- typically via
 // NameRegistry.BootstrapNames(FoundationalNames). capsules must already
 // be constructed over the same graph.
-func NewListRegistry(graph *Graph, capsules *CapsuleRegistry, allLists, allHeads, allTails NodeID) (*ListRegistry, error) {
+func NewListRegistry(graph GraphAPI, capsules *CapsuleRegistry, allLists, allHeads, allTails NodeID) (*ListRegistry, error) {
 	if !graph.NodeExists(allLists) {
 		return nil, ErrNodeNotFound
 	}
@@ -3488,7 +3559,7 @@ func NewListRegistry(graph *Graph, capsules *CapsuleRegistry, allLists, allHeads
 	graph.RegisterChecker(Checker{
 		Name: fmt.Sprintf("ListRegistry(tag=%d)", allLists),
 		Tags: []NodeID{allLists},
-		Check: func(g *Graph, touched map[NodeID]struct{}) error {
+		Check: func(g GraphReader, touched map[NodeID]struct{}) error {
 			for node := range touched {
 				if !g.HasRelationship(allLists, node) {
 					continue
@@ -4290,7 +4361,7 @@ func (l *ListRegistry) DeleteList(list NodeID) error {
 // refuses (ErrSetRepresentationConflict) to tag a node already carrying
 // any of them.
 type SetRegistry struct {
-	graph   *Graph
+	graph   GraphAPI
 	allSets NodeID
 
 	// otherSetTags holds the tag NodeIDs of every other
@@ -4313,7 +4384,7 @@ type SetRegistry struct {
 // Passing none is valid (no cross-representation check is performed),
 // which is only appropriate if no other Set representation exists in the
 // calling program yet.
-func NewSetRegistry(graph *Graph, allSets NodeID, otherSetTags ...NodeID) (*SetRegistry, error) {
+func NewSetRegistry(graph GraphAPI, allSets NodeID, otherSetTags ...NodeID) (*SetRegistry, error) {
 	if !graph.NodeExists(allSets) {
 		return nil, ErrNodeNotFound
 	}
@@ -4521,7 +4592,7 @@ func (s *SetRegistry) DeleteSet(set NodeID) error {
 // merely which side of each axis currently holds. Shared by
 // CompositeSetRegistry.RemoveOperand and
 // CompositeSetLogRegistry.RemoveOperation.
-func operandDescriptorAxes(graph *Graph, u, allAdditiveOp, allSubtractiveOp, allScalarOperand, allSetOperand NodeID) (operand NodeID, hasOperand bool, operationTag, operandTag NodeID, err error) {
+func operandDescriptorAxes(graph GraphReader, u, allAdditiveOp, allSubtractiveOp, allScalarOperand, allSetOperand NodeID) (operand NodeID, hasOperand bool, operationTag, operandTag NodeID, err error) {
 	operand, hasOperand, err = singleChildTarget(graph, u)
 	if err != nil {
 		return 0, false, 0, 0, err
@@ -4622,7 +4693,7 @@ func deleteOperandDescriptorTx(tx txOps, operand NodeID, hasOperand bool, operat
 // outgoing relationship target. Shared by CompositeSetRegistry.OperandTarget
 // and CompositeSetLogRegistry.OperandTarget, since both build identically
 // shaped descriptors (theorystate.md section 80).
-func operandTargetGeneric(graph *Graph, u NodeID) (operand NodeID, err error) {
+func operandTargetGeneric(graph GraphReader, u NodeID) (operand NodeID, err error) {
 	operand, found, err := singleChildTarget(graph, u)
 	if err != nil {
 		return 0, err
@@ -4731,7 +4802,7 @@ func resolveSetOperandGeneric(sets *SetRegistry, composites *CompositeSetRegistr
 // operand's own resolved membership (via resolveSetOperandGeneric) for a
 // set-axis descriptor. Shared by CompositeSetRegistry.resolveOperand and
 // CompositeSetLogRegistry.resolveOperand.
-func resolveOperandGeneric(graph *Graph, allScalarOperand, allSetOperand NodeID, sets *SetRegistry, composites *CompositeSetRegistry, logs *CompositeSetLogRegistry, u NodeID, visited map[NodeID]struct{}) ([]NodeID, error) {
+func resolveOperandGeneric(graph GraphReader, allScalarOperand, allSetOperand NodeID, sets *SetRegistry, composites *CompositeSetRegistry, logs *CompositeSetLogRegistry, u NodeID, visited map[NodeID]struct{}) ([]NodeID, error) {
 	operand, found, err := singleChildTarget(graph, u)
 	if err != nil {
 		return nil, err
@@ -4823,7 +4894,7 @@ func resolveOperandGeneric(graph *Graph, allScalarOperand, allSetOperand NodeID,
 // existing nodes. If a TagAsCompositeSet is added later, it must apply
 // the same ErrSetRepresentationConflict check.
 type CompositeSetRegistry struct {
-	graph            *Graph
+	graph            GraphAPI
 	sets             *SetRegistry
 	logs             *CompositeSetLogRegistry
 	allCompositeSets NodeID
@@ -4847,7 +4918,7 @@ type CompositeSetRegistry struct {
 // CompositeSetLogRegistry exists to enable that; see SetLogs's doc
 // comment for why this is a required second step rather than a
 // constructor parameter.
-func NewCompositeSetRegistry(graph *Graph, sets *SetRegistry, allCompositeSets, allAdditiveOp, allSubtractiveOp, allScalarOperand, allSetOperand NodeID) (*CompositeSetRegistry, error) {
+func NewCompositeSetRegistry(graph GraphAPI, sets *SetRegistry, allCompositeSets, allAdditiveOp, allSubtractiveOp, allScalarOperand, allSetOperand NodeID) (*CompositeSetRegistry, error) {
 	for _, tag := range []NodeID{allCompositeSets, allAdditiveOp, allSubtractiveOp, allScalarOperand, allSetOperand} {
 		if !graph.NodeExists(tag) {
 			return nil, ErrNodeNotFound
@@ -4885,7 +4956,7 @@ func NewCompositeSetRegistry(graph *Graph, sets *SetRegistry, allCompositeSets, 
 	graph.RegisterChecker(Checker{
 		Name: fmt.Sprintf("CompositeSetRegistry(tag=%d)", allCompositeSets),
 		Tags: []NodeID{allCompositeSets},
-		Check: func(g *Graph, touched map[NodeID]struct{}) error {
+		Check: func(g GraphReader, touched map[NodeID]struct{}) error {
 			for node := range touched {
 				if !g.HasRelationship(allCompositeSets, node) {
 					continue
@@ -4918,7 +4989,7 @@ func NewCompositeSetRegistry(graph *Graph, sets *SetRegistry, allCompositeSets, 
 	graph.RegisterChecker(Checker{
 		Name: fmt.Sprintf("OperandDescriptor(tags=%d,%d,%d,%d)", allAdditiveOp, allSubtractiveOp, allScalarOperand, allSetOperand),
 		Tags: []NodeID{allAdditiveOp, allSubtractiveOp, allScalarOperand, allSetOperand},
-		Check: func(g *Graph, touched map[NodeID]struct{}) error {
+		Check: func(g GraphReader, touched map[NodeID]struct{}) error {
 			for node := range touched {
 				isDescriptor := g.HasRelationship(allAdditiveOp, node) ||
 					g.HasRelationship(allSubtractiveOp, node) ||
@@ -5391,7 +5462,7 @@ func (c *CompositeSetRegistry) DeleteCompositeSet(set NodeID) error {
 // step. See CompositeSetRegistry.SetLogs's doc comment for the required
 // construction order.
 type CompositeSetLogRegistry struct {
-	graph               *Graph
+	graph               GraphAPI
 	lists               *ListRegistry
 	sets                *SetRegistry
 	composites          *CompositeSetRegistry
@@ -5433,7 +5504,7 @@ type CompositeSetLogRegistry struct {
 // (including recursive self-reference) until composites is told about it
 // via composites.SetLogs(this registry) -- see that method's doc comment
 // for why this second wiring step is required.
-func NewCompositeSetLogRegistry(graph *Graph, lists *ListRegistry, composites *CompositeSetRegistry, allCompositeSetLogs, allAdditiveOp, allSubtractiveOp, allScalarOperand, allSetOperand NodeID) (*CompositeSetLogRegistry, error) {
+func NewCompositeSetLogRegistry(graph GraphAPI, lists *ListRegistry, composites *CompositeSetRegistry, allCompositeSetLogs, allAdditiveOp, allSubtractiveOp, allScalarOperand, allSetOperand NodeID) (*CompositeSetLogRegistry, error) {
 	for _, tag := range []NodeID{allCompositeSetLogs, allAdditiveOp, allSubtractiveOp, allScalarOperand, allSetOperand} {
 		if !graph.NodeExists(tag) {
 			return nil, ErrNodeNotFound
@@ -5894,7 +5965,7 @@ func (c *CompositeSetLogRegistry) DeleteCompositeSetLog(log NodeID) error {
 // under the same tag would register a redundant (if harmless) duplicate
 // Checker for the identical cardinality invariant.
 type domainConstraint struct {
-	graph       *Graph
+	graph       GraphAPI
 	domainSlots *PointerRegistry
 	sets        *SetRegistry
 	composites  *CompositeSetRegistry
@@ -6089,7 +6160,7 @@ type DomainPointerRegistryB struct {
 // a domain pointed at a CompositeSetLog-kind node is then rejected via
 // ErrInvalidSetOperand exactly like any other unrecognized domain kind,
 // until logs is available.
-func NewDomainPointerRegistryB(graph *Graph, pointers, domainSlots *PointerRegistry, sets *SetRegistry, composites *CompositeSetRegistry, logs *CompositeSetLogRegistry) *DomainPointerRegistryB {
+func NewDomainPointerRegistryB(graph GraphAPI, pointers, domainSlots *PointerRegistry, sets *SetRegistry, composites *CompositeSetRegistry, logs *CompositeSetLogRegistry) *DomainPointerRegistryB {
 	return &DomainPointerRegistryB{
 		domainConstraint: domainConstraint{
 			graph:       graph,
@@ -6272,7 +6343,7 @@ type DomainPointerRegistryD struct {
 // domain, catching a caller bypassing this type and mutating the
 // underlying PointerMetadataRegistryD or the shared domainSlots registry
 // directly through either one.
-func NewDomainPointerRegistryD(graph *Graph, metadata *PointerMetadataRegistryD, domainSlots *PointerRegistry, sets *SetRegistry, composites *CompositeSetRegistry, logs *CompositeSetLogRegistry) *DomainPointerRegistryD {
+func NewDomainPointerRegistryD(graph GraphAPI, metadata *PointerMetadataRegistryD, domainSlots *PointerRegistry, sets *SetRegistry, composites *CompositeSetRegistry, logs *CompositeSetLogRegistry) *DomainPointerRegistryD {
 	d := &DomainPointerRegistryD{
 		domainConstraint: domainConstraint{
 			graph:       graph,
@@ -6287,7 +6358,7 @@ func NewDomainPointerRegistryD(graph *Graph, metadata *PointerMetadataRegistryD,
 	graph.RegisterChecker(Checker{
 		Name: fmt.Sprintf("DomainPointerRegistryD(tag=%d)", domainSlots.allPointers),
 		Tags: []NodeID{metadata.allTargetSlots, domainSlots.allPointers},
-		Check: func(g *Graph, touched map[NodeID]struct{}) error {
+		Check: func(g GraphReader, touched map[NodeID]struct{}) error {
 			anchors := make(map[NodeID]struct{})
 
 			for node := range touched {
