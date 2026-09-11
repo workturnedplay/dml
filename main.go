@@ -951,7 +951,7 @@ func (r *NameRegistry) CreateNamedNode(name string) (NodeID, error) {
 		return r.Bind(name, id)
 	})
 	if err != nil {
-		return 0, wrapTxOpsErr(err)
+		return 0, wrapInterfaceErr(err)
 	}
 
 	return id, nil
@@ -1016,7 +1016,7 @@ func (r *NameRegistry) Unbind(name string) (bool, error) {
 // behaves like a plain Graph.DeleteNode.
 func (r *NameRegistry) DeleteNode(id NodeID) error {
 	if err := r.graph.DeleteNode(id); err != nil {
-		return wrapTxOpsErr(err)
+		return wrapInterfaceErr(err)
 	}
 
 	if name, ok := r.byID[id]; ok {
@@ -1641,7 +1641,7 @@ type txOps interface {
 	DeleteNode(id NodeID) error
 }
 
-// wrapTxOpsErr wraps an error returned directly from a call to one of
+// wrapInterfaceErr wraps an error returned directly from a call to one of
 // this package's interface-typed values -- txOps
 // (CreateNode/AddRelationship/RemoveRelationship/DeleteNode), or
 // GraphAPI/GraphStore/GraphReader (Transact/FindOutgoing/FindIncoming/
@@ -1657,7 +1657,7 @@ type txOps interface {
 // behavior, only a satisfied linter. A nil err must stay nil:
 // fmt.Errorf("%w", nil) would otherwise turn a successful call into a
 // non-nil error.
-func wrapTxOpsErr(err error) error {
+func wrapInterfaceErr(err error) error {
 	if err == nil {
 		return nil
 	}
@@ -1671,7 +1671,7 @@ func wrapTxOpsErr(err error) error {
 // two independent axis tags on the same freshly created node.
 func tagNodeTx(tx txOps, tag, id NodeID) error {
 	_, err := tx.AddRelationship(tag, id)
-	return wrapTxOpsErr(err)
+	return wrapInterfaceErr(err)
 }
 
 // createTaggedNodeTx creates a fresh node and tags it via (tag, id),
@@ -1683,7 +1683,7 @@ func tagNodeTx(tx txOps, tag, id NodeID) error {
 func createTaggedNodeTx(tx txOps, tag NodeID) (NodeID, error) {
 	id, err := tx.CreateNode()
 	if err != nil {
-		return 0, wrapTxOpsErr(err)
+		return 0, wrapInterfaceErr(err)
 	}
 
 	if err := tagNodeTx(tx, tag, id); err != nil {
@@ -1714,12 +1714,12 @@ func newPointerTx(tx txOps, allPointers NodeID) (NodeID, error) {
 func setPointerTargetTx(tx txOps, id, current NodeID, hasCurrent bool, target NodeID) error {
 	if hasCurrent {
 		if _, err := tx.RemoveRelationship(id, current); err != nil {
-			return wrapTxOpsErr(err)
+			return wrapInterfaceErr(err)
 		}
 	}
 
 	_, err := tx.AddRelationship(id, target)
-	return wrapTxOpsErr(err)
+	return wrapInterfaceErr(err)
 }
 
 // singleChildTargetSetTx sets node's single "target" child -- under the
@@ -1776,7 +1776,7 @@ func singleChildTargetRemoveTx(tx txOps, graph GraphReader, node NodeID) (remove
 	}
 
 	removed, err = tx.RemoveRelationship(node, current)
-	return removed, wrapTxOpsErr(err)
+	return removed, wrapInterfaceErr(err)
 }
 
 // singleChildTarget returns the single relevant child of node in the
@@ -1803,7 +1803,7 @@ func singleChildTargetRemoveTx(tx txOps, graph GraphReader, node NodeID) (remove
 func singleChildTarget(g GraphReader, node NodeID, exclude ...NodeID) (target NodeID, hasTarget bool, err error) {
 	outgoing, err := g.FindOutgoing(node)
 	if err != nil {
-		return 0, false, wrapTxOpsErr(err)
+		return 0, false, wrapInterfaceErr(err)
 	}
 
 outer:
@@ -2028,7 +2028,7 @@ func (p *PointerRegistry) SetTarget(id, target NodeID) error {
 		return nil
 	}
 
-	return wrapTxOpsErr(p.graph.Transact(func(tx *Txn) error {
+	return wrapInterfaceErr(p.graph.Transact(func(tx *Txn) error {
 		return setPointerTargetTx(tx, id, current, hasTarget, target)
 	}))
 }
@@ -2052,7 +2052,7 @@ func (p *PointerRegistry) RemoveTarget(id NodeID) (removed bool, err error) {
 	}
 
 	removed, err = p.graph.RemoveRelationship(id, current)
-	return removed, wrapTxOpsErr(err)
+	return removed, wrapInterfaceErr(err)
 }
 
 // NewPointer creates a fresh NodeID and immediately tags it Pointer-kind.
@@ -2075,7 +2075,7 @@ func (p *PointerRegistry) NewPointer() (NodeID, error) {
 		return err
 	})
 	if err != nil {
-		return 0, wrapTxOpsErr(err)
+		return 0, wrapInterfaceErr(err)
 	}
 
 	return id, nil
@@ -2098,7 +2098,7 @@ func (p *PointerRegistry) NewPointer() (NodeID, error) {
 func (p *PointerRegistry) TagAsPointer(id NodeID) error {
 	outgoing, err := p.graph.FindOutgoing(id)
 	if err != nil {
-		return wrapTxOpsErr(err)
+		return wrapInterfaceErr(err)
 	}
 
 	if len(outgoing) > 1 {
@@ -2106,7 +2106,7 @@ func (p *PointerRegistry) TagAsPointer(id NodeID) error {
 	}
 
 	_, err = p.graph.AddRelationship(p.allPointers, id)
-	return wrapTxOpsErr(err)
+	return wrapInterfaceErr(err)
 }
 
 // findUniqueTaggedParent returns the single parent of node that is tagged
@@ -2121,7 +2121,7 @@ func (p *PointerRegistry) TagAsPointer(id NodeID) error {
 func findUniqueTaggedParent(g GraphReader, node, tag NodeID) (parent NodeID, found bool, err error) {
 	incoming, err := g.FindIncoming(node)
 	if err != nil {
-		return 0, false, wrapTxOpsErr(err)
+		return 0, false, wrapInterfaceErr(err)
 	}
 
 	for _, rel := range incoming {
@@ -2156,7 +2156,7 @@ func findUniqueTaggedParent(g GraphReader, node, tag NodeID) (parent NodeID, fou
 func findUniqueTaggedChild(g GraphReader, node, tag NodeID) (child NodeID, found bool, err error) {
 	outgoing, err := g.FindOutgoing(node)
 	if err != nil {
-		return 0, false, wrapTxOpsErr(err)
+		return 0, false, wrapInterfaceErr(err)
 	}
 
 	for _, rel := range outgoing {
@@ -2256,7 +2256,7 @@ func ensureMetadataWithSubjectSlot(g GraphAPI, subject, allPointerMetadata, allS
 		return err2
 	})
 	if err != nil {
-		return 0, 0, wrapTxOpsErr(err)
+		return 0, 0, wrapInterfaceErr(err)
 	}
 
 	return metadata, subjectSlot, nil
@@ -2494,7 +2494,7 @@ func (m *PointerMetadataRegistry) SetTarget(subject, target NodeID) error {
 		return nil
 	}
 
-	return wrapTxOpsErr(m.graph.Transact(func(tx *Txn) error {
+	return wrapInterfaceErr(m.graph.Transact(func(tx *Txn) error {
 		return setPointerTargetTx(tx, metadata, current, hasTarget, target)
 	}))
 }
@@ -2526,7 +2526,7 @@ func (m *PointerMetadataRegistry) RemoveTarget(subject NodeID) (removed bool, er
 	}
 
 	removed, err = m.graph.RemoveRelationship(metadata, target)
-	return removed, wrapTxOpsErr(err)
+	return removed, wrapInterfaceErr(err)
 }
 
 // PointerMetadataRegistryD implements Representation D, a corrected
@@ -2705,7 +2705,7 @@ func (m *PointerMetadataRegistryD) SetTarget(subject, target NodeID) error {
 	}
 
 	if !found {
-		return wrapTxOpsErr(m.graph.Transact(func(tx *Txn) error {
+		return wrapInterfaceErr(m.graph.Transact(func(tx *Txn) error {
 			var txErr error
 			slot, txErr = createTaggedNodeTx(tx, m.allTargetSlots)
 			if txErr != nil {
@@ -2728,7 +2728,7 @@ func (m *PointerMetadataRegistryD) SetTarget(subject, target NodeID) error {
 		return nil
 	}
 
-	return wrapTxOpsErr(m.graph.Transact(func(tx *Txn) error {
+	return wrapInterfaceErr(m.graph.Transact(func(tx *Txn) error {
 		return setPointerTargetTx(tx, slot, current, hasTarget, target)
 	}))
 }
@@ -2768,7 +2768,7 @@ func (m *PointerMetadataRegistryD) RemoveTarget(subject NodeID) (removed bool, e
 	}
 
 	removed, err = m.graph.RemoveRelationship(slot, target)
-	return removed, wrapTxOpsErr(err)
+	return removed, wrapInterfaceErr(err)
 }
 
 // CapsuleRegistry implements the ElementCapsule primitive of Ordered
@@ -2994,7 +2994,7 @@ func buildCapsuleTx(tx txOps, allElementCapsules, allPrevSlot, allValueSlot, all
 		return 0, err
 	}
 	if _, err2 := tx.AddRelationship(capsule, prevSlot); err2 != nil {
-		return 0, wrapTxOpsErr(err2)
+		return 0, wrapInterfaceErr(err2)
 	}
 
 	valueSlot, err := newPointerTx(tx, allValueSlot)
@@ -3002,10 +3002,10 @@ func buildCapsuleTx(tx txOps, allElementCapsules, allPrevSlot, allValueSlot, all
 		return 0, err
 	}
 	if _, err3 := tx.AddRelationship(capsule, valueSlot); err3 != nil {
-		return 0, wrapTxOpsErr(err3)
+		return 0, wrapInterfaceErr(err3)
 	}
 	if _, err4 := tx.AddRelationship(valueSlot, value); err4 != nil {
-		return 0, wrapTxOpsErr(err4)
+		return 0, wrapInterfaceErr(err4)
 	}
 
 	nextSlot, err := newPointerTx(tx, allNextSlot)
@@ -3015,7 +3015,7 @@ func buildCapsuleTx(tx txOps, allElementCapsules, allPrevSlot, allValueSlot, all
 
 	_, err = tx.AddRelationship(capsule, nextSlot)
 	if err != nil {
-		return 0, wrapTxOpsErr(err)
+		return 0, wrapInterfaceErr(err)
 	}
 
 	return capsule, nil
@@ -3110,7 +3110,7 @@ func (c *CapsuleRegistry) NewCapsule(value NodeID) (NodeID, error) {
 		return err
 	})
 	if err != nil {
-		return 0, wrapTxOpsErr(err)
+		return 0, wrapInterfaceErr(err)
 	}
 
 	return capsule, nil
@@ -3232,7 +3232,7 @@ func (c *CapsuleRegistry) SetValue(capsule, value NodeID) error {
 func (c *CapsuleRegistry) CapsulesWithValue(value NodeID) ([]NodeID, error) {
 	incoming, err := c.graph.FindIncoming(value)
 	if err != nil {
-		return nil, wrapTxOpsErr(err)
+		return nil, wrapInterfaceErr(err)
 	}
 
 	var capsules []NodeID
@@ -3396,7 +3396,7 @@ func (c *CapsuleRegistry) DeleteCapsule(capsule NodeID) error {
 		return ErrNotCapsule
 	}
 
-	return wrapTxOpsErr(c.graph.Transact(func(tx *Txn) error {
+	return wrapInterfaceErr(c.graph.Transact(func(tx *Txn) error {
 		prevSlot, hasPrevSlot, err := c.slotFor(capsule, c.prevSlots.allPointers)
 		if err != nil {
 			return err
@@ -3600,7 +3600,7 @@ func (l *ListRegistry) NewList() (NodeID, error) {
 		return err
 	})
 	if err != nil {
-		return 0, wrapTxOpsErr(err)
+		return 0, wrapInterfaceErr(err)
 	}
 
 	return list, nil
@@ -3679,7 +3679,7 @@ func (l *ListRegistry) Append(list, value NodeID) (NodeID, error) {
 		return err
 	})
 	if err != nil {
-		return 0, wrapTxOpsErr(err)
+		return 0, wrapInterfaceErr(err)
 	}
 
 	return capsule, nil
@@ -3709,7 +3709,7 @@ func (l *ListRegistry) appendTx(tx txOps, list, value NodeID) (NodeID, error) {
 	}
 
 	if _, err2 := tx.AddRelationship(list, capsule); err2 != nil {
-		return 0, wrapTxOpsErr(err2)
+		return 0, wrapInterfaceErr(err2)
 	}
 
 	if hasTail {
@@ -3720,16 +3720,16 @@ func (l *ListRegistry) appendTx(tx txOps, list, value NodeID) (NodeID, error) {
 			return 0, err4
 		}
 		if _, err5 := tx.RemoveRelationship(l.allTails, oldTail); err5 != nil {
-			return 0, wrapTxOpsErr(err5)
+			return 0, wrapInterfaceErr(err5)
 		}
 	} else {
 		if _, err6 := tx.AddRelationship(l.allHeads, capsule); err6 != nil {
-			return 0, wrapTxOpsErr(err6)
+			return 0, wrapInterfaceErr(err6)
 		}
 	}
 
 	_, err = tx.AddRelationship(l.allTails, capsule)
-	return capsule, wrapTxOpsErr(err)
+	return capsule, wrapInterfaceErr(err)
 }
 
 // Prepend creates a fresh capsule holding value and links it as the new
@@ -3788,7 +3788,7 @@ func (l *ListRegistry) Prepend(list, value NodeID) (NodeID, error) {
 		return err
 	})
 	if err != nil {
-		return 0, wrapTxOpsErr(err)
+		return 0, wrapInterfaceErr(err)
 	}
 
 	return capsule, nil
@@ -3864,7 +3864,7 @@ func (l *ListRegistry) InsertAfter(list, afterCapsule, value NodeID) (NodeID, er
 		return err
 	})
 	if err != nil {
-		return 0, wrapTxOpsErr(err)
+		return 0, wrapInterfaceErr(err)
 	}
 
 	return capsule, nil
@@ -3894,7 +3894,7 @@ func (l *ListRegistry) validateStructure(list NodeID) error {
 
 	outgoing, err := l.graph.FindOutgoing(list)
 	if err != nil {
-		return wrapTxOpsErr(err)
+		return wrapInterfaceErr(err)
 	}
 
 	members := make(map[NodeID]struct{})
@@ -4140,7 +4140,7 @@ func (l *ListRegistry) RemoveWithoutDeletingCapsule(list, capsule NodeID) error 
 		return ErrCapsuleNotInList
 	}
 
-	return wrapTxOpsErr(l.graph.Transact(func(tx *Txn) error {
+	return wrapInterfaceErr(l.graph.Transact(func(tx *Txn) error {
 		prev, hasPrev, err := l.capsules.Prev(capsule)
 		if err != nil {
 			return err
@@ -4295,7 +4295,7 @@ func (l *ListRegistry) DeleteList(list NodeID) error {
 		return ErrNotList
 	}
 
-	return wrapTxOpsErr(l.graph.Transact(func(tx *Txn) error {
+	return wrapInterfaceErr(l.graph.Transact(func(tx *Txn) error {
 		if _, err := tx.RemoveRelationship(l.allLists, list); err != nil {
 			return err
 		}
@@ -4425,7 +4425,7 @@ func (s *SetRegistry) NewSet() (NodeID, error) {
 		return err
 	})
 	if err != nil {
-		return 0, wrapTxOpsErr(err)
+		return 0, wrapInterfaceErr(err)
 	}
 
 	return id, nil
@@ -4457,7 +4457,7 @@ func (s *SetRegistry) TagAsSet(id NodeID) error {
 	}
 
 	_, err := s.graph.AddRelationship(s.allSets, id)
-	return wrapTxOpsErr(err)
+	return wrapInterfaceErr(err)
 }
 
 // Add adds member to set. Both must already exist, and set must already
@@ -4481,7 +4481,7 @@ func (s *SetRegistry) Add(set, member NodeID) (added bool, err error) {
 	}
 
 	added, err = s.graph.AddRelationship(set, member)
-	return added, wrapTxOpsErr(err)
+	return added, wrapInterfaceErr(err)
 }
 
 // Remove removes member from set, if present.
@@ -4503,7 +4503,7 @@ func (s *SetRegistry) Remove(set, member NodeID) (removed bool, err error) {
 	}
 
 	removed, err = s.graph.RemoveRelationship(set, member)
-	return removed, wrapTxOpsErr(err)
+	return removed, wrapInterfaceErr(err)
 }
 
 // Contains reports whether member currently belongs to set.
@@ -4539,7 +4539,7 @@ func (s *SetRegistry) Members(set NodeID) ([]NodeID, error) {
 
 	outgoing, err := s.graph.FindOutgoing(set)
 	if err != nil {
-		return nil, wrapTxOpsErr(err)
+		return nil, wrapInterfaceErr(err)
 	}
 
 	members := make([]NodeID, 0, len(outgoing))
@@ -4584,7 +4584,7 @@ func (s *SetRegistry) DeleteSet(set NodeID) error {
 		return ErrNotSet
 	}
 
-	return wrapTxOpsErr(s.graph.Transact(func(tx *Txn) error {
+	return wrapInterfaceErr(s.graph.Transact(func(tx *Txn) error {
 		if _, err := tx.RemoveRelationship(s.allSets, set); err != nil {
 			return err
 		}
@@ -4650,7 +4650,7 @@ func buildOperandDescriptorTx(tx txOps, additiveTag, subtractiveTag, scalarTag, 
 
 	u, err = tx.CreateNode()
 	if err != nil {
-		return 0, wrapTxOpsErr(err)
+		return 0, wrapInterfaceErr(err)
 	}
 	if err2 := tagNodeTx(tx, operationTag, u); err2 != nil {
 		return 0, err2
@@ -4660,7 +4660,7 @@ func buildOperandDescriptorTx(tx txOps, additiveTag, subtractiveTag, scalarTag, 
 	}
 
 	_, err = tx.AddRelationship(u, operand)
-	return u, wrapTxOpsErr(err)
+	return u, wrapInterfaceErr(err)
 }
 
 // clearOperandDescriptorEdgesTx removes descriptor u's own edge to its
@@ -4670,16 +4670,16 @@ func buildOperandDescriptorTx(tx txOps, additiveTag, subtractiveTag, scalarTag, 
 func clearOperandDescriptorEdgesTx(tx txOps, operand NodeID, hasOperand bool, operationTag, operandTag, u NodeID) error {
 	if hasOperand {
 		if _, err := tx.RemoveRelationship(u, operand); err != nil {
-			return wrapTxOpsErr(err)
+			return wrapInterfaceErr(err)
 		}
 	}
 
 	if _, err := tx.RemoveRelationship(operationTag, u); err != nil {
-		return wrapTxOpsErr(err)
+		return wrapInterfaceErr(err)
 	}
 
 	_, err := tx.RemoveRelationship(operandTag, u)
-	return wrapTxOpsErr(err)
+	return wrapInterfaceErr(err)
 }
 
 // deleteOperandDescriptorTx clears descriptor u's own edges (see
@@ -4695,7 +4695,7 @@ func deleteOperandDescriptorTx(tx txOps, operand NodeID, hasOperand bool, operat
 		return err
 	}
 
-	return wrapTxOpsErr(tx.DeleteNode(u))
+	return wrapInterfaceErr(tx.DeleteNode(u))
 }
 
 // operandTargetGeneric returns descriptor u's operand, i.e. u's single
@@ -4973,7 +4973,7 @@ func NewCompositeSetRegistry(graph GraphAPI, sets *SetRegistry, allCompositeSets
 
 				outgoing, err := g.FindOutgoing(node)
 				if err != nil {
-					return wrapTxOpsErr(err)
+					return wrapInterfaceErr(err)
 				}
 
 				for _, rel := range outgoing {
@@ -5075,7 +5075,7 @@ func (c *CompositeSetRegistry) NewCompositeSet() (NodeID, error) {
 		return err
 	})
 	if err != nil {
-		return 0, wrapTxOpsErr(err)
+		return 0, wrapInterfaceErr(err)
 	}
 
 	return id, nil
@@ -5128,7 +5128,7 @@ func (c *CompositeSetRegistry) AddOperand(set, operand NodeID, additive, expand 
 		return err2
 	})
 	if err != nil {
-		return 0, wrapTxOpsErr(err)
+		return 0, wrapInterfaceErr(err)
 	}
 
 	return u, nil
@@ -5167,7 +5167,7 @@ func (c *CompositeSetRegistry) RemoveOperand(set, u NodeID) error {
 		return err
 	}
 
-	return wrapTxOpsErr(c.graph.Transact(func(tx *Txn) error {
+	return wrapInterfaceErr(c.graph.Transact(func(tx *Txn) error {
 		if _, err := tx.RemoveRelationship(set, u); err != nil {
 			return err
 		}
@@ -5191,7 +5191,7 @@ func (c *CompositeSetRegistry) Operands(set NodeID) ([]NodeID, error) {
 
 	outgoing, err := c.graph.FindOutgoing(set)
 	if err != nil {
-		return nil, wrapTxOpsErr(err)
+		return nil, wrapInterfaceErr(err)
 	}
 
 	operands := make([]NodeID, 0, len(outgoing))
@@ -5293,7 +5293,7 @@ func (c *CompositeSetRegistry) Contains(set, value NodeID) (bool, error) {
 func (c *CompositeSetRegistry) evaluate(set NodeID, visited map[NodeID]struct{}) ([]NodeID, error) {
 	operands, err := c.graph.FindOutgoing(set)
 	if err != nil {
-		return nil, wrapTxOpsErr(err)
+		return nil, wrapInterfaceErr(err)
 	}
 
 	type descriptor struct {
@@ -5378,7 +5378,7 @@ func (c *CompositeSetRegistry) DeleteCompositeSet(set NodeID) error {
 		return ErrNotCompositeSet
 	}
 
-	return wrapTxOpsErr(c.graph.Transact(func(tx *Txn) error {
+	return wrapInterfaceErr(c.graph.Transact(func(tx *Txn) error {
 		if _, err := tx.RemoveRelationship(c.allCompositeSets, set); err != nil {
 			return err
 		}
@@ -5560,7 +5560,7 @@ func (c *CompositeSetLogRegistry) NewCompositeSetLog() (NodeID, error) {
 		return tagNodeTx(tx, c.allCompositeSetLogs, id)
 	})
 	if err != nil {
-		return 0, wrapTxOpsErr(err)
+		return 0, wrapInterfaceErr(err)
 	}
 
 	return id, nil
@@ -5608,7 +5608,7 @@ func (c *CompositeSetLogRegistry) AppendOperation(log, operand NodeID, additive,
 		return err2
 	})
 	if err != nil {
-		return 0, 0, wrapTxOpsErr(err)
+		return 0, 0, wrapInterfaceErr(err)
 	}
 
 	return u, capsule, nil
@@ -5678,7 +5678,7 @@ func (c *CompositeSetLogRegistry) RemoveOperation(log, capsule NodeID) error {
 		return err3
 	}
 
-	return wrapTxOpsErr(c.graph.Transact(func(tx *Txn) error {
+	return wrapInterfaceErr(c.graph.Transact(func(tx *Txn) error {
 		return deleteOperandDescriptorTx(tx, operand, hasOperand, operationTag, operandTag, u)
 	}))
 }
@@ -5937,7 +5937,7 @@ func (c *CompositeSetLogRegistry) DeleteCompositeSetLog(log NodeID) error {
 		return ErrNotCompositeSetLog
 	}
 
-	return wrapTxOpsErr(c.graph.Transact(func(tx *Txn) error {
+	return wrapInterfaceErr(c.graph.Transact(func(tx *Txn) error {
 		if _, err := tx.RemoveRelationship(c.allCompositeSetLogs, log); err != nil {
 			return err
 		}
@@ -6031,7 +6031,7 @@ func (d *domainConstraint) SetDomain(anchor, domain NodeID) error {
 	}
 
 	if !found {
-		return wrapTxOpsErr(d.graph.Transact(func(tx *Txn) error {
+		return wrapInterfaceErr(d.graph.Transact(func(tx *Txn) error {
 			newSlot, err2 := createTaggedNodeTx(tx, d.domainSlots.allPointers)
 			if err2 != nil {
 				return err2
@@ -6224,7 +6224,7 @@ func (b *DomainPointerRegistryB) NewDomainPointer(anchor NodeID) error {
 		return nil
 	}
 
-	return wrapTxOpsErr(b.graph.Transact(func(tx *Txn) error {
+	return wrapInterfaceErr(b.graph.Transact(func(tx *Txn) error {
 		u, err2 := newPointerTx(tx, b.pointers.allPointers)
 		if err2 != nil {
 			return err2
