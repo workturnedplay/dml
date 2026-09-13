@@ -2159,6 +2159,289 @@ GraphReader, ...)` or similar, but this is a mechanical consequence of
 question and this section's per-backend-concurrency question interact,
 should §88 ever be revisited.
 
+**§89c — Concurrent access to one graph: mechanism candidates, and a
+conflict-granularity constraint found this session (mostly OPEN,
+TENTATIVE where noted; nothing here implemented).** §89/§89a/§89b
+established that concurrency is a per-backend contract and named,
+without resolving, the in-memory backend's own goroutine-safety gap
+(§89b). This addendum records a subsequent design discussion about *how*
+real concurrent access to one graph instance could actually be provided
+— whether from multiple goroutines in one process, or, per §19a's own
+"same concern at smaller scale" framing, as a rehearsal of Part B/C's
+distributed case — without assuming any of it decided or built. Per
+§33's discipline, three separable questions are kept apart rather than
+treated as one: what mechanism keeps a single shared graph consistent
+under concurrent access; what unit of state that mechanism must reason
+about to avoid manufacturing false contention; and whether either can be
+added later without disturbing what already exists, or requires a
+genuine rewrite.
+
+**Two mechanisms, not two competitors.** CSP/actor-style single
+ownership (channels/goroutines in Go; the lineage Rob Pike has cited
+Hoare's CSP as ancestral to) and MVCC (multi-version concurrency
+control: transactions run against an immutable snapshot, conflicting
+writes resolved by validate-then-retry rather than locking) answer
+different questions. CSP/actor decides *who is allowed to touch a piece
+of shared mutable state at all* — exactly one execution context, ever —
+and gets safety from that alone, not throughput. MVCC decides *how to
+keep one piece of state consistent when more than one writer legitimately
+needs to touch it*. Nothing requires choosing only one; the two nest
+naturally rather than compete, as the closing point below makes concrete.
+
+**GraphActor — CSP/actor applied to this codebase's existing seam.**
+Because every registry in this file already depends on
+`GraphAPI`/`GraphStore`/`GraphReader` rather than the concrete `*Graph`
+(§87) — built purely for testability/decoupling, with no concurrency
+motivation at the time — a wrapper type owning a private `*Graph` behind
+one dedicated goroutine, accepting whole closures over a channel and
+itself satisfying `GraphAPI`, could be substituted for `*Graph` in every
+registry constructor with zero change to registry logic. Call this
+candidate type `GraphActor`. Under it, `Txn` and `Checker` need no change
+at all — not because they happen to still work, but because the specific
+premise both already state as load-bearing ("nothing runs between two
+statements in the same synchronous call," §19) becomes literally true
+again by construction, merely relocated from "whichever goroutine happens
+to call `Transact`" to "the one goroutine `GraphActor` dedicates to the
+real graph." Any operation expressible as one Go closure — including
+arbitrarily deep static call nesting, op calling op calling op, all
+within one function passed to `Transact` — is atomic under `GraphActor`
+for the identical reason it is atomic today.
+
+**What is not free: dynamically-assembled grouping.** `GraphActor`'s
+atomicity is bounded exactly by what is bundled into one submitted
+closure. An operation whose steps are decided dynamically by something
+with no fixed Go-source shape — in particular, a future in-graph
+processor (§27) assembling a plan as it goes — cannot be expressed as one
+closure ahead of time, and `GraphActor` has no way to infer, merely from
+watching a sequence of arriving closures, that several were meant to be
+one logical unit. Submitting them separately reopens the hazard described
+next.
+
+**This is not deadlock.** A closure running on `GraphActor`'s one
+goroutine never blocks waiting for an external reply mid-flight — the
+same non-blocking request/response discipline already required
+cross-graph (§47a: a step either completes or returns, never holds the
+goroutine open awaiting a second party) — so there is no circular-wait
+condition for deadlock to arise from. The real risk is narrower and
+already named elsewhere in this document: two separately-submitted
+closures, each individually valid against what its own caller read,
+jointly violating an invariant neither alone would trip — a
+lost-update/write-skew anomaly, not a locking bug.
+
+**This hazard already has a live example and a live fix in this
+codebase.** `DomainPointerRegistryD` registers a commit-time `Checker`
+re-deriving the domain/target relationship against the real, current
+graph immediately after any relevant mutation (§10c), so even if
+`SetTarget` and `SetDomain` arrived as two separately-submitted closures
+under a future concurrent submitter, whichever committed second would be
+caught and rejected if it left the pair inconsistent — because the
+Checker never trusts what an earlier caller read, only what currently
+holds. `DomainPointerRegistryB` has no equivalent Checker (deferred per
+its own doc comment, since its anchor carries no self-identifying tag a
+Checker could reverse-discover it from, §7) and is enforced write-time
+only. Under today's single-threaded execution this asymmetry is
+invisible; under any concurrent submitter it is exactly the shape of gap
+that would surface first. The general fix this illustrates: validate a
+cross-cutting invariant against live current state at commit time, never
+against whatever a submitter believed when it decided what to send —
+precisely what `Checker` (§73/§77/§83) already does, generalized to a
+concurrent submitter rather than only to an out-of-band Graph bypass.
+
+**In-graph transaction descriptors — new work, not free reuse.** Closing
+the dynamically-assembled-grouping gap above requires the plan itself to
+become ordinary, visible graph structure rather than living only on some
+goroutine's stack — a fresh node representing the pending operation
+(§75's occurrence-identity pattern; §44's "pending state requires
+relationship-objects" reasoning; §8's relationship-object nodes
+generally), built up non-atomically since nothing commits until it is
+complete, then applied via one `GraphActor` closure that reads the plan
+node and atomically validates-and-applies it. This is a genuine
+generalization of §44/§58's cross-graph PENDING-state machinery down to
+the same-graph case, directly realizing §19a's "same concern at smaller
+scale" framing — but it requires designing a vocabulary that does not yet
+exist in any form (what a plan node may assert: which edges to add or
+remove, which preconditions must still hold, whether the whole plan is
+all-or-nothing). It must not be assumed to fall out of anything already
+built merely because the surrounding pattern is familiar.
+
+**Goroutines as Part C participants.** A different resolution to the same
+grouping problem: give each goroutine its own private `*Graph` rather
+than sharing one, and model cross-goroutine interaction through the same
+cross-graph correspondence machinery Part C already explores (S/P
+proxies, §39–48/58, or real composite IDs, §59–61) rather than inventing
+a second, parallel design for concurrency inside one process. This is
+attractive precisely because it means resolving Part C once serves both
+the fully-distributed case and the merely-multi-goroutine case, directly
+realizing §20's "if two things communicate locally, the system should be
+able to make that look like communication between remote things." It
+does not resolve Part C's own still-open fork; it only means that fork
+now also gates intra-process concurrency, not only cross-machine
+distribution.
+
+**MVCC for genuine intra-graph parallelism, and one candidate rejected
+outright.** Cloning the entire `Graph` per transaction attempt was
+considered and rejected: wasteful by construction, and reconciling what
+changed in order to merge a clone back into shared state is not an
+acceptable shape of solution regardless of implementation effort spent on
+it. Two other candidate shapes remain open:
+
+- **(a) Staged/overlay `Txn`** — §77's own originally-proposed
+  staged/copy-on-write transaction mode, at the time deliberately not
+  built because nothing could observe a `Txn`'s intermediate state under
+  single-threaded execution (§77's resolution note, §83). That premise is
+  exactly what stops holding once real concurrent submitters exist. A
+  `Txn` would accumulate a small delta — proportional to the size of that
+  one transaction, not the whole graph — with reads checking the overlay
+  before falling through to the shared base, and only the final merge
+  into shared state needing to be one atomic step, naturally expressible
+  as one `GraphActor` closure with no separate compare-and-swap primitive
+  required.
+- **(b) Persistent, structurally-shared storage with atomic-swap
+  commit** — `Graph`'s plain map-shaped internals replaced by a
+  persistent/structurally-shared data structure (e.g. a HAMT or
+  persistent trie/B-tree), so a new version shares nearly all structure
+  with the old one (cost proportional to the size of the change, not the
+  graph) and readers holding an old version need no lock or copy at all —
+  an unchanging, immutable value they simply already have. Commit is a
+  compare-and-swap of one shared root pointer; a losing writer discards
+  its candidate and re-runs its transaction body fresh against the new
+  root. This is the Datomic/Clojure-`atom` shape, and is a genuine
+  rewrite of `Graph`'s storage internals rather than a wrapper layered on
+  top of what exists.
+
+Both (a) and (b) rely on the same already-true property, discovered as a
+side effect of an unrelated discipline rather than built for this: every
+registry in this file already re-derives its answers fresh from the
+graph on every call and never caches (§74). This is exactly the property
+that makes "discard this attempt and re-run the same registry logic
+against newer state" safe rather than a risk of silently reusing a stale
+intermediate conclusion.
+
+**Deciding question, and a session finding.** §77 already asked, and
+left open, "what actually needs concurrent access" as the deciding
+factor here. This session's answer was "both": genuine parallel writes
+across multiple cores, *and* a slow or externally-blocked decision phase
+that should not freeze unrelated work queued behind it at one
+serialization point. (a) alone addresses only the latter; only (b)
+addresses the former. This leans the eventual target toward (b), with
+`GraphActor`'s role correspondingly shifting from "the one thing doing
+all the work serially" toward "the coordination point between genuinely
+separate graph instances/participants" (dovetailing with the
+goroutines-as-Part-C-participants direction above), each such instance
+internally using (b) for real parallelism where warranted. Not yet a
+decision — see Part D.
+
+**Retry is not pointless, provided conflict detection is fine-grained.**
+A transaction that loses a commit race must not be treated as doomed to
+fail identically on retry — that intuition only holds under *coarse*
+conflict detection (a single whole-graph version counter, invalidated by
+any commit anywhere), which would make nearly every retry re-fail
+against changes with no actual bearing on the losing transaction's own
+work, and is close to pointless as a mechanism. The correct granularity
+tracks the specific `(A,B)` relationship facts and node-existence checks
+a transaction's own decision-making actually depended on, and the
+specific facts it is about to write, validating only that overlap against
+whatever committed since its snapshot was taken. Under this granularity,
+concurrent transactions touching disjoint parts of the graph retry
+successfully on the very next attempt — staleness alone is not failure,
+only genuine overlap is. This is independently confirmed, checked
+directly this session rather than assumed, by a real shipped system:
+SpacetimeDB's reducers appear serializable from the caller's own
+perspective, are explicitly reserved to run concurrently under MVCC
+internally, and are documented as re-executable with the same arguments
+if a serializability anomaly is detected — the identical validate-then-
+retry shape considered here.
+
+**Conflict-detection granularity is not uniform across node kinds — a
+concrete constraint, not yet built.** A tempting, wrong shortcut for
+either (a) or (b) would be to treat "did this node's adjacency structure
+change at all" as one uniform conflict unit for every node. Whether that
+is correct or actively wrong depends entirely on what invariant, if any,
+already governs that node — and this is already fully legible from
+existing code and registered `Checker`s, not something needing separate
+declaration:
+
+- **Bare membership/tag nodes** — `AllPointers`, `AllSets`, `AllLists`,
+  and every other hub tag reused across independent structures per §76's
+  tag-parameterization discipline. No invariant spans more than one edge
+  here: `IsPointer`/`IsSet` are each one independent `HasRelationship`
+  check, and `SetRegistry` registers no `Checker` at all, since a Set
+  imposes no cross-edge constraint on its children (implementation_state.md
+  item 17). The correct, necessary conflict unit is the individual `(A,B)`
+  edge — never "this node's whole adjacency changed." Treating these
+  node-wide would manufacture false contention between entities sharing
+  nothing but an incidental "kind" tag, reproducing exactly the hotspot
+  pathology a real system's own scaling limits already confirm:
+  contending transactions must serialize regardless of core count, so an
+  unnecessarily coarse conflict unit directly costs throughput, not
+  merely elegance.
+- **Cardinality-governed nodes** — any node `singleChildTarget` is run
+  against: Representation A/B pointer nodes, `PointerMetadataRegistry`/
+  `PointerMetadataRegistryD`'s slot and target-slot nodes (the former
+  excluding a known, tag-identified subject-slot from the scan, §10a),
+  each of `CapsuleRegistry`'s three role slots, an operand descriptor's
+  own single outgoing edge (§80), and the domain slot (§10c). Here the
+  invariant ("at most one target") is defined over the *entire* outgoing
+  set, not any one edge in isolation, so the correct, necessary conflict
+  unit is that whole outgoing set — treating this per-edge would let two
+  concurrent `SetTarget`-shaped writes race past each other undetected
+  and silently reintroduce the exact `ErrTooManyPointerTargets`
+  corruption this file already treats as a serious, fail-loud violation
+  when reached via an out-of-band bypass (implementation_state.md item 4);
+  arriving via a race instead of a bypass changes nothing about how
+  serious it is.
+- **Small fixed-candidate-set checks** — `exactlyOneTag`'s two axis-tag
+  reads (§80): neither "one arbitrary edge" nor "the whole set," but
+  exactly the small, enumerable, known-in-advance pair of candidate
+  relationships the check itself reads. An operand descriptor needs both
+  treatments simultaneously, for different edges in different directions:
+  its one outgoing edge (its operand target) is cardinality-governed,
+  while its two incoming axis-tag edges are small-fixed-candidate-set
+  checks — the correct unit is a property of a specific relationship's
+  role, not of the node as an undifferentiated whole.
+
+Consequence: a future read/write-set tracking mechanism does not need a
+separately invented declaration scheme. Every existing accessor's own
+query shape (`FindOutgoing` scanning a whole set vs. `HasRelationship`
+checked against a specific known node) and every registered `Checker`'s
+own `Check` body already state, precisely, which of these shapes governs
+that structure — a tracker could piggyback directly on those same call
+sites rather than requiring registries to separately annotate what they
+depend on.
+
+**Livelock/starvation under naive retry — a distinct hazard from
+conflict detection above.** Even with correctly fine-grained conflict
+detection, naive immediate-retry-on-loss with no backoff or arbitration
+does not by itself guarantee any transaction eventually succeeds: two or
+more genuinely contending transactions can retry in a pattern that keeps
+causing each other to lose, indefinitely — the same shape of hazard
+randomized exponential backoff schemes (e.g. Ethernet's collision-
+detection retry) were invented to address, not a hypothetical specific to
+this project. This can occur even when every individual conflict is
+detected correctly, so it is a separate hazard from lost-update/write-
+skew above, not another instance of it. Candidate remedies, none yet
+chosen: randomized backoff between retries; priority/age-based
+arbitration (an aging transaction's priority increases until it is
+guaranteed to win); or a bounded-retry-count escape hatch that falls
+through to full serialization — naturally realized by routing that one
+contended operation through `GraphActor` instead — once a transaction has
+retried too many times. The last option is a concrete illustration of the
+two mechanisms nesting rather than competing: optimistic by default, with
+the actor's absolute serialization available as a guaranteed-progress
+fallback for the narrow case that needs it.
+
+**What this section does not decide.** Whether (a) or (b) is the
+eventual mechanism for intra-graph parallelism; the concrete backoff/
+priority/escape-hatch policy for livelock avoidance; the concrete
+vocabulary for in-graph transaction-descriptor nodes — which
+preconditions and edge-operations a plan node may express, and what
+"atomically apply" means once decided; whether a future read/write-set
+tracker should be built directly out of `Checker.Tags`/`Check`'s existing
+shape or needs separate machinery; and whether goroutines-as-Part-C-
+participants is adopted at all, as opposed to a single shared
+`GraphActor` per process. All of the above remain OPEN, tracked in
+Part D.
+
 ---
 
 ## PART D — STATUS SUMMARY (consolidated)
@@ -2256,6 +2539,24 @@ kept current as sections above resolve or split further.)*
 - The concrete Go shape/naming of the extracted storage interface (§87a),
   and which of `Transact`/`RegisterChecker` belong on it versus a
   separate layer (§89a's contract-not-mechanism framing).
+- CSP/actor ownership (`GraphActor`) and MVCC address different
+  questions — who may touch shared state, versus how one shared thing
+  stays consistent under multiple legitimate writers — rather than
+  competing designs (§89c).
+- Reusing Part C's cross-graph correspondence machinery to model
+  cross-goroutine interaction within one process, rather than a second,
+  parallel intra-process design (§89c).
+- Persistent/structurally-shared storage with atomic-swap commit, rather
+  than staged/overlay `Txn` alone, as the eventual mechanism for genuine
+  intra-graph parallel writes, given this session's finding that both
+  parallel writes and non-blocking slow decision phases are wanted
+  (§89c).
+- Conflict-detection granularity for any future optimistic-concurrency
+  mechanism must follow each node's own governing invariant — per-edge
+  for bare tag/membership nodes, whole-outgoing-set for any
+  `singleChildTarget`-governed node, small-fixed-candidate-set for
+  `exactlyOneTag`-shaped checks — rather than one uniform per-node rule
+  (§89c).
 
 ### OPEN
 - Exact Set/Pointer/List definitions; exact primitive storage; whether a
@@ -2304,6 +2605,22 @@ kept current as sections above resolve or split further.)*
   goroutine misuse with a mutex, document the single-goroutine assumption
   explicitly as a caller-facing constraint, or leave it unaddressed
   (§89b).
+- Whether real concurrent access to one graph, when eventually needed, is
+  provided via staged/overlay `Txn` (§77's originally-shelved proposal)
+  or via persistent/structurally-shared storage with atomic-swap commit,
+  and the concrete Go shape of either (§89c).
+- Whether cross-goroutine concurrency within one process is modeled by
+  giving each goroutine its own graph and reusing Part C's still-open
+  cross-graph identity question, or by some other means (§89c).
+- The vocabulary for in-graph transaction-descriptor nodes needed once an
+  operation's steps are assembled dynamically (e.g. by a future in-graph
+  processor, §27) rather than fixed in Go source, so such an operation
+  can still be submitted to a single-owner concurrency mechanism as one
+  atomic unit (§89c).
+- The concrete policy — randomized backoff, priority/age-based
+  arbitration, or a bounded-retry escape hatch to full serialization —
+  for preventing livelock/starvation among repeatedly-conflicting
+  optimistic retries (§89c).
 
 ### REJECTED FOR NOW
 - Giving primitive relationships their own NodeIDs.
@@ -2319,6 +2636,13 @@ kept current as sections above resolve or split further.)*
 - Concurrent/bidirectional search for composite Set membership queries
   (§84) — explored, found not to structurally transfer from
   CapsulesWithValue's reverse-lookup precedent.
+- Cloning the entire `Graph` per transaction attempt as a basis for
+  optimistic concurrency — rejected as wasteful, with no acceptable way
+  to reconcile a clone's changes back into shared state (§89c).
+- A single, uniform "did this node's adjacency change at all"
+  conflict-detection unit applied identically to every node — correct
+  only for bare membership/tag nodes; actively wrong for any node whose
+  own invariant is defined over its whole outgoing set (§89c).
 
 ---
 
