@@ -9568,7 +9568,8 @@ func TestGraphActorTransactPanicPropagatesAndActorSurvives(t *testing.T) {
 			}
 		}()
 
-		_ = actor.Transact(func(tx *Txn) error {
+		//nolint:errcheck // because there's no error, it panics
+		_ = actor.Transact(func(_ *Txn) error {
 			panic("boom")
 		})
 	}()
@@ -9582,7 +9583,7 @@ func TestGraphActorTransactPanicPropagatesAndActorSurvives(t *testing.T) {
 	}
 }
 
-func TestGraphActorCloseIsIdempotent(t *testing.T) {
+func TestGraphActorCloseIsIdempotent(_ *testing.T) {
 	actor := NewGraphActor(&Graph{})
 
 	actor.Close()
