@@ -20,6 +20,7 @@ import (
 	"errors"
 	"reflect"
 	"sort"
+	"sync"
 	"testing"
 )
 
@@ -9433,5 +9434,319 @@ func TestCrossRoleSetRegistryConflictCheckExercisedWhileSetIsDomainAndOperand(t 
 	err = fx.domainD.SetTarget(subject, outside)
 	if !errors.Is(err, ErrTargetOutsideDomain) {
 		t.Fatalf("SetTarget(subject, outside) after declined TagAsSet: error = %v, want %v", err, ErrTargetOutsideDomain)
+	}
+}
+
+// The following tests exercise GraphActor (theorystate.md section 89c):
+// a CSP/actor-style wrapper making it safe for multiple goroutines to
+// share one underlying *Graph, none of them ever touching it directly.
+
+func TestGraphActorBasicOperations(t *testing.T) {
+	actor := NewGraphActor(&Graph{})
+	defer actor.Close()
+
+	a, err := actor.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for a: %v", err)
+	}
+
+	b, err := actor.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for b: %v", err)
+	}
+
+	if !actor.NodeExists(a) || !actor.NodeExists(b) {
+		t.Fatal("created nodes do not both exist")
+	}
+
+	created, err := actor.AddRelationship(a, b)
+	if err != nil {
+		t.Fatalf("AddRelationship(a,b): %v", err)
+	}
+	if !created {
+		t.Fatal("AddRelationship(a,b) reported that nothing was created")
+	}
+
+	if !actor.HasRelationship(a, b) {
+		t.Fatal("HasRelationship(a,b) = false, want true")
+	}
+
+	relationship, exists, err := actor.FindRelationship(a, b)
+	if err != nil {
+		t.Fatalf("FindRelationship(a,b): %v", err)
+	}
+	if !exists {
+		t.Fatal("FindRelationship(a,b) reported the relationship does not exist")
+	}
+	want := Relationship{From: a, To: b}
+	if !reflect.DeepEqual(relationship, want) {
+		t.Fatalf("FindRelationship(a,b) = %v, want %v", relationship, want)
+	}
+
+	outgoing, err := actor.FindOutgoing(a)
+	if err != nil {
+		t.Fatalf("FindOutgoing(a): %v", err)
+	}
+	if !reflect.DeepEqual(outgoing, []Relationship{want}) {
+		t.Fatalf("FindOutgoing(a) = %v, want %v", outgoing, []Relationship{want})
+	}
+
+	incoming, err := actor.FindIncoming(b)
+	if err != nil {
+		t.Fatalf("FindIncoming(b): %v", err)
+	}
+	if !reflect.DeepEqual(incoming, []Relationship{want}) {
+		t.Fatalf("FindIncoming(b) = %v, want %v", incoming, []Relationship{want})
+	}
+
+	all := actor.FindRelationships()
+	if !reflect.DeepEqual(all, []Relationship{want}) {
+		t.Fatalf("FindRelationships() = %v, want %v", all, []Relationship{want})
+	}
+
+	removed, err := actor.RemoveRelationship(a, b)
+	if err != nil {
+		t.Fatalf("RemoveRelationship(a,b): %v", err)
+	}
+	if !removed {
+		t.Fatal("RemoveRelationship(a,b) reported that nothing was removed")
+	}
+
+	if actor.HasRelationship(a, b) {
+		t.Fatal("relationship still exists after removal")
+	}
+
+	if err := actor.DeleteNode(a); err != nil {
+		t.Fatalf("DeleteNode(a): %v", err)
+	}
+	if actor.NodeExists(a) {
+		t.Fatal("node a still exists after DeleteNode()")
+	}
+}
+
+func TestGraphActorTransactRollsBackOnFailure(t *testing.T) {
+	actor := NewGraphActor(&Graph{})
+	defer actor.Close()
+
+	const nonexistent NodeID = 999999
+
+	var id NodeID
+	err := actor.Transact(func(tx *Txn) error {
+		var err error
+		id, err = tx.CreateNode()
+		if err != nil {
+			return err
+		}
+
+		_, err = tx.AddRelationship(id, nonexistent)
+		return err
+	})
+
+	if !errors.Is(err, ErrNodeNotFound) {
+		t.Fatalf("Transact() error = %v, want %v", err, ErrNodeNotFound)
+	}
+
+	if actor.NodeExists(id) {
+		t.Fatalf("node %d still exists after its creating transaction rolled back", id)
+	}
+}
+
+// TestGraphActorTransactPanicPropagatesAndActorSurvives covers the
+// panic-handling behavior documented on GraphActor.do: a panic inside a
+// Transact closure must still propagate to its original caller, exactly
+// as a direct, non-actor Graph.Transact call already does, while
+// leaving the actor's own dedicated goroutine alive to service every
+// later, unrelated call.
+func TestGraphActorTransactPanicPropagatesAndActorSurvives(t *testing.T) {
+	actor := NewGraphActor(&Graph{})
+	defer actor.Close()
+
+	func() {
+		defer func() {
+			if r := recover(); r == nil {
+				t.Fatal("expected panic to propagate out of GraphActor.Transact()")
+			}
+		}()
+
+		_ = actor.Transact(func(tx *Txn) error {
+			panic("boom")
+		})
+	}()
+
+	id, err := actor.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() after a panicking Transact(): %v", err)
+	}
+	if !actor.NodeExists(id) {
+		t.Fatalf("node %d does not exist after a panicking Transact()", id)
+	}
+}
+
+func TestGraphActorCloseIsIdempotent(t *testing.T) {
+	actor := NewGraphActor(&Graph{})
+
+	actor.Close()
+	actor.Close()
+}
+
+// TestGraphActorConcurrentCreateNodeProducesUniqueIDs exercises
+// GraphActor under real concurrent load: many goroutines each mint a
+// fresh node and link it to a shared hub node, entirely through the
+// actor, with no direct access to the underlying *Graph at all.
+// Graph.CreateNode's own nextID counter increment is not atomic on its
+// own -- this is exactly what go test -race, or a duplicate/missing
+// NodeID, would be expected to catch if GraphActor's serialization
+// guarantee did not actually hold.
+func TestGraphActorConcurrentCreateNodeProducesUniqueIDs(t *testing.T) {
+	actor := NewGraphActor(&Graph{})
+	defer actor.Close()
+
+	hub, err := actor.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for hub: %v", err)
+	}
+
+	const goroutines = 50
+
+	var wg sync.WaitGroup
+	ids := make([]NodeID, goroutines)
+	errs := make([]error, goroutines)
+
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+
+			id, createErr := actor.CreateNode()
+			if createErr != nil {
+				errs[i] = createErr
+				return
+			}
+
+			if _, addErr := actor.AddRelationship(hub, id); addErr != nil {
+				errs[i] = addErr
+				return
+			}
+
+			ids[i] = id
+		}()
+	}
+
+	wg.Wait()
+
+	seen := make(map[NodeID]struct{}, goroutines)
+	for i, id := range ids {
+		if errs[i] != nil {
+			t.Fatalf("goroutine %d: %v", i, errs[i])
+		}
+		if _, dup := seen[id]; dup {
+			t.Fatalf("CreateNode() returned duplicate NodeID %d", id)
+		}
+		seen[id] = struct{}{}
+	}
+
+	outgoing, err := actor.FindOutgoing(hub)
+	if err != nil {
+		t.Fatalf("FindOutgoing(hub): %v", err)
+	}
+	if len(outgoing) != goroutines {
+		t.Fatalf("FindOutgoing(hub) has %d relationships, want %d", len(outgoing), goroutines)
+	}
+}
+
+// TestGraphActorConcurrentSetTargetNeverProducesTooManyTargets exercises
+// the write-skew hazard theorystate.md section 89c names directly: many
+// goroutines racing PointerRegistry.SetTarget on the very same pointer,
+// entirely through one GraphActor, with no direct *Graph access from any
+// of them. PointerRegistry.SetTarget's own read-then-Transact shape
+// (reading the current target, then separately committing a replacement)
+// is not atomic as a whole under GraphActor -- only each of its two
+// round trips is individually serialized -- so two goroutines can
+// legitimately interleave between them.
+//
+// This test does not assert which goroutine "wins": that depends on
+// scheduling. It asserts the actual safety property instead: every
+// returned error, if any, is specifically ErrTooManyPointerTargets --
+// PointerRegistry's own existing Checker (registered once, at
+// construction, exactly as it already is for single-threaded use)
+// catching and rolling back a losing goroutine's stale commit, with no
+// GraphActor-specific machinery required -- and exactly one target
+// survives at the end regardless of how the goroutines happened to
+// interleave.
+func TestGraphActorConcurrentSetTargetNeverProducesTooManyTargets(t *testing.T) {
+	actor := NewGraphActor(&Graph{})
+	defer actor.Close()
+
+	names := NewNameRegistry(actor)
+	ids, err := names.BootstrapNames(FoundationalNames)
+	if err != nil {
+		t.Fatalf("BootstrapNames(): %v", err)
+	}
+
+	pointers, err := NewPointerRegistry(actor, ids[NameAllPointers])
+	if err != nil {
+		t.Fatalf("NewPointerRegistry(): %v", err)
+	}
+
+	p, err := pointers.NewPointer()
+	if err != nil {
+		t.Fatalf("NewPointer(): %v", err)
+	}
+
+	const goroutines = 50
+
+	candidates := make([]NodeID, goroutines)
+	for i := range candidates {
+		candidate, createErr := actor.CreateNode()
+		if createErr != nil {
+			t.Fatalf("CreateNode() for candidate %d: %v", i, createErr)
+		}
+		candidates[i] = candidate
+	}
+
+	var wg sync.WaitGroup
+	errs := make([]error, goroutines)
+
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs[i] = pointers.SetTarget(p, candidates[i])
+		}()
+	}
+
+	wg.Wait()
+
+	for i, setErr := range errs {
+		if setErr != nil && !errors.Is(setErr, ErrTooManyPointerTargets) {
+			t.Fatalf("goroutine %d: SetTarget() error = %v, want nil or %v", i, setErr, ErrTooManyPointerTargets)
+		}
+	}
+
+	outgoing, err := actor.FindOutgoing(p)
+	if err != nil {
+		t.Fatalf("FindOutgoing(p): %v", err)
+	}
+	if len(outgoing) != 1 {
+		t.Fatalf("FindOutgoing(p) = %v, want exactly one surviving target regardless of interleaving", outgoing)
+	}
+
+	target, hasTarget, err := pointers.Target(p)
+	if err != nil {
+		t.Fatalf("Target(p): %v", err)
+	}
+	if !hasTarget {
+		t.Fatal("Target(p) reports no target after concurrent SetTarget calls")
+	}
+
+	found := false
+	for _, candidate := range candidates {
+		if candidate == target {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("Target(p) = %d, want one of the attempted candidates %v", target, candidates)
 	}
 }

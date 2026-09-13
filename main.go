@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"sync"
 )
 
 type NodeID uint64
@@ -788,6 +789,292 @@ func (g *Graph) checkerRelevant(checker Checker, touched map[NodeID]struct{}) bo
 	}
 
 	return false
+}
+
+// GraphActor is a concurrency-safe wrapper around a private *Graph,
+// implementing GraphAPI so it can be substituted for a concrete *Graph
+// anywhere a registry in this file expects one -- with zero change to
+// any registry's own logic, exactly per section 87's decoupling
+// refactor. GraphActor is the CSP/actor-style mechanism explored in
+// theorystate.md section 89c: rather than protecting the underlying
+// *Graph with a lock, GraphActor gives it exactly one owner -- a single
+// dedicated goroutine, started by NewGraphActor -- and every other
+// goroutine communicates with that owner by submitting whole closures
+// over a channel, never by touching the *Graph directly. This makes
+// Graph's own bare, unsynchronized maps (theorystate.md section 89b)
+// safe to share across goroutines for the first time, without changing
+// Graph itself at all.
+//
+// Txn and Checker need no change to work correctly underneath
+// GraphActor. Both already state, as their own load-bearing soundness
+// argument, that nothing can observe an in-progress mutation because
+// nothing else runs between two statements in the same synchronous call
+// (theorystate.md section 19). GraphActor does not weaken that
+// argument -- it makes it true again by construction, merely relocated
+// from "whichever goroutine happens to call Transact" to "the one
+// goroutine GraphActor dedicates to the real Graph."
+//
+// What is, and is not, atomic under GraphActor. Any single call routed
+// through GraphActor -- including an entire Graph.Transact call, however
+// many CreateNode/AddRelationship/RemoveRelationship/DeleteNode steps its
+// own fn performs internally -- runs to completion on the actor's
+// goroutine before the next queued call is even looked at, so it can
+// never be interleaved with anything else. What is NOT free is grouping
+// more than one separately-submitted call into one larger atomic unit:
+// PointerRegistry.SetTarget, for example, reads the pointer's current
+// target via one call and only later, separately, commits a replacement
+// via Graph.Transact -- two distinct round trips through GraphActor, not
+// one -- so a second goroutine's own SetTarget call on the very same
+// pointer can legitimately land in between them. This is a real,
+// lost-update/write-skew-shaped hazard, not a bug in GraphActor itself
+// (theorystate.md section 89c); it is exactly the same shape of gap
+// DomainPointerRegistryD's own commit-time Checker already exists to
+// close for that structure specifically, by re-validating against live
+// current state at commit time rather than trusting what an earlier
+// caller read. TestGraphActorConcurrentSetTargetNeverProducesTooManyTargets
+// demonstrates this concretely: PointerRegistry's own existing Checker
+// (registered once, exactly as it already is for single-threaded use) is
+// what catches and rolls back a losing goroutine's stale commit, with no
+// GraphActor-specific machinery required. Solving this in general -- for
+// a plan whose steps are not fixed in Go source, e.g. one assembled
+// dynamically by some future in-graph processor -- needs new,
+// not-yet-designed, in-graph transaction-descriptor machinery
+// (theorystate.md section 89c); GraphActor deliberately does not attempt
+// that here.
+//
+// Deadlock is not a risk GraphActor introduces: a job running on its one
+// goroutine never blocks waiting for an external reply mid-flight (the
+// same non-blocking request/response discipline theorystate.md section
+// 47a already requires cross-graph), so there is no circular wait for
+// deadlock to arise from.
+//
+// Panics are recovered inside the actor's own goroutine and re-raised in
+// the original calling goroutine once that call returns, so that a
+// panicking Transact closure -- see Graph.Transact's own documented
+// panic-then-rollback behavior -- looks, from its caller's perspective,
+// exactly like a direct, non-actor call to Graph.Transact would: the
+// panic still propagates to the caller, but the actor's single dedicated
+// goroutine survives to keep serving every other, unrelated caller
+// afterward, rather than the panic silently killing the one goroutine
+// every future request depends on (which, left unrecovered, would in
+// fact crash the entire process, not merely this actor -- an unrecovered
+// panic in any goroutine terminates the whole program).
+//
+// Close stops the actor's goroutine. GraphActor must not be used
+// concurrently with, or after, a call to Close -- an accepted,
+// documented caller responsibility (theorystate.md section 89b's
+// "document the assumption explicitly" resolution), not something
+// GraphActor attempts to guard against itself.
+type GraphActor struct {
+	graph     *Graph
+	requests  chan func(*Graph)
+	stopped   chan struct{}
+	closeOnce sync.Once
+}
+
+// Compile-time assertion that *GraphActor satisfies GraphAPI, exactly
+// mirroring the existing assertion for *Graph above.
+var _ GraphAPI = (*GraphActor)(nil)
+
+// NewGraphActor starts a GraphActor's dedicated goroutine and returns
+// immediately. graph becomes owned by that goroutine from this point
+// on: per the GraphActor doc comment, nothing outside the returned
+// *GraphActor may touch graph directly again -- every future access
+// must go through the returned value's own methods.
+func NewGraphActor(graph *Graph) *GraphActor {
+	ga := &GraphActor{
+		graph:    graph,
+		requests: make(chan func(*Graph)),
+		stopped:  make(chan struct{}),
+	}
+
+	go ga.run()
+
+	return ga
+}
+
+// run is the body of GraphActor's one dedicated goroutine: it services
+// requests until the channel is closed (by Close), then closes stopped
+// so Close can report that the goroutine has actually exited.
+func (ga *GraphActor) run() {
+	defer close(ga.stopped)
+
+	for req := range ga.requests {
+		req(ga.graph)
+	}
+}
+
+// do submits fn to run against ga's private *Graph, on ga's own
+// dedicated goroutine, and blocks until fn has returned. Every exported
+// GraphActor method is built on this one primitive; see the GraphActor
+// doc comment for exactly what this does and does not make atomic. A
+// panic inside fn is recovered here, on the actor's own goroutine (so
+// the actor survives to service future callers), and re-raised here
+// again, back on the calling goroutine, once fn has finished -- see the
+// GraphActor doc comment's panic-handling paragraph.
+func (ga *GraphActor) do(fn func(g *Graph)) {
+	done := make(chan struct{})
+
+	var recovered any
+	var panicked bool
+
+	ga.requests <- func(g *Graph) {
+		defer func() {
+			if r := recover(); r != nil {
+				panicked = true
+				recovered = r
+			}
+			close(done)
+		}()
+
+		fn(g)
+	}
+
+	<-done
+
+	if panicked {
+		panic(recovered)
+	}
+}
+
+// Close stops ga's dedicated goroutine and blocks until it has actually
+// exited. Close is idempotent: only the first call has any effect,
+// later calls simply return once the goroutine has stopped. See the
+// GraphActor doc comment for what Close does not attempt to guard
+// against.
+func (ga *GraphActor) Close() {
+	ga.closeOnce.Do(func() {
+		close(ga.requests)
+	})
+
+	<-ga.stopped
+}
+
+// CreateNode behaves exactly like Graph.CreateNode, routed through ga's
+// dedicated goroutine.
+func (ga *GraphActor) CreateNode() (id NodeID, err error) {
+	ga.do(func(g *Graph) {
+		id, err = g.CreateNode()
+	})
+
+	return id, err
+}
+
+// NodeExists behaves exactly like Graph.NodeExists, routed through ga's
+// dedicated goroutine.
+func (ga *GraphActor) NodeExists(id NodeID) bool {
+	var exists bool
+
+	ga.do(func(g *Graph) {
+		exists = g.NodeExists(id)
+	})
+
+	return exists
+}
+
+// AddRelationship behaves exactly like Graph.AddRelationship, routed
+// through ga's dedicated goroutine.
+func (ga *GraphActor) AddRelationship(a, b NodeID) (created bool, err error) {
+	ga.do(func(g *Graph) {
+		created, err = g.AddRelationship(a, b)
+	})
+
+	return created, err
+}
+
+// RemoveRelationship behaves exactly like Graph.RemoveRelationship,
+// routed through ga's dedicated goroutine.
+func (ga *GraphActor) RemoveRelationship(a, b NodeID) (removed bool, err error) {
+	ga.do(func(g *Graph) {
+		removed, err = g.RemoveRelationship(a, b)
+	})
+
+	return removed, err
+}
+
+// HasRelationship behaves exactly like Graph.HasRelationship, routed
+// through ga's dedicated goroutine.
+func (ga *GraphActor) HasRelationship(a, b NodeID) bool {
+	var has bool
+
+	ga.do(func(g *Graph) {
+		has = g.HasRelationship(a, b)
+	})
+
+	return has
+}
+
+// FindRelationship behaves exactly like Graph.FindRelationship, routed
+// through ga's dedicated goroutine.
+func (ga *GraphActor) FindRelationship(from, to NodeID) (relationship Relationship, exists bool, err error) {
+	ga.do(func(g *Graph) {
+		relationship, exists, err = g.FindRelationship(from, to)
+	})
+
+	return relationship, exists, err
+}
+
+// FindOutgoing behaves exactly like Graph.FindOutgoing, routed through
+// ga's dedicated goroutine.
+func (ga *GraphActor) FindOutgoing(from NodeID) (relationships []Relationship, err error) {
+	ga.do(func(g *Graph) {
+		relationships, err = g.FindOutgoing(from)
+	})
+
+	return relationships, err
+}
+
+// FindIncoming behaves exactly like Graph.FindIncoming, routed through
+// ga's dedicated goroutine.
+func (ga *GraphActor) FindIncoming(to NodeID) (relationships []Relationship, err error) {
+	ga.do(func(g *Graph) {
+		relationships, err = g.FindIncoming(to)
+	})
+
+	return relationships, err
+}
+
+// FindRelationships behaves exactly like Graph.FindRelationships, routed
+// through ga's dedicated goroutine.
+func (ga *GraphActor) FindRelationships() []Relationship {
+	var relationships []Relationship
+
+	ga.do(func(g *Graph) {
+		relationships = g.FindRelationships()
+	})
+
+	return relationships
+}
+
+// DeleteNode behaves exactly like Graph.DeleteNode, routed through ga's
+// dedicated goroutine.
+func (ga *GraphActor) DeleteNode(id NodeID) (err error) {
+	ga.do(func(g *Graph) {
+		err = g.DeleteNode(id)
+	})
+
+	return err
+}
+
+// Transact behaves exactly like Graph.Transact, with fn's entire body --
+// however many steps it performs against tx -- run as one single job on
+// ga's dedicated goroutine, so nothing else can ever be interleaved with
+// it. See the GraphActor doc comment for what this does and does not
+// make atomic relative to some other, separately-submitted call.
+func (ga *GraphActor) Transact(fn func(tx *Txn) error) (err error) {
+	ga.do(func(g *Graph) {
+		err = g.Transact(fn)
+	})
+
+	return err
+}
+
+// RegisterChecker behaves exactly like Graph.RegisterChecker, routed
+// through ga's dedicated goroutine.
+func (ga *GraphActor) RegisterChecker(c Checker) {
+	ga.do(func(g *Graph) {
+		g.RegisterChecker(c)
+	})
 }
 
 var (

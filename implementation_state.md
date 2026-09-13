@@ -1144,14 +1144,109 @@ NodeID-keyed structure outside the primitive graph.
  FindOutgoing/FindRelationships need to enumerate every existing node,
  which requires reaching into Graph's private nodes map directly -- no
  GraphAPI method exposes "every node that exists" today. RootGraph
- therefore still depends on the concrete *Graph type, not GraphAPI; see
- GraphAPI's own doc comment for this noted gap. Txn similarly still
- depends on the concrete *Graph type (via its unexported resurrectNode
- method), which is correct and deliberate, not an oversight --
- theorystate.md section 89a records that Txn's undo-log rollback
- approach is specific to the in-memory backend's own mechanism for
- satisfying the Transact contract, not a mechanism every future backend
- is expected to reuse.
+ therefore still depends on the concrete *Graph type, not GraphAPI, until
+ (or unless) a node-enumeration method is added to this interface -- a
+ real, newly-identified gap, named here rather than silently worked
+ around(see GraphAPI's own doc comment for this noted gap).
+ Txn similarly still depends on the concrete *Graph type (via its
+ unexported resurrectNode method), which is correct and deliberate, not
+ an oversight -- theorystate.md section 89a records that Txn's undo-log
+ rollback approach is specific to the in-memory backend's own mechanism
+ for satisfying the Transact contract, not a mechanism every future
+ backend is expected to reuse.
+
+25. Added GraphActor (theorystate.md section 89c), a CSP/actor-style
+ wrapper making the in-memory Graph safe to share across multiple
+ goroutines for the first time: GraphActor owns a private *Graph behind
+ one dedicated goroutine, and every other goroutine communicates with it
+ only by submitting whole closures over a channel (the new do method),
+ never by touching the wrapped *Graph directly. GraphActor implements
+ GraphAPI exactly like *Graph already does (see the new
+ var _ GraphAPI = (*GraphActor)(nil) assertion), so it can be substituted
+ for a concrete *Graph in every existing registry constructor with zero
+ change to any registry's own logic -- a direct, concrete use of the
+ section 87 storage-interface extraction, which was built purely for
+ testability/decoupling reasons at the time and had no concurrency
+ motivation.
+
+ Txn and Checker needed no change at all to work correctly underneath
+ GraphActor: both already state, as their own load-bearing soundness
+ argument, that nothing can observe an in-progress mutation because
+ nothing else runs between two statements in the same synchronous call
+ (theorystate.md section 19) -- GraphActor does not weaken that premise,
+ it makes it literally true again by construction, merely relocated from
+ "whichever goroutine happens to call Transact" to "the one goroutine
+ GraphActor dedicates to the real Graph."
+
+ Any single call routed through GraphActor -- including an entire
+ Graph.Transact call, however many steps its own fn performs internally
+ -- is atomic, since it runs to completion on the actor's one goroutine
+ before the next queued call is even looked at. What is NOT free, and is
+ documented as such on GraphActor itself rather than silently glossed
+ over, is grouping more than one separately-submitted call into one
+ larger atomic unit: PointerRegistry.SetTarget's own read-then-Transact
+ shape (reading the current target via one round trip, committing a
+ replacement via a separate, later round trip) means two goroutines'
+ SetTarget calls on the same pointer can legitimately interleave between
+ those two round trips. This is a real lost-update/write-skew hazard,
+ not a bug in GraphActor -- and, exactly as theorystate.md section 89c
+ predicted, it is already caught by machinery built for an entirely
+ different reason: PointerRegistry's own commit-time Checker (registered
+ once, at construction, unchanged from its existing single-threaded
+ form) re-validates the "at most one target" invariant against live
+ current state immediately after any relevant Transact call, so a
+ losing goroutine's stale commit is rejected and rolled back with
+ ErrTooManyPointerTargets rather than silently corrupting the pointer.
+ TestGraphActorConcurrentSetTargetNeverProducesTooManyTargets
+ demonstrates this concretely, under real concurrent goroutines racing
+ SetTarget on one shared pointer via one GraphActor. Solving this in
+ general -- for a plan whose steps are not fixed in Go source, e.g. one
+ assembled dynamically by a future in-graph processor -- remains open,
+ needing the not-yet-designed in-graph transaction-descriptor machinery
+ theorystate.md section 89c names but does not build.
+
+ Panics are handled explicitly: a panic inside any closure submitted via
+ do is recovered on the actor's own goroutine and re-raised on the
+ original calling goroutine once that call returns, so a panicking
+ Transact closure looks, from its caller's perspective, exactly like a
+ direct, non-actor Graph.Transact call already does (see Graph.Transact's
+ own documented panic-then-rollback behavior), while the actor's single
+ dedicated goroutine survives to keep serving every other, unrelated
+ caller afterward -- left unrecovered, that panic would otherwise crash
+ the entire process, not merely this one actor, since an unrecovered
+ panic in any goroutine terminates the whole program.
+ TestGraphActorTransactPanicPropagatesAndActorSurvives covers both
+ halves of this: the panic reaching the original caller, and the actor
+ remaining usable immediately afterward.
+
+ Close stops the actor's dedicated goroutine and blocks until it has
+ actually exited; it is idempotent (TestGraphActorCloseIsIdempotent) via
+ sync.Once. GraphActor must not be used concurrently with, or after, a
+ call to Close -- an accepted, explicitly documented caller
+ responsibility, matching theorystate.md section 89b's "document the
+ assumption explicitly" resolution rather than building unrequested
+ synchronization no current caller needs.
+
+ Covered by TestGraphActorBasicOperations (exercising every GraphAPI
+ method at least once through the actor), TestGraphActorTransactRollsBackOnFailure,
+ TestGraphActorTransactPanicPropagatesAndActorSurvives,
+ TestGraphActorCloseIsIdempotent,
+ TestGraphActorConcurrentCreateNodeProducesUniqueIDs (proving
+ Graph.CreateNode's own non-atomic nextID counter increment is safe
+ under real concurrent goroutines only because GraphActor serializes
+ access to it), and
+ TestGraphActorConcurrentSetTargetNeverProducesTooManyTargets.
+
+ Not addressed by this item, and not claimed to be: MVCC/persistent-
+ structure-based intra-graph parallelism (theorystate.md section 89c
+ options (a)/(b), still OPEN); in-graph transaction-descriptor
+ vocabulary for dynamically-assembled multi-step operations;
+ goroutines-as-Part-C-participants as an alternative to one shared
+ GraphActor; and RootGraph's own pre-existing, unrelated dependency on
+ the concrete *Graph type (still open, per the "Currently unaddressed
+ yet" list below), which GraphActor does not resolve -- RootGraph still
+ cannot be safely layered on top of a GraphActor for the identical
+ reason it cannot yet be layered on top of GraphAPI generically.
 
 Currently unaddressed yet:
 - Txn does not support nesting one Graph.Transact call inside another
@@ -1166,10 +1261,17 @@ Currently unaddressed yet:
   access no GraphAPI method currently exposes (see GraphAPI's own doc
   comment; theorystate.md section 87a). Revisit if a node-enumeration
   method is ever added to GraphAPI.
-- The in-memory Graph still has no protection against concurrent
-  goroutine access (theorystate.md section 89b) -- unaffected by item
-  24's interface extraction, since that extraction only changes which
-  type callers reference, not Graph's own synchronization.
+- The in-memory Graph itself still has no protection against concurrent
+  goroutine access if used directly (theorystate.md section 89b) --
+  unaffected by item 24's interface extraction, since that extraction
+  only changes which type callers reference, not Graph's own
+  synchronization. This is now mitigated, not resolved, for callers
+  willing to route every access through GraphActor (item 25,
+  theorystate.md section 89c) instead of holding a *Graph directly:
+  GraphActor makes concurrent multi-goroutine use safe by construction,
+  but a caller who bypasses it and keeps a direct *Graph reference
+  around gets no protection at all, exactly as documented on GraphActor
+  itself.
 
 Explored and declined (implementation-level; the theory-level
 counterpart of this list is theorystate.md's own DECIDED/TENTATIVE/OPEN/
