@@ -18,10 +18,14 @@
 package dml
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
+	"runtime"
 	"sort"
+	"strconv"
 	"sync"
+	"sync/atomic"
 )
 
 type NodeID uint64
@@ -652,6 +656,63 @@ func (tx *Txn) DeleteNode(id NodeID) error {
 	return nil
 }
 
+// NodeExists, HasRelationship, FindRelationship, FindOutgoing,
+// FindIncoming, and FindRelationships below make *Txn satisfy
+// GraphReader, delegating directly to the real, concrete *Graph this Txn
+// is running against.
+//
+// These exist so tx-composable helpers (the *Tx-suffixed functions
+// throughout this file) can read current state through the same tx value
+// they already use for writes, instead of needing a second, separately
+// threaded GraphReader parameter that a caller could accidentally supply
+// from some other source -- in particular, from a registry's own stored
+// graph reference. Reading through a stored reference instead of tx is
+// exactly the bug class theorystate.md section 90 records: under a plain
+// *Graph it is harmless, since tx.graph and the stored reference are the
+// same value, but under GraphActor a stored reference may itself be the
+// GraphActor, and calling back into it from inside a closure already
+// running on the actor's one dedicated goroutine deadlocks. tx.NodeExists
+// and friends give every helper a value that is always correct for both
+// cases: the real *Graph, directly, with no channel involved at all.
+func (tx *Txn) NodeExists(id NodeID) bool {
+	return tx.graph.NodeExists(id)
+}
+
+// HasRelationship delegates to the real, concrete *Graph. See the
+// NodeExists doc comment above.
+func (tx *Txn) HasRelationship(a, b NodeID) bool {
+	return tx.graph.HasRelationship(a, b)
+}
+
+// FindRelationship delegates to the real, concrete *Graph. See the
+// NodeExists doc comment above.
+func (tx *Txn) FindRelationship(from, to NodeID) (Relationship, bool, error) {
+	return tx.graph.FindRelationship(from, to)
+}
+
+// FindOutgoing delegates to the real, concrete *Graph. See the
+// NodeExists doc comment above.
+func (tx *Txn) FindOutgoing(from NodeID) ([]Relationship, error) {
+	return tx.graph.FindOutgoing(from)
+}
+
+// FindIncoming delegates to the real, concrete *Graph. See the
+// NodeExists doc comment above.
+func (tx *Txn) FindIncoming(to NodeID) ([]Relationship, error) {
+	return tx.graph.FindIncoming(to)
+}
+
+// FindRelationships delegates to the real, concrete *Graph. See the
+// NodeExists doc comment above.
+func (tx *Txn) FindRelationships() []Relationship {
+	return tx.graph.FindRelationships()
+}
+
+// Compile-time assertion that *Txn satisfies GraphReader, exactly
+// mirroring the existing assertions for *Graph and *GraphActor against
+// GraphAPI.
+var _ GraphReader = (*Txn)(nil)
+
 // Checker validates one domain-specific invariant against the graph
 // immediately after a Graph.Transact call's mutations have been fully
 // applied, before Transact reports success to its own caller. This is
@@ -791,6 +852,63 @@ func (g *Graph) checkerRelevant(checker Checker, touched map[NodeID]struct{}) bo
 	return false
 }
 
+// graphActorReentrancyDetectionEnabled gates the debug-only reentrancy
+// tripwire in GraphActor.do (theorystate.md section 90). Off by default:
+// determining the calling goroutine's ID has a real per-call cost
+// (parsing a freshly captured stack trace header), acceptable for tests
+// but not something every production caller should pay for unasked.
+//
+// This tripwire is a dynamic safety net, not the correctness mechanism --
+// Go closures always retain full access to their enclosing lexical
+// scope, so no compile-time change makes misusing a captured variable
+// (e.g. reading through a registry's stored graph reference instead of
+// through tx/g) literally impossible. The actual fix is that no
+// interpretation-layer registry in this file stores a graph reference at
+// all anymore (theorystate.md section 90); this tripwire exists only to
+// turn a future regression of that discipline into an immediate, loud
+// panic instead of a silent hang, in the specific case where the
+// regression would otherwise deadlock GraphActor.
+var graphActorReentrancyDetectionEnabled atomic.Bool
+
+// EnableGraphActorReentrancyDetection turns on GraphActor's debug-only
+// reentrancy tripwire for every GraphActor in the process, for as long as
+// it remains enabled. Intended for test binaries (see this file's
+// TestMain), not for production use, given the per-call cost noted on
+// graphActorReentrancyDetectionEnabled above.
+func EnableGraphActorReentrancyDetection() {
+	graphActorReentrancyDetectionEnabled.Store(true)
+}
+
+// DisableGraphActorReentrancyDetection turns the tripwire back off.
+func DisableGraphActorReentrancyDetection() {
+	graphActorReentrancyDetectionEnabled.Store(false)
+}
+
+// currentGoroutineID parses the numeric goroutine ID out of the calling
+// goroutine's own stack trace header (the "goroutine NNN [running]:"
+// line runtime.Stack always writes first), for GraphActor's debug-only
+// reentrancy tripwire. This relies on the exact format of runtime.Stack's
+// output, which the Go runtime does not guarantee as a stable API --
+// acceptable here specifically because this is a debug-only backstop
+// that fails safe: every caller below simply skips the tripwire check on
+// any error rather than treating a parse failure as itself a violation.
+func currentGoroutineID() (int64, error) {
+	buf := make([]byte, 64)
+	buf = buf[:runtime.Stack(buf, false)]
+
+	fields := bytes.Fields(buf)
+	if len(fields) < 2 {
+		return 0, fmt.Errorf("unexpected goroutine stack header: %q", buf)
+	}
+
+	id, err := strconv.ParseInt(string(fields[1]), 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("parsing goroutine id from %q: %w", fields[1], err)
+	}
+
+	return id, nil
+}
+
 // GraphActor is a concurrency-safe wrapper around a private *Graph,
 // implementing GraphAPI so it can be substituted for a concrete *Graph
 // anywhere a registry in this file expects one -- with zero change to
@@ -870,6 +988,18 @@ type GraphActor struct {
 	requests  chan func(*Graph)
 	stopped   chan struct{}
 	closeOnce sync.Once
+
+	// workerGoroutineID holds the goroutine ID of this actor's own
+	// dedicated worker goroutine (the one running run(), below), once it
+	// has started. Zero means "not yet known" -- real goroutine IDs
+	// assigned by the runtime never reach zero, so zero is a safe
+	// "unset" sentinel. Used only by the debug-only reentrancy tripwire
+	// in do(); see graphActorReentrancyDetectionEnabled above. Stored as
+	// atomic.Int64, not a plain int64 field, because it is written once
+	// from run()'s own goroutine and read from every other goroutine
+	// calling do() -- an ordinary unsynchronized field here would itself
+	// be a data race.
+	workerGoroutineID atomic.Int64
 }
 
 // Compile-time assertion that *GraphActor satisfies GraphAPI, exactly
@@ -899,6 +1029,17 @@ func NewGraphActor(graph *Graph) *GraphActor {
 func (ga *GraphActor) run() {
 	defer close(ga.stopped)
 
+	// Record this goroutine's own ID once, before servicing any request,
+	// for the reentrancy tripwire in do() below. If the ID cannot be
+	// determined for some reason, workerGoroutineID is simply left at
+	// its zero-value "unknown" sentinel and the tripwire silently does
+	// not fire for this actor -- a missed debug assertion, not a
+	// correctness problem, since the tripwire is a backstop on top of
+	// the real fix (theorystate.md section 90), not the fix itself.
+	if id, err := currentGoroutineID(); err == nil {
+		ga.workerGoroutineID.Store(id)
+	}
+
 	for req := range ga.requests {
 		req(ga.graph)
 	}
@@ -913,6 +1054,17 @@ func (ga *GraphActor) run() {
 // again, back on the calling goroutine, once fn has finished -- see the
 // GraphActor doc comment's panic-handling paragraph.
 func (ga *GraphActor) do(fn func(g *Graph)) {
+	if graphActorReentrancyDetectionEnabled.Load() {
+		if callerID, err := currentGoroutineID(); err == nil {
+			if workerID := ga.workerGoroutineID.Load(); workerID != 0 && callerID == workerID {
+				panic(fmt.Sprintf(
+					"GraphActor reentrancy detected: goroutine %d, this actor's own dedicated worker, called back into GraphActor.do while already executing an earlier request on this same actor -- this is the reentrancy-deadlock class documented on GraphActor and theorystate.md section 90 (e.g. a Checker or tx-composable helper reading through a registry's stored graph reference instead of through tx/g), which would otherwise hang forever instead of panicking. Enabled via EnableGraphActorReentrancyDetection; see that function's doc comment.",
+					callerID,
+				))
+			}
+		}
+	}
+
 	done := make(chan struct{})
 
 	var recovered any
@@ -1100,19 +1252,39 @@ var (
 //
 // Names are bootstrap metadata outside the primitive graph. The primitive
 // Graph does not know about names.
+//
+// Like every other registry in this file, NameRegistry stores no graph
+// reference of its own (theorystate.md section 90): every method that
+// needs graph access takes it as an explicit parameter instead. byName/
+// byID, in contrast, are genuine registry-owned bookkeeping -- not graph
+// storage -- and stay as ordinary receiver fields; only a stored graph
+// reference is the thing being eliminated here.
+//
+// byName/byID are plain, unsynchronized Go maps, with no protection
+// against concurrent access from multiple goroutines -- a known,
+// currently unfixed gap, independent of anything GraphActor protects on
+// the graph itself (theorystate.md section 90, implementation_state.md).
+// No current caller exercises this concurrently, so no synchronization
+// has been added speculatively.
 type NameRegistry struct {
-	graph GraphAPI
-
 	byName map[string]NodeID
 	byID   map[NodeID]string
 }
 
-// NewNameRegistry creates an empty name registry associated with graph.
+// NewNameRegistry creates an empty name registry.
 //
-// It does not create any nodes.
-func NewNameRegistry(graph GraphAPI) *NameRegistry {
+// It does not create any nodes. Unlike every other registry constructor
+// in this file, NewNameRegistry accepts but ignores a graph parameter:
+// NameRegistry has no tag nodes to check for existence and registers no
+// Checker, so it has no actual use for one at construction time (contrast
+// PointerRegistry and friends, which use their graph parameter for
+// exactly those two things -- theorystate.md section 90). The parameter
+// is named `_` deliberately, both so every registry constructor in this
+// file keeps the same recognizable shape and so this unused parameter
+// never trips revive's unused-parameter check. Every method below that
+// actually needs graph access takes it explicitly, per call.
+func NewNameRegistry(_ GraphAPI) *NameRegistry {
 	return &NameRegistry{
-		graph:  graph,
 		byName: make(map[string]NodeID),
 		byID:   make(map[NodeID]string),
 	}
@@ -1152,13 +1324,13 @@ func (r *NameRegistry) NameForNode(id NodeID) (string, bool) {
 // Lookup and NameForNode deliberately do NOT go through lookupLive: they
 // are raw, side-effect-free bookkeeping queries, not NodeID-issuing
 // operations, and keep their existing simple (value, bool) contract.
-func (r *NameRegistry) lookupLive(name string) (id NodeID, bound bool, err error) {
+func (r *NameRegistry) lookupLive(graph GraphReader, name string) (id NodeID, bound bool, err error) {
 	id, ok := r.byName[name]
 	if !ok {
 		return 0, false, nil
 	}
 
-	if !r.graph.NodeExists(id) {
+	if !graph.NodeExists(id) {
 		return 0, false, ErrNameBoundToDeletedNode
 	}
 
@@ -1173,12 +1345,25 @@ func (r *NameRegistry) lookupLive(name string) (id NodeID, bound bool, err error
 //
 // Binding the exact same name to the exact same NodeID is an idempotent
 // success.
-func (r *NameRegistry) Bind(name string, id NodeID) error {
-	if !r.graph.NodeExists(id) {
+func (r *NameRegistry) Bind(graph GraphAPI, name string, id NodeID) error {
+	return r.bindCore(graph, name, id)
+}
+
+// bindCore performs Bind's actual validation and map bookkeeping against
+// graph, without opening any transaction of its own -- graph here is
+// only ever read (NodeExists), never mutated. Shared by the exported
+// Bind (called directly against a caller's GraphAPI) and
+// CreateNamedNode's internal Transact closure (called against tx, so
+// this read happens through the same synchronous call graph.Transact is
+// already running, rather than reaching back out through some separately
+// supplied graph reference -- see theorystate.md section 90 for why that
+// distinction matters specifically under GraphActor).
+func (r *NameRegistry) bindCore(graph GraphReader, name string, id NodeID) error {
+	if !graph.NodeExists(id) {
 		return ErrNodeNotFound
 	}
 
-	existingID, bound, err := r.lookupLive(name)
+	existingID, bound, err := r.lookupLive(graph, name)
 	if err != nil {
 		return err
 	}
@@ -1219,8 +1404,8 @@ func (r *NameRegistry) Bind(name string, id NodeID) error {
 // Bind's checks will pass -- but wrapping it in Transact costs nothing
 // and removes the dependency on that reasoning staying true as this code
 // evolves.
-func (r *NameRegistry) CreateNamedNode(name string) (NodeID, error) {
-	if _, bound, err := r.lookupLive(name); err != nil {
+func (r *NameRegistry) CreateNamedNode(graph GraphAPI, name string) (NodeID, error) {
+	if _, bound, err := r.lookupLive(graph, name); err != nil {
 		return 0, err
 	} else if bound {
 		return 0, ErrNameAlreadyBound
@@ -1228,14 +1413,14 @@ func (r *NameRegistry) CreateNamedNode(name string) (NodeID, error) {
 
 	var id NodeID
 
-	err := r.graph.Transact(func(tx *Txn) error {
+	err := graph.Transact(func(tx *Txn) error {
 		var err error
 		id, err = tx.CreateNode()
 		if err != nil {
 			return err
 		}
 
-		return r.Bind(name, id)
+		return r.bindCore(tx, name, id)
 	})
 	if err != nil {
 		return 0, wrapInterfaceErr(err)
@@ -1258,8 +1443,8 @@ func (r *NameRegistry) CreateNamedNode(name string) (NodeID, error) {
 // If name is bound to a NodeID that no longer exists, EnsureNamedNode
 // returns ErrNameBoundToDeletedNode (see lookupLive) rather than silently
 // trusting the stale association or silently creating a replacement.
-func (r *NameRegistry) EnsureNamedNode(name string) (NodeID, error) {
-	id, bound, err := r.lookupLive(name)
+func (r *NameRegistry) EnsureNamedNode(graph GraphAPI, name string) (NodeID, error) {
+	id, bound, err := r.lookupLive(graph, name)
 	if err != nil {
 		return 0, err
 	}
@@ -1268,7 +1453,7 @@ func (r *NameRegistry) EnsureNamedNode(name string) (NodeID, error) {
 		return id, nil
 	}
 
-	return r.CreateNamedNode(name)
+	return r.CreateNamedNode(graph, name)
 }
 
 // Unbind removes the name association without deleting the NodeID.
@@ -1301,8 +1486,8 @@ func (r *NameRegistry) Unbind(name string) (bool, error) {
 //
 // It is not an error for id to have no name association; this then simply
 // behaves like a plain Graph.DeleteNode.
-func (r *NameRegistry) DeleteNode(id NodeID) error {
-	if err := r.graph.DeleteNode(id); err != nil {
+func (r *NameRegistry) DeleteNode(graph GraphAPI, id NodeID) error {
+	if err := graph.DeleteNode(id); err != nil {
 		return wrapInterfaceErr(err)
 	}
 
@@ -1328,11 +1513,11 @@ func (r *NameRegistry) DeleteNode(id NodeID) error {
 //
 // The returned map has one entry per distinct name in names; duplicate
 // entries in names collapse into a single map entry, as expected.
-func (r *NameRegistry) BootstrapNames(names []string) (map[string]NodeID, error) {
+func (r *NameRegistry) BootstrapNames(graph GraphAPI, names []string) (map[string]NodeID, error) {
 	ids := make(map[string]NodeID, len(names))
 
 	for _, name := range names {
-		id, err := r.EnsureNamedNode(name)
+		id, err := r.EnsureNamedNode(graph, name)
 		if err != nil {
 			return nil, err
 		}
@@ -1928,6 +2113,22 @@ type txOps interface {
 	DeleteNode(id NodeID) error
 }
 
+// txReader is the combined surface for helpers that both compose
+// mutations into an already-open transaction (txOps) and need to read
+// current graph state as part of deciding what to do (GraphReader) --
+// e.g. reading a slot's current target before deciding whether it must
+// be replaced. A single txReader-typed parameter, rather than two
+// separately threaded txOps and GraphReader parameters, is what makes it
+// impossible for a caller to accidentally supply the read half from a
+// different -- and, under GraphActor, potentially deadlocking -- source
+// than the write half (theorystate.md section 90). *Graph and *Txn both
+// satisfy txReader automatically, since each already independently
+// satisfies both txOps and GraphReader.
+type txReader interface {
+	txOps
+	GraphReader
+}
+
 // wrapInterfaceErr wraps an error returned directly from a call to one of
 // this package's interface-typed values -- txOps
 // (CreateNode/AddRelationship/RemoveRelationship/DeleteNode), or
@@ -2173,11 +2374,23 @@ outer:
 // particular, it is failure-atomicity, not isolation from concurrent
 // access; true multi-primitive-operation transactional grouping as a
 // first-class graph concept is still theorystate.md section 14/45,
-// OPEN. What exists here is the minimum needed to stop PointerRegistry's
+// OPEN.
+// What exists here is the minimum needed to stop PointerRegistry's
 // own multi-step operations from corrupting state on failure, not a
 // general transaction feature.
+//
+// PointerRegistry deliberately stores no graph reference of its own
+// (theorystate.md section 90): every method below takes the graph it
+// should operate against as an explicit parameter instead, typed as
+// narrowly as that method actually needs (GraphReader for pure reads,
+// GraphAPI for methods that open their own transaction). This is what
+// lets the exact same PointerRegistry value be safely reused across
+// several separately-submitted GraphActor calls without any risk of a
+// Checker or tx-composable helper accidentally reading through a stored
+// reference instead of through the tx/g value it was actually handed --
+// see GraphActor's own doc comment for why that specific mistake
+// deadlocks rather than merely misbehaving.
 type PointerRegistry struct {
-	graph       GraphAPI
 	allPointers NodeID
 }
 
@@ -2236,15 +2449,17 @@ func NewPointerRegistry(graph GraphAPI, allPointers NodeID) (*PointerRegistry, e
 	})
 
 	return &PointerRegistry{
-		graph:       graph,
 		allPointers: allPointers,
 	}, nil
 }
 
 // IsPointer reports whether id is currently tagged Pointer-kind via
-// (AllPointers, id).
-func (p *PointerRegistry) IsPointer(id NodeID) bool {
-	return p.graph.HasRelationship(p.allPointers, id)
+// (AllPointers, id). graph is passed explicitly, never stored (see the
+// PointerRegistry doc comment) -- passing the wrong graph value here is
+// a caller error at the call site, not a hidden footgun inside this
+// type.
+func (p *PointerRegistry) IsPointer(graph GraphReader, id NodeID) bool {
+	return graph.HasRelationship(p.allPointers, id)
 }
 
 // currentTarget returns P's current single target, re-derived fresh from
@@ -2258,16 +2473,16 @@ func (p *PointerRegistry) IsPointer(id NodeID) bool {
 // this registry and violated the Pointer invariant directly through the
 // primitive Graph -- currentTarget returns ErrTooManyPointerTargets
 // rather than silently picking one of them.
-func (p *PointerRegistry) currentTarget(id NodeID) (target NodeID, hasTarget bool, err error) {
-	if !p.graph.NodeExists(id) {
+func (p *PointerRegistry) currentTarget(graph GraphReader, id NodeID) (target NodeID, hasTarget bool, err error) {
+	if !graph.NodeExists(id) {
 		return 0, false, ErrNodeNotFound
 	}
 
-	if !p.IsPointer(id) {
+	if !p.IsPointer(graph, id) {
 		return 0, false, ErrNotPointer
 	}
 
-	return singleChildTarget(p.graph, id)
+	return singleChildTarget(graph, id)
 }
 
 // Target returns P's current target.
@@ -2275,8 +2490,8 @@ func (p *PointerRegistry) currentTarget(id NodeID) (target NodeID, hasTarget boo
 // hasTarget is false when P is a valid, currently-empty Pointer. See
 // currentTarget for the error cases: P missing, P not tagged Pointer-kind,
 // or P's invariant already violated by an out-of-band Graph mutation.
-func (p *PointerRegistry) Target(id NodeID) (target NodeID, hasTarget bool, err error) {
-	return p.currentTarget(id)
+func (p *PointerRegistry) Target(graph GraphReader, id NodeID) (target NodeID, hasTarget bool, err error) {
+	return p.currentTarget(graph, id)
 }
 
 // SetTarget sets P's target to X, enforcing that P has at most one target
@@ -2301,13 +2516,13 @@ func (p *PointerRegistry) Target(id NodeID) (target NodeID, hasTarget bool, err 
 // Self-targeting, i.e. SetTarget(P, P), is allowed: self-relationships
 // are permitted at the primitive layer (theorystate.md section 2.8)
 // and nothing about the Pointer invariant rules it out.
-func (p *PointerRegistry) SetTarget(id, target NodeID) error {
-	current, hasTarget, err := p.currentTarget(id)
+func (p *PointerRegistry) SetTarget(graph GraphAPI, id, target NodeID) error {
+	current, hasTarget, err := p.currentTarget(graph, id)
 	if err != nil {
 		return err
 	}
 
-	if !p.graph.NodeExists(target) {
+	if !graph.NodeExists(target) {
 		return ErrNodeNotFound
 	}
 
@@ -2315,7 +2530,7 @@ func (p *PointerRegistry) SetTarget(id, target NodeID) error {
 		return nil
 	}
 
-	return wrapInterfaceErr(p.graph.Transact(func(tx *Txn) error {
+	return wrapInterfaceErr(graph.Transact(func(tx *Txn) error {
 		return setPointerTargetTx(tx, id, current, hasTarget, target)
 	}))
 }
@@ -2328,8 +2543,8 @@ func (p *PointerRegistry) SetTarget(id, target NodeID) error {
 // RemoveTarget makes no changes and returns ErrTooManyPointerTargets, for
 // the same reason given in SetTarget: this registry does not silently
 // repair violations it did not create.
-func (p *PointerRegistry) RemoveTarget(id NodeID) (removed bool, err error) {
-	current, hasTarget, err := p.currentTarget(id)
+func (p *PointerRegistry) RemoveTarget(graph GraphAPI, id NodeID) (removed bool, err error) {
+	current, hasTarget, err := p.currentTarget(graph, id)
 	if err != nil {
 		return false, err
 	}
@@ -2338,7 +2553,7 @@ func (p *PointerRegistry) RemoveTarget(id NodeID) (removed bool, err error) {
 		return false, nil
 	}
 
-	removed, err = p.graph.RemoveRelationship(id, current)
+	removed, err = graph.RemoveRelationship(id, current)
 	return removed, wrapInterfaceErr(err)
 }
 
@@ -2353,10 +2568,10 @@ func (p *PointerRegistry) RemoveTarget(id NodeID) (removed bool, err error) {
 // otherwise be left orphaned -- it would exist but never be discoverable
 // as a Pointer. See the Txn doc comment and the PointerRegistry doc
 // comment above for what this atomicity does and does not cover.
-func (p *PointerRegistry) NewPointer() (NodeID, error) {
+func (p *PointerRegistry) NewPointer(graph GraphAPI) (NodeID, error) {
 	var id NodeID
 
-	err := p.graph.Transact(func(tx *Txn) error {
+	err := graph.Transact(func(tx *Txn) error {
 		var err error
 		id, err = newPointerTx(tx, p.allPointers)
 		return err
@@ -2382,8 +2597,8 @@ func (p *PointerRegistry) NewPointer() (NodeID, error) {
 // Tagging an id that is already tagged Pointer-kind is an idempotent
 // success, exactly like the underlying Graph.AddRelationship being
 // idempotent for an already-existing relationship.
-func (p *PointerRegistry) TagAsPointer(id NodeID) error {
-	outgoing, err := p.graph.FindOutgoing(id)
+func (p *PointerRegistry) TagAsPointer(graph GraphAPI, id NodeID) error {
+	outgoing, err := graph.FindOutgoing(id)
 	if err != nil {
 		return wrapInterfaceErr(err)
 	}
@@ -2392,7 +2607,7 @@ func (p *PointerRegistry) TagAsPointer(id NodeID) error {
 		return ErrTooManyPointerTargets
 	}
 
-	_, err = p.graph.AddRelationship(p.allPointers, id)
+	_, err = graph.AddRelationship(p.allPointers, id)
 	return wrapInterfaceErr(err)
 }
 

@@ -18,11 +18,25 @@ package dml
 
 import (
 	"errors"
+	"os"
 	"reflect"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 )
+
+// TestMain enables GraphActor's debug-only reentrancy tripwire
+// (theorystate.md section 90) for this entire test binary, so any test
+// anywhere in this file that reintroduces the misplaced-storage bug
+// class the tripwire exists to catch -- a registry reading through a
+// stored graph reference instead of through the tx/g value it was
+// actually handed -- panics loudly and immediately instead of hanging
+// forever.
+func TestMain(m *testing.M) {
+	EnableGraphActorReentrancyDetection()
+	os.Exit(m.Run())
+}
 
 // sortedNodeIDs returns a sorted copy of ids, for comparing test results
 // against results whose order is documented as unspecified (e.g.
@@ -630,7 +644,7 @@ func TestNameRegistryCreateNamedNode(t *testing.T) {
 	var g Graph
 	names := NewNameRegistry(&g)
 
-	id, err := names.CreateNamedNode("ROOT")
+	id, err := names.CreateNamedNode(&g, "ROOT")
 	if err != nil {
 		t.Fatalf("CreateNamedNode() returned error: %v", err)
 	}
@@ -664,7 +678,7 @@ func TestNameRegistryRequiresExistingNode(t *testing.T) {
 
 	const nonexistent NodeID = 12345
 
-	err := names.Bind("A", nonexistent)
+	err := names.Bind(&g, "A", nonexistent)
 	if !errors.Is(err, ErrNodeNotFound) {
 		t.Fatalf("Bind() error = %v, want %v", err, ErrNodeNotFound)
 	}
@@ -688,11 +702,11 @@ func TestNameRegistryNameIsUnique(t *testing.T) {
 		t.Fatalf("CreateNode() returned error: %v", err)
 	}
 
-	if err2 := names.Bind("A", a); err2 != nil {
+	if err2 := names.Bind(&g, "A", a); err2 != nil {
 		t.Fatalf("first Bind() returned error: %v", err2)
 	}
 
-	err = names.Bind("A", b)
+	err = names.Bind(&g, "A", b)
 	if !errors.Is(err, ErrNameAlreadyBound) {
 		t.Fatalf("second Bind() error = %v, want %v", err, ErrNameAlreadyBound)
 	}
@@ -712,11 +726,11 @@ func TestNameRegistryNodeIDIsUnique(t *testing.T) {
 		t.Fatalf("CreateNode() returned error: %v", err)
 	}
 
-	if err2 := names.Bind("A", id); err2 != nil {
+	if err2 := names.Bind(&g, "A", id); err2 != nil {
 		t.Fatalf("first Bind() returned error: %v", err2)
 	}
 
-	err = names.Bind("B", id)
+	err = names.Bind(&g, "B", id)
 	if !errors.Is(err, ErrNodeAlreadyNamed) {
 		t.Fatalf("second Bind() error = %v, want %v", err, ErrNodeAlreadyNamed)
 	}
@@ -736,11 +750,11 @@ func TestNameRegistrySameBindingIsIdempotent(t *testing.T) {
 		t.Fatalf("CreateNode() returned error: %v", err)
 	}
 
-	if err := names.Bind("A", id); err != nil {
+	if err := names.Bind(&g, "A", id); err != nil {
 		t.Fatalf("first Bind() returned error: %v", err)
 	}
 
-	if err := names.Bind("A", id); err != nil {
+	if err := names.Bind(&g, "A", id); err != nil {
 		t.Fatalf("identical second Bind() returned error: %v", err)
 	}
 }
@@ -749,12 +763,12 @@ func TestNameRegistryCreateNamedNodeDoesNotDuplicateName(t *testing.T) {
 	var g Graph
 	names := NewNameRegistry(&g)
 
-	first, err := names.CreateNamedNode("A")
+	first, err := names.CreateNamedNode(&g, "A")
 	if err != nil {
 		t.Fatalf("first CreateNamedNode() returned error: %v", err)
 	}
 
-	_, err = names.CreateNamedNode("A")
+	_, err = names.CreateNamedNode(&g, "A")
 	if !errors.Is(err, ErrNameAlreadyBound) {
 		t.Fatalf(
 			"second CreateNamedNode() error = %v, want %v",
@@ -771,7 +785,7 @@ func TestNameRegistryUnbindDoesNotDeleteNode(t *testing.T) {
 	var g Graph
 	names := NewNameRegistry(&g)
 
-	id, err := names.CreateNamedNode("A")
+	id, err := names.CreateNamedNode(&g, "A")
 	if err != nil {
 		t.Fatalf("CreateNamedNode() returned error: %v", err)
 	}
@@ -816,12 +830,12 @@ func TestNameRegistryDeleteNodeRemovesNameAssociation(t *testing.T) {
 	var g Graph
 	names := NewNameRegistry(&g)
 
-	id, err := names.CreateNamedNode("A")
+	id, err := names.CreateNamedNode(&g, "A")
 	if err != nil {
 		t.Fatalf("CreateNamedNode(): %v", err)
 	}
 
-	if err := names.DeleteNode(id); err != nil {
+	if err := names.DeleteNode(&g, id); err != nil {
 		t.Fatalf("DeleteNode(%d): %v", id, err)
 	}
 
@@ -842,7 +856,7 @@ func TestNameRegistryDeleteNodeFailsIfNotEmpty(t *testing.T) {
 	var g Graph
 	names := NewNameRegistry(&g)
 
-	a, err := names.CreateNamedNode("A")
+	a, err := names.CreateNamedNode(&g, "A")
 	if err != nil {
 		t.Fatalf("CreateNamedNode(): %v", err)
 	}
@@ -856,7 +870,7 @@ func TestNameRegistryDeleteNodeFailsIfNotEmpty(t *testing.T) {
 		t.Fatalf("AddRelationship(): %v", err2)
 	}
 
-	err = names.DeleteNode(a)
+	err = names.DeleteNode(&g, a)
 	if !errors.Is(err, ErrNodeNotEmpty) {
 		t.Fatalf("DeleteNode(%d) error = %v, want %v", a, err, ErrNodeNotEmpty)
 	}
@@ -880,7 +894,7 @@ func TestNameRegistryDeleteNodeWithoutNameWorks(t *testing.T) {
 		t.Fatalf("CreateNode(): %v", err)
 	}
 
-	if err := names.DeleteNode(id); err != nil {
+	if err := names.DeleteNode(&g, id); err != nil {
 		t.Fatalf("DeleteNode(%d): %v", id, err)
 	}
 
@@ -893,12 +907,12 @@ func TestNameRegistryDoesNotCreateRelationships(t *testing.T) {
 	var g Graph
 	names := NewNameRegistry(&g)
 
-	a, err := names.CreateNamedNode("A")
+	a, err := names.CreateNamedNode(&g, "A")
 	if err != nil {
 		t.Fatalf("CreateNamedNode(\"A\") returned error: %v", err)
 	}
 
-	b, err := names.CreateNamedNode("B")
+	b, err := names.CreateNamedNode(&g, "B")
 	if err != nil {
 		t.Fatalf("CreateNamedNode(\"B\") returned error: %v", err)
 	}
@@ -916,7 +930,7 @@ func TestNameRegistryEnsureNamedNodeCreatesWhenMissing(t *testing.T) {
 	var g Graph
 	names := NewNameRegistry(&g)
 
-	id, err := names.EnsureNamedNode("A")
+	id, err := names.EnsureNamedNode(&g, "A")
 	if err != nil {
 		t.Fatalf("EnsureNamedNode() returned error: %v", err)
 	}
@@ -935,12 +949,12 @@ func TestNameRegistryEnsureNamedNodeIsIdempotent(t *testing.T) {
 	var g Graph
 	names := NewNameRegistry(&g)
 
-	first, err := names.EnsureNamedNode("A")
+	first, err := names.EnsureNamedNode(&g, "A")
 	if err != nil {
 		t.Fatalf("first EnsureNamedNode() returned error: %v", err)
 	}
 
-	second, err := names.EnsureNamedNode("A")
+	second, err := names.EnsureNamedNode(&g, "A")
 	if err != nil {
 		t.Fatalf("second EnsureNamedNode() returned error: %v", err)
 	}
@@ -962,11 +976,11 @@ func TestNameRegistryEnsureNamedNodeFindsExistingBinding(t *testing.T) {
 		t.Fatalf("CreateNode() returned error: %v", err)
 	}
 
-	if err2 := names.Bind("A", id); err2 != nil {
+	if err2 := names.Bind(&g, "A", id); err2 != nil {
 		t.Fatalf("Bind() returned error: %v", err2)
 	}
 
-	found, err := names.EnsureNamedNode("A")
+	found, err := names.EnsureNamedNode(&g, "A")
 	if err != nil {
 		t.Fatalf("EnsureNamedNode() returned error: %v", err)
 	}
@@ -988,7 +1002,7 @@ func TestNameRegistryEnsureNamedNodeFailsOnStaleBinding(t *testing.T) {
 		t.Fatalf("CreateNode(): %v", err)
 	}
 
-	if err2 := names.Bind("A", id); err2 != nil {
+	if err2 := names.Bind(&g, "A", id); err2 != nil {
 		t.Fatalf("Bind(): %v", err2)
 	}
 
@@ -998,7 +1012,7 @@ func TestNameRegistryEnsureNamedNodeFailsOnStaleBinding(t *testing.T) {
 		t.Fatalf("DeleteNode(%d) via raw Graph: %v", id, err3)
 	}
 
-	_, err = names.EnsureNamedNode("A")
+	_, err = names.EnsureNamedNode(&g, "A")
 	if !errors.Is(err, ErrNameBoundToDeletedNode) {
 		t.Fatalf("EnsureNamedNode() error = %v, want %v", err, ErrNameBoundToDeletedNode)
 	}
@@ -1013,7 +1027,7 @@ func TestNameRegistryCreateNamedNodeFailsOnStaleBinding(t *testing.T) {
 		t.Fatalf("CreateNode(): %v", err)
 	}
 
-	if err2 := names.Bind("A", id); err2 != nil {
+	if err2 := names.Bind(&g, "A", id); err2 != nil {
 		t.Fatalf("Bind(): %v", err2)
 	}
 
@@ -1021,7 +1035,7 @@ func TestNameRegistryCreateNamedNodeFailsOnStaleBinding(t *testing.T) {
 		t.Fatalf("DeleteNode(%d) via raw Graph: %v", id, err3)
 	}
 
-	_, err = names.CreateNamedNode("A")
+	_, err = names.CreateNamedNode(&g, "A")
 	if !errors.Is(err, ErrNameBoundToDeletedNode) {
 		t.Fatalf("CreateNamedNode() error = %v, want %v", err, ErrNameBoundToDeletedNode)
 	}
@@ -1036,7 +1050,7 @@ func TestNameRegistryBindFailsOnStaleBindingToDifferentNode(t *testing.T) {
 		t.Fatalf("CreateNode() for stale: %v", err)
 	}
 
-	if err2 := names.Bind("A", stale); err2 != nil {
+	if err2 := names.Bind(&g, "A", stale); err2 != nil {
 		t.Fatalf("Bind(): %v", err2)
 	}
 
@@ -1049,7 +1063,7 @@ func TestNameRegistryBindFailsOnStaleBindingToDifferentNode(t *testing.T) {
 		t.Fatalf("CreateNode() for replacement: %v", err)
 	}
 
-	err = names.Bind("A", replacement)
+	err = names.Bind(&g, "A", replacement)
 	if !errors.Is(err, ErrNameBoundToDeletedNode) {
 		t.Fatalf("Bind() error = %v, want %v", err, ErrNameBoundToDeletedNode)
 	}
@@ -1064,7 +1078,7 @@ func TestBootstrapNamesFailsOnStaleBinding(t *testing.T) {
 		t.Fatalf("CreateNode(): %v", err)
 	}
 
-	if err2 := names.Bind("A", id); err2 != nil {
+	if err2 := names.Bind(&g, "A", id); err2 != nil {
 		t.Fatalf("Bind(): %v", err2)
 	}
 
@@ -1072,7 +1086,7 @@ func TestBootstrapNamesFailsOnStaleBinding(t *testing.T) {
 		t.Fatalf("DeleteNode(%d) via raw Graph: %v", id, err3)
 	}
 
-	_, err = names.BootstrapNames([]string{"A", "B"})
+	_, err = names.BootstrapNames(&g, []string{"A", "B"})
 	if !errors.Is(err, ErrNameBoundToDeletedNode) {
 		t.Fatalf("BootstrapNames() error = %v, want %v", err, ErrNameBoundToDeletedNode)
 	}
@@ -1082,7 +1096,7 @@ func TestBootstrapNamesCreatesAllNames(t *testing.T) {
 	var g Graph
 	names := NewNameRegistry(&g)
 
-	ids, err := names.BootstrapNames([]string{"A", "B", "C"})
+	ids, err := names.BootstrapNames(&g, []string{"A", "B", "C"})
 	if err != nil {
 		t.Fatalf("BootstrapNames() returned error: %v", err)
 	}
@@ -1112,12 +1126,12 @@ func TestBootstrapNamesIsIdempotent(t *testing.T) {
 	var g Graph
 	names := NewNameRegistry(&g)
 
-	first, err := names.BootstrapNames([]string{"A", "B"})
+	first, err := names.BootstrapNames(&g, []string{"A", "B"})
 	if err != nil {
 		t.Fatalf("first BootstrapNames() returned error: %v", err)
 	}
 
-	second, err := names.BootstrapNames([]string{"A", "B"})
+	second, err := names.BootstrapNames(&g, []string{"A", "B"})
 	if err != nil {
 		t.Fatalf("second BootstrapNames() returned error: %v", err)
 	}
@@ -1131,12 +1145,12 @@ func TestBootstrapNamesResumesAcrossOverlappingCalls(t *testing.T) {
 	var g Graph
 	names := NewNameRegistry(&g)
 
-	first, err := names.BootstrapNames([]string{"A", "B"})
+	first, err := names.BootstrapNames(&g, []string{"A", "B"})
 	if err != nil {
 		t.Fatalf("first BootstrapNames() returned error: %v", err)
 	}
 
-	second, err := names.BootstrapNames([]string{"B", "C"})
+	second, err := names.BootstrapNames(&g, []string{"B", "C"})
 	if err != nil {
 		t.Fatalf("second BootstrapNames() returned error: %v", err)
 	}
@@ -1161,7 +1175,7 @@ func TestBootstrapNamesHandlesDuplicateNamesInList(t *testing.T) {
 	var g Graph
 	names := NewNameRegistry(&g)
 
-	ids, err := names.BootstrapNames([]string{"A", "A", "A"})
+	ids, err := names.BootstrapNames(&g, []string{"A", "A", "A"})
 	if err != nil {
 		t.Fatalf("BootstrapNames() returned error: %v", err)
 	}
@@ -1188,7 +1202,7 @@ func TestAllPointersTagsPointerViaRelationship(t *testing.T) {
 	var g Graph
 	names := NewNameRegistry(&g)
 
-	ids, err := names.BootstrapNames(FoundationalNames)
+	ids, err := names.BootstrapNames(&g, FoundationalNames)
 	if err != nil {
 		t.Fatalf("BootstrapNames() returned error: %v", err)
 	}
@@ -1731,7 +1745,7 @@ func newPointerTestFixture(t *testing.T) (*Graph, *PointerRegistry) {
 	var g Graph
 	names := NewNameRegistry(&g)
 
-	allPointers, err := names.EnsureNamedNode(NameAllPointers)
+	allPointers, err := names.EnsureNamedNode(&g, NameAllPointers)
 	if err != nil {
 		t.Fatalf("EnsureNamedNode(%q): %v", NameAllPointers, err)
 	}
@@ -1758,7 +1772,7 @@ func TestNewPointerRegistryRequiresExistingAllPointers(t *testing.T) {
 func TestPointerRegistryNewPointerStartsEmpty(t *testing.T) {
 	g, pointers := newPointerTestFixture(t)
 
-	p, err := pointers.NewPointer()
+	p, err := pointers.NewPointer(g)
 	if err != nil {
 		t.Fatalf("NewPointer(): %v", err)
 	}
@@ -1767,11 +1781,11 @@ func TestPointerRegistryNewPointerStartsEmpty(t *testing.T) {
 		t.Fatalf("NewPointer() returned NodeID %d that does not exist", p)
 	}
 
-	if !pointers.IsPointer(p) {
+	if !pointers.IsPointer(g, p) {
 		t.Fatalf("NewPointer() did not tag %d as Pointer-kind", p)
 	}
 
-	_, hasTarget, err := pointers.Target(p)
+	_, hasTarget, err := pointers.Target(g, p)
 	if err != nil {
 		t.Fatalf("Target(%d): %v", p, err)
 	}
@@ -1784,7 +1798,7 @@ func TestPointerRegistryNewPointerStartsEmpty(t *testing.T) {
 func TestPointerRegistrySetTargetAddsFirstTarget(t *testing.T) {
 	g, pointers := newPointerTestFixture(t)
 
-	p, err := pointers.NewPointer()
+	p, err := pointers.NewPointer(g)
 	if err != nil {
 		t.Fatalf("NewPointer(): %v", err)
 	}
@@ -1794,11 +1808,11 @@ func TestPointerRegistrySetTargetAddsFirstTarget(t *testing.T) {
 		t.Fatalf("CreateNode() for x: %v", err)
 	}
 
-	if err2 := pointers.SetTarget(p, x); err2 != nil {
+	if err2 := pointers.SetTarget(g, p, x); err2 != nil {
 		t.Fatalf("SetTarget(%d,%d): %v", p, x, err2)
 	}
 
-	target, hasTarget, err := pointers.Target(p)
+	target, hasTarget, err := pointers.Target(g, p)
 	if err != nil {
 		t.Fatalf("Target(%d): %v", p, err)
 	}
@@ -1811,7 +1825,7 @@ func TestPointerRegistrySetTargetAddsFirstTarget(t *testing.T) {
 func TestPointerRegistrySetTargetIsIdempotentForSameTarget(t *testing.T) {
 	g, pointers := newPointerTestFixture(t)
 
-	p, err := pointers.NewPointer()
+	p, err := pointers.NewPointer(g)
 	if err != nil {
 		t.Fatalf("NewPointer(): %v", err)
 	}
@@ -1821,11 +1835,11 @@ func TestPointerRegistrySetTargetIsIdempotentForSameTarget(t *testing.T) {
 		t.Fatalf("CreateNode() for x: %v", err)
 	}
 
-	if err2 := pointers.SetTarget(p, x); err2 != nil {
+	if err2 := pointers.SetTarget(g, p, x); err2 != nil {
 		t.Fatalf("first SetTarget(%d,%d): %v", p, x, err2)
 	}
 
-	if err3 := pointers.SetTarget(p, x); err3 != nil {
+	if err3 := pointers.SetTarget(g, p, x); err3 != nil {
 		t.Fatalf("second SetTarget(%d,%d): %v", p, x, err3)
 	}
 
@@ -1842,7 +1856,7 @@ func TestPointerRegistrySetTargetIsIdempotentForSameTarget(t *testing.T) {
 func TestPointerRegistrySetTargetReplacesExistingTarget(t *testing.T) {
 	g, pointers := newPointerTestFixture(t)
 
-	p, err := pointers.NewPointer()
+	p, err := pointers.NewPointer(g)
 	if err != nil {
 		t.Fatalf("NewPointer(): %v", err)
 	}
@@ -1857,15 +1871,15 @@ func TestPointerRegistrySetTargetReplacesExistingTarget(t *testing.T) {
 		t.Fatalf("CreateNode() for y: %v", err)
 	}
 
-	if err2 := pointers.SetTarget(p, x); err2 != nil {
+	if err2 := pointers.SetTarget(g, p, x); err2 != nil {
 		t.Fatalf("SetTarget(%d,%d): %v", p, x, err2)
 	}
 
-	if err3 := pointers.SetTarget(p, y); err3 != nil {
+	if err3 := pointers.SetTarget(g, p, y); err3 != nil {
 		t.Fatalf("SetTarget(%d,%d): %v", p, y, err3)
 	}
 
-	target, hasTarget, err := pointers.Target(p)
+	target, hasTarget, err := pointers.Target(g, p)
 	if err != nil {
 		t.Fatalf("Target(%d): %v", p, err)
 	}
@@ -1889,18 +1903,18 @@ func TestPointerRegistrySetTargetReplacesExistingTarget(t *testing.T) {
 }
 
 func TestPointerRegistrySetTargetAllowsSelfTarget(t *testing.T) {
-	_, pointers := newPointerTestFixture(t)
+	g, pointers := newPointerTestFixture(t)
 
-	p, err := pointers.NewPointer()
+	p, err := pointers.NewPointer(g)
 	if err != nil {
 		t.Fatalf("NewPointer(): %v", err)
 	}
 
-	if err2 := pointers.SetTarget(p, p); err2 != nil {
+	if err2 := pointers.SetTarget(g, p, p); err2 != nil {
 		t.Fatalf("SetTarget(%d,%d) self-target: %v", p, p, err2)
 	}
 
-	target, hasTarget, err := pointers.Target(p)
+	target, hasTarget, err := pointers.Target(g, p)
 	if err != nil {
 		t.Fatalf("Target(%d): %v", p, err)
 	}
@@ -1911,16 +1925,16 @@ func TestPointerRegistrySetTargetAllowsSelfTarget(t *testing.T) {
 }
 
 func TestPointerRegistrySetTargetRequiresExistingTarget(t *testing.T) {
-	_, pointers := newPointerTestFixture(t)
+	g, pointers := newPointerTestFixture(t)
 
-	p, err := pointers.NewPointer()
+	p, err := pointers.NewPointer(g)
 	if err != nil {
 		t.Fatalf("NewPointer(): %v", err)
 	}
 
 	const nonexistent NodeID = 999999
 
-	err = pointers.SetTarget(p, nonexistent)
+	err = pointers.SetTarget(g, p, nonexistent)
 	if !errors.Is(err, ErrNodeNotFound) {
 		t.Fatalf("SetTarget() error = %v, want %v", err, ErrNodeNotFound)
 	}
@@ -1939,7 +1953,7 @@ func TestPointerRegistrySetTargetRequiresPointerTag(t *testing.T) {
 		t.Fatalf("CreateNode() for x: %v", err)
 	}
 
-	err = pointers.SetTarget(id, x)
+	err = pointers.SetTarget(g, id, x)
 	if !errors.Is(err, ErrNotPointer) {
 		t.Fatalf("SetTarget() error = %v, want %v", err, ErrNotPointer)
 	}
@@ -1948,7 +1962,7 @@ func TestPointerRegistrySetTargetRequiresPointerTag(t *testing.T) {
 func TestPointerRegistryRemoveTargetRemovesExisting(t *testing.T) {
 	g, pointers := newPointerTestFixture(t)
 
-	p, err := pointers.NewPointer()
+	p, err := pointers.NewPointer(g)
 	if err != nil {
 		t.Fatalf("NewPointer(): %v", err)
 	}
@@ -1958,11 +1972,11 @@ func TestPointerRegistryRemoveTargetRemovesExisting(t *testing.T) {
 		t.Fatalf("CreateNode() for x: %v", err)
 	}
 
-	if err2 := pointers.SetTarget(p, x); err2 != nil {
+	if err2 := pointers.SetTarget(g, p, x); err2 != nil {
 		t.Fatalf("SetTarget(%d,%d): %v", p, x, err2)
 	}
 
-	removed, err := pointers.RemoveTarget(p)
+	removed, err := pointers.RemoveTarget(g, p)
 	if err != nil {
 		t.Fatalf("RemoveTarget(%d): %v", p, err)
 	}
@@ -1971,7 +1985,7 @@ func TestPointerRegistryRemoveTargetRemovesExisting(t *testing.T) {
 		t.Fatal("RemoveTarget() reported that nothing was removed")
 	}
 
-	_, hasTarget, err := pointers.Target(p)
+	_, hasTarget, err := pointers.Target(g, p)
 	if err != nil {
 		t.Fatalf("Target(%d): %v", p, err)
 	}
@@ -1982,14 +1996,14 @@ func TestPointerRegistryRemoveTargetRemovesExisting(t *testing.T) {
 }
 
 func TestPointerRegistryRemoveTargetNoOpWhenEmpty(t *testing.T) {
-	_, pointers := newPointerTestFixture(t)
+	g, pointers := newPointerTestFixture(t)
 
-	p, err := pointers.NewPointer()
+	p, err := pointers.NewPointer(g)
 	if err != nil {
 		t.Fatalf("NewPointer(): %v", err)
 	}
 
-	removed, err := pointers.RemoveTarget(p)
+	removed, err := pointers.RemoveTarget(g, p)
 	if err != nil {
 		t.Fatalf("RemoveTarget(%d): %v", p, err)
 	}
@@ -2007,15 +2021,15 @@ func TestPointerRegistryTagAsPointerTagsFreshNode(t *testing.T) {
 		t.Fatalf("CreateNode(): %v", err)
 	}
 
-	if pointers.IsPointer(id) {
+	if pointers.IsPointer(g, id) {
 		t.Fatalf("node %d is unexpectedly already tagged Pointer-kind", id)
 	}
 
-	if err := pointers.TagAsPointer(id); err != nil {
+	if err := pointers.TagAsPointer(g, id); err != nil {
 		t.Fatalf("TagAsPointer(%d): %v", id, err)
 	}
 
-	if !pointers.IsPointer(id) {
+	if !pointers.IsPointer(g, id) {
 		t.Fatalf("TagAsPointer(%d) did not tag the node", id)
 	}
 }
@@ -2037,11 +2051,11 @@ func TestPointerRegistryTagAsPointerAllowsExistingSingleChild(t *testing.T) {
 		t.Fatalf("AddRelationship(%d,%d): %v", id, x, err2)
 	}
 
-	if err3 := pointers.TagAsPointer(id); err3 != nil {
+	if err3 := pointers.TagAsPointer(g, id); err3 != nil {
 		t.Fatalf("TagAsPointer(%d): %v", id, err3)
 	}
 
-	target, hasTarget, err := pointers.Target(id)
+	target, hasTarget, err := pointers.Target(g, id)
 	if err != nil {
 		t.Fatalf("Target(%d): %v", id, err)
 	}
@@ -2077,12 +2091,12 @@ func TestPointerRegistryTagAsPointerRejectsMultipleExistingChildren(t *testing.T
 		t.Fatalf("AddRelationship(%d,%d): %v", id, y, err3)
 	}
 
-	err = pointers.TagAsPointer(id)
+	err = pointers.TagAsPointer(g, id)
 	if !errors.Is(err, ErrTooManyPointerTargets) {
 		t.Fatalf("TagAsPointer() error = %v, want %v", err, ErrTooManyPointerTargets)
 	}
 
-	if pointers.IsPointer(id) {
+	if pointers.IsPointer(g, id) {
 		t.Fatalf("node %d was tagged despite violating the Pointer invariant", id)
 	}
 }
@@ -2095,11 +2109,11 @@ func TestPointerRegistryTagAsPointerIsIdempotent(t *testing.T) {
 		t.Fatalf("CreateNode(): %v", err)
 	}
 
-	if err := pointers.TagAsPointer(id); err != nil {
+	if err := pointers.TagAsPointer(g, id); err != nil {
 		t.Fatalf("first TagAsPointer(%d): %v", id, err)
 	}
 
-	if err := pointers.TagAsPointer(id); err != nil {
+	if err := pointers.TagAsPointer(g, id); err != nil {
 		t.Fatalf("second TagAsPointer(%d): %v", id, err)
 	}
 }
@@ -2107,7 +2121,7 @@ func TestPointerRegistryTagAsPointerIsIdempotent(t *testing.T) {
 func TestPointerRegistryDetectsOutOfBandInvariantViolation(t *testing.T) {
 	g, pointers := newPointerTestFixture(t)
 
-	p, err := pointers.NewPointer()
+	p, err := pointers.NewPointer(g)
 	if err != nil {
 		t.Fatalf("NewPointer(): %v", err)
 	}
@@ -2132,7 +2146,7 @@ func TestPointerRegistryDetectsOutOfBandInvariantViolation(t *testing.T) {
 		t.Fatalf("AddRelationship(%d,%d) via raw Graph: %v", p, y, err3)
 	}
 
-	if _, _, err4 := pointers.Target(p); !errors.Is(err4, ErrTooManyPointerTargets) {
+	if _, _, err4 := pointers.Target(g, p); !errors.Is(err4, ErrTooManyPointerTargets) {
 		t.Fatalf("Target() error = %v, want %v", err4, ErrTooManyPointerTargets)
 	}
 
@@ -2141,11 +2155,11 @@ func TestPointerRegistryDetectsOutOfBandInvariantViolation(t *testing.T) {
 		t.Fatalf("CreateNode() for z: %v", err)
 	}
 
-	if err5 := pointers.SetTarget(p, z); !errors.Is(err5, ErrTooManyPointerTargets) {
+	if err5 := pointers.SetTarget(g, p, z); !errors.Is(err5, ErrTooManyPointerTargets) {
 		t.Fatalf("SetTarget() error = %v, want %v", err5, ErrTooManyPointerTargets)
 	}
 
-	if _, err6 := pointers.RemoveTarget(p); !errors.Is(err6, ErrTooManyPointerTargets) {
+	if _, err6 := pointers.RemoveTarget(g, p); !errors.Is(err6, ErrTooManyPointerTargets) {
 		t.Fatalf("RemoveTarget() error = %v, want %v", err6, ErrTooManyPointerTargets)
 	}
 
@@ -2378,7 +2392,7 @@ func TestSubPointerReusesPointerRegistryUnderDifferentTag(t *testing.T) {
 	var g Graph
 	names := NewNameRegistry(&g)
 
-	ids, err := names.BootstrapNames(FoundationalNames)
+	ids, err := names.BootstrapNames(&g, FoundationalNames)
 	if err != nil {
 		t.Fatalf("BootstrapNames(): %v", err)
 	}
@@ -2393,7 +2407,7 @@ func TestSubPointerReusesPointerRegistryUnderDifferentTag(t *testing.T) {
 		t.Fatalf("CreateNode() for p: %v", err)
 	}
 
-	u, err := subPointers.NewPointer()
+	u, err := subPointers.NewPointer(&g)
 	if err != nil {
 		t.Fatalf("NewPointer() for u: %v", err)
 	}
@@ -2416,11 +2430,11 @@ func TestSubPointerReusesPointerRegistryUnderDifferentTag(t *testing.T) {
 		t.Fatalf("CreateNode() for x: %v", err)
 	}
 
-	if err4 := subPointers.SetTarget(u, x); err4 != nil {
+	if err4 := subPointers.SetTarget(&g, u, x); err4 != nil {
 		t.Fatalf("SetTarget(u, x): %v", err4)
 	}
 
-	target, hasTarget, err := subPointers.Target(u)
+	target, hasTarget, err := subPointers.Target(&g, u)
 	if err != nil {
 		t.Fatalf("Target(u): %v", err)
 	}
@@ -2443,7 +2457,7 @@ func newPointerMetadataTestFixture(t *testing.T) (*Graph, *PointerMetadataRegist
 	var g Graph
 	names := NewNameRegistry(&g)
 
-	ids, err := names.BootstrapNames(FoundationalNames)
+	ids, err := names.BootstrapNames(&g, FoundationalNames)
 	if err != nil {
 		t.Fatalf("BootstrapNames(): %v", err)
 	}
@@ -2733,7 +2747,7 @@ func newPointerMetadataDTestFixture(t *testing.T) (*Graph, *PointerMetadataRegis
 	var g Graph
 	names := NewNameRegistry(&g)
 
-	ids, err := names.BootstrapNames(FoundationalNames)
+	ids, err := names.BootstrapNames(&g, FoundationalNames)
 	if err != nil {
 		t.Fatalf("BootstrapNames(): %v", err)
 	}
@@ -3088,7 +3102,7 @@ func newCapsuleTestFixture(t *testing.T) (*Graph, *CapsuleRegistry) {
 	var g Graph
 	names := NewNameRegistry(&g)
 
-	ids, err := names.BootstrapNames(FoundationalNames)
+	ids, err := names.BootstrapNames(&g, FoundationalNames)
 	if err != nil {
 		t.Fatalf("BootstrapNames(): %v", err)
 	}
@@ -3560,7 +3574,7 @@ func TestCapsuleRoleSlotsAreNotTaggedWithGenericAllPointers(t *testing.T) {
 	var g Graph
 	names := NewNameRegistry(&g)
 
-	ids, err := names.BootstrapNames(FoundationalNames)
+	ids, err := names.BootstrapNames(&g, FoundationalNames)
 	if err != nil {
 		t.Fatalf("BootstrapNames(): %v", err)
 	}
@@ -3798,7 +3812,7 @@ func newListTestFixture(t *testing.T) (*Graph, *CapsuleRegistry, *ListRegistry) 
 	var g Graph
 	names := NewNameRegistry(&g)
 
-	ids, err := names.BootstrapNames(FoundationalNames)
+	ids, err := names.BootstrapNames(&g, FoundationalNames)
 	if err != nil {
 		t.Fatalf("BootstrapNames(): %v", err)
 	}
@@ -3843,7 +3857,7 @@ func TestNewListRegistryRequiresExistingTags(t *testing.T) {
 	var g Graph
 	names := NewNameRegistry(&g)
 
-	ids, err := names.BootstrapNames(FoundationalNames)
+	ids, err := names.BootstrapNames(&g, FoundationalNames)
 	if err != nil {
 		t.Fatalf("BootstrapNames(): %v", err)
 	}
@@ -5930,7 +5944,7 @@ func newSetTestFixture(t *testing.T) (*Graph, *SetRegistry) {
 	var g Graph
 	names := NewNameRegistry(&g)
 
-	ids, err := names.BootstrapNames(FoundationalNames)
+	ids, err := names.BootstrapNames(&g, FoundationalNames)
 	if err != nil {
 		t.Fatalf("BootstrapNames(): %v", err)
 	}
@@ -6629,7 +6643,7 @@ func newCompositeSetTestFixture(t *testing.T) (*Graph, *SetRegistry, *CompositeS
 	var g Graph
 	names := NewNameRegistry(&g)
 
-	ids, err := names.BootstrapNames(FoundationalNames)
+	ids, err := names.BootstrapNames(&g, FoundationalNames)
 	if err != nil {
 		t.Fatalf("BootstrapNames(): %v", err)
 	}
@@ -7290,7 +7304,7 @@ func newCompositeSetLogTestFixture(t *testing.T) (*Graph, *SetRegistry, *Composi
 	var g Graph
 	names := NewNameRegistry(&g)
 
-	ids, err := names.BootstrapNames(FoundationalNames)
+	ids, err := names.BootstrapNames(&g, FoundationalNames)
 	if err != nil {
 		t.Fatalf("BootstrapNames(): %v", err)
 	}
@@ -7362,7 +7376,7 @@ func TestNewCompositeSetLogRegistryRequiresExistingTags(t *testing.T) {
 	var g Graph
 	names := NewNameRegistry(&g)
 
-	ids, err := names.BootstrapNames(FoundationalNames)
+	ids, err := names.BootstrapNames(&g, FoundationalNames)
 	if err != nil {
 		t.Fatalf("BootstrapNames(): %v", err)
 	}
@@ -7742,7 +7756,7 @@ func TestCompositeSetRegistryWithoutSetLogsRejectsCompositeSetLogOperand(t *test
 	var g Graph
 	names := NewNameRegistry(&g)
 
-	ids, err := names.BootstrapNames(FoundationalNames)
+	ids, err := names.BootstrapNames(&g, FoundationalNames)
 	if err != nil {
 		t.Fatalf("BootstrapNames(): %v", err)
 	}
@@ -8265,7 +8279,7 @@ func newDomainPointerTestFixture(t *testing.T) *domainPointerTestFixture {
 	var g Graph
 	names := NewNameRegistry(&g)
 
-	ids, err := names.BootstrapNames(FoundationalNames)
+	ids, err := names.BootstrapNames(&g, FoundationalNames)
 	if err != nil {
 		t.Fatalf("BootstrapNames(): %v", err)
 	}
@@ -9037,7 +9051,7 @@ func TestCrossRoleNodeParticipatesInMultipleStructuresSimultaneously(t *testing.
 		t.Fatalf("Evaluate(composite) = %v, want %v (S's own members, resolved through the operand)", got, wantMembers)
 	}
 
-	p, err := fx.pointers.NewPointer()
+	p, err := fx.pointers.NewPointer(g)
 	if err != nil {
 		t.Fatalf("NewPointer(): %v", err)
 	}
@@ -9045,7 +9059,7 @@ func TestCrossRoleNodeParticipatesInMultipleStructuresSimultaneously(t *testing.
 		t.Fatalf("SetTarget(p, list): %v", err6)
 	}
 
-	target, hasTarget, err := fx.pointers.Target(p)
+	target, hasTarget, err := fx.pointers.Target(g, p)
 	if err != nil {
 		t.Fatalf("Target(p): %v", err)
 	}
@@ -9583,6 +9597,51 @@ func TestGraphActorTransactPanicPropagatesAndActorSurvives(t *testing.T) {
 	}
 }
 
+// TestGraphActorReentrancyTripwireFiresAndActorSurvives exercises the
+// debug-only reentrancy tripwire (theorystate.md section 90) directly: a
+// Transact closure calls back into the very same GraphActor it is
+// already running on, from the actor's own dedicated goroutine -- the
+// exact shape of the original NameRegistry/GraphActor deadlock this
+// tripwire exists to turn into a loud, immediate panic instead of a
+// silent, permanent hang. Mirrors
+// TestGraphActorTransactPanicPropagatesAndActorSurvives's structure: the
+// panic must reach the original caller, and the actor must remain fully
+// usable immediately afterward.
+func TestGraphActorReentrancyTripwireFiresAndActorSurvives(t *testing.T) {
+	actor := NewGraphActor(&Graph{})
+	defer actor.Close()
+
+	func() {
+		defer func() {
+			r := recover()
+			if r == nil {
+				t.Fatal("expected the reentrancy tripwire to panic")
+			}
+			message, ok := r.(string)
+			if !ok || !strings.Contains(message, "reentrancy") {
+				t.Fatalf("panic value = %v, want a string mentioning reentrancy", r)
+			}
+		}()
+
+		//nolint:errcheck // the tripwire panics before Transact can return
+		_ = actor.Transact(func(_ *Txn) error {
+			// Reentrant: this closure is already running on actor's one
+			// dedicated goroutine, so calling back into the actor here
+			// is exactly the deadlock class the tripwire detects.
+			actor.RegisterChecker(Checker{})
+			return nil
+		})
+	}()
+
+	id, err := actor.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() after the tripwire panicked: %v", err)
+	}
+	if !actor.NodeExists(id) {
+		t.Fatalf("node %d does not exist after the tripwire panicked", id)
+	}
+}
+
 func TestGraphActorCloseIsIdempotent(_ *testing.T) {
 	actor := NewGraphActor(&Graph{})
 
@@ -9679,7 +9738,7 @@ func TestGraphActorConcurrentSetTargetNeverProducesTooManyTargets(t *testing.T) 
 	defer actor.Close()
 
 	names := NewNameRegistry(actor)
-	ids, err := names.BootstrapNames(FoundationalNames)
+	ids, err := names.BootstrapNames(actor, FoundationalNames)
 	if err != nil {
 		t.Fatalf("BootstrapNames(): %v", err)
 	}
@@ -9689,7 +9748,7 @@ func TestGraphActorConcurrentSetTargetNeverProducesTooManyTargets(t *testing.T) 
 		t.Fatalf("NewPointerRegistry(): %v", err)
 	}
 
-	p, err := pointers.NewPointer()
+	p, err := pointers.NewPointer(actor)
 	if err != nil {
 		t.Fatalf("NewPointer(): %v", err)
 	}
@@ -9712,7 +9771,7 @@ func TestGraphActorConcurrentSetTargetNeverProducesTooManyTargets(t *testing.T) 
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			errs[i] = pointers.SetTarget(p, candidates[i])
+			errs[i] = pointers.SetTarget(actor, p, candidates[i])
 		}()
 	}
 
@@ -9732,7 +9791,7 @@ func TestGraphActorConcurrentSetTargetNeverProducesTooManyTargets(t *testing.T) 
 		t.Fatalf("FindOutgoing(p) = %v, want exactly one surviving target regardless of interleaving", outgoing)
 	}
 
-	target, hasTarget, err := pointers.Target(p)
+	target, hasTarget, err := pointers.Target(actor, p)
 	if err != nil {
 		t.Fatalf("Target(p): %v", err)
 	}
