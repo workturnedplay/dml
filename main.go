@@ -6155,7 +6155,7 @@ func (c *CompositeSetLogRegistry) RemoveOperation(log, capsule NodeID) error {
 		return ErrCapsuleNotInList
 	}
 
-	u, hasValue, err := c.lists.capsules.Value(capsule)
+	u, hasValue, err := c.lists.capsules.Value(g, capsule)
 	if err != nil {
 		return err
 	}
@@ -6168,11 +6168,11 @@ func (c *CompositeSetLogRegistry) RemoveOperation(log, capsule NodeID) error {
 		return err
 	}
 
-	if err2 := c.lists.RemoveWithoutDeletingCapsule(log, capsule); err2 != nil {
+	if err2 := c.lists.RemoveWithoutDeletingCapsule(g, log, capsule); err2 != nil {
 		return err2
 	}
 
-	if err3 := c.lists.capsules.DeleteCapsule(capsule); err3 != nil {
+	if err3 := c.lists.capsules.DeleteCapsule(g, capsule); err3 != nil {
 		return err3
 	}
 
@@ -6195,7 +6195,7 @@ func (c *CompositeSetLogRegistry) Operations(log NodeID) ([]NodeID, error) {
 		return nil, ErrNotCompositeSetLog
 	}
 
-	return c.lists.Elements(log)
+	return c.lists.Elements(g, log)
 }
 
 // OperandTarget returns descriptor u's operand, i.e. u's single outgoing
@@ -6247,7 +6247,7 @@ func (c *CompositeSetLogRegistry) Evaluate(log NodeID) ([]NodeID, error) {
 // -- the same reasoning applies identically here, now shared across both
 // representations (theorystate.md section 83).
 func (c *CompositeSetLogRegistry) evaluate(log NodeID, visited map[NodeID]struct{}) ([]NodeID, error) {
-	operations, err := c.lists.Elements(log)
+	operations, err := c.lists.Elements(g, log)
 	if err != nil {
 		return nil, err
 	}
@@ -6330,7 +6330,7 @@ func (c *CompositeSetLogRegistry) Contains(log, value NodeID) (bool, error) {
 // already been confirmed to exist, log to be tagged CompositeSetLog-kind,
 // and log to already be recorded in visited.
 func (c *CompositeSetLogRegistry) contains(log, value NodeID, visited map[NodeID]struct{}) (bool, error) {
-	operations, err := c.lists.Elements(log)
+	operations, err := c.lists.Elements(g, log)
 	if err != nil {
 		return false, err
 	}
@@ -6495,7 +6495,7 @@ func (d *domainConstraint) Domain(anchor NodeID) (domain NodeID, hasDomain bool,
 		return 0, false, err
 	}
 
-	return d.domainSlots.Target(slot)
+	return d.domainSlots.Target(g, slot)
 }
 
 // SetDomain sets anchor's domain to domain, creating anchor's domain
@@ -6542,7 +6542,7 @@ func (d *domainConstraint) SetDomain(anchor, domain NodeID) error {
 		}))
 	}
 
-	return d.domainSlots.SetTarget(slot, domain)
+	return d.domainSlots.SetTarget(g, slot, domain)
 }
 
 // RemoveDomain clears anchor's domain, if any. The domain-slot node
@@ -6560,7 +6560,7 @@ func (d *domainConstraint) RemoveDomain(anchor NodeID) (removed bool, err error)
 		return false, err
 	}
 
-	return d.domainSlots.RemoveTarget(slot)
+	return d.domainSlots.RemoveTarget(g, slot)
 }
 
 // validateMembership reports whether target currently belongs to
@@ -6742,7 +6742,7 @@ func (b *DomainPointerRegistryB) Target(anchor NodeID) (target NodeID, hasTarget
 		return 0, false, err
 	}
 
-	return b.pointers.Target(u)
+	return b.pointers.Target(g, u)
 }
 
 // SetTarget sets anchor's target to target, first validating target
@@ -6768,7 +6768,7 @@ func (b *DomainPointerRegistryB) SetTarget(anchor, target NodeID) error {
 		return ErrNotPointer
 	}
 
-	return b.pointers.SetTarget(u, target)
+	return b.pointers.SetTarget(g, u, target)
 }
 
 // RemoveTarget clears anchor's target, if any, via its sub-pointer node
@@ -6779,7 +6779,7 @@ func (b *DomainPointerRegistryB) RemoveTarget(anchor NodeID) (removed bool, err 
 		return false, err
 	}
 
-	return b.pointers.RemoveTarget(u)
+	return b.pointers.RemoveTarget(g, u)
 }
 
 // SetDomain sets anchor's domain to domain, additionally validating that

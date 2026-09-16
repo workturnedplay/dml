@@ -3223,13 +3223,13 @@ func TestNewCapsuleStartsWithNoPrevOrNext(t *testing.T) {
 		t.Fatalf("NewCapsule(): %v", err)
 	}
 
-	if _, hasPrev, err := capsules.Prev(capsule); err != nil {
+	if _, hasPrev, err := capsules.Prev(g, capsule); err != nil {
 		t.Fatalf("Prev(%d): %v", capsule, err)
 	} else if hasPrev {
 		t.Fatalf("freshly created capsule %d unexpectedly has a prev", capsule)
 	}
 
-	if _, hasNext, err := capsules.Next(capsule); err != nil {
+	if _, hasNext, err := capsules.Next(g, capsule); err != nil {
 		t.Fatalf("Next(%d): %v", capsule, err)
 	} else if hasNext {
 		t.Fatalf("freshly created capsule %d unexpectedly has a next", capsule)
@@ -3275,7 +3275,7 @@ func TestCapsuleSetPrevAndNextLinkCapsules(t *testing.T) {
 		t.Fatalf("Next(c1) = (%d,%v), want (%d,true)", next, hasNext, c2)
 	}
 
-	prev, hasPrev, err := capsules.Prev(c2)
+	prev, hasPrev, err := capsules.Prev(g, c2)
 	if err != nil {
 		t.Fatalf("Prev(c2): %v", err)
 	}
@@ -3653,7 +3653,7 @@ func TestCapsulesWithValueFindsAllOccurrences(t *testing.T) {
 	}
 
 	// A capsule holding an unrelated value must not show up.
-	if _, err2 := capsules.NewCapsule(other); err2 != nil {
+	if _, err2 := capsules.NewCapsule(g, other); err2 != nil {
 		t.Fatalf("NewCapsule(other): %v", err2)
 	}
 
@@ -4247,11 +4247,11 @@ func TestListOperationsRequireListTag(t *testing.T) {
 		t.Fatalf("CreateNode() for value: %v", err)
 	}
 
-	if _, _, err := lists.Head(notAList); !errors.Is(err, ErrNotList) {
+	if _, _, err := lists.Head(g, notAList); !errors.Is(err, ErrNotList) {
 		t.Fatalf("Head() error = %v, want %v", err, ErrNotList)
 	}
 
-	if _, _, err := lists.Tail(notAList); !errors.Is(err, ErrNotList) {
+	if _, _, err := lists.Tail(g, notAList); !errors.Is(err, ErrNotList) {
 		t.Fatalf("Tail() error = %v, want %v", err, ErrNotList)
 	}
 
@@ -4263,7 +4263,7 @@ func TestListOperationsRequireListTag(t *testing.T) {
 		t.Fatalf("Prepend() error = %v, want %v", err, ErrNotList)
 	}
 
-	if _, err := lists.Elements(notAList); !errors.Is(err, ErrNotList) {
+	if _, err := lists.Elements(g, notAList); !errors.Is(err, ErrNotList) {
 		t.Fatalf("Elements() error = %v, want %v", err, ErrNotList)
 	}
 }
@@ -4514,7 +4514,7 @@ func TestListRemoveWithoutDeletingCapsuleMiddleElement(t *testing.T) {
 	if !hasNext {
 		t.Fatal("capsuleA lost its next link after an unrelated middle removal")
 	}
-	nextValue, _, err := lists.capsules.Value(next)
+	nextValue, _, err := lists.capsules.Value(g, next)
 	if err != nil {
 		t.Fatalf("Value(next): %v", err)
 	}
@@ -5134,7 +5134,7 @@ func TestAdversarialSharedValueAcrossListsRemainsSeparateOccurrences(t *testing.
 		t.Fatalf("CreateNode(value): %v", err)
 	}
 
-	cA, err := lists.Append(listA, value)
+	cA, err := lists.Append(g, listA, value)
 	if err != nil {
 		t.Fatalf("Append(A): %v", err)
 	}
@@ -5349,11 +5349,11 @@ func TestAdversarialListChainCanContainCapsuleFromAnotherList(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c1, err := lists.Append(listA, valueA)
+	c1, err := lists.Append(g, listA, valueA)
 	if err != nil {
 		t.Fatal(err)
 	}
-	c2, err := lists.Append(listB, valueB)
+	c2, err := lists.Append(g, listB, valueB)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -5569,7 +5569,7 @@ func TestAdversarialDuplicatePrevSlotFailsLoudly(t *testing.T) {
 	if _, err3 := g.AddRelationship(capsules.prevSlots.allPointers, other); err3 != nil {
 		t.Fatal(err3)
 	}
-	_, _, err = capsules.Prev(capsule)
+	_, _, err = capsules.Prev(g, capsule)
 	if !errors.Is(err, ErrAmbiguousPointerMetadata) {
 		t.Fatalf("Prev() error = %v, want %v", err, ErrAmbiguousPointerMetadata)
 	}
@@ -5595,7 +5595,7 @@ func TestAdversarialDuplicateNextSlotFailsLoudly(t *testing.T) {
 	if _, err3 := g.AddRelationship(capsules.nextSlots.allPointers, other); err3 != nil {
 		t.Fatal(err3)
 	}
-	_, _, err = capsules.Next(capsule)
+	_, _, err = capsules.Next(g, capsule)
 	if !errors.Is(err, ErrAmbiguousPointerMetadata) {
 		t.Fatalf("Next() error = %v, want %v", err, ErrAmbiguousPointerMetadata)
 	}
@@ -5629,7 +5629,7 @@ func TestAdversarialRoleSlotWithExtraChildFailsLoudly(t *testing.T) {
 	if _, err3 := g.AddRelationship(slot, extra); err3 != nil {
 		t.Fatal(err3)
 	}
-	_, _, err = capsules.Next(capsule)
+	_, _, err = capsules.Next(g, capsule)
 	if !errors.Is(err, ErrTooManyPointerTargets) {
 		t.Fatalf("Next() error = %v, want %v", err, ErrTooManyPointerTargets)
 	}
@@ -5712,7 +5712,7 @@ func TestAdversarialCapsuleMultipleRoleViolationsEachDetectedIndependently(t *te
 	// Each role's own accessor must independently report its own specific
 	// violation -- there is no single call that reports all three at
 	// once, which is exactly the gap this test documents.
-	if _, _, err6 := capsules.Prev(capsule); !errors.Is(err6, ErrTooManyPointerTargets) {
+	if _, _, err6 := capsules.Prev(g, capsule); !errors.Is(err6, ErrTooManyPointerTargets) {
 		t.Fatalf("Prev() error = %v, want %v", err6, ErrTooManyPointerTargets)
 	}
 
@@ -5720,7 +5720,7 @@ func TestAdversarialCapsuleMultipleRoleViolationsEachDetectedIndependently(t *te
 		t.Fatalf("Value() error = %v, want %v", err7, ErrAmbiguousPointerMetadata)
 	}
 
-	if _, _, err8 := capsules.Next(capsule); !errors.Is(err8, ErrNotCapsule) {
+	if _, _, err8 := capsules.Next(g, capsule); !errors.Is(err8, ErrNotCapsule) {
 		t.Fatalf("Next() error = %v, want %v", err8, ErrNotCapsule)
 	}
 }
@@ -7449,7 +7449,7 @@ func TestNewCompositeSetLogTagsBothAllListsAndAllCompositeSetLogs(t *testing.T) 
 	if !logs.IsCompositeSetLog(log) {
 		t.Fatalf("NewCompositeSetLog() did not tag %d as a composite set log", log)
 	}
-	if !logs.lists.IsList(log) {
+	if !logs.lists.IsList(g, log) {
 		t.Fatalf("NewCompositeSetLog() did not also tag %d as a list", log)
 	}
 
@@ -8058,7 +8058,7 @@ func TestCompositeSetLogDeleteCompositeSetLogFailsIfNotEmpty(t *testing.T) {
 	if !logs.IsCompositeSetLog(log) {
 		t.Fatal("log lost its AllCompositeSetLogs tag despite a failed DeleteCompositeSetLog()")
 	}
-	if !logs.lists.IsList(log) {
+	if !logs.lists.IsList(g, log) {
 		t.Fatal("log lost its AllLists tag despite a failed DeleteCompositeSetLog()")
 	}
 }
@@ -8112,7 +8112,7 @@ func TestCompositeSetLogEvaluateDetectsMalformedDescriptor(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err2 := logs.lists.Append(log, x); err2 != nil {
+	if _, err2 := logs.lists.Append(g, log, x); err2 != nil {
 		t.Fatalf("Append() bypassing AppendOperation: %v", err2)
 	}
 
@@ -8200,12 +8200,12 @@ func TestCompositeSetLogRegistrySharesOperandDescriptorChecker(t *testing.T) {
 		t.Fatalf("AddRelationship(u, x): %v", err5)
 	}
 
-	_, err = logs.lists.Append(log, u)
+	_, err = logs.lists.Append(g, log, u)
 	if !errors.Is(err, ErrInvalidOperandDescriptor) {
 		t.Fatalf("Append() error = %v, want %v", err, ErrInvalidOperandDescriptor)
 	}
 
-	elements, err := logs.lists.Elements(log)
+	elements, err := logs.lists.Elements(g, log)
 	if err != nil {
 		t.Fatalf("Elements(log): %v", err)
 	}
@@ -8937,7 +8937,7 @@ func TestDomainPointerRegistryDCheckerCatchesOutOfBandDomainChange(t *testing.T)
 		t.Fatalf("domainSlotFor(m): found=%v err=%v", found, err)
 	}
 
-	err = fx.domainD.domainSlots.SetTarget(slot, secondDomain)
+	err = fx.domainD.domainSlots.SetTarget(g, slot, secondDomain)
 	if !errors.Is(err, ErrTargetOutsideDomain) {
 		t.Fatalf("bypassing SetDomain() error = %v, want %v", err, ErrTargetOutsideDomain)
 	}
@@ -9011,7 +9011,7 @@ func TestCrossRoleNodeParticipatesInMultipleStructuresSimultaneously(t *testing.
 	if err != nil {
 		t.Fatalf("NewList(): %v", err)
 	}
-	if _, err4 := fx.lists.Append(list, s); err4 != nil {
+	if _, err4 := fx.lists.Append(g, list, s); err4 != nil {
 		t.Fatalf("Append(list, s): %v", err4)
 	}
 
@@ -9055,7 +9055,7 @@ func TestCrossRoleNodeParticipatesInMultipleStructuresSimultaneously(t *testing.
 	if err != nil {
 		t.Fatalf("NewPointer(): %v", err)
 	}
-	if err6 := fx.pointers.SetTarget(p, list); err6 != nil {
+	if err6 := fx.pointers.SetTarget(g, p, list); err6 != nil {
 		t.Fatalf("SetTarget(p, list): %v", err6)
 	}
 
@@ -9304,14 +9304,14 @@ func TestCrossRoleCorruptedLoggedOperandDoesNotCorruptSiblingStructures(t *testi
 	// The underlying List's own head/tail must likewise be completely
 	// unaffected: ListRegistry never inspects a value's own outgoing
 	// relationships at all.
-	head, hasHead, err := fx.lists.Head(log)
+	head, hasHead, err := fx.lists.Head(g, log)
 	if err != nil {
 		t.Fatalf("Head(log) after corrupting u2: %v", err)
 	}
 	if !hasHead || head != capsule1 {
 		t.Fatalf("Head(log) = (%d,%v), want (%d,true)", head, hasHead, capsule1)
 	}
-	tail, hasTail, err := fx.lists.Tail(log)
+	tail, hasTail, err := fx.lists.Tail(g, log)
 	if err != nil {
 		t.Fatalf("Tail(log) after corrupting u2: %v", err)
 	}
