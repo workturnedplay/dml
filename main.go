@@ -3316,7 +3316,6 @@ func (m *PointerMetadataRegistryD) RemoveTarget(subject NodeID) (removed bool, e
 // (AllTAILs, X) are already two distinct relationships even when the same
 // capsule X is simultaneously both head and tail (a single-element list).
 type CapsuleRegistry struct {
-	graph              GraphAPI
 	allElementCapsules NodeID
 	prevSlots          *PointerRegistry
 	valueSlots         *PointerRegistry
@@ -3351,7 +3350,6 @@ func NewCapsuleRegistry(graph GraphAPI, allElementCapsules, allPrevSlot, allValu
 	}
 
 	c := &CapsuleRegistry{
-		graph:              graph,
 		allElementCapsules: allElementCapsules,
 		prevSlots:          prevSlots,
 		valueSlots:         valueSlots,
@@ -3376,7 +3374,7 @@ func NewCapsuleRegistry(graph GraphAPI, allElementCapsules, allPrevSlot, allValu
 					continue
 				}
 
-				if err2 := c.wellFormed(node); err2 != nil {
+				if err2 := c.wellFormed(g, node); err2 != nil {
 					return err2
 				}
 			}
@@ -3390,8 +3388,8 @@ func NewCapsuleRegistry(graph GraphAPI, allElementCapsules, allPrevSlot, allValu
 
 // IsCapsule reports whether id is currently tagged
 // (AllElementCapsules, id).
-func (c *CapsuleRegistry) IsCapsule(id NodeID) bool {
-	return c.graph.HasRelationship(c.allElementCapsules, id)
+func (c *CapsuleRegistry) IsCapsule(graph GraphReader, id NodeID) bool {
+	return graph.HasRelationship(c.allElementCapsules, id)
 }
 
 // slotFor returns capsule's role-slot child tagged via (tag, slot) --
@@ -3409,13 +3407,13 @@ func (c *CapsuleRegistry) IsCapsule(id NodeID) bool {
 // silently alias that role. Unrelated non-capsule parents remain permitted;
 // two distinct capsule-tagged parents produce ErrAmbiguousPointerMetadata.
 // capsule's existence is checked implicitly by the underlying lookups.
-func (c *CapsuleRegistry) slotFor(capsule, tag NodeID) (slot NodeID, found bool, err error) {
-	slot, found, err = findUniqueTaggedChild(c.graph, capsule, tag)
+func (c *CapsuleRegistry) slotFor(graph GraphReader, capsule, tag NodeID) (slot NodeID, found bool, err error) {
+	slot, found, err = findUniqueTaggedChild(graph, capsule, tag)
 	if err != nil || !found {
 		return slot, found, err
 	}
 
-	owner, foundOwner, err := findUniqueTaggedParent(c.graph, slot, c.allElementCapsules)
+	owner, foundOwner, err := findUniqueTaggedParent(graph, slot, c.allElementCapsules)
 	if err != nil {
 		return 0, false, err
 	}
@@ -3446,13 +3444,13 @@ func (c *CapsuleRegistry) slotFor(capsule, tag NodeID) (slot NodeID, found bool,
 // existing rollback if any of them turns out to fail (see DeleteCapsule's
 // own doc comment) -- a pre-check here would only be redundant work for
 // that specific caller, not a missed reuse opportunity.
-func (c *CapsuleRegistry) wellFormed(capsule NodeID) error {
-	if !c.IsCapsule(capsule) {
+func (c *CapsuleRegistry) wellFormed(graph GraphReader, capsule NodeID) error {
+	if !c.IsCapsule(graph, capsule) {
 		return ErrNotCapsule
 	}
 
 	for _, slots := range []*PointerRegistry{c.prevSlots, c.valueSlots, c.nextSlots} {
-		slot, found, err := c.slotFor(capsule, slots.allPointers)
+		slot, found, err := c.slotFor(graph, capsule, slots.allPointers)
 		if err != nil {
 			return err
 		}
@@ -3460,7 +3458,7 @@ func (c *CapsuleRegistry) wellFormed(capsule NodeID) error {
 			return ErrNotCapsule
 		}
 
-		if _, _, err = slots.Target(slot); err != nil {
+		if _, _, err = slots.Target(graph, slot); err != nil {
 			return err
 		}
 	}
@@ -3538,8 +3536,8 @@ func (c *CapsuleRegistry) newCapsuleTx(tx txOps, value NodeID) (NodeID, error) {
 // SetPrev/SetNext, for callers (ListRegistry) that need to rewire a
 // capsule's slot as one step of a larger enclosing transaction rather
 // than opening a new Graph.Transact per slot.
-func (c *CapsuleRegistry) setSlotTargetTx(tx txOps, capsule, slotTag, target NodeID) error {
-	slot, found, err := findUniqueTaggedChild(c.graph, capsule, slotTag)
+func (c *CapsuleRegistry) setSlotTargetTx(tx txReader, capsule, slotTag, target NodeID) error {
+	slot, found, err := findUniqueTaggedChild(tx, capsule, slotTag)
 	if err != nil {
 		return err
 	}
@@ -3547,18 +3545,18 @@ func (c *CapsuleRegistry) setSlotTargetTx(tx txOps, capsule, slotTag, target Nod
 		return ErrNotCapsule
 	}
 
-	return singleChildTargetSetTx(tx, c.graph, slot, target)
+	return singleChildTargetSetTx(tx, tx, slot, target)
 }
 
 // setPrevTx rewires capsule's prev-slot to target, composed into an
 // existing tx. See setSlotTargetTx.
-func (c *CapsuleRegistry) setPrevTx(tx txOps, capsule, target NodeID) error {
+func (c *CapsuleRegistry) setPrevTx(tx txReader, capsule, target NodeID) error {
 	return c.setSlotTargetTx(tx, capsule, c.prevSlots.allPointers, target)
 }
 
 // setNextTx rewires capsule's next-slot to target, composed into an
 // existing tx. See setSlotTargetTx.
-func (c *CapsuleRegistry) setNextTx(tx txOps, capsule, target NodeID) error {
+func (c *CapsuleRegistry) setNextTx(tx txReader, capsule, target NodeID) error {
 	return c.setSlotTargetTx(tx, capsule, c.nextSlots.allPointers, target)
 }
 
@@ -3569,8 +3567,8 @@ func (c *CapsuleRegistry) setNextTx(tx txOps, capsule, target NodeID) error {
 // separate tx-composable path is needed rather than reusing those
 // directly), used by ListRegistry.Remove so a capsule's own links can be
 // cleared as part of the same transaction that relinks its neighbors.
-func (c *CapsuleRegistry) removeSlotTargetTx(tx txOps, capsule, slotTag NodeID) (removed bool, err error) {
-	slot, found, err := findUniqueTaggedChild(c.graph, capsule, slotTag)
+func (c *CapsuleRegistry) removeSlotTargetTx(tx txReader, capsule, slotTag NodeID) (removed bool, err error) {
+	slot, found, err := findUniqueTaggedChild(tx, capsule, slotTag)
 	if err != nil {
 		return false, err
 	}
@@ -3578,18 +3576,18 @@ func (c *CapsuleRegistry) removeSlotTargetTx(tx txOps, capsule, slotTag NodeID) 
 		return false, ErrNotCapsule
 	}
 
-	return singleChildTargetRemoveTx(tx, c.graph, slot)
+	return singleChildTargetRemoveTx(tx, tx, slot)
 }
 
 // removePrevTx clears capsule's prev-slot, composed into an existing tx.
 // See removeSlotTargetTx.
-func (c *CapsuleRegistry) removePrevTx(tx txOps, capsule NodeID) (bool, error) {
+func (c *CapsuleRegistry) removePrevTx(tx txReader, capsule NodeID) (bool, error) {
 	return c.removeSlotTargetTx(tx, capsule, c.prevSlots.allPointers)
 }
 
 // removeNextTx clears capsule's next-slot, composed into an existing tx.
 // See removeSlotTargetTx.
-func (c *CapsuleRegistry) removeNextTx(tx txOps, capsule NodeID) (bool, error) {
+func (c *CapsuleRegistry) removeNextTx(tx txReader, capsule NodeID) (bool, error) {
 	return c.removeSlotTargetTx(tx, capsule, c.nextSlots.allPointers)
 }
 
@@ -3599,14 +3597,14 @@ func (c *CapsuleRegistry) removeNextTx(tx txOps, capsule NodeID) (bool, error) {
 // newCapsuleTx.
 //
 // value must already exist.
-func (c *CapsuleRegistry) NewCapsule(value NodeID) (NodeID, error) {
-	if !c.graph.NodeExists(value) {
+func (c *CapsuleRegistry) NewCapsule(graph GraphAPI, value NodeID) (NodeID, error) {
+	if !graph.NodeExists(value) {
 		return 0, ErrNodeNotFound
 	}
 
 	var capsule NodeID
 
-	err := c.graph.Transact(func(tx *Txn) error {
+	err := graph.Transact(func(tx *Txn) error {
 		var err error
 		capsule, err = c.newCapsuleTx(tx, value)
 		return err
@@ -3625,8 +3623,8 @@ func (c *CapsuleRegistry) NewCapsule(value NodeID) (NodeID, error) {
 // NewCapsule always sets the value slot's target immediately. It can
 // only arise from an out-of-band mutation (e.g. RemoveTarget called
 // directly through the underlying value PointerRegistry).
-func (c *CapsuleRegistry) Value(capsule NodeID) (value NodeID, hasValue bool, err error) {
-	slot, found, err := c.slotFor(capsule, c.valueSlots.allPointers)
+func (c *CapsuleRegistry) Value(graph GraphReader, capsule NodeID) (value NodeID, hasValue bool, err error) {
+	slot, found, err := c.slotFor(graph, capsule, c.valueSlots.allPointers)
 	if err != nil {
 		return 0, false, err
 	}
@@ -3634,12 +3632,12 @@ func (c *CapsuleRegistry) Value(capsule NodeID) (value NodeID, hasValue bool, er
 		return 0, false, ErrNotCapsule
 	}
 
-	return c.valueSlots.Target(slot)
+	return c.valueSlots.Target(graph, slot)
 }
 
 // SetValue replaces capsule's value.
-func (c *CapsuleRegistry) SetValue(capsule, value NodeID) error {
-	slot, found, err := c.slotFor(capsule, c.valueSlots.allPointers)
+func (c *CapsuleRegistry) SetValue(graph GraphAPI, capsule, value NodeID) error {
+	slot, found, err := c.slotFor(graph, capsule, c.valueSlots.allPointers)
 	if err != nil {
 		return err
 	}
@@ -3647,7 +3645,7 @@ func (c *CapsuleRegistry) SetValue(capsule, value NodeID) error {
 		return ErrNotCapsule
 	}
 
-	return c.valueSlots.SetTarget(slot, value)
+	return c.valueSlots.SetTarget(graph, slot, value)
 }
 
 // CapsulesWithValue returns every capsule, anywhere in the graph, whose
@@ -3731,8 +3729,8 @@ func (c *CapsuleRegistry) SetValue(capsule, value NodeID) error {
 // The returned capsules are in no particular semantic order (they follow
 // Graph.FindIncoming's own deterministic sort by slot NodeID, which does
 // not necessarily correspond to capsule creation order).
-func (c *CapsuleRegistry) CapsulesWithValue(value NodeID) ([]NodeID, error) {
-	incoming, err := c.graph.FindIncoming(value)
+func (c *CapsuleRegistry) CapsulesWithValue(graph GraphReader, value NodeID) ([]NodeID, error) {
+	incoming, err := graph.FindIncoming(value)
 	if err != nil {
 		return nil, wrapInterfaceErr(err)
 	}
@@ -3742,11 +3740,11 @@ func (c *CapsuleRegistry) CapsulesWithValue(value NodeID) ([]NodeID, error) {
 	for _, rel := range incoming {
 		slot := rel.From
 
-		if !c.valueSlots.IsPointer(slot) {
+		if !c.valueSlots.IsPointer(graph, slot) {
 			continue
 		}
 
-		capsule, found, err := findUniqueTaggedParent(c.graph, slot, c.allElementCapsules)
+		capsule, found, err := findUniqueTaggedParent(graph, slot, c.allElementCapsules)
 		if err != nil {
 			return nil, err
 		}
@@ -3762,8 +3760,8 @@ func (c *CapsuleRegistry) CapsulesWithValue(value NodeID) ([]NodeID, error) {
 
 // Prev returns capsule's previous-capsule link, if any. hasPrev is false
 // for a capsule currently at the head of its list.
-func (c *CapsuleRegistry) Prev(capsule NodeID) (prev NodeID, hasPrev bool, err error) {
-	slot, found, err := c.slotFor(capsule, c.prevSlots.allPointers)
+func (c *CapsuleRegistry) Prev(graph GraphReader, capsule NodeID) (prev NodeID, hasPrev bool, err error) {
+	slot, found, err := c.slotFor(graph, capsule, c.prevSlots.allPointers)
 	if err != nil {
 		return 0, false, err
 	}
@@ -3771,12 +3769,12 @@ func (c *CapsuleRegistry) Prev(capsule NodeID) (prev NodeID, hasPrev bool, err e
 		return 0, false, ErrNotCapsule
 	}
 
-	return c.prevSlots.Target(slot)
+	return c.prevSlots.Target(graph, slot)
 }
 
 // SetPrev sets capsule's previous-capsule link.
-func (c *CapsuleRegistry) SetPrev(capsule, prev NodeID) error {
-	slot, found, err := c.slotFor(capsule, c.prevSlots.allPointers)
+func (c *CapsuleRegistry) SetPrev(graph GraphAPI, capsule, prev NodeID) error {
+	slot, found, err := c.slotFor(graph, capsule, c.prevSlots.allPointers)
 	if err != nil {
 		return err
 	}
@@ -3784,12 +3782,12 @@ func (c *CapsuleRegistry) SetPrev(capsule, prev NodeID) error {
 		return ErrNotCapsule
 	}
 
-	return c.prevSlots.SetTarget(slot, prev)
+	return c.prevSlots.SetTarget(graph, slot, prev)
 }
 
 // RemovePrev clears capsule's previous-capsule link, if any.
-func (c *CapsuleRegistry) RemovePrev(capsule NodeID) (removed bool, err error) {
-	slot, found, err := c.slotFor(capsule, c.prevSlots.allPointers)
+func (c *CapsuleRegistry) RemovePrev(graph GraphAPI, capsule NodeID) (removed bool, err error) {
+	slot, found, err := c.slotFor(graph, capsule, c.prevSlots.allPointers)
 	if err != nil {
 		return false, err
 	}
@@ -3797,13 +3795,13 @@ func (c *CapsuleRegistry) RemovePrev(capsule NodeID) (removed bool, err error) {
 		return false, ErrNotCapsule
 	}
 
-	return c.prevSlots.RemoveTarget(slot)
+	return c.prevSlots.RemoveTarget(graph, slot)
 }
 
 // Next returns capsule's next-capsule link, if any. hasNext is false for
 // a capsule currently at the tail of its list.
-func (c *CapsuleRegistry) Next(capsule NodeID) (next NodeID, hasNext bool, err error) {
-	slot, found, err := c.slotFor(capsule, c.nextSlots.allPointers)
+func (c *CapsuleRegistry) Next(graph GraphReader, capsule NodeID) (next NodeID, hasNext bool, err error) {
+	slot, found, err := c.slotFor(graph, capsule, c.nextSlots.allPointers)
 	if err != nil {
 		return 0, false, err
 	}
@@ -3811,12 +3809,12 @@ func (c *CapsuleRegistry) Next(capsule NodeID) (next NodeID, hasNext bool, err e
 		return 0, false, ErrNotCapsule
 	}
 
-	return c.nextSlots.Target(slot)
+	return c.nextSlots.Target(graph, slot)
 }
 
 // SetNext sets capsule's next-capsule link.
-func (c *CapsuleRegistry) SetNext(capsule, next NodeID) error {
-	slot, found, err := c.slotFor(capsule, c.nextSlots.allPointers)
+func (c *CapsuleRegistry) SetNext(graph GraphAPI, capsule, next NodeID) error {
+	slot, found, err := c.slotFor(graph, capsule, c.nextSlots.allPointers)
 	if err != nil {
 		return err
 	}
@@ -3824,12 +3822,12 @@ func (c *CapsuleRegistry) SetNext(capsule, next NodeID) error {
 		return ErrNotCapsule
 	}
 
-	return c.nextSlots.SetTarget(slot, next)
+	return c.nextSlots.SetTarget(graph, slot, next)
 }
 
 // RemoveNext clears capsule's next-capsule link, if any.
-func (c *CapsuleRegistry) RemoveNext(capsule NodeID) (removed bool, err error) {
-	slot, found, err := c.slotFor(capsule, c.nextSlots.allPointers)
+func (c *CapsuleRegistry) RemoveNext(graph GraphAPI, capsule NodeID) (removed bool, err error) {
+	slot, found, err := c.slotFor(graph, capsule, c.nextSlots.allPointers)
 	if err != nil {
 		return false, err
 	}
@@ -3837,7 +3835,7 @@ func (c *CapsuleRegistry) RemoveNext(capsule NodeID) (removed bool, err error) {
 		return false, ErrNotCapsule
 	}
 
-	return c.nextSlots.RemoveTarget(slot)
+	return c.nextSlots.RemoveTarget(graph, slot)
 }
 
 // DeleteCapsule deletes capsule and all three of its role-slot nodes
@@ -3889,27 +3887,27 @@ func (c *CapsuleRegistry) RemoveNext(capsule NodeID) (removed bool, err error) {
 // capsule somehow missing one of its three role slots -- only reachable
 // through an out-of-band Graph mutation -- is treated the same as
 // ErrCapsuleNotEmpty rather than guessed about.
-func (c *CapsuleRegistry) DeleteCapsule(capsule NodeID) error {
-	if !c.graph.NodeExists(capsule) {
+func (c *CapsuleRegistry) DeleteCapsule(graph GraphAPI, capsule NodeID) error {
+	if !graph.NodeExists(capsule) {
 		return ErrNodeNotFound
 	}
 
-	if !c.IsCapsule(capsule) {
+	if !c.IsCapsule(graph, capsule) {
 		return ErrNotCapsule
 	}
 
-	return wrapInterfaceErr(c.graph.Transact(func(tx *Txn) error {
-		prevSlot, hasPrevSlot, err := c.slotFor(capsule, c.prevSlots.allPointers)
+	return wrapInterfaceErr(graph.Transact(func(tx *Txn) error {
+		prevSlot, hasPrevSlot, err := c.slotFor(tx, capsule, c.prevSlots.allPointers)
 		if err != nil {
 			return err
 		}
 
-		valueSlot, hasValueSlot, err := c.slotFor(capsule, c.valueSlots.allPointers)
+		valueSlot, hasValueSlot, err := c.slotFor(tx, capsule, c.valueSlots.allPointers)
 		if err != nil {
 			return err
 		}
 
-		nextSlot, hasNextSlot, err := c.slotFor(capsule, c.nextSlots.allPointers)
+		nextSlot, hasNextSlot, err := c.slotFor(tx, capsule, c.nextSlots.allPointers)
 		if err != nil {
 			return err
 		}
@@ -3918,7 +3916,7 @@ func (c *CapsuleRegistry) DeleteCapsule(capsule NodeID) error {
 			return ErrCapsuleNotEmpty
 		}
 
-		value, hasValue, err := c.valueSlots.Target(valueSlot)
+		value, hasValue, err := c.valueSlots.Target(tx, valueSlot)
 		if err != nil {
 			return err
 		}
@@ -4009,7 +4007,6 @@ func (c *CapsuleRegistry) DeleteCapsule(capsule NodeID) error {
 // whenever nothing else still references it. DeleteList removes a list
 // itself once empty.
 type ListRegistry struct {
-	graph    GraphAPI
 	capsules *CapsuleRegistry
 	allLists NodeID
 	allHeads NodeID
@@ -4036,7 +4033,6 @@ func NewListRegistry(graph GraphAPI, capsules *CapsuleRegistry, allLists, allHea
 	}
 
 	l := &ListRegistry{
-		graph:    graph,
 		capsules: capsules,
 		allLists: allLists,
 		allHeads: allHeads,
@@ -4074,7 +4070,7 @@ func NewListRegistry(graph GraphAPI, capsules *CapsuleRegistry, allLists, allHea
 					continue
 				}
 
-				if err := l.validateStructure(node); err != nil {
+				if err := l.validateStructure(g, node); err != nil {
 					return err
 				}
 			}
@@ -4087,16 +4083,16 @@ func NewListRegistry(graph GraphAPI, capsules *CapsuleRegistry, allLists, allHea
 }
 
 // IsList reports whether id is currently tagged (AllLists, id).
-func (l *ListRegistry) IsList(id NodeID) bool {
-	return l.graph.HasRelationship(l.allLists, id)
+func (l *ListRegistry) IsList(graph GraphReader, id NodeID) bool {
+	return graph.HasRelationship(l.allLists, id)
 }
 
 // NewList creates a fresh NodeID and tags it (AllLists, id). The new list
 // starts empty: no head, no tail, no element capsules.
-func (l *ListRegistry) NewList() (NodeID, error) {
+func (l *ListRegistry) NewList(graph GraphAPI) (NodeID, error) {
 	var list NodeID
 
-	err := l.graph.Transact(func(tx *Txn) error {
+	err := graph.Transact(func(tx *Txn) error {
 		var err error
 		list, err = createTaggedNodeTx(tx, l.allLists)
 		return err
@@ -4110,20 +4106,20 @@ func (l *ListRegistry) NewList() (NodeID, error) {
 
 // Head returns list's current head capsule, if any. hasHead is false for
 // an empty list.
-func (l *ListRegistry) Head(list NodeID) (head NodeID, hasHead bool, err error) {
-	if !l.graph.NodeExists(list) {
+func (l *ListRegistry) Head(graph GraphReader, list NodeID) (head NodeID, hasHead bool, err error) {
+	if !graph.NodeExists(list) {
 		return 0, false, ErrNodeNotFound
 	}
 
-	if !l.IsList(list) {
+	if !l.IsList(graph, list) {
 		return 0, false, ErrNotList
 	}
 
-	head, found, err := findUniqueTaggedChild(l.graph, list, l.allHeads)
+	head, found, err := findUniqueTaggedChild(graph, list, l.allHeads)
 	if err != nil || !found {
 		return head, found, err
 	}
-	if !l.capsules.IsCapsule(head) || !l.graph.HasRelationship(list, head) {
+	if !l.capsules.IsCapsule(graph, head) || !graph.HasRelationship(list, head) {
 		return 0, false, ErrInvalidListStructure
 	}
 	return head, true, nil
@@ -4131,20 +4127,20 @@ func (l *ListRegistry) Head(list NodeID) (head NodeID, hasHead bool, err error) 
 
 // Tail returns list's current tail capsule, if any. hasTail is false for
 // an empty list.
-func (l *ListRegistry) Tail(list NodeID) (tail NodeID, hasTail bool, err error) {
-	if !l.graph.NodeExists(list) {
+func (l *ListRegistry) Tail(graph GraphReader, list NodeID) (tail NodeID, hasTail bool, err error) {
+	if !graph.NodeExists(list) {
 		return 0, false, ErrNodeNotFound
 	}
 
-	if !l.IsList(list) {
+	if !l.IsList(graph, list) {
 		return 0, false, ErrNotList
 	}
 
-	tail, found, err := findUniqueTaggedChild(l.graph, list, l.allTails)
+	tail, found, err := findUniqueTaggedChild(graph, list, l.allTails)
 	if err != nil || !found {
 		return tail, found, err
 	}
-	if !l.capsules.IsCapsule(tail) || !l.graph.HasRelationship(list, tail) {
+	if !l.capsules.IsCapsule(graph, tail) || !graph.HasRelationship(list, tail) {
 		return 0, false, ErrInvalidListStructure
 	}
 	return tail, true, nil
@@ -4160,22 +4156,22 @@ func (l *ListRegistry) Tail(list NodeID) (tail NodeID, hasTail bool, err error) 
 //
 // list must already be tagged (AllLists, list); value must already
 // exist.
-func (l *ListRegistry) Append(list, value NodeID) (NodeID, error) {
-	if !l.graph.NodeExists(list) {
+func (l *ListRegistry) Append(graph GraphAPI, list, value NodeID) (NodeID, error) {
+	if !graph.NodeExists(list) {
 		return 0, ErrNodeNotFound
 	}
 
-	if !l.IsList(list) {
+	if !l.IsList(graph, list) {
 		return 0, ErrNotList
 	}
 
-	if !l.graph.NodeExists(value) {
+	if !graph.NodeExists(value) {
 		return 0, ErrNodeNotFound
 	}
 
 	var capsule NodeID
 
-	err := l.graph.Transact(func(tx *Txn) error {
+	err := graph.Transact(func(tx *Txn) error {
 		var err error
 		capsule, err = l.appendTx(tx, list, value)
 		return err
@@ -4199,8 +4195,8 @@ func (l *ListRegistry) Append(list, value NodeID) (NodeID, error) {
 // (AllLists, list), and value to already exist -- exactly like every
 // other *Tx helper in this file, callers are responsible for the checks
 // Append itself performs before opening its transaction.
-func (l *ListRegistry) appendTx(tx txOps, list, value NodeID) (NodeID, error) {
-	oldTail, hasTail, err := findUniqueTaggedChild(l.graph, list, l.allTails)
+func (l *ListRegistry) appendTx(tx txReader, list, value NodeID) (NodeID, error) {
+	oldTail, hasTail, err := findUniqueTaggedChild(tx, list, l.allTails)
 	if err != nil {
 		return 0, err
 	}
@@ -4240,23 +4236,23 @@ func (l *ListRegistry) appendTx(tx txOps, list, value NodeID) (NodeID, error) {
 //
 // list must already be tagged (AllLists, list); value must already
 // exist.
-func (l *ListRegistry) Prepend(list, value NodeID) (NodeID, error) {
-	if !l.graph.NodeExists(list) {
+func (l *ListRegistry) Prepend(graph GraphAPI, list, value NodeID) (NodeID, error) {
+	if !graph.NodeExists(list) {
 		return 0, ErrNodeNotFound
 	}
 
-	if !l.IsList(list) {
+	if !l.IsList(graph, list) {
 		return 0, ErrNotList
 	}
 
-	if !l.graph.NodeExists(value) {
+	if !graph.NodeExists(value) {
 		return 0, ErrNodeNotFound
 	}
 
 	var capsule NodeID
 
-	err := l.graph.Transact(func(tx *Txn) error {
-		oldHead, hasHead, err := findUniqueTaggedChild(l.graph, list, l.allHeads)
+	err := graph.Transact(func(tx *Txn) error {
+		oldHead, hasHead, err := findUniqueTaggedChild(tx, list, l.allHeads)
 		if err != nil {
 			return err
 		}
@@ -4308,27 +4304,27 @@ func (l *ListRegistry) Prepend(list, value NodeID) (NodeID, error) {
 // already be an element of list (checked via the (list, afterCapsule)
 // containment edge, returning ErrCapsuleNotInList otherwise); value must
 // already exist.
-func (l *ListRegistry) InsertAfter(list, afterCapsule, value NodeID) (NodeID, error) {
-	if !l.graph.NodeExists(list) {
+func (l *ListRegistry) InsertAfter(graph GraphAPI, list, afterCapsule, value NodeID) (NodeID, error) {
+	if !graph.NodeExists(list) {
 		return 0, ErrNodeNotFound
 	}
 
-	if !l.IsList(list) {
+	if !l.IsList(graph, list) {
 		return 0, ErrNotList
 	}
 
-	if !l.graph.NodeExists(value) {
+	if !graph.NodeExists(value) {
 		return 0, ErrNodeNotFound
 	}
 
-	if !l.graph.HasRelationship(list, afterCapsule) {
+	if !graph.HasRelationship(list, afterCapsule) {
 		return 0, ErrCapsuleNotInList
 	}
 
 	var capsule NodeID
 
-	err := l.graph.Transact(func(tx *Txn) error {
-		oldNext, hasNext, err := l.capsules.Next(afterCapsule)
+	err := graph.Transact(func(tx *Txn) error {
+		oldNext, hasNext, err := l.capsules.Next(tx, afterCapsule)
 		if err != nil {
 			return err
 		}
@@ -4384,24 +4380,24 @@ func (l *ListRegistry) InsertAfter(list, afterCapsule, value NodeID) (NodeID, er
 // reciprocal Prev/Next links, and that every capsule-tagged list member is
 // actually reachable from the head. Thus a corrupted graph is rejected
 // rather than silently producing a plausible partial sequence.
-func (l *ListRegistry) validateStructure(list NodeID) error {
-	head, hasHead, err := findUniqueTaggedChild(l.graph, list, l.allHeads)
+func (l *ListRegistry) validateStructure(graph GraphReader, list NodeID) error {
+	head, hasHead, err := findUniqueTaggedChild(graph, list, l.allHeads)
 	if err != nil {
 		return err
 	}
-	tail, hasTail, err := findUniqueTaggedChild(l.graph, list, l.allTails)
+	tail, hasTail, err := findUniqueTaggedChild(graph, list, l.allTails)
 	if err != nil {
 		return err
 	}
 
-	outgoing, err := l.graph.FindOutgoing(list)
+	outgoing, err := graph.FindOutgoing(list)
 	if err != nil {
 		return wrapInterfaceErr(err)
 	}
 
 	members := make(map[NodeID]struct{})
 	for _, rel := range outgoing {
-		if l.capsules.IsCapsule(rel.To) {
+		if l.capsules.IsCapsule(graph, rel.To) {
 			members[rel.To] = struct{}{}
 		}
 	}
@@ -4413,7 +4409,7 @@ func (l *ListRegistry) validateStructure(list NodeID) error {
 		return nil
 	}
 
-	if !l.capsules.IsCapsule(head) || !l.capsules.IsCapsule(tail) {
+	if !l.capsules.IsCapsule(graph, head) || !l.capsules.IsCapsule(graph, tail) {
 		return ErrInvalidListStructure
 	}
 	if _, ok := members[head]; !ok {
@@ -4431,19 +4427,19 @@ func (l *ListRegistry) validateStructure(list NodeID) error {
 		}
 		visited[current] = struct{}{}
 
-		if !l.capsules.IsCapsule(current) {
+		if !l.capsules.IsCapsule(graph, current) {
 			return ErrInvalidListStructure
 		}
-		if !l.graph.HasRelationship(list, current) {
+		if !graph.HasRelationship(list, current) {
 			return ErrInvalidListStructure
 		}
-		if _, hasValue, err := l.capsules.Value(current); err != nil {
+		if _, hasValue, err := l.capsules.Value(graph, current); err != nil {
 			return err
 		} else if !hasValue {
 			return ErrInvalidListStructure
 		}
 
-		next, hasNext, err := l.capsules.Next(current)
+		next, hasNext, err := l.capsules.Next(graph, current)
 		if err != nil {
 			return err
 		}
@@ -4454,10 +4450,10 @@ func (l *ListRegistry) validateStructure(list NodeID) error {
 			break
 		}
 
-		if !l.capsules.IsCapsule(next) || !l.graph.HasRelationship(list, next) {
+		if !l.capsules.IsCapsule(graph, next) || !graph.HasRelationship(list, next) {
 			return ErrInvalidListStructure
 		}
-		prev, hasPrev, err := l.capsules.Prev(next)
+		prev, hasPrev, err := l.capsules.Prev(graph, next)
 		if err != nil {
 			return err
 		}
@@ -4468,7 +4464,7 @@ func (l *ListRegistry) validateStructure(list NodeID) error {
 		current = next
 	}
 
-	if _, hasPrev, err := l.capsules.Prev(head); err != nil {
+	if _, hasPrev, err := l.capsules.Prev(graph, head); err != nil {
 		return err
 	} else if hasPrev {
 		return ErrInvalidListStructure
@@ -4484,16 +4480,16 @@ func (l *ListRegistry) validateStructure(list NodeID) error {
 // traversing the capsule chain via CapsuleRegistry.Next. It first validates
 // the list structure so out-of-band mutations cannot turn a corrupted
 // chain into a silently accepted partial or cross-list traversal.
-func (l *ListRegistry) Elements(list NodeID) ([]NodeID, error) {
-	if !l.graph.NodeExists(list) {
+func (l *ListRegistry) Elements(graph GraphReader, list NodeID) ([]NodeID, error) {
+	if !graph.NodeExists(list) {
 		return nil, ErrNodeNotFound
 	}
 
-	if !l.IsList(list) {
+	if !l.IsList(graph, list) {
 		return nil, ErrNotList
 	}
 
-	if err := l.validateStructure(list); err != nil {
+	if err := l.validateStructure(graph, list); err != nil {
 		return nil, err
 	}
 
@@ -4505,7 +4501,7 @@ func (l *ListRegistry) Elements(list NodeID) ([]NodeID, error) {
 	// assuming that well-formed construction is the only possible state.
 	visited := make(map[NodeID]struct{})
 
-	current, hasCurrent, err := findUniqueTaggedChild(l.graph, list, l.allHeads)
+	current, hasCurrent, err := findUniqueTaggedChild(graph, list, l.allHeads)
 	if err != nil {
 		return nil, err
 	}
@@ -4516,7 +4512,7 @@ func (l *ListRegistry) Elements(list NodeID) ([]NodeID, error) {
 		}
 		visited[current] = struct{}{}
 
-		value, hasValue, err := l.capsules.Value(current)
+		value, hasValue, err := l.capsules.Value(graph, current)
 		if err != nil {
 			return nil, err
 		}
@@ -4524,7 +4520,7 @@ func (l *ListRegistry) Elements(list NodeID) ([]NodeID, error) {
 			values = append(values, value)
 		}
 
-		current, hasCurrent, err = l.capsules.Next(current)
+		current, hasCurrent, err = l.capsules.Next(graph, current)
 		if err != nil {
 			return nil, err
 		}
@@ -4549,16 +4545,16 @@ func (l *ListRegistry) Elements(list NodeID) ([]NodeID, error) {
 // list must already be tagged (AllLists, list). If value does not
 // exist, this fails with ErrNodeNotFound, via
 // CapsuleRegistry.CapsulesWithValue.
-func (l *ListRegistry) OccurrencesOf(list, value NodeID) ([]NodeID, error) {
-	if !l.graph.NodeExists(list) {
+func (l *ListRegistry) OccurrencesOf(graph GraphReader, list, value NodeID) ([]NodeID, error) {
+	if !graph.NodeExists(list) {
 		return nil, ErrNodeNotFound
 	}
 
-	if !l.IsList(list) {
+	if !l.IsList(graph, list) {
 		return nil, ErrNotList
 	}
 
-	candidates, err := l.capsules.CapsulesWithValue(value)
+	candidates, err := l.capsules.CapsulesWithValue(graph, value)
 	if err != nil {
 		return nil, err
 	}
@@ -4566,7 +4562,7 @@ func (l *ListRegistry) OccurrencesOf(list, value NodeID) ([]NodeID, error) {
 	var occurrences []NodeID
 
 	for _, capsule := range candidates {
-		if l.graph.HasRelationship(list, capsule) {
+		if graph.HasRelationship(list, capsule) {
 			occurrences = append(occurrences, capsule)
 		}
 	}
@@ -4589,8 +4585,8 @@ func (l *ListRegistry) OccurrencesOf(list, value NodeID) ([]NodeID, error) {
 //
 // list must already be tagged (AllLists, list). If value does not
 // exist, this fails with ErrNodeNotFound.
-func (l *ListRegistry) Contains(list, value NodeID) (capsule NodeID, found bool, err error) {
-	occurrences, err := l.OccurrencesOf(list, value)
+func (l *ListRegistry) Contains(graph GraphReader, list, value NodeID) (capsule NodeID, found bool, err error) {
+	occurrences, err := l.OccurrencesOf(graph, list, value)
 	if err != nil {
 		return 0, false, err
 	}
@@ -4629,26 +4625,26 @@ func (l *ListRegistry) Contains(list, value NodeID) (capsule NodeID, found bool,
 // list must already be tagged (AllLists, list); capsule must currently
 // be an element of list (checked via the (list, capsule) containment
 // edge, returning ErrCapsuleNotInList otherwise).
-func (l *ListRegistry) RemoveWithoutDeletingCapsule(list, capsule NodeID) error {
-	if !l.graph.NodeExists(list) {
+func (l *ListRegistry) RemoveWithoutDeletingCapsule(graph GraphAPI, list, capsule NodeID) error {
+	if !graph.NodeExists(list) {
 		return ErrNodeNotFound
 	}
 
-	if !l.IsList(list) {
+	if !l.IsList(graph, list) {
 		return ErrNotList
 	}
 
-	if !l.graph.HasRelationship(list, capsule) {
+	if !graph.HasRelationship(list, capsule) {
 		return ErrCapsuleNotInList
 	}
 
-	return wrapInterfaceErr(l.graph.Transact(func(tx *Txn) error {
-		prev, hasPrev, err := l.capsules.Prev(capsule)
+	return wrapInterfaceErr(graph.Transact(func(tx *Txn) error {
+		prev, hasPrev, err := l.capsules.Prev(tx, capsule)
 		if err != nil {
 			return err
 		}
 
-		next, hasNext, err := l.capsules.Next(capsule)
+		next, hasNext, err := l.capsules.Next(tx, capsule)
 		if err != nil {
 			return err
 		}
@@ -4747,12 +4743,12 @@ func (l *ListRegistry) RemoveWithoutDeletingCapsule(list, capsule NodeID) error 
 //
 // list must already be tagged (AllLists, list); capsule must currently
 // be an element of list, exactly like RemoveWithoutDeletingCapsule.
-func (l *ListRegistry) Remove(list, capsule NodeID) (deleted bool, err error) {
-	if err := l.RemoveWithoutDeletingCapsule(list, capsule); err != nil {
+func (l *ListRegistry) Remove(graph GraphAPI, list, capsule NodeID) (deleted bool, err error) {
+	if err := l.RemoveWithoutDeletingCapsule(graph, list, capsule); err != nil {
 		return false, err
 	}
 
-	if err := l.capsules.DeleteCapsule(capsule); err != nil {
+	if err := l.capsules.DeleteCapsule(graph, capsule); err != nil {
 		if errors.Is(err, ErrCapsuleNotEmpty) {
 			return false, nil
 		}
@@ -4788,16 +4784,16 @@ func (l *ListRegistry) Remove(list, capsule NodeID) (deleted bool, err error) {
 // nodes at all.
 //
 // list must currently be tagged (AllLists, list).
-func (l *ListRegistry) DeleteList(list NodeID) error {
-	if !l.graph.NodeExists(list) {
+func (l *ListRegistry) DeleteList(graph GraphAPI, list NodeID) error {
+	if !graph.NodeExists(list) {
 		return ErrNodeNotFound
 	}
 
-	if !l.IsList(list) {
+	if !l.IsList(graph, list) {
 		return ErrNotList
 	}
 
-	return wrapInterfaceErr(l.graph.Transact(func(tx *Txn) error {
+	return wrapInterfaceErr(graph.Transact(func(tx *Txn) error {
 		if _, err := tx.RemoveRelationship(l.allLists, list); err != nil {
 			return err
 		}
