@@ -1248,6 +1248,47 @@ NodeID-keyed structure outside the primitive graph.
  cannot be safely layered on top of a GraphActor for the identical
  reason it cannot yet be layered on top of GraphAPI generically.
 
+26. Closed the last two exceptions to the "no stored graph reference"
+ discipline (theorystate.md section 90, newly written up this session):
+ subjectMetadataBase (embedded by PointerMetadataRegistry and
+ PointerMetadataRegistryD) and domainConstraint (embedded by
+ DomainPointerRegistryB and DomainPointerRegistryD) each used to store a
+ GraphAPI field at construction and read it back via b.graph/d.graph in
+ their own methods -- the exact stored-reference pattern every other
+ registry in this file (PointerRegistry, CapsuleRegistry, ListRegistry,
+ SetRegistry, CompositeSetRegistry, CompositeSetLogRegistry) had already
+ been refactored away from. Both fields are now removed, and every
+ affected method gained an explicit graph parameter instead, typed as
+ narrowly as it actually needs (GraphReader for pure reads, GraphAPI for
+ methods opening their own Transact): subjectMetadataBase's locate/
+ ensureMetadata/EnsureMetadata/HasMetadata; PointerMetadataRegistry's
+ Target/SetTarget/RemoveTarget; PointerMetadataRegistryD's targetSlot/
+ Target/SetTarget/RemoveTarget; domainConstraint's domainSlotFor/Domain/
+ SetDomain/RemoveDomain/validateMembership/checkAllowed;
+ DomainPointerRegistryB's subPointer/NewDomainPointer/Target/SetTarget/
+ RemoveTarget/SetDomain; and DomainPointerRegistryD's Target/SetTarget/
+ RemoveTarget/Domain/SetDomain/RemoveDomain, including the commit-time
+ Checker closure registered in NewDomainPointerRegistryD (which now
+ threads its own g parameter into metadata.targetSlot and
+ d.checkAllowed rather than reading a stored reference).
+ NewDomainPointerRegistryB's graph parameter is now unused for storage
+ and renamed to _, matching NewNameRegistry's existing convention for an
+ accepted-but-unused constructor parameter.
+
+ This is a pure mechanical signature refactor with no behavior change --
+ every existing error, idempotency guarantee, and test outcome is
+ unchanged, only how the graph value reaches each method. Motivation
+ (theorystate.md section 90): under GraphActor, a stored reference could
+ itself be the GraphActor, and any code already running on its one
+ dedicated worker goroutine (a Checker, or a tx-composable helper) that
+ read through the stored reference instead of the g/tx value it was
+ actually given would call back into GraphActor.do from within that same
+ goroutine's own execution -- a genuine reentrancy deadlock, exactly the
+ class of bug GraphActor's debug-only reentrancy tripwire
+ (EnableGraphActorReentrancyDetection) exists to catch. No registry in
+ this file now stores a graph reference at all, closing this hazard by
+ construction rather than only detecting it after the fact.
+
 Currently unaddressed yet:
 - Txn does not support nesting one Graph.Transact call inside another
   (Txn.DeleteNode is supported -- see item 15). Nesting is not needed by

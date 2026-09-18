@@ -2437,10 +2437,79 @@ vocabulary for in-graph transaction-descriptor nodes — which
 preconditions and edge-operations a plan node may express, and what
 "atomically apply" means once decided; whether a future read/write-set
 tracker should be built directly out of `Checker.Tags`/`Check`'s existing
-shape or needs separate machinery; and whether goroutines-as-Part-C-
-participants is adopted at all, as opposed to a single shared
+shape or needs separate machinery; and whether goroutines-as-Part-C-participants is adopted at all, as opposed to a single shared
 `GraphActor` per process. All of the above remain OPEN, tracked in
 Part D.
+
+## 90. No stored graph references — every registry method takes its graph explicitly (DECIDED, validated by `dml`)
+
+Every higher-level registry in this codebase — `NameRegistry`,
+`PointerRegistry`, `subjectMetadataBase` (and therefore
+`PointerMetadataRegistry`/`PointerMetadataRegistryD`), `CapsuleRegistry`,
+`ListRegistry`, `SetRegistry`, `CompositeSetRegistry`,
+`CompositeSetLogRegistry`, and `domainConstraint` (and therefore
+`DomainPointerRegistryB`/`DomainPointerRegistryD`) — stores no
+`Graph`/`GraphAPI`/`GraphReader` field of its own. Every method that
+needs graph access takes it as an explicit parameter instead, typed as
+narrowly as that method actually needs: `GraphReader` for pure reads,
+`GraphAPI` for methods that open their own `Transact`.
+
+**Why this is load-bearing specifically because of `GraphActor` (§89c),
+not merely a style preference.** `GraphActor` makes a `*Graph` safe to
+share across goroutines by giving it exactly one owner — a single
+dedicated goroutine — and funneling every access through `do`, which
+sends a closure over an unbuffered channel and blocks until that closure
+finishes running on the actor's own goroutine. If some registry stored a
+graph reference at construction time, and that stored reference happened
+to be a `*GraphActor` rather than a plain `*Graph`, then any code
+already running on the actor's own dedicated worker goroutine — a
+`Checker`'s `Check` function, or a tx-composable helper invoked from
+inside a `Transact` closure — that read through the *stored* reference
+instead of through the `g`/`tx` value it was actually handed would call
+`ga.do` a second time from *within* the first `do` call's own execution.
+This is a genuine deadlock, not merely a bug: the nested `do` blocks
+forever trying to send on `ga.requests`, because the only goroutine that
+would ever receive from that channel is the very goroutine currently
+blocked making the send.
+
+This is not a hypothetical failure mode invented for this section: it is
+exactly the class of bug `GraphActor`'s debug-only reentrancy tripwire
+(`graphActorReentrancyDetectionEnabled`, `currentGoroutineID`,
+`GraphActor.do`) exists to catch and turn into an immediate, loud panic
+instead of a silent, permanent hang.
+
+**The fix is structural, not defensive.** No interpretation-layer type in
+this file stores a graph reference at all, so there is nothing for a
+future `Checker` or helper to accidentally read through in the first
+place. A stored reference was never necessary: every caller of a
+registry method already holds the graph value it wants operated
+against — a `*Graph`, a `*GraphActor`, or a `*Txn` mid-transaction — and
+can pass it explicitly. Threading it through as a parameter costs
+nothing and removes the entire hazard class by construction, rather than
+only detecting it after the fact via the tripwire.
+
+**`subjectMetadataBase` and `domainConstraint` were the last two
+holdouts**, closed in this session in the same mechanical way applied
+earlier to every other registry: remove the stored field, add an
+explicit graph parameter to every method that used it, and update every
+call site — including cross-registry calls, e.g.
+`DomainPointerRegistryD.SetDomain` calling into `d.metadata.Target` /
+`d.metadata.EnsureMetadata` / `d.metadata.locate`, and the commit-time
+`Checker` closure registered in `NewDomainPointerRegistryD` calling
+`metadata.targetSlot` / `d.checkAllowed`.
+
+**Deliberate exceptions, already documented elsewhere, not addressed by
+this section.** `RootGraph` and `Txn` (via its unexported
+`resurrectNode` call) still hold a concrete `*Graph` reference.
+`RootGraph`'s ROOT-overlay node enumeration needs private-map access no
+`GraphAPI` method exposes yet (§87a); `Txn`'s own undo-log rollback is
+specific to the in-memory backend's own mechanism for satisfying the
+`Transact` contract (§89a). Neither is an instance of the mistake this
+section addresses — reading through a stored reference instead of an
+explicitly supplied one — since both are single-purpose, non-swappable
+low-level types, not higher-level interpretation registries meant to be
+constructed once and reused across many separately-submitted
+`GraphActor` calls.
 
 ---
 
@@ -2521,6 +2590,11 @@ kept current as sections above resolve or split further.)*
   interface rather than the concrete `Graph` type; this is a pure
   refactor with no semantic effect, since no registry currently reaches
   past that surface (§87).
+- No higher-level registry stores a graph reference of its own; every
+  method takes the graph it should operate against as an explicit
+  parameter instead, closing the reentrancy-deadlock hazard a stored
+  reference would create under `GraphActor` (§90). `subjectMetadataBase`
+  and `domainConstraint` were the last two holdouts, now closed.
 
 ### TENTATIVE
 - Monotonically increasing NodeIDs; serialized first implementation.
