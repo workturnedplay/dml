@@ -631,6 +631,47 @@ func TestZeroValueGraphWorks(t *testing.T) {
 	}
 }
 
+// TestConcurrentAccessGuardFiresOnDoubleAcquire exercises Graph's fail-
+// fast concurrent-access guard (theorystate.md section 89b) directly and
+// deterministically: acquiring it a second time before the first
+// acquisition's release has run must panic immediately, exactly as
+// documented on concurrentAccessGuard, rather than blocking or silently
+// succeeding. This is tested against the guard type itself, not by
+// racing real goroutines against a *Graph, since genuinely provoking two
+// goroutines to overlap inside a guarded call is inherently
+// timing-dependent and would make this test flaky; every other existing
+// test in this file already exercises the "ordinary sequential and
+// Transact-based usage never trips this guard" side of the contract,
+// since none of them introduce genuine concurrent overlap and all
+// continue to pass unmodified against the guarded implementation.
+func TestConcurrentAccessGuardFiresOnDoubleAcquire(t *testing.T) {
+	var g concurrentAccessGuard
+
+	release := g.acquire()
+	defer release()
+
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatal("expected second acquire() to panic while the guard is still held")
+		}
+	}()
+
+	g.acquire()
+}
+
+// TestConcurrentAccessGuardAllowsSequentialReuse confirms the guard is
+// not a one-shot latch: once released, it can be acquired again by a
+// later, non-overlapping call without panicking.
+func TestConcurrentAccessGuardAllowsSequentialReuse(t *testing.T) {
+	var g concurrentAccessGuard
+
+	release := g.acquire()
+	release()
+
+	release = g.acquire()
+	release()
+}
+
 func TestNameRegistryLookupMissing(t *testing.T) {
 	var g Graph
 	names := NewNameRegistry(&g)

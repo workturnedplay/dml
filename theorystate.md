@@ -2126,27 +2126,79 @@ satisfy the contract its own way:
 
 **§89b — A related but distinct, already-existing gap: the in-memory
 backend has no protection against concurrent goroutine misuse,
-independent of whether any second backend is ever added.** `Graph`'s
+independent of whether any second backend is ever added -- now DECIDED
+and implemented as a fail-fast guard, not a mutex.** `Graph`'s
 `nodes`/`outgoing`/`incoming` maps are plain, unsynchronized Go maps;
-nothing today prevents two goroutines from calling into the same
-`*Graph` concurrently, which would be an ordinary data race, not merely
-an unsupported use case. This is a narrower, same-process version of the
-concern §19a already names for multiple processors sharing one graph. It
-is independent of §87/§88/§89's storage-backend question — it would
-exist even if no second backend were ever built — but is recorded here
-because it is the concrete, present-tense instance of "what happens when
-more than one writer touches this backend," which is the same underlying
-question the networked backends raise at a larger scale. **Not yet
-decided:** whether to guard the in-memory backend with a mutex (cheap,
-but changes `Transact`'s current lock-free reasoning), document the
-single-goroutine assumption as an explicit constraint on callers
-(cheapest, but pushes the burden outward, mirroring §19's existing
-"deadlock avoidance belongs to the relevant abstraction level" framing),
-or leave it as an unstated assumption the way it is today (rejected as
-the status quo once this is named explicitly, since an unstated
-assumption invites exactly the kind of bug this document otherwise
-insists on naming rather than leaving implicit, per its own stated
-practice throughout Part C and D).
+nothing before this session prevented two goroutines from calling into
+the same `*Graph` concurrently, which would be an ordinary data race, not
+merely an unsupported use case. This is a narrower, same-process version
+of the concern §19a already names for multiple processors sharing one
+graph. It is independent of §87/§88/§89's storage-backend question -- it
+would exist even if no second backend were ever built -- but is recorded
+here because it is the concrete, present-tense instance of "what happens
+when more than one writer touches this backend," which is the same
+underlying question the networked backends raise at a larger scale.
+
+Three options were on the table: guard the in-memory backend with a
+`sync.Mutex` (blocks a second, concurrent caller until the first
+finishes, silently turning a caller bug into merely slow-but-correct
+behavior); document the single-goroutine assumption as an explicit
+constraint on callers with no runtime enforcement at all (cheapest, but
+pushes the burden outward and gives a misusing caller no signal at the
+moment of misuse); or fail fast the instant genuine cross-goroutine
+overlap is detected, panicking rather than either blocking or silently
+tolerating it.
+
+**Resolved: fail-fast, via the new `concurrentAccessGuard` type,
+implemented on `Graph` itself.** Every public `Graph` method -- each
+mutating/query method individually, and `Transact` for its entire
+duration (including running `fn` and every relevant `Checker`) --
+acquires this guard on entry and releases it on return; a second
+goroutine finding the guard already held panics immediately, naming
+`GraphActor` as the supported path for real concurrent access, rather
+than silently corrupting state (no guard) or silently degrading a caller
+bug into serialized-but-unnoticed behavior (a mutex). This is the same
+fail-loud-not-silently-repair discipline already used throughout this
+document for `ErrTooManyPointerTargets`/`ErrNameBoundToDeletedNode`, and
+is architecturally the same idea as `GraphActor`'s own reentrancy
+tripwire (§90) -- a dynamic safety net catching a caller bug at the
+moment it happens, not the correctness mechanism itself (the correctness
+mechanism, for real concurrency, remains `GraphActor`'s actual
+serialization).
+
+Unlike the reentrancy tripwire, this guard needs no goroutine-identity
+tracking and therefore has no `runtime.Stack`-based per-call cost, so it
+is unconditionally on rather than gated behind a toggle: no `*Graph`
+method ever legitimately calls back into another `*Graph` method through
+the guarded public API while already executing one. Every method's own
+logic instead runs through an unexported "core" counterpart
+(`createNodeCore`, `addRelationshipCore`, and so on), and `Txn`'s
+methods, `runCheckers`/`checkerRelevant`, and every `Checker`'s `Check`
+function (via the new `graphCoreReader` adapter, satisfying `GraphReader`
+by reading through the same cores) all reach graph state through those
+cores directly rather than through the guarded public methods. This
+split is only tractable with no per-registry changes at all because of
+§90's own precondition: since no registry anywhere in this file stores a
+graph reference of its own, every `Checker`'s `Check` closure already
+reads exclusively through whatever `GraphReader` value it is handed at
+call time, never through a captured reference -- so redirecting that one
+call-time value (from the concrete, guarded `*Graph` to the new
+`graphCoreReader`) is sufficient on its own, with zero changes needed to
+`PointerRegistry`, `CapsuleRegistry`, `ListRegistry`, or any other
+registry's own code.
+
+Known, accepted limitation, named on `concurrentAccessGuard` itself
+rather than left implicit: this catches genuine *temporal overlap*
+between two calls -- the overwhelmingly common real-world shape of this
+bug -- but does not by itself give the full Go memory-model guarantee
+`go test -race` checks (a non-overlapping handoff between goroutines with
+no happens-before synchronization is still technically racy under the
+memory model, even though this guard would never observe any overlap to
+panic on). `RootGraph`'s own pre-existing, separate exception (§87a) is
+also explicitly not covered: its ROOT-overlay `FindOutgoing`/
+`FindRelationships` read `Graph.nodes` directly, bypassing every public
+`Graph` method -- and therefore this guard -- entirely, exactly as they
+already bypass `GraphAPI` itself.
 
 **What this section does not decide.** Whether either etcd or
 SpacetimeDB is ever actually implemented as a backend (no current
@@ -2595,6 +2647,14 @@ kept current as sections above resolve or split further.)*
   parameter instead, closing the reentrancy-deadlock hazard a stored
   reference would create under `GraphActor` (§90). `subjectMetadataBase`
   and `domainConstraint` were the last two holdouts, now closed.
+- The in-memory backend's own goroutine-safety gap (§89b) is resolved as
+  fail-fast, not blocking: a new `concurrentAccessGuard` on `Graph`
+  panics the instant genuine cross-goroutine overlap is detected on a
+  bare `*Graph`, rather than silently corrupting state or silently
+  serializing a caller bug the way a `sync.Mutex` would. `GraphActor`
+  remains the supported mechanism for real concurrent access and never
+  trips this guard, since it already serializes every access onto one
+  dedicated goroutine.
 
 ### TENTATIVE
 - Monotonically increasing NodeIDs; serialized first implementation.
@@ -2675,10 +2735,6 @@ kept current as sections above resolve or split further.)*
   otherwise) should use to satisfy the `Transact`/`Checker` contract,
   since the current undo-log/rollback mechanism is sound only under the
   in-memory backend's single-threaded premise (§89, §89a).
-- Whether to guard the current in-memory backend against concurrent
-  goroutine misuse with a mutex, document the single-goroutine assumption
-  explicitly as a caller-facing constraint, or leave it unaddressed
-  (§89b).
 - Whether real concurrent access to one graph, when eventually needed, is
   provided via staged/overlay `Txn` (§77's originally-shelved proposal)
   or via persistent/structurally-shared storage with atomic-swap commit,

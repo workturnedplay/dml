@@ -41,6 +41,79 @@ var (
 	ErrNodeIDExhausted = errors.New("node ID space exhausted")
 )
 
+// concurrentAccessGuard is a fail-fast (not blocking) protection against
+// two goroutines calling into the same *Graph at the same time. Unlike a
+// sync.Mutex, which would make a second, concurrent caller simply wait
+// its turn -- silently turning a caller bug into merely slow, serialized
+// behavior -- this panics the instant overlap is detected, on the theory
+// that concurrent access to a bare *Graph is always a caller bug (the
+// safe, supported path for real concurrency is GraphActor,
+// theorystate.md section 89c) and should fail loud rather than either
+// silently corrupt state or silently paper over the mistake. This
+// mirrors the same fail-loud-not-silently-repair discipline used
+// throughout this file (ErrTooManyPointerTargets,
+// ErrNameBoundToDeletedNode) and, more specifically, GraphActor's own
+// reentrancy tripwire (theorystate.md section 90) -- this is that same
+// idea, applied to genuine cross-goroutine racing on Graph itself rather
+// than to GraphActor's specific reentrancy-deadlock shape.
+//
+// This deliberately does NOT track which goroutine holds the guard,
+// unlike GraphActor's reentrancy tripwire (which does, via
+// currentGoroutineID): no *Graph method ever calls back into another
+// *Graph method through its own public, guarded API while already
+// executing one -- every guarded method's own logic instead runs through
+// an unexported, unguarded "core" counterpart (createNodeCore,
+// addRelationshipCore, and so on), and Txn's methods, runCheckers,
+// checkerRelevant, and every Checker's Check function (via the
+// graphCoreReader adapter passed to it) all read and write through those
+// same cores directly, never through the guarded public methods. There
+// is therefore no legitimate same-goroutine nesting for a goroutine-ID
+// check to need to distinguish from genuine cross-goroutine overlap:
+// Graph.Transact acquires this guard exactly once for its own entire
+// duration (including running fn and every relevant Checker), and
+// nothing internal to this file ever re-enters it.
+//
+// A caller wanting real concurrent access to one Graph should use
+// GraphActor instead, which serializes every access onto one dedicated
+// goroutine and therefore never trips this guard at all.
+//
+// Known limitation, the same honest caveat GraphActor's own tripwire
+// names on itself: this catches genuine *temporal overlap* between two
+// calls -- the overwhelmingly common real-world shape of this bug -- but
+// does not by itself give the full Go memory-model guarantee `go test
+// -race` checks (a handoff between goroutines with no overlap but also
+// no happens-before synchronization is still technically racy under the
+// memory model, even though this guard would never observe any overlap
+// to panic on). This is a dynamic safety net for the common case, not a
+// substitute for -race or for GraphActor's actual serialization.
+//
+// RootGraph is a known, separate, pre-existing exception to this guard's
+// coverage: its ROOT-overlay FindOutgoing/FindRelationships read
+// Graph.nodes directly, bypassing every public Graph method (and
+// therefore this guard) entirely, for the reason already documented on
+// GraphAPI itself -- no GraphAPI method exposes "every node that exists"
+// yet (theorystate.md section 87a). This is not a new gap introduced
+// here; it is that same documented exception, now simply also
+// unprotected by this guard specifically.
+type concurrentAccessGuard struct {
+	held atomic.Bool
+}
+
+// acquire panics immediately if the guard is already held -- by any
+// goroutine, including this one -- and otherwise marks it held and
+// returns a function that releases it. See the concurrentAccessGuard
+// doc comment for why this fails loud rather than blocking, and why no
+// goroutine-identity tracking is needed.
+func (c *concurrentAccessGuard) acquire() (release func()) {
+	if !c.held.CompareAndSwap(false, true) {
+		panic("dml: concurrent access to *Graph detected from more than one goroutine -- a bare *Graph supports only one goroutine at a time; use GraphActor for safe multi-goroutine access (theorystate.md section 89c)")
+	}
+
+	return func() {
+		c.held.Store(false)
+	}
+}
+
 // Graph is the primitive graph.
 //
 // Semantically, it consists of:
@@ -66,13 +139,38 @@ type Graph struct {
 	// before Transact reports that success to its own caller. See the
 	// Checker type below (theorystate.md sections 73/77).
 	checkers []Checker
+
+	// guard is the fail-fast concurrent-access protection described on
+	// concurrentAccessGuard above (theorystate.md section 89b). Every
+	// public, top-level entry point into a *Graph -- each mutating/query
+	// method, and Transact for its entire duration -- acquires and
+	// releases it; nothing internal to this file ever re-enters it.
+	guard concurrentAccessGuard
 }
 
 // CreateNode creates a new node and returns its NodeID.
 //
 // IDs currently increase monotonically. Reuse of deleted IDs is
 // deliberately not implemented yet.
+//
+// This acquires g's concurrentAccessGuard for the duration of the call;
+// see that type's doc comment for what this does and does not protect
+// against, and createNodeCore for the actual, unguarded implementation.
 func (g *Graph) CreateNode() (NodeID, error) {
+	release := g.guard.acquire()
+	defer release()
+
+	return g.createNodeCore()
+}
+
+// createNodeCore is CreateNode's unguarded implementation. It is called
+// directly -- bypassing g's concurrentAccessGuard -- by Txn.CreateNode
+// and by anything else already running inside a single already-guarded
+// Graph.Transact call, so that this same-goroutine nesting is never
+// mistaken for genuine cross-goroutine overlap. See the
+// concurrentAccessGuard doc comment for the full reasoning; every other
+// *Core method below follows this same split for the same reason.
+func (g *Graph) createNodeCore() (NodeID, error) {
 	g.ensureInitialized()
 
 	if g.exhausted {
@@ -95,7 +193,15 @@ func (g *Graph) CreateNode() (NodeID, error) {
 }
 
 // NodeExists reports whether id currently identifies an existing node.
+//
+// This acquires g's concurrentAccessGuard for the duration of the call;
+// see that type's doc comment. The unexported nodeExists already serves
+// as this method's unguarded core, called directly by every other
+// *Graph method and by graphCoreReader/Txn.
 func (g *Graph) NodeExists(id NodeID) bool {
+	release := g.guard.acquire()
+	defer release()
+
 	return g.nodeExists(id)
 }
 
@@ -105,7 +211,20 @@ func (g *Graph) NodeExists(id NodeID) bool {
 //
 // Relationships are unique. Adding the same relationship again simply
 // reports created=false.
+//
+// This acquires g's concurrentAccessGuard for the duration of the call;
+// see addRelationshipCore for the actual, unguarded implementation.
 func (g *Graph) AddRelationship(a, b NodeID) (created bool, err error) {
+	release := g.guard.acquire()
+	defer release()
+
+	return g.addRelationshipCore(a, b)
+}
+
+// addRelationshipCore is AddRelationship's unguarded implementation; see
+// createNodeCore's doc comment for why this split exists and who calls
+// it directly.
+func (g *Graph) addRelationshipCore(a, b NodeID) (created bool, err error) {
 	g.ensureInitialized()
 
 	if !g.nodeExists(a) {
@@ -129,7 +248,20 @@ func (g *Graph) AddRelationship(a, b NodeID) (created bool, err error) {
 //
 // The returned bool reports whether a relationship actually existed and
 // was removed.
+//
+// This acquires g's concurrentAccessGuard for the duration of the call;
+// see removeRelationshipCore for the actual, unguarded implementation.
 func (g *Graph) RemoveRelationship(a, b NodeID) (removed bool, err error) {
+	release := g.guard.acquire()
+	defer release()
+
+	return g.removeRelationshipCore(a, b)
+}
+
+// removeRelationshipCore is RemoveRelationship's unguarded
+// implementation; see createNodeCore's doc comment for why this split
+// exists and who calls it directly.
+func (g *Graph) removeRelationshipCore(a, b NodeID) (removed bool, err error) {
 	if !g.nodeExists(a) {
 		return false, ErrNodeNotFound
 	}
@@ -148,7 +280,20 @@ func (g *Graph) RemoveRelationship(a, b NodeID) (removed bool, err error) {
 }
 
 // HasRelationship reports whether the primitive relationship (a, b) exists.
+//
+// This acquires g's concurrentAccessGuard for the duration of the call;
+// see hasRelationshipCore for the actual, unguarded implementation.
 func (g *Graph) HasRelationship(a, b NodeID) bool {
+	release := g.guard.acquire()
+	defer release()
+
+	return g.hasRelationshipCore(a, b)
+}
+
+// hasRelationshipCore is HasRelationship's unguarded implementation; see
+// createNodeCore's doc comment for why this split exists and who calls
+// it directly.
+func (g *Graph) hasRelationshipCore(a, b NodeID) bool {
 	if !g.nodeExists(a) || !g.nodeExists(b) {
 		return false
 	}
@@ -159,7 +304,20 @@ func (g *Graph) HasRelationship(a, b NodeID) bool {
 
 // FindRelationship reports whether the exact primitive relationship (from, to)
 // exists.
+//
+// This acquires g's concurrentAccessGuard for the duration of the call;
+// see findRelationshipCore for the actual, unguarded implementation.
 func (g *Graph) FindRelationship(from, to NodeID) (Relationship, bool, error) {
+	release := g.guard.acquire()
+	defer release()
+
+	return g.findRelationshipCore(from, to)
+}
+
+// findRelationshipCore is FindRelationship's unguarded implementation;
+// see createNodeCore's doc comment for why this split exists and who
+// calls it directly.
+func (g *Graph) findRelationshipCore(from, to NodeID) (Relationship, bool, error) {
 	if !g.nodeExists(from) {
 		return Relationship{}, false, ErrNodeNotFound
 	}
@@ -181,7 +339,20 @@ func (g *Graph) FindRelationship(from, to NodeID) (Relationship, bool, error) {
 // FindOutgoing returns all primitive relationships whose source is from.
 //
 // In other words, it finds every X for which (from, X) exists.
+//
+// This acquires g's concurrentAccessGuard for the duration of the call;
+// see findOutgoingCore for the actual, unguarded implementation.
 func (g *Graph) FindOutgoing(from NodeID) ([]Relationship, error) {
+	release := g.guard.acquire()
+	defer release()
+
+	return g.findOutgoingCore(from)
+}
+
+// findOutgoingCore is FindOutgoing's unguarded implementation; see
+// createNodeCore's doc comment for why this split exists and who calls
+// it directly.
+func (g *Graph) findOutgoingCore(from NodeID) ([]Relationship, error) {
 	if !g.nodeExists(from) {
 		return nil, ErrNodeNotFound
 	}
@@ -205,7 +376,20 @@ func (g *Graph) FindOutgoing(from NodeID) ([]Relationship, error) {
 // FindIncoming returns all primitive relationships whose target is to.
 //
 // In other words, it finds every X for which (X, to) exists.
+//
+// This acquires g's concurrentAccessGuard for the duration of the call;
+// see findIncomingCore for the actual, unguarded implementation.
 func (g *Graph) FindIncoming(to NodeID) ([]Relationship, error) {
+	release := g.guard.acquire()
+	defer release()
+
+	return g.findIncomingCore(to)
+}
+
+// findIncomingCore is FindIncoming's unguarded implementation; see
+// createNodeCore's doc comment for why this split exists and who calls
+// it directly.
+func (g *Graph) findIncomingCore(to NodeID) ([]Relationship, error) {
 	if !g.nodeExists(to) {
 		return nil, ErrNodeNotFound
 	}
@@ -230,7 +414,20 @@ func (g *Graph) FindIncoming(to NodeID) ([]Relationship, error) {
 //
 // The returned relationships are sorted by From, then To. This ordering
 // has no semantic meaning.
+//
+// This acquires g's concurrentAccessGuard for the duration of the call;
+// see findRelationshipsCore for the actual, unguarded implementation.
 func (g *Graph) FindRelationships() []Relationship {
+	release := g.guard.acquire()
+	defer release()
+
+	return g.findRelationshipsCore()
+}
+
+// findRelationshipsCore is FindRelationships's unguarded implementation;
+// see createNodeCore's doc comment for why this split exists and who
+// calls it directly.
+func (g *Graph) findRelationshipsCore() []Relationship {
 	total := 0
 	for _, targets := range g.outgoing {
 		total += len(targets)
@@ -260,7 +457,20 @@ func (g *Graph) FindRelationships() []Relationship {
 // DeleteNode deletes a node only when it has no relationships.
 //
 // Cascade deletion is deliberately not part of this primitive API.
+//
+// This acquires g's concurrentAccessGuard for the duration of the call;
+// see deleteNodeCore for the actual, unguarded implementation.
 func (g *Graph) DeleteNode(id NodeID) error {
+	release := g.guard.acquire()
+	defer release()
+
+	return g.deleteNodeCore(id)
+}
+
+// deleteNodeCore is DeleteNode's unguarded implementation; see
+// createNodeCore's doc comment for why this split exists and who calls
+// it directly.
+func (g *Graph) deleteNodeCore(id NodeID) error {
 	if !g.nodeExists(id) {
 		return ErrNodeNotFound
 	}
@@ -502,7 +712,19 @@ func (tx *Txn) touch(ids ...NodeID) {
 // Checker type's own doc comment for the fuller reasoning, including why
 // a staged/overlay view (theorystate.md section 77's original proposal)
 // is deferred rather than needed here.
+//
+// Transact also acquires g's concurrentAccessGuard (theorystate.md
+// section 89b) for its entire duration -- including running fn and every
+// relevant Checker -- rather than per sub-step, so the whole call is
+// treated as one atomic unit from the guard's perspective. tx's own
+// methods, and every Checker's Check function, read and write through
+// Graph's unguarded core methods directly rather than through the
+// guarded public API, so this single acquisition is never re-entered by
+// anything Transact itself calls.
 func (g *Graph) Transact(fn func(tx *Txn) error) (err error) {
+	release := g.guard.acquire()
+	defer release()
+
 	tx := &Txn{graph: g}
 
 	defer func() {
@@ -545,7 +767,7 @@ func (tx *Txn) rollback() {
 // recording an undo step that deletes the new node again if the
 // enclosing transaction rolls back.
 func (tx *Txn) CreateNode() (NodeID, error) {
-	id, err := tx.graph.CreateNode()
+	id, err := tx.graph.createNodeCore()
 	if err != nil {
 		return 0, err
 	}
@@ -563,7 +785,13 @@ func (tx *Txn) CreateNode() (NodeID, error) {
 		// has no error return of its own to report it through, and a
 		// caller misusing Txn this way is a bug in the caller, not
 		// something Txn can prevent by construction.
-		if err := tx.graph.DeleteNode(id); err != nil {
+		//
+		// This calls the unguarded core, not the public CreateNode/
+		// DeleteNode methods, since this closure only ever runs from
+		// inside rollback, itself only ever called from within a single
+		// already-guarded Graph.Transact call -- see the
+		// concurrentAccessGuard doc comment.
+		if err := tx.graph.deleteNodeCore(id); err != nil {
 			_ = err
 		}
 	})
@@ -578,7 +806,7 @@ func (tx *Txn) CreateNode() (NodeID, error) {
 // (created == false), there is nothing for this call to undo: the
 // relationship was not this transaction's to remove.
 func (tx *Txn) AddRelationship(a, b NodeID) (created bool, err error) {
-	created, err = tx.graph.AddRelationship(a, b)
+	created, err = tx.graph.addRelationshipCore(a, b)
 	if err != nil {
 		return false, err
 	}
@@ -588,8 +816,9 @@ func (tx *Txn) AddRelationship(a, b NodeID) (created bool, err error) {
 
 		tx.undo = append(tx.undo, func() {
 			// Best-effort: deliberately swallowed, mirroring
-			// Txn.CreateNode's undo closure above.
-			if _, err := tx.graph.RemoveRelationship(a, b); err != nil {
+			// Txn.CreateNode's undo closure above. Calls the unguarded
+			// core for the same reason given there.
+			if _, err := tx.graph.removeRelationshipCore(a, b); err != nil {
 				_ = err
 			}
 		})
@@ -603,7 +832,7 @@ func (tx *Txn) AddRelationship(a, b NodeID) (created bool, err error) {
 // again if the enclosing transaction rolls back -- but only if this call
 // actually removed it, symmetric with AddRelationship above.
 func (tx *Txn) RemoveRelationship(a, b NodeID) (removed bool, err error) {
-	removed, err = tx.graph.RemoveRelationship(a, b)
+	removed, err = tx.graph.removeRelationshipCore(a, b)
 	if err != nil {
 		return false, err
 	}
@@ -613,8 +842,9 @@ func (tx *Txn) RemoveRelationship(a, b NodeID) (removed bool, err error) {
 
 		tx.undo = append(tx.undo, func() {
 			// Best-effort: deliberately swallowed, mirroring
-			// Txn.CreateNode's undo closure above.
-			if _, err := tx.graph.AddRelationship(a, b); err != nil {
+			// Txn.CreateNode's undo closure above. Calls the unguarded
+			// core for the same reason given there.
+			if _, err := tx.graph.addRelationshipCore(a, b); err != nil {
 				_ = err
 			}
 		})
@@ -643,7 +873,7 @@ func (tx *Txn) RemoveRelationship(a, b NodeID) (removed bool, err error) {
 // earlier in that same sequence, exactly like it already does for
 // AddRelationship/RemoveRelationship/CreateNode.
 func (tx *Txn) DeleteNode(id NodeID) error {
-	if err := tx.graph.DeleteNode(id); err != nil {
+	if err := tx.graph.deleteNodeCore(id); err != nil {
 		return err
 	}
 
@@ -659,7 +889,14 @@ func (tx *Txn) DeleteNode(id NodeID) error {
 // NodeExists , HasRelationship, FindRelationship, FindOutgoing,
 // FindIncoming, and FindRelationships below make *Txn satisfy
 // GraphReader, delegating directly to the real, concrete *Graph this Txn
-// is running against.
+// is running against -- specifically, to its unexported, unguarded core
+// methods, never to its guarded public ones. Every Txn method exists
+// only while a single Graph.Transact call already holds that Graph's
+// concurrentAccessGuard for the call's entire duration (theorystate.md
+// section 89b); calling back into the guarded public API from here would
+// incorrectly panic as if a second goroutine had raced in, even though
+// it is the same goroutine legitimately still inside its one enclosing
+// Transact call.
 //
 // These exist so tx-composable helpers (the *Tx-suffixed functions
 // throughout this file) can read current state through the same tx value
@@ -675,37 +912,37 @@ func (tx *Txn) DeleteNode(id NodeID) error {
 // and friends give every helper a value that is always correct for both
 // cases: the real *Graph, directly, with no channel involved at all.
 func (tx *Txn) NodeExists(id NodeID) bool {
-	return tx.graph.NodeExists(id)
+	return tx.graph.nodeExists(id)
 }
 
-// HasRelationship delegates to the real, concrete *Graph. See the
-// NodeExists doc comment above.
+// HasRelationship delegates to the real, concrete *Graph's unguarded
+// core. See the NodeExists doc comment above.
 func (tx *Txn) HasRelationship(a, b NodeID) bool {
-	return tx.graph.HasRelationship(a, b)
+	return tx.graph.hasRelationshipCore(a, b)
 }
 
-// FindRelationship delegates to the real, concrete *Graph. See the
-// NodeExists doc comment above.
+// FindRelationship delegates to the real, concrete *Graph's unguarded
+// core. See the NodeExists doc comment above.
 func (tx *Txn) FindRelationship(from, to NodeID) (Relationship, bool, error) {
-	return tx.graph.FindRelationship(from, to)
+	return tx.graph.findRelationshipCore(from, to)
 }
 
-// FindOutgoing delegates to the real, concrete *Graph. See the
-// NodeExists doc comment above.
+// FindOutgoing delegates to the real, concrete *Graph's unguarded core.
+// See the NodeExists doc comment above.
 func (tx *Txn) FindOutgoing(from NodeID) ([]Relationship, error) {
-	return tx.graph.FindOutgoing(from)
+	return tx.graph.findOutgoingCore(from)
 }
 
-// FindIncoming delegates to the real, concrete *Graph. See the
-// NodeExists doc comment above.
+// FindIncoming delegates to the real, concrete *Graph's unguarded core.
+// See the NodeExists doc comment above.
 func (tx *Txn) FindIncoming(to NodeID) ([]Relationship, error) {
-	return tx.graph.FindIncoming(to)
+	return tx.graph.findIncomingCore(to)
 }
 
-// FindRelationships delegates to the real, concrete *Graph. See the
-// NodeExists doc comment above.
+// FindRelationships delegates to the real, concrete *Graph's unguarded
+// core. See the NodeExists doc comment above.
 func (tx *Txn) FindRelationships() []Relationship {
-	return tx.graph.FindRelationships()
+	return tx.graph.findRelationshipsCore()
 }
 
 // Compile-time assertion that *Txn satisfies GraphReader, exactly
@@ -802,9 +1039,73 @@ type Checker struct {
 // Checkers registered when its required *ListRegistry and
 // *CompositeSetRegistry constructor arguments were themselves
 // constructed.
+// RegisterChecker also acquires g's concurrentAccessGuard for the
+// duration of the call (theorystate.md section 89b): appending to
+// g.checkers is itself an unsynchronized mutation, exactly like the node
+// and relationship maps, and every call site in this codebase happens at
+// registry-construction time, before any Transact call is in flight, so
+// this can never be re-entered from within an already-guarded scope.
 func (g *Graph) RegisterChecker(c Checker) {
+	release := g.guard.acquire()
+	defer release()
+
 	g.checkers = append(g.checkers, c)
 }
+
+// graphCoreReader is a thin GraphReader adapter that reads directly
+// through Graph's unexported, unguarded core methods, rather than
+// through Graph's own public, guarded ones. runCheckers hands one of
+// these to every Checker's Check function -- instead of the concrete
+// *Graph directly -- because Check always runs from inside a
+// Graph.Transact call that is already holding that Graph's
+// concurrentAccessGuard for the call's entire duration (theorystate.md
+// section 89b); calling back into the guarded public API from there
+// would incorrectly panic as if a second goroutine had raced in, even
+// though it is the same goroutine legitimately still inside its one
+// enclosing Transact call.
+type graphCoreReader struct {
+	graph *Graph
+}
+
+// NodeExists delegates to graph's unguarded core. See the
+// graphCoreReader doc comment.
+func (r graphCoreReader) NodeExists(id NodeID) bool {
+	return r.graph.nodeExists(id)
+}
+
+// HasRelationship delegates to graph's unguarded core. See the
+// graphCoreReader doc comment.
+func (r graphCoreReader) HasRelationship(a, b NodeID) bool {
+	return r.graph.hasRelationshipCore(a, b)
+}
+
+// FindRelationship delegates to graph's unguarded core. See the
+// graphCoreReader doc comment.
+func (r graphCoreReader) FindRelationship(from, to NodeID) (Relationship, bool, error) {
+	return r.graph.findRelationshipCore(from, to)
+}
+
+// FindOutgoing delegates to graph's unguarded core. See the
+// graphCoreReader doc comment.
+func (r graphCoreReader) FindOutgoing(from NodeID) ([]Relationship, error) {
+	return r.graph.findOutgoingCore(from)
+}
+
+// FindIncoming delegates to graph's unguarded core. See the
+// graphCoreReader doc comment.
+func (r graphCoreReader) FindIncoming(to NodeID) ([]Relationship, error) {
+	return r.graph.findIncomingCore(to)
+}
+
+// FindRelationships delegates to graph's unguarded core. See the
+// graphCoreReader doc comment.
+func (r graphCoreReader) FindRelationships() []Relationship {
+	return r.graph.findRelationshipsCore()
+}
+
+// Compile-time assertion that graphCoreReader satisfies GraphReader,
+// mirroring the existing assertions for *Graph, *Txn, and *GraphActor.
+var _ GraphReader = graphCoreReader{}
 
 // runCheckers consults every registered Checker whose Tags make it
 // plausibly relevant to touched (see checkerRelevant), in registration
@@ -813,17 +1114,24 @@ func (g *Graph) RegisterChecker(c Checker) {
 // transaction that made no effective mutations at all) or no Checkers
 // being registered on g are both treated as trivially passing, without
 // iterating any further.
+//
+// Every Checker's Check function is handed a graphCoreReader wrapping g,
+// not g itself, since Check always runs from inside a call to Transact
+// that is already holding g's concurrentAccessGuard -- see the
+// graphCoreReader doc comment.
 func (g *Graph) runCheckers(touched map[NodeID]struct{}) error {
 	if len(touched) == 0 || len(g.checkers) == 0 {
 		return nil
 	}
+
+	reader := graphCoreReader{graph: g}
 
 	for _, checker := range g.checkers {
 		if !g.checkerRelevant(checker, touched) {
 			continue
 		}
 
-		if err := checker.Check(g, touched); err != nil {
+		if err := checker.Check(reader, touched); err != nil {
 			return fmt.Errorf("%s: %w", checker.Name, err)
 		}
 	}
@@ -843,7 +1151,7 @@ func (g *Graph) runCheckers(touched map[NodeID]struct{}) error {
 func (g *Graph) checkerRelevant(checker Checker, touched map[NodeID]struct{}) bool {
 	for _, tag := range checker.Tags {
 		for node := range touched {
-			if g.HasRelationship(tag, node) {
+			if g.hasRelationshipCore(tag, node) {
 				return true
 			}
 		}
