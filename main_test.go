@@ -662,7 +662,7 @@ func TestConcurrentAccessGuardFiresOnDoubleAcquire(t *testing.T) {
 // TestConcurrentAccessGuardAllowsSequentialReuse confirms the guard is
 // not a one-shot latch: once released, it can be acquired again by a
 // later, non-overlapping call without panicking.
-func TestConcurrentAccessGuardAllowsSequentialReuse(t *testing.T) {
+func TestConcurrentAccessGuardAllowsSequentialReuse(_ *testing.T) {
 	var g concurrentAccessGuard
 
 	release := g.acquire()
