@@ -2764,7 +2764,7 @@ func ensureMetadataWithSubjectSlot(g GraphAPI, subject, allPointerMetadata, allS
 	return metadata, subjectSlot, nil
 }
 
-// subjectMetadataBase holds the graph/tag state and subject-side
+// subjectMetadataBase holds the shared tag state and subject-side
 // operations -- locate, ensureMetadata, EnsureMetadata, HasMetadata --
 // shared identically by PointerMetadataRegistry (Representation C) and
 // PointerMetadataRegistryD (Representation D). Both representations
@@ -2775,47 +2775,51 @@ func ensureMetadataWithSubjectSlot(g GraphAPI, subject, allPointerMetadata, allS
 // factored out here rather than merging the two types outright.
 //
 // PointerMetadataRegistry and PointerMetadataRegistryD each embed this
-// struct anonymously, so its fields (graph, allPointerMetadata,
-// allSubjectSlots) and methods are promoted and usable exactly as if
-// they were declared directly on the embedding type.
+// struct anonymously, so its fields (allPointerMetadata, allSubjectSlots)
+// and methods are promoted and usable exactly as if they were declared
+// directly on the embedding type.
+//
+// Like every other registry in this file, subjectMetadataBase stores no
+// graph reference of its own (theorystate.md section 90): every method
+// below takes the graph it should operate against as an explicit
+// parameter instead.
 type subjectMetadataBase struct {
-	graph              GraphAPI
 	allPointerMetadata NodeID
 	allSubjectSlots    NodeID
 }
 
 // locate finds subject's metadata node and subject-slot node, if any.
 // found is false if subject has no metadata yet. subject must exist.
-func (b *subjectMetadataBase) locate(subject NodeID) (metadata, subjectSlot NodeID, found bool, err error) {
-	return locateBySubjectSlot(b.graph, subject, b.allPointerMetadata, b.allSubjectSlots)
+func (b *subjectMetadataBase) locate(graph GraphReader, subject NodeID) (metadata, subjectSlot NodeID, found bool, err error) {
+	return locateBySubjectSlot(graph, subject, b.allPointerMetadata, b.allSubjectSlots)
 }
 
 // ensureMetadata returns subject's existing metadata/subject-slot pair,
 // creating a fresh, empty one (M -> S -> subject, both tagged) if none
 // exists yet.
-func (b *subjectMetadataBase) ensureMetadata(subject NodeID) (metadata, subjectSlot NodeID, err error) {
-	if !b.graph.NodeExists(subject) {
+func (b *subjectMetadataBase) ensureMetadata(graph GraphAPI, subject NodeID) (metadata, subjectSlot NodeID, err error) {
+	if !graph.NodeExists(subject) {
 		return 0, 0, ErrNodeNotFound
 	}
 
-	return ensureMetadataWithSubjectSlot(b.graph, subject, b.allPointerMetadata, b.allSubjectSlots)
+	return ensureMetadataWithSubjectSlot(graph, subject, b.allPointerMetadata, b.allSubjectSlots)
 }
 
 // EnsureMetadata returns subject's metadata node, creating an empty one
 // if none exists yet.
-func (b *subjectMetadataBase) EnsureMetadata(subject NodeID) (NodeID, error) {
-	metadata, _, err := b.ensureMetadata(subject)
+func (b *subjectMetadataBase) EnsureMetadata(graph GraphAPI, subject NodeID) (NodeID, error) {
+	metadata, _, err := b.ensureMetadata(graph, subject)
 	return metadata, err
 }
 
 // HasMetadata reports whether subject currently has an associated
 // metadata node, regardless of whether a target has been set.
-func (b *subjectMetadataBase) HasMetadata(subject NodeID) (bool, error) {
-	if !b.graph.NodeExists(subject) {
+func (b *subjectMetadataBase) HasMetadata(graph GraphReader, subject NodeID) (bool, error) {
+	if !graph.NodeExists(subject) {
 		return false, ErrNodeNotFound
 	}
 
-	_, _, found, err := b.locate(subject)
+	_, _, found, err := b.locate(graph, subject)
 	return found, err
 }
 
@@ -2942,7 +2946,6 @@ func NewPointerMetadataRegistry(graph GraphAPI, allPointerMetadata, allSubjectSl
 
 	return &PointerMetadataRegistry{
 		subjectMetadataBase: subjectMetadataBase{
-			graph:              graph,
 			allPointerMetadata: allPointerMetadata,
 			allSubjectSlots:    allSubjectSlots,
 		},
@@ -2954,12 +2957,12 @@ func NewPointerMetadataRegistry(graph GraphAPI, allPointerMetadata, allSubjectSl
 // hasTarget is false both when subject has no metadata node at all and
 // when it has one with no target set yet -- callers that need to
 // distinguish those two cases should use HasMetadata first.
-func (m *PointerMetadataRegistry) Target(subject NodeID) (target NodeID, hasTarget bool, err error) {
-	if !m.graph.NodeExists(subject) {
+func (m *PointerMetadataRegistry) Target(graph GraphReader, subject NodeID) (target NodeID, hasTarget bool, err error) {
+	if !graph.NodeExists(subject) {
 		return 0, false, ErrNodeNotFound
 	}
 
-	metadata, slot, found, err := m.locate(subject)
+	metadata, slot, found, err := m.locate(graph, subject)
 	if err != nil {
 		return 0, false, err
 	}
@@ -2967,7 +2970,7 @@ func (m *PointerMetadataRegistry) Target(subject NodeID) (target NodeID, hasTarg
 		return 0, false, nil
 	}
 
-	return singleChildTarget(m.graph, metadata, slot)
+	return singleChildTarget(graph, metadata, slot)
 }
 
 // SetTarget sets subject's target to target, creating subject's metadata
@@ -2977,17 +2980,17 @@ func (m *PointerMetadataRegistry) Target(subject NodeID) (target NodeID, hasTarg
 // and correctly distinguished from an empty target -- see the
 // PointerMetadataRegistry doc comment for why the subject-slot
 // indirection is what makes this possible.
-func (m *PointerMetadataRegistry) SetTarget(subject, target NodeID) error {
-	if !m.graph.NodeExists(target) {
+func (m *PointerMetadataRegistry) SetTarget(graph GraphAPI, subject, target NodeID) error {
+	if !graph.NodeExists(target) {
 		return ErrNodeNotFound
 	}
 
-	metadata, slot, err := m.ensureMetadata(subject)
+	metadata, slot, err := m.ensureMetadata(graph, subject)
 	if err != nil {
 		return err
 	}
 
-	current, hasTarget, err := singleChildTarget(m.graph, metadata, slot)
+	current, hasTarget, err := singleChildTarget(graph, metadata, slot)
 	if err != nil {
 		return err
 	}
@@ -2996,7 +2999,7 @@ func (m *PointerMetadataRegistry) SetTarget(subject, target NodeID) error {
 		return nil
 	}
 
-	return wrapInterfaceErr(m.graph.Transact(func(tx *Txn) error {
+	return wrapInterfaceErr(graph.Transact(func(tx *Txn) error {
 		return setPointerTargetTx(tx, metadata, current, hasTarget, target)
 	}))
 }
@@ -3006,12 +3009,12 @@ func (m *PointerMetadataRegistry) SetTarget(subject, target NodeID) error {
 // theorystate.md section 18's rejection of
 // deleteNodeAndRelationships); an empty metadata node is a valid,
 // meaningful state, exactly like an empty Pointer in Representation A.
-func (m *PointerMetadataRegistry) RemoveTarget(subject NodeID) (removed bool, err error) {
-	if !m.graph.NodeExists(subject) {
+func (m *PointerMetadataRegistry) RemoveTarget(graph GraphAPI, subject NodeID) (removed bool, err error) {
+	if !graph.NodeExists(subject) {
 		return false, ErrNodeNotFound
 	}
 
-	metadata, slot, found, err := m.locate(subject)
+	metadata, slot, found, err := m.locate(graph, subject)
 	if err != nil {
 		return false, err
 	}
@@ -3019,7 +3022,7 @@ func (m *PointerMetadataRegistry) RemoveTarget(subject NodeID) (removed bool, er
 		return false, nil
 	}
 
-	target, hasTarget, err := singleChildTarget(m.graph, metadata, slot)
+	target, hasTarget, err := singleChildTarget(graph, metadata, slot)
 	if err != nil {
 		return false, err
 	}
@@ -3027,7 +3030,7 @@ func (m *PointerMetadataRegistry) RemoveTarget(subject NodeID) (removed bool, er
 		return false, nil
 	}
 
-	removed, err = m.graph.RemoveRelationship(metadata, target)
+	removed, err = graph.RemoveRelationship(metadata, target)
 	return removed, wrapInterfaceErr(err)
 }
 
@@ -3138,7 +3141,6 @@ func NewPointerMetadataRegistryD(graph GraphAPI, allPointerMetadata, allSubjectS
 
 	return &PointerMetadataRegistryD{
 		subjectMetadataBase: subjectMetadataBase{
-			graph:              graph,
 			allPointerMetadata: allPointerMetadata,
 			allSubjectSlots:    allSubjectSlots,
 		},
@@ -3149,8 +3151,8 @@ func NewPointerMetadataRegistryD(graph GraphAPI, allPointerMetadata, allSubjectS
 // targetSlot returns metadata's current target-slot child (U2), if any,
 // found by tag rather than by exclusion -- see the PointerMetadataRegistryD
 // doc comment for why this is the fix over Representation C.
-func (m *PointerMetadataRegistryD) targetSlot(metadata NodeID) (slot NodeID, found bool, err error) {
-	return findUniqueTaggedChild(m.graph, metadata, m.allTargetSlots)
+func (m *PointerMetadataRegistryD) targetSlot(graph GraphReader, metadata NodeID) (slot NodeID, found bool, err error) {
+	return findUniqueTaggedChild(graph, metadata, m.allTargetSlots)
 }
 
 // Target returns subject's current target via its metadata/target-slot
@@ -3160,12 +3162,12 @@ func (m *PointerMetadataRegistryD) targetSlot(metadata NodeID) (slot NodeID, fou
 // has one with no target-slot yet, or when it has a target-slot with no
 // target set yet -- callers that need to distinguish those cases should
 // use HasMetadata and EnsureMetadata directly.
-func (m *PointerMetadataRegistryD) Target(subject NodeID) (target NodeID, hasTarget bool, err error) {
-	if !m.graph.NodeExists(subject) {
+func (m *PointerMetadataRegistryD) Target(graph GraphReader, subject NodeID) (target NodeID, hasTarget bool, err error) {
+	if !graph.NodeExists(subject) {
 		return 0, false, ErrNodeNotFound
 	}
 
-	metadata, _, found, err := m.locate(subject)
+	metadata, _, found, err := m.locate(graph, subject)
 	if err != nil {
 		return 0, false, err
 	}
@@ -3173,7 +3175,7 @@ func (m *PointerMetadataRegistryD) Target(subject NodeID) (target NodeID, hasTar
 		return 0, false, nil
 	}
 
-	slot, found, err := m.targetSlot(metadata)
+	slot, found, err := m.targetSlot(graph, metadata)
 	if err != nil {
 		return 0, false, err
 	}
@@ -3181,7 +3183,7 @@ func (m *PointerMetadataRegistryD) Target(subject NodeID) (target NodeID, hasTar
 		return 0, false, nil
 	}
 
-	return singleChildTarget(m.graph, slot)
+	return singleChildTarget(graph, slot)
 }
 
 // SetTarget sets subject's target to target, creating subject's metadata
@@ -3191,23 +3193,23 @@ func (m *PointerMetadataRegistryD) Target(subject NodeID) (target NodeID, hasTar
 // target-slot) is a freshly-minted node distinct from subject, U1, and M,
 // so U2 -> target can never collide with any other relationship no
 // matter what target equals.
-func (m *PointerMetadataRegistryD) SetTarget(subject, target NodeID) error {
-	if !m.graph.NodeExists(target) {
+func (m *PointerMetadataRegistryD) SetTarget(graph GraphAPI, subject, target NodeID) error {
+	if !graph.NodeExists(target) {
 		return ErrNodeNotFound
 	}
 
-	metadata, _, err := m.ensureMetadata(subject)
+	metadata, _, err := m.ensureMetadata(graph, subject)
 	if err != nil {
 		return err
 	}
 
-	slot, found, err := m.targetSlot(metadata)
+	slot, found, err := m.targetSlot(graph, metadata)
 	if err != nil {
 		return err
 	}
 
 	if !found {
-		return wrapInterfaceErr(m.graph.Transact(func(tx *Txn) error {
+		return wrapInterfaceErr(graph.Transact(func(tx *Txn) error {
 			var txErr error
 			slot, txErr = createTaggedNodeTx(tx, m.allTargetSlots)
 			if txErr != nil {
@@ -3221,7 +3223,7 @@ func (m *PointerMetadataRegistryD) SetTarget(subject, target NodeID) error {
 		}))
 	}
 
-	current, hasTarget, err := singleChildTarget(m.graph, slot)
+	current, hasTarget, err := singleChildTarget(graph, slot)
 	if err != nil {
 		return err
 	}
@@ -3230,7 +3232,7 @@ func (m *PointerMetadataRegistryD) SetTarget(subject, target NodeID) error {
 		return nil
 	}
 
-	return wrapInterfaceErr(m.graph.Transact(func(tx *Txn) error {
+	return wrapInterfaceErr(graph.Transact(func(tx *Txn) error {
 		return setPointerTargetTx(tx, slot, current, hasTarget, target)
 	}))
 }
@@ -3240,12 +3242,12 @@ func (m *PointerMetadataRegistryD) SetTarget(subject, target NodeID) error {
 // deletion, consistent with theorystate.md section 18's rejection of
 // deleteNodeAndRelationships); an empty target-slot -- or no target-slot
 // at all -- is a valid, meaningful state.
-func (m *PointerMetadataRegistryD) RemoveTarget(subject NodeID) (removed bool, err error) {
-	if !m.graph.NodeExists(subject) {
+func (m *PointerMetadataRegistryD) RemoveTarget(graph GraphAPI, subject NodeID) (removed bool, err error) {
+	if !graph.NodeExists(subject) {
 		return false, ErrNodeNotFound
 	}
 
-	metadata, _, found, err := m.locate(subject)
+	metadata, _, found, err := m.locate(graph, subject)
 	if err != nil {
 		return false, err
 	}
@@ -3253,7 +3255,7 @@ func (m *PointerMetadataRegistryD) RemoveTarget(subject NodeID) (removed bool, e
 		return false, nil
 	}
 
-	slot, found, err := m.targetSlot(metadata)
+	slot, found, err := m.targetSlot(graph, metadata)
 	if err != nil {
 		return false, err
 	}
@@ -3261,7 +3263,7 @@ func (m *PointerMetadataRegistryD) RemoveTarget(subject NodeID) (removed bool, e
 		return false, nil
 	}
 
-	target, hasTarget, err := singleChildTarget(m.graph, slot)
+	target, hasTarget, err := singleChildTarget(graph, slot)
 	if err != nil {
 		return false, err
 	}
@@ -3269,7 +3271,7 @@ func (m *PointerMetadataRegistryD) RemoveTarget(subject NodeID) (removed bool, e
 		return false, nil
 	}
 
-	removed, err = m.graph.RemoveRelationship(slot, target)
+	removed, err = graph.RemoveRelationship(slot, target)
 	return removed, wrapInterfaceErr(err)
 }
 
