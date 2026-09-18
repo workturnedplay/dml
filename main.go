@@ -6468,7 +6468,6 @@ func (c *CompositeSetLogRegistry) DeleteCompositeSetLog(graph GraphAPI, log Node
 // under the same tag would register a redundant (if harmless) duplicate
 // Checker for the identical cardinality invariant.
 type domainConstraint struct {
-	graph       GraphAPI
 	domainSlots *PointerRegistry
 	sets        *SetRegistry
 	composites  *CompositeSetRegistry
@@ -6478,20 +6477,20 @@ type domainConstraint struct {
 // domainSlotFor returns anchor's domain-slot child (U3), if any, found
 // by tag rather than by position or exclusion, exactly like every other
 // slot lookup in this file.
-func (d *domainConstraint) domainSlotFor(anchor NodeID) (slot NodeID, found bool, err error) {
-	return findUniqueTaggedChild(d.graph, anchor, d.domainSlots.allPointers)
+func (d *domainConstraint) domainSlotFor(graph GraphReader, anchor NodeID) (slot NodeID, found bool, err error) {
+	return findUniqueTaggedChild(graph, anchor, d.domainSlots.allPointers)
 }
 
 // Domain returns anchor's current domain node, if any. hasDomain is
 // false both when anchor has no domain slot at all and when it has one
 // with no domain node set yet.
-func (d *domainConstraint) Domain(anchor NodeID) (domain NodeID, hasDomain bool, err error) {
-	slot, found, err := d.domainSlotFor(anchor)
+func (d *domainConstraint) Domain(graph GraphReader, anchor NodeID) (domain NodeID, hasDomain bool, err error) {
+	slot, found, err := d.domainSlotFor(graph, anchor)
 	if err != nil || !found {
 		return 0, false, err
 	}
 
-	return d.domainSlots.Target(d.graph, slot)
+	return d.domainSlots.Target(graph, slot)
 }
 
 // SetDomain sets anchor's domain to domain, creating anchor's domain
@@ -6508,24 +6507,24 @@ func (d *domainConstraint) Domain(anchor NodeID) (domain NodeID, hasDomain bool,
 // target for its own representation, so that check is performed there,
 // before delegating to this method -- see DomainPointerRegistryB.
 // SetDomain / DomainPointerRegistryD.SetDomain.
-func (d *domainConstraint) SetDomain(anchor, domain NodeID) error {
-	if !d.graph.NodeExists(anchor) {
+func (d *domainConstraint) SetDomain(graph GraphAPI, anchor, domain NodeID) error {
+	if !graph.NodeExists(anchor) {
 		return ErrNodeNotFound
 	}
-	if !d.graph.NodeExists(domain) {
+	if !graph.NodeExists(domain) {
 		return ErrNodeNotFound
 	}
-	if !operandCarriesKnownSetTag(d.graph, d.sets, d.composites, d.logs, domain) {
+	if !operandCarriesKnownSetTag(graph, d.sets, d.composites, d.logs, domain) {
 		return ErrInvalidSetOperand
 	}
 
-	slot, found, err := d.domainSlotFor(anchor)
+	slot, found, err := d.domainSlotFor(graph, anchor)
 	if err != nil {
 		return err
 	}
 
 	if !found {
-		return wrapInterfaceErr(d.graph.Transact(func(tx *Txn) error {
+		return wrapInterfaceErr(graph.Transact(func(tx *Txn) error {
 			newSlot, err2 := createTaggedNodeTx(tx, d.domainSlots.allPointers)
 			if err2 != nil {
 				return err2
@@ -6538,7 +6537,7 @@ func (d *domainConstraint) SetDomain(anchor, domain NodeID) error {
 		}))
 	}
 
-	return d.domainSlots.SetTarget(d.graph, slot, domain)
+	return d.domainSlots.SetTarget(graph, slot, domain)
 }
 
 // RemoveDomain clears anchor's domain, if any. The domain-slot node
@@ -6546,25 +6545,25 @@ func (d *domainConstraint) SetDomain(anchor, domain NodeID) error {
 // theorystate.md section 18); a domain-slot with no domain set is a
 // valid, meaningful "no constraint" state, exactly like an empty
 // Pointer elsewhere in this file.
-func (d *domainConstraint) RemoveDomain(anchor NodeID) (removed bool, err error) {
-	if !d.graph.NodeExists(anchor) {
+func (d *domainConstraint) RemoveDomain(graph GraphAPI, anchor NodeID) (removed bool, err error) {
+	if !graph.NodeExists(anchor) {
 		return false, ErrNodeNotFound
 	}
 
-	slot, found, err := d.domainSlotFor(anchor)
+	slot, found, err := d.domainSlotFor(graph, anchor)
 	if err != nil || !found {
 		return false, err
 	}
 
-	return d.domainSlots.RemoveTarget(d.graph, slot)
+	return d.domainSlots.RemoveTarget(graph, slot)
 }
 
 // validateMembership reports whether target currently belongs to
 // domain's resolved membership, dispatched generically over whichever of
 // the three Set representations domain actually carries (see
 // domainContainsGeneric), returning ErrTargetOutsideDomain if not.
-func (d *domainConstraint) validateMembership(domain, target NodeID) error {
-	contains, err := domainContainsGeneric(d.graph, d.sets, d.composites, d.logs, domain, target)
+func (d *domainConstraint) validateMembership(graph GraphReader, domain, target NodeID) error {
+	contains, err := domainContainsGeneric(graph, d.sets, d.composites, d.logs, domain, target)
 	if err != nil {
 		return err
 	}
@@ -6588,8 +6587,8 @@ func (d *domainConstraint) validateMembership(domain, target NodeID) error {
 // detected here or by any Checker -- SetDomain and SetTarget (on
 // whichever of DomainPointerRegistryB/D this is embedded in) are the
 // only two write paths that ever re-validate this relationship.
-func (d *domainConstraint) checkAllowed(anchor, target NodeID) error {
-	domain, hasDomain, err := d.Domain(anchor)
+func (d *domainConstraint) checkAllowed(graph GraphReader, anchor, target NodeID) error {
+	domain, hasDomain, err := d.Domain(graph, anchor)
 	if err != nil {
 		return err
 	}
@@ -6597,7 +6596,7 @@ func (d *domainConstraint) checkAllowed(anchor, target NodeID) error {
 		return nil
 	}
 
-	return d.validateMembership(domain, target)
+	return d.validateMembership(graph, domain, target)
 }
 
 // DomainPointerRegistryB adds domain-constrained target enforcement on
@@ -6663,10 +6662,9 @@ type DomainPointerRegistryB struct {
 // a domain pointed at a CompositeSetLog-kind node is then rejected via
 // ErrInvalidSetOperand exactly like any other unrecognized domain kind,
 // until logs is available.
-func NewDomainPointerRegistryB(graph GraphAPI, pointers, domainSlots *PointerRegistry, sets *SetRegistry, composites *CompositeSetRegistry, logs *CompositeSetLogRegistry) *DomainPointerRegistryB {
+func NewDomainPointerRegistryB(_ GraphAPI, pointers, domainSlots *PointerRegistry, sets *SetRegistry, composites *CompositeSetRegistry, logs *CompositeSetLogRegistry) *DomainPointerRegistryB {
 	return &DomainPointerRegistryB{
 		domainConstraint: domainConstraint{
-			graph:       graph,
 			domainSlots: domainSlots,
 			sets:        sets,
 			composites:  composites,
@@ -6680,8 +6678,8 @@ func NewDomainPointerRegistryB(graph GraphAPI, pointers, domainSlots *PointerReg
 // single child of anchor tagged via the underlying PointerRegistry's own
 // tag -- found by tag, not by position, exactly like every other slot
 // lookup in this file.
-func (b *DomainPointerRegistryB) subPointer(anchor NodeID) (u NodeID, found bool, err error) {
-	return findUniqueTaggedChild(b.graph, anchor, b.pointers.allPointers)
+func (b *DomainPointerRegistryB) subPointer(graph GraphReader, anchor NodeID) (u NodeID, found bool, err error) {
+	return findUniqueTaggedChild(graph, anchor, b.pointers.allPointers)
 }
 
 // NewDomainPointer mints a fresh sub-pointer node U, tags it via the
@@ -6705,12 +6703,12 @@ func (b *DomainPointerRegistryB) subPointer(anchor NodeID) (u NodeID, found bool
 // idempotency discipline already followed by
 // PointerRegistry.TagAsPointer and NameRegistry.EnsureNamedNode
 // elsewhere in this file.
-func (b *DomainPointerRegistryB) NewDomainPointer(anchor NodeID) error {
-	if !b.graph.NodeExists(anchor) {
+func (b *DomainPointerRegistryB) NewDomainPointer(graph GraphAPI, anchor NodeID) error {
+	if !graph.NodeExists(anchor) {
 		return ErrNodeNotFound
 	}
 
-	_, found, err := b.subPointer(anchor)
+	_, found, err := b.subPointer(graph, anchor)
 	if err != nil {
 		return err
 	}
@@ -6718,7 +6716,7 @@ func (b *DomainPointerRegistryB) NewDomainPointer(anchor NodeID) error {
 		return nil
 	}
 
-	return wrapInterfaceErr(b.graph.Transact(func(tx *Txn) error {
+	return wrapInterfaceErr(graph.Transact(func(tx *Txn) error {
 		u, err2 := newPointerTx(tx, b.pointers.allPointers)
 		if err2 != nil {
 			return err2
@@ -6732,13 +6730,13 @@ func (b *DomainPointerRegistryB) NewDomainPointer(anchor NodeID) error {
 // Target returns anchor's current target via its sub-pointer node U, if
 // any. hasTarget is false both when anchor has no discoverable U at all
 // and when U exists but has no target set yet.
-func (b *DomainPointerRegistryB) Target(anchor NodeID) (target NodeID, hasTarget bool, err error) {
-	u, found, err := b.subPointer(anchor)
+func (b *DomainPointerRegistryB) Target(graph GraphReader, anchor NodeID) (target NodeID, hasTarget bool, err error) {
+	u, found, err := b.subPointer(graph, anchor)
 	if err != nil || !found {
 		return 0, false, err
 	}
 
-	return b.pointers.Target(b.graph, u)
+	return b.pointers.Target(graph, u)
 }
 
 // SetTarget sets anchor's target to target, first validating target
@@ -6747,16 +6745,16 @@ func (b *DomainPointerRegistryB) Target(anchor NodeID) (target NodeID, hasTarget
 // discoverable sub-pointer node U (see NewDomainPointer); otherwise this
 // returns ErrNotPointer, mirroring the underlying PointerRegistry's own
 // error for an untagged node.
-func (b *DomainPointerRegistryB) SetTarget(anchor, target NodeID) error {
-	if !b.graph.NodeExists(target) {
+func (b *DomainPointerRegistryB) SetTarget(graph GraphAPI, anchor, target NodeID) error {
+	if !graph.NodeExists(target) {
 		return ErrNodeNotFound
 	}
 
-	if err := b.checkAllowed(anchor, target); err != nil {
+	if err := b.checkAllowed(graph, anchor, target); err != nil {
 		return err
 	}
 
-	u, found, err := b.subPointer(anchor)
+	u, found, err := b.subPointer(graph, anchor)
 	if err != nil {
 		return err
 	}
@@ -6764,18 +6762,18 @@ func (b *DomainPointerRegistryB) SetTarget(anchor, target NodeID) error {
 		return ErrNotPointer
 	}
 
-	return b.pointers.SetTarget(b.graph, u, target)
+	return b.pointers.SetTarget(graph, u, target)
 }
 
 // RemoveTarget clears anchor's target, if any, via its sub-pointer node
 // U.
-func (b *DomainPointerRegistryB) RemoveTarget(anchor NodeID) (removed bool, err error) {
-	u, found, err := b.subPointer(anchor)
+func (b *DomainPointerRegistryB) RemoveTarget(graph GraphAPI, anchor NodeID) (removed bool, err error) {
+	u, found, err := b.subPointer(graph, anchor)
 	if err != nil || !found {
 		return false, err
 	}
 
-	return b.pointers.RemoveTarget(b.graph, u)
+	return b.pointers.RemoveTarget(graph, u)
 }
 
 // SetDomain sets anchor's domain to domain, additionally validating that
@@ -6783,19 +6781,19 @@ func (b *DomainPointerRegistryB) RemoveTarget(anchor NodeID) (removed bool, err 
 // committing -- symmetric with SetTarget's own validation against the
 // current domain. See domainConstraint.SetDomain for the shared
 // creation/validation logic this delegates to.
-func (b *DomainPointerRegistryB) SetDomain(anchor, domain NodeID) error {
-	target, hasTarget, err := b.Target(anchor)
+func (b *DomainPointerRegistryB) SetDomain(graph GraphAPI, anchor, domain NodeID) error {
+	target, hasTarget, err := b.Target(graph, anchor)
 	if err != nil {
 		return err
 	}
 
 	if hasTarget {
-		if err2 := b.validateMembership(domain, target); err2 != nil {
+		if err2 := b.validateMembership(graph, domain, target); err2 != nil {
 			return err2
 		}
 	}
 
-	return b.domainConstraint.SetDomain(anchor, domain)
+	return b.domainConstraint.SetDomain(graph, anchor, domain)
 }
 
 // DomainPointerRegistryD adds domain-constrained target enforcement on
@@ -6849,7 +6847,6 @@ type DomainPointerRegistryD struct {
 func NewDomainPointerRegistryD(graph GraphAPI, metadata *PointerMetadataRegistryD, domainSlots *PointerRegistry, sets *SetRegistry, composites *CompositeSetRegistry, logs *CompositeSetLogRegistry) *DomainPointerRegistryD {
 	d := &DomainPointerRegistryD{
 		domainConstraint: domainConstraint{
-			graph:       graph,
 			domainSlots: domainSlots,
 			sets:        sets,
 			composites:  composites,
@@ -6879,7 +6876,7 @@ func NewDomainPointerRegistryD(graph GraphAPI, metadata *PointerMetadataRegistry
 			}
 
 			for m := range anchors {
-				slot, found, err := metadata.targetSlot(m)
+				slot, found, err := metadata.targetSlot(g, m)
 				if err != nil {
 					return err
 				}
@@ -6895,7 +6892,7 @@ func NewDomainPointerRegistryD(graph GraphAPI, metadata *PointerMetadataRegistry
 					continue
 				}
 
-				if err := d.checkAllowed(m, target); err != nil {
+				if err := d.checkAllowed(g, m, target); err != nil {
 					return err
 				}
 			}
@@ -6909,8 +6906,8 @@ func NewDomainPointerRegistryD(graph GraphAPI, metadata *PointerMetadataRegistry
 
 // Target returns subject's current target, delegating directly to the
 // underlying PointerMetadataRegistryD.
-func (d *DomainPointerRegistryD) Target(subject NodeID) (target NodeID, hasTarget bool, err error) {
-	return d.metadata.Target(subject)
+func (d *DomainPointerRegistryD) Target(graph GraphReader, subject NodeID) (target NodeID, hasTarget bool, err error) {
+	return d.metadata.Target(graph, subject)
 }
 
 // SetTarget sets subject's target to target, first validating target
@@ -6923,28 +6920,28 @@ func (d *DomainPointerRegistryD) Target(subject NodeID) (target NodeID, hasTarge
 // rather than forcing metadata into existence merely to discover there
 // is nothing to check -- exactly the same "read-only, don't create"
 // discipline PointerMetadataRegistryD.Target itself already follows.
-func (d *DomainPointerRegistryD) SetTarget(subject, target NodeID) error {
-	if !d.graph.NodeExists(target) {
+func (d *DomainPointerRegistryD) SetTarget(graph GraphAPI, subject, target NodeID) error {
+	if !graph.NodeExists(target) {
 		return ErrNodeNotFound
 	}
 
-	m, _, found, err := d.metadata.locate(subject)
+	m, _, found, err := d.metadata.locate(graph, subject)
 	if err != nil {
 		return err
 	}
 	if found {
-		if err2 := d.checkAllowed(m, target); err2 != nil {
+		if err2 := d.checkAllowed(graph, m, target); err2 != nil {
 			return err2
 		}
 	}
 
-	return d.metadata.SetTarget(subject, target)
+	return d.metadata.SetTarget(graph, subject, target)
 }
 
 // RemoveTarget clears subject's target, if any, delegating directly to
 // the underlying PointerMetadataRegistryD.
-func (d *DomainPointerRegistryD) RemoveTarget(subject NodeID) (removed bool, err error) {
-	return d.metadata.RemoveTarget(subject)
+func (d *DomainPointerRegistryD) RemoveTarget(graph GraphAPI, subject NodeID) (removed bool, err error) {
+	return d.metadata.RemoveTarget(graph, subject)
 }
 
 // Domain returns subject's current domain node, if any, resolving
@@ -6953,13 +6950,13 @@ func (d *DomainPointerRegistryD) RemoveTarget(subject NodeID) (removed bool, err
 // if subject has no metadata node at all yet, in addition to
 // domainConstraint.Domain's own "no domain slot" and "no domain set"
 // cases.
-func (d *DomainPointerRegistryD) Domain(subject NodeID) (domain NodeID, hasDomain bool, err error) {
-	m, _, found, err := d.metadata.locate(subject)
+func (d *DomainPointerRegistryD) Domain(graph GraphReader, subject NodeID) (domain NodeID, hasDomain bool, err error) {
+	m, _, found, err := d.metadata.locate(graph, subject)
 	if err != nil || !found {
 		return 0, false, err
 	}
 
-	return d.domainConstraint.Domain(m)
+	return d.domainConstraint.Domain(graph, m)
 }
 
 // SetDomain sets subject's domain to domain, creating subject's metadata
@@ -6967,35 +6964,35 @@ func (d *DomainPointerRegistryD) Domain(subject NodeID) (domain NodeID, hasDomai
 // subject's current target (if any) still belongs to domain before
 // committing -- symmetric with SetTarget's own validation against the
 // current domain.
-func (d *DomainPointerRegistryD) SetDomain(subject, domain NodeID) error {
-	m, err := d.metadata.EnsureMetadata(subject)
+func (d *DomainPointerRegistryD) SetDomain(graph GraphAPI, subject, domain NodeID) error {
+	m, err := d.metadata.EnsureMetadata(graph, subject)
 	if err != nil {
 		return err
 	}
 
-	target, hasTarget, err := d.metadata.Target(subject)
+	target, hasTarget, err := d.metadata.Target(graph, subject)
 	if err != nil {
 		return err
 	}
 
 	if hasTarget {
-		if err2 := d.validateMembership(domain, target); err2 != nil {
+		if err2 := d.validateMembership(graph, domain, target); err2 != nil {
 			return err2
 		}
 	}
 
-	return d.domainConstraint.SetDomain(m, domain)
+	return d.domainConstraint.SetDomain(graph, m, domain)
 }
 
 // RemoveDomain clears subject's domain, if any, resolving subject's
 // metadata node M first. removed is false if subject has no metadata
 // node at all yet, in addition to domainConstraint.RemoveDomain's own
 // "no domain slot" case.
-func (d *DomainPointerRegistryD) RemoveDomain(subject NodeID) (removed bool, err error) {
-	m, _, found, err := d.metadata.locate(subject)
+func (d *DomainPointerRegistryD) RemoveDomain(graph GraphAPI, subject NodeID) (removed bool, err error) {
+	m, _, found, err := d.metadata.locate(graph, subject)
 	if err != nil || !found {
 		return false, err
 	}
 
-	return d.domainConstraint.RemoveDomain(m)
+	return d.domainConstraint.RemoveDomain(graph, m)
 }

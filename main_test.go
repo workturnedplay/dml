@@ -2497,7 +2497,7 @@ func TestPointerMetadataRegistryHasMetadataFalseInitially(t *testing.T) {
 		t.Fatalf("CreateNode(): %v", err)
 	}
 
-	has, err := metadata.HasMetadata(subject)
+	has, err := metadata.HasMetadata(g, subject)
 	if err != nil {
 		t.Fatalf("HasMetadata(): %v", err)
 	}
@@ -2505,7 +2505,7 @@ func TestPointerMetadataRegistryHasMetadataFalseInitially(t *testing.T) {
 		t.Fatal("fresh subject unexpectedly already has metadata")
 	}
 
-	_, hasTarget, err := metadata.Target(subject)
+	_, hasTarget, err := metadata.Target(g, subject)
 	if err != nil {
 		t.Fatalf("Target(): %v", err)
 	}
@@ -2536,7 +2536,7 @@ func TestPointerMetadataRegistrySetTargetLeavesSubjectChildrenUntouched(t *testi
 		t.Fatalf("CreateNode() for x: %v", err)
 	}
 
-	if err3 := metadata.SetTarget(subject, x); err3 != nil {
+	if err3 := metadata.SetTarget(g, subject, x); err3 != nil {
 		t.Fatalf("SetTarget(subject, x): %v", err3)
 	}
 
@@ -2550,7 +2550,7 @@ func TestPointerMetadataRegistrySetTargetLeavesSubjectChildrenUntouched(t *testi
 		t.Fatalf("FindOutgoing(subject) = %v, want %v (unchanged by the pointer representation)", outgoing, want)
 	}
 
-	target, hasTarget, err := metadata.Target(subject)
+	target, hasTarget, err := metadata.Target(g, subject)
 	if err != nil {
 		t.Fatalf("Target(subject): %v", err)
 	}
@@ -2567,11 +2567,11 @@ func TestPointerMetadataRegistrySetTargetAllowsSelfTarget(t *testing.T) {
 		t.Fatalf("CreateNode(): %v", err)
 	}
 
-	if err2 := metadata.SetTarget(subject, subject); err2 != nil {
+	if err2 := metadata.SetTarget(g, subject, subject); err2 != nil {
 		t.Fatalf("SetTarget(subject, subject): %v", err2)
 	}
 
-	target, hasTarget, err := metadata.Target(subject)
+	target, hasTarget, err := metadata.Target(g, subject)
 	if err != nil {
 		t.Fatalf("Target(subject): %v", err)
 	}
@@ -2598,15 +2598,15 @@ func TestPointerMetadataRegistrySetTargetReplacesExistingTarget(t *testing.T) {
 		t.Fatalf("CreateNode() for y: %v", err)
 	}
 
-	if err2 := metadata.SetTarget(subject, x); err2 != nil {
+	if err2 := metadata.SetTarget(g, subject, x); err2 != nil {
 		t.Fatalf("SetTarget(subject, x): %v", err2)
 	}
 
-	if err3 := metadata.SetTarget(subject, y); err3 != nil {
+	if err3 := metadata.SetTarget(g, subject, y); err3 != nil {
 		t.Fatalf("SetTarget(subject, y): %v", err3)
 	}
 
-	target, hasTarget, err := metadata.Target(subject)
+	target, hasTarget, err := metadata.Target(g, subject)
 	if err != nil {
 		t.Fatalf("Target(subject): %v", err)
 	}
@@ -2628,11 +2628,11 @@ func TestPointerMetadataRegistryRemoveTargetRemovesExisting(t *testing.T) {
 		t.Fatalf("CreateNode() for x: %v", err)
 	}
 
-	if err2 := metadata.SetTarget(subject, x); err2 != nil {
+	if err2 := metadata.SetTarget(g, subject, x); err2 != nil {
 		t.Fatalf("SetTarget(subject, x): %v", err2)
 	}
 
-	removed, err := metadata.RemoveTarget(subject)
+	removed, err := metadata.RemoveTarget(g, subject)
 	if err != nil {
 		t.Fatalf("RemoveTarget(subject): %v", err)
 	}
@@ -2640,7 +2640,7 @@ func TestPointerMetadataRegistryRemoveTargetRemovesExisting(t *testing.T) {
 		t.Fatal("RemoveTarget() reported that nothing was removed")
 	}
 
-	has, err := metadata.HasMetadata(subject)
+	has, err := metadata.HasMetadata(g, subject)
 	if err != nil {
 		t.Fatalf("HasMetadata(): %v", err)
 	}
@@ -2648,7 +2648,7 @@ func TestPointerMetadataRegistryRemoveTargetRemovesExisting(t *testing.T) {
 		t.Fatal("metadata node should still exist after RemoveTarget (no cascade delete)")
 	}
 
-	_, hasTarget, err := metadata.Target(subject)
+	_, hasTarget, err := metadata.Target(g, subject)
 	if err != nil {
 		t.Fatalf("Target(subject): %v", err)
 	}
@@ -2667,7 +2667,7 @@ func TestPointerMetadataRegistrySetTargetRequiresExistingTarget(t *testing.T) {
 
 	const nonexistent NodeID = 999999
 
-	err = metadata.SetTarget(subject, nonexistent)
+	err = metadata.SetTarget(g, subject, nonexistent)
 	if !errors.Is(err, ErrNodeNotFound) {
 		t.Fatalf("SetTarget() error = %v, want %v", err, ErrNodeNotFound)
 	}
@@ -2691,11 +2691,11 @@ func TestPointerMetadataRegistryDetectsOutOfBandInvariantViolation(t *testing.T)
 		t.Fatalf("CreateNode() for x: %v", err)
 	}
 
-	if err2 := metadata.SetTarget(subject, x); err2 != nil {
+	if err2 := metadata.SetTarget(g, subject, x); err2 != nil {
 		t.Fatalf("SetTarget(subject, x): %v", err2)
 	}
 
-	m, err := metadata.EnsureMetadata(subject)
+	m, err := metadata.EnsureMetadata(g, subject)
 	if err != nil {
 		t.Fatalf("EnsureMetadata(subject): %v", err)
 	}
@@ -2713,7 +2713,7 @@ func TestPointerMetadataRegistryDetectsOutOfBandInvariantViolation(t *testing.T)
 		t.Fatalf("AddRelationship(m, y) via raw Graph: %v", err3)
 	}
 
-	if _, _, err4 := metadata.Target(subject); !errors.Is(err4, ErrTooManyPointerTargets) {
+	if _, _, err4 := metadata.Target(g, subject); !errors.Is(err4, ErrTooManyPointerTargets) {
 		t.Fatalf("Target() error = %v, want %v", err4, ErrTooManyPointerTargets)
 	}
 
@@ -2722,11 +2722,11 @@ func TestPointerMetadataRegistryDetectsOutOfBandInvariantViolation(t *testing.T)
 		t.Fatalf("CreateNode() for z: %v", err)
 	}
 
-	if err5 := metadata.SetTarget(subject, z); !errors.Is(err5, ErrTooManyPointerTargets) {
+	if err5 := metadata.SetTarget(g, subject, z); !errors.Is(err5, ErrTooManyPointerTargets) {
 		t.Fatalf("SetTarget() error = %v, want %v", err5, ErrTooManyPointerTargets)
 	}
 
-	if _, err6 := metadata.RemoveTarget(subject); !errors.Is(err6, ErrTooManyPointerTargets) {
+	if _, err6 := metadata.RemoveTarget(g, subject); !errors.Is(err6, ErrTooManyPointerTargets) {
 		t.Fatalf("RemoveTarget() error = %v, want %v", err6, ErrTooManyPointerTargets)
 	}
 
@@ -2806,7 +2806,7 @@ func TestPointerMetadataRegistryDHasMetadataFalseInitially(t *testing.T) {
 		t.Fatalf("CreateNode(): %v", err)
 	}
 
-	has, err := metadata.HasMetadata(subject)
+	has, err := metadata.HasMetadata(g, subject)
 	if err != nil {
 		t.Fatalf("HasMetadata(): %v", err)
 	}
@@ -2814,7 +2814,7 @@ func TestPointerMetadataRegistryDHasMetadataFalseInitially(t *testing.T) {
 		t.Fatal("fresh subject unexpectedly already has metadata")
 	}
 
-	_, hasTarget, err := metadata.Target(subject)
+	_, hasTarget, err := metadata.Target(g, subject)
 	if err != nil {
 		t.Fatalf("Target(): %v", err)
 	}
@@ -2845,7 +2845,7 @@ func TestPointerMetadataRegistryDSetTargetLeavesSubjectChildrenUntouched(t *test
 		t.Fatalf("CreateNode() for x: %v", err)
 	}
 
-	if err3 := metadata.SetTarget(subject, x); err3 != nil {
+	if err3 := metadata.SetTarget(g, subject, x); err3 != nil {
 		t.Fatalf("SetTarget(subject, x): %v", err3)
 	}
 
@@ -2859,7 +2859,7 @@ func TestPointerMetadataRegistryDSetTargetLeavesSubjectChildrenUntouched(t *test
 		t.Fatalf("FindOutgoing(subject) = %v, want %v (unchanged by the pointer representation)", outgoing, want)
 	}
 
-	target, hasTarget, err := metadata.Target(subject)
+	target, hasTarget, err := metadata.Target(g, subject)
 	if err != nil {
 		t.Fatalf("Target(subject): %v", err)
 	}
@@ -2876,11 +2876,11 @@ func TestPointerMetadataRegistryDSetTargetAllowsSelfTarget(t *testing.T) {
 		t.Fatalf("CreateNode(): %v", err)
 	}
 
-	if err2 := metadata.SetTarget(subject, subject); err2 != nil {
+	if err2 := metadata.SetTarget(g, subject, subject); err2 != nil {
 		t.Fatalf("SetTarget(subject, subject): %v", err2)
 	}
 
-	target, hasTarget, err := metadata.Target(subject)
+	target, hasTarget, err := metadata.Target(g, subject)
 	if err != nil {
 		t.Fatalf("Target(subject): %v", err)
 	}
@@ -2907,15 +2907,15 @@ func TestPointerMetadataRegistryDSetTargetReplacesExistingTarget(t *testing.T) {
 		t.Fatalf("CreateNode() for y: %v", err)
 	}
 
-	if err2 := metadata.SetTarget(subject, x); err2 != nil {
+	if err2 := metadata.SetTarget(g, subject, x); err2 != nil {
 		t.Fatalf("SetTarget(subject, x): %v", err2)
 	}
 
-	if err3 := metadata.SetTarget(subject, y); err3 != nil {
+	if err3 := metadata.SetTarget(g, subject, y); err3 != nil {
 		t.Fatalf("SetTarget(subject, y): %v", err3)
 	}
 
-	target, hasTarget, err := metadata.Target(subject)
+	target, hasTarget, err := metadata.Target(g, subject)
 	if err != nil {
 		t.Fatalf("Target(subject): %v", err)
 	}
@@ -2937,11 +2937,11 @@ func TestPointerMetadataRegistryDRemoveTargetRemovesExisting(t *testing.T) {
 		t.Fatalf("CreateNode() for x: %v", err)
 	}
 
-	if err2 := metadata.SetTarget(subject, x); err2 != nil {
+	if err2 := metadata.SetTarget(g, subject, x); err2 != nil {
 		t.Fatalf("SetTarget(subject, x): %v", err2)
 	}
 
-	removed, err := metadata.RemoveTarget(subject)
+	removed, err := metadata.RemoveTarget(g, subject)
 	if err != nil {
 		t.Fatalf("RemoveTarget(subject): %v", err)
 	}
@@ -2949,7 +2949,7 @@ func TestPointerMetadataRegistryDRemoveTargetRemovesExisting(t *testing.T) {
 		t.Fatal("RemoveTarget() reported that nothing was removed")
 	}
 
-	_, hasTarget, err := metadata.Target(subject)
+	_, hasTarget, err := metadata.Target(g, subject)
 	if err != nil {
 		t.Fatalf("Target(subject): %v", err)
 	}
@@ -2968,7 +2968,7 @@ func TestPointerMetadataRegistryDSetTargetRequiresExistingTarget(t *testing.T) {
 
 	const nonexistent NodeID = 999999
 
-	err = metadata.SetTarget(subject, nonexistent)
+	err = metadata.SetTarget(g, subject, nonexistent)
 	if !errors.Is(err, ErrNodeNotFound) {
 		t.Fatalf("SetTarget() error = %v, want %v", err, ErrNodeNotFound)
 	}
@@ -2992,16 +2992,16 @@ func TestPointerMetadataRegistryDDetectsOutOfBandInvariantViolation(t *testing.T
 		t.Fatalf("CreateNode() for x: %v", err)
 	}
 
-	if err2 := metadata.SetTarget(subject, x); err2 != nil {
+	if err2 := metadata.SetTarget(g, subject, x); err2 != nil {
 		t.Fatalf("SetTarget(subject, x): %v", err2)
 	}
 
-	m, err := metadata.EnsureMetadata(subject)
+	m, err := metadata.EnsureMetadata(g, subject)
 	if err != nil {
 		t.Fatalf("EnsureMetadata(subject): %v", err)
 	}
 
-	slot, found, err := metadata.targetSlot(m)
+	slot, found, err := metadata.targetSlot(g, m)
 	if err != nil || !found {
 		t.Fatalf("targetSlot(m): found=%v err=%v", found, err)
 	}
@@ -3018,7 +3018,7 @@ func TestPointerMetadataRegistryDDetectsOutOfBandInvariantViolation(t *testing.T
 		t.Fatalf("AddRelationship(slot, y) via raw Graph: %v", err3)
 	}
 
-	if _, _, err4 := metadata.Target(subject); !errors.Is(err4, ErrTooManyPointerTargets) {
+	if _, _, err4 := metadata.Target(g, subject); !errors.Is(err4, ErrTooManyPointerTargets) {
 		t.Fatalf("Target() error = %v, want %v", err4, ErrTooManyPointerTargets)
 	}
 
@@ -3027,11 +3027,11 @@ func TestPointerMetadataRegistryDDetectsOutOfBandInvariantViolation(t *testing.T
 		t.Fatalf("CreateNode() for z: %v", err)
 	}
 
-	if err5 := metadata.SetTarget(subject, z); !errors.Is(err5, ErrTooManyPointerTargets) {
+	if err5 := metadata.SetTarget(g, subject, z); !errors.Is(err5, ErrTooManyPointerTargets) {
 		t.Fatalf("SetTarget() error = %v, want %v", err5, ErrTooManyPointerTargets)
 	}
 
-	if _, err6 := metadata.RemoveTarget(subject); !errors.Is(err6, ErrTooManyPointerTargets) {
+	if _, err6 := metadata.RemoveTarget(g, subject); !errors.Is(err6, ErrTooManyPointerTargets) {
 		t.Fatalf("RemoveTarget() error = %v, want %v", err6, ErrTooManyPointerTargets)
 	}
 
@@ -3065,11 +3065,11 @@ func TestPointerMetadataRegistryDAllowsUnrelatedMetadataChildren(t *testing.T) {
 		t.Fatalf("CreateNode() for x: %v", err)
 	}
 
-	if err2 := metadata.SetTarget(subject, x); err2 != nil {
+	if err2 := metadata.SetTarget(g, subject, x); err2 != nil {
 		t.Fatalf("SetTarget(subject, x): %v", err2)
 	}
 
-	m, err := metadata.EnsureMetadata(subject)
+	m, err := metadata.EnsureMetadata(g, subject)
 	if err != nil {
 		t.Fatalf("EnsureMetadata(subject): %v", err)
 	}
@@ -3087,7 +3087,7 @@ func TestPointerMetadataRegistryDAllowsUnrelatedMetadataChildren(t *testing.T) {
 		t.Fatalf("AddRelationship(m, unrelated): %v", err3)
 	}
 
-	target, hasTarget, err := metadata.Target(subject)
+	target, hasTarget, err := metadata.Target(g, subject)
 	if err != nil {
 		t.Fatalf("Target(subject) after adding an unrelated child to M: %v", err)
 	}
@@ -8377,7 +8377,7 @@ func TestDomainPointerRegistryBNewDomainPointerAndTargetWithNoDomain(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err2 := fx.domainB.NewDomainPointer(p); err2 != nil {
+	if err2 := fx.domainB.NewDomainPointer(fx.graph, p); err2 != nil {
 		t.Fatalf("NewDomainPointer(p): %v", err2)
 	}
 
@@ -8385,11 +8385,11 @@ func TestDomainPointerRegistryBNewDomainPointerAndTargetWithNoDomain(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err3 := fx.domainB.SetTarget(p, x); err3 != nil {
+	if err3 := fx.domainB.SetTarget(fx.graph, p, x); err3 != nil {
 		t.Fatalf("SetTarget(p, x) with no domain set: %v", err3)
 	}
 
-	target, hasTarget, err := fx.domainB.Target(p)
+	target, hasTarget, err := fx.domainB.Target(fx.graph, p)
 	if err != nil {
 		t.Fatalf("Target(p): %v", err)
 	}
@@ -8414,7 +8414,7 @@ func TestDomainPointerRegistryBNewDomainPointerIsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err2 := fx.domainB.NewDomainPointer(p); err2 != nil {
+	if err2 := fx.domainB.NewDomainPointer(fx.graph, p); err2 != nil {
 		t.Fatalf("first NewDomainPointer(p): %v", err2)
 	}
 
@@ -8422,15 +8422,15 @@ func TestDomainPointerRegistryBNewDomainPointerIsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err3 := fx.domainB.SetTarget(p, x); err3 != nil {
+	if err3 := fx.domainB.SetTarget(fx.graph, p, x); err3 != nil {
 		t.Fatalf("SetTarget(p, x): %v", err3)
 	}
 
-	if err4 := fx.domainB.NewDomainPointer(p); err4 != nil {
+	if err4 := fx.domainB.NewDomainPointer(fx.graph, p); err4 != nil {
 		t.Fatalf("second NewDomainPointer(p): %v", err4)
 	}
 
-	target, hasTarget, err := fx.domainB.Target(p)
+	target, hasTarget, err := fx.domainB.Target(fx.graph, p)
 	if err != nil {
 		t.Fatalf("Target(p) after second NewDomainPointer(): %v", err)
 	}
@@ -8446,7 +8446,7 @@ func TestDomainPointerRegistryBSetDomainEnforcesMembership(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err2 := fx.domainB.NewDomainPointer(p); err2 != nil {
+	if err2 := fx.domainB.NewDomainPointer(fx.graph, p); err2 != nil {
 		t.Fatalf("NewDomainPointer(p): %v", err2)
 	}
 
@@ -8462,11 +8462,11 @@ func TestDomainPointerRegistryBSetDomainEnforcesMembership(t *testing.T) {
 		t.Fatal(err3)
 	}
 
-	if err4 := fx.domainB.SetDomain(p, domainSet); err4 != nil {
+	if err4 := fx.domainB.SetDomain(fx.graph, p, domainSet); err4 != nil {
 		t.Fatalf("SetDomain(p, domainSet): %v", err4)
 	}
 
-	if err5 := fx.domainB.SetTarget(p, allowed); err5 != nil {
+	if err5 := fx.domainB.SetTarget(fx.graph, p, allowed); err5 != nil {
 		t.Fatalf("SetTarget(p, allowed) within domain: %v", err5)
 	}
 
@@ -8475,12 +8475,12 @@ func TestDomainPointerRegistryBSetDomainEnforcesMembership(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err = fx.domainB.SetTarget(p, disallowed)
+	err = fx.domainB.SetTarget(fx.graph, p, disallowed)
 	if !errors.Is(err, ErrTargetOutsideDomain) {
 		t.Fatalf("SetTarget(p, disallowed) error = %v, want %v", err, ErrTargetOutsideDomain)
 	}
 
-	target, hasTarget, err := fx.domainB.Target(p)
+	target, hasTarget, err := fx.domainB.Target(fx.graph, p)
 	if err != nil {
 		t.Fatalf("Target(p): %v", err)
 	}
@@ -8496,7 +8496,7 @@ func TestDomainPointerRegistryBSetDomainRejectsNonSetTaggedNode(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err2 := fx.domainB.NewDomainPointer(p); err2 != nil {
+	if err2 := fx.domainB.NewDomainPointer(fx.graph, p); err2 != nil {
 		t.Fatalf("NewDomainPointer(p): %v", err2)
 	}
 
@@ -8505,7 +8505,7 @@ func TestDomainPointerRegistryBSetDomainRejectsNonSetTaggedNode(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err = fx.domainB.SetDomain(p, notASet)
+	err = fx.domainB.SetDomain(fx.graph, p, notASet)
 	if !errors.Is(err, ErrInvalidSetOperand) {
 		t.Fatalf("SetDomain(p, notASet) error = %v, want %v", err, ErrInvalidSetOperand)
 	}
@@ -8518,7 +8518,7 @@ func TestDomainPointerRegistryBSetDomainRejectsWhenCurrentTargetOutsideNewDomain
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err2 := fx.domainB.NewDomainPointer(p); err2 != nil {
+	if err2 := fx.domainB.NewDomainPointer(fx.graph, p); err2 != nil {
 		t.Fatalf("NewDomainPointer(p): %v", err2)
 	}
 
@@ -8526,7 +8526,7 @@ func TestDomainPointerRegistryBSetDomainRejectsWhenCurrentTargetOutsideNewDomain
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err3 := fx.domainB.SetTarget(p, x); err3 != nil {
+	if err3 := fx.domainB.SetTarget(fx.graph, p, x); err3 != nil {
 		t.Fatalf("SetTarget(p, x): %v", err3)
 	}
 
@@ -8536,12 +8536,12 @@ func TestDomainPointerRegistryBSetDomainRejectsWhenCurrentTargetOutsideNewDomain
 	}
 	// domainSet deliberately does not contain x.
 
-	err = fx.domainB.SetDomain(p, domainSet)
+	err = fx.domainB.SetDomain(fx.graph, p, domainSet)
 	if !errors.Is(err, ErrTargetOutsideDomain) {
 		t.Fatalf("SetDomain(p, domainSet) error = %v, want %v", err, ErrTargetOutsideDomain)
 	}
 
-	_, hasDomain, err := fx.domainB.Domain(p)
+	_, hasDomain, err := fx.domainB.Domain(fx.graph, p)
 	if err != nil {
 		t.Fatalf("Domain(p): %v", err)
 	}
@@ -8557,7 +8557,7 @@ func TestDomainPointerRegistryBRemoveDomainAllowsAnyTargetAgain(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err2 := fx.domainB.NewDomainPointer(p); err2 != nil {
+	if err2 := fx.domainB.NewDomainPointer(fx.graph, p); err2 != nil {
 		t.Fatalf("NewDomainPointer(p): %v", err2)
 	}
 
@@ -8565,7 +8565,7 @@ func TestDomainPointerRegistryBRemoveDomainAllowsAnyTargetAgain(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err3 := fx.domainB.SetDomain(p, domainSet); err3 != nil {
+	if err3 := fx.domainB.SetDomain(fx.graph, p, domainSet); err3 != nil {
 		t.Fatalf("SetDomain(p, domainSet): %v", err3)
 	}
 
@@ -8574,11 +8574,11 @@ func TestDomainPointerRegistryBRemoveDomainAllowsAnyTargetAgain(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err4 := fx.domainB.SetTarget(p, outside); !errors.Is(err4, ErrTargetOutsideDomain) {
+	if err4 := fx.domainB.SetTarget(fx.graph, p, outside); !errors.Is(err4, ErrTargetOutsideDomain) {
 		t.Fatalf("SetTarget(p, outside) before RemoveDomain error = %v, want %v", err4, ErrTargetOutsideDomain)
 	}
 
-	removed, err := fx.domainB.RemoveDomain(p)
+	removed, err := fx.domainB.RemoveDomain(fx.graph, p)
 	if err != nil {
 		t.Fatalf("RemoveDomain(p): %v", err)
 	}
@@ -8586,7 +8586,7 @@ func TestDomainPointerRegistryBRemoveDomainAllowsAnyTargetAgain(t *testing.T) {
 		t.Fatal("RemoveDomain() reported that nothing was removed")
 	}
 
-	if err5 := fx.domainB.SetTarget(p, outside); err5 != nil {
+	if err5 := fx.domainB.SetTarget(fx.graph, p, outside); err5 != nil {
 		t.Fatalf("SetTarget(p, outside) after RemoveDomain: %v", err5)
 	}
 }
@@ -8605,7 +8605,7 @@ func TestDomainPointerRegistryBSetTargetRequiresExistingSubPointer(t *testing.T)
 		t.Fatal(err)
 	}
 
-	err = fx.domainB.SetTarget(p, x)
+	err = fx.domainB.SetTarget(fx.graph, p, x)
 	if !errors.Is(err, ErrNotPointer) {
 		t.Fatalf("SetTarget(p, x) without a sub-pointer error = %v, want %v", err, ErrNotPointer)
 	}
@@ -8623,11 +8623,11 @@ func TestDomainPointerRegistryDTargetWithNoDomainAllowsAnyTarget(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err2 := fx.domainD.SetTarget(subject, x); err2 != nil {
+	if err2 := fx.domainD.SetTarget(fx.graph, subject, x); err2 != nil {
 		t.Fatalf("SetTarget(subject, x) with no domain: %v", err2)
 	}
 
-	target, hasTarget, err := fx.domainD.Target(subject)
+	target, hasTarget, err := fx.domainD.Target(fx.graph, subject)
 	if err != nil {
 		t.Fatalf("Target(subject): %v", err)
 	}
@@ -8656,11 +8656,11 @@ func TestDomainPointerRegistryDSetDomainEnforcesMembership(t *testing.T) {
 		t.Fatal(err2)
 	}
 
-	if err3 := fx.domainD.SetDomain(subject, domainSet); err3 != nil {
+	if err3 := fx.domainD.SetDomain(fx.graph, subject, domainSet); err3 != nil {
 		t.Fatalf("SetDomain(subject, domainSet): %v", err3)
 	}
 
-	if err4 := fx.domainD.SetTarget(subject, allowed); err4 != nil {
+	if err4 := fx.domainD.SetTarget(fx.graph, subject, allowed); err4 != nil {
 		t.Fatalf("SetTarget(subject, allowed): %v", err4)
 	}
 
@@ -8669,7 +8669,7 @@ func TestDomainPointerRegistryDSetDomainEnforcesMembership(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err = fx.domainD.SetTarget(subject, disallowed)
+	err = fx.domainD.SetTarget(fx.graph, subject, disallowed)
 	if !errors.Is(err, ErrTargetOutsideDomain) {
 		t.Fatalf("SetTarget(subject, disallowed) error = %v, want %v", err, ErrTargetOutsideDomain)
 	}
@@ -8687,7 +8687,7 @@ func TestDomainPointerRegistryDSetDomainRejectsNonSetTaggedNode(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err = fx.domainD.SetDomain(subject, notASet)
+	err = fx.domainD.SetDomain(fx.graph, subject, notASet)
 	if !errors.Is(err, ErrInvalidSetOperand) {
 		t.Fatalf("SetDomain(subject, notASet) error = %v, want %v", err, ErrInvalidSetOperand)
 	}
@@ -8704,7 +8704,7 @@ func TestDomainPointerRegistryDSetDomainRejectsWhenCurrentTargetOutsideNewDomain
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err2 := fx.domainD.SetTarget(subject, x); err2 != nil {
+	if err2 := fx.domainD.SetTarget(fx.graph, subject, x); err2 != nil {
 		t.Fatalf("SetTarget(subject, x): %v", err2)
 	}
 
@@ -8714,12 +8714,12 @@ func TestDomainPointerRegistryDSetDomainRejectsWhenCurrentTargetOutsideNewDomain
 	}
 	// domainSet deliberately does not contain x.
 
-	err = fx.domainD.SetDomain(subject, domainSet)
+	err = fx.domainD.SetDomain(fx.graph, subject, domainSet)
 	if !errors.Is(err, ErrTargetOutsideDomain) {
 		t.Fatalf("SetDomain(subject, domainSet) error = %v, want %v", err, ErrTargetOutsideDomain)
 	}
 
-	_, hasDomain, err := fx.domainD.Domain(subject)
+	_, hasDomain, err := fx.domainD.Domain(fx.graph, subject)
 	if err != nil {
 		t.Fatalf("Domain(subject): %v", err)
 	}
@@ -8739,7 +8739,7 @@ func TestDomainPointerRegistryDRemoveDomainAllowsAnyTargetAgain(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err2 := fx.domainD.SetDomain(subject, domainSet); err2 != nil {
+	if err2 := fx.domainD.SetDomain(fx.graph, subject, domainSet); err2 != nil {
 		t.Fatalf("SetDomain(subject, domainSet): %v", err2)
 	}
 
@@ -8747,11 +8747,11 @@ func TestDomainPointerRegistryDRemoveDomainAllowsAnyTargetAgain(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err3 := fx.domainD.SetTarget(subject, outside); !errors.Is(err3, ErrTargetOutsideDomain) {
+	if err3 := fx.domainD.SetTarget(fx.graph, subject, outside); !errors.Is(err3, ErrTargetOutsideDomain) {
 		t.Fatalf("SetTarget(subject, outside) before RemoveDomain error = %v, want %v", err3, ErrTargetOutsideDomain)
 	}
 
-	removed, err := fx.domainD.RemoveDomain(subject)
+	removed, err := fx.domainD.RemoveDomain(fx.graph, subject)
 	if err != nil {
 		t.Fatalf("RemoveDomain(subject): %v", err)
 	}
@@ -8759,7 +8759,7 @@ func TestDomainPointerRegistryDRemoveDomainAllowsAnyTargetAgain(t *testing.T) {
 		t.Fatal("RemoveDomain() reported that nothing was removed")
 	}
 
-	if err4 := fx.domainD.SetTarget(subject, outside); err4 != nil {
+	if err4 := fx.domainD.SetTarget(fx.graph, subject, outside); err4 != nil {
 		t.Fatalf("SetTarget(subject, outside) after RemoveDomain: %v", err4)
 	}
 }
@@ -8784,11 +8784,11 @@ func TestDomainPointerRegistryDDomainViaCompositeSet(t *testing.T) {
 		t.Fatalf("AddOperand(): %v", err2)
 	}
 
-	if err3 := fx.domainD.SetDomain(subject, domainComposite); err3 != nil {
+	if err3 := fx.domainD.SetDomain(fx.graph, subject, domainComposite); err3 != nil {
 		t.Fatalf("SetDomain(subject, domainComposite): %v", err3)
 	}
 
-	if err4 := fx.domainD.SetTarget(subject, allowed); err4 != nil {
+	if err4 := fx.domainD.SetTarget(fx.graph, subject, allowed); err4 != nil {
 		t.Fatalf("SetTarget(subject, allowed): %v", err4)
 	}
 
@@ -8796,7 +8796,7 @@ func TestDomainPointerRegistryDDomainViaCompositeSet(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = fx.domainD.SetTarget(subject, disallowed)
+	err = fx.domainD.SetTarget(fx.graph, subject, disallowed)
 	if !errors.Is(err, ErrTargetOutsideDomain) {
 		t.Fatalf("SetTarget(subject, disallowed) error = %v, want %v", err, ErrTargetOutsideDomain)
 	}
@@ -8822,11 +8822,11 @@ func TestDomainPointerRegistryDDomainViaCompositeSetLog(t *testing.T) {
 		t.Fatalf("AppendOperation(): %v", err2)
 	}
 
-	if err3 := fx.domainD.SetDomain(subject, domainLog); err3 != nil {
+	if err3 := fx.domainD.SetDomain(fx.graph, subject, domainLog); err3 != nil {
 		t.Fatalf("SetDomain(subject, domainLog): %v", err3)
 	}
 
-	if err4 := fx.domainD.SetTarget(subject, allowed); err4 != nil {
+	if err4 := fx.domainD.SetTarget(fx.graph, subject, allowed); err4 != nil {
 		t.Fatalf("SetTarget(subject, allowed): %v", err4)
 	}
 
@@ -8834,7 +8834,7 @@ func TestDomainPointerRegistryDDomainViaCompositeSetLog(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = fx.domainD.SetTarget(subject, disallowed)
+	err = fx.domainD.SetTarget(fx.graph, subject, disallowed)
 	if !errors.Is(err, ErrTargetOutsideDomain) {
 		t.Fatalf("SetTarget(subject, disallowed) error = %v, want %v", err, ErrTargetOutsideDomain)
 	}
@@ -8867,7 +8867,7 @@ func TestDomainPointerRegistryDCheckerCatchesOutOfBandTargetChange(t *testing.T)
 	if _, err2 := fx.sets.Add(fx.graph, domainSet, allowed); err2 != nil {
 		t.Fatal(err2)
 	}
-	if err3 := fx.domainD.SetDomain(subject, domainSet); err3 != nil {
+	if err3 := fx.domainD.SetDomain(fx.graph, subject, domainSet); err3 != nil {
 		t.Fatalf("SetDomain(subject, domainSet): %v", err3)
 	}
 
@@ -8876,12 +8876,12 @@ func TestDomainPointerRegistryDCheckerCatchesOutOfBandTargetChange(t *testing.T)
 		t.Fatal(err)
 	}
 
-	err = fx.domainD.metadata.SetTarget(subject, disallowed)
+	err = fx.domainD.metadata.SetTarget(fx.graph, subject, disallowed)
 	if !errors.Is(err, ErrTargetOutsideDomain) {
 		t.Fatalf("bypassing SetTarget() error = %v, want %v", err, ErrTargetOutsideDomain)
 	}
 
-	target, hasTarget, err := fx.domainD.Target(subject)
+	target, hasTarget, err := fx.domainD.Target(fx.graph, subject)
 	if err != nil {
 		t.Fatalf("Target(subject): %v", err)
 	}
@@ -8914,10 +8914,10 @@ func TestDomainPointerRegistryDCheckerCatchesOutOfBandDomainChange(t *testing.T)
 	if _, err2 := fx.sets.Add(fx.graph, firstDomain, x); err2 != nil {
 		t.Fatal(err2)
 	}
-	if err3 := fx.domainD.SetDomain(subject, firstDomain); err3 != nil {
+	if err3 := fx.domainD.SetDomain(fx.graph, subject, firstDomain); err3 != nil {
 		t.Fatalf("SetDomain(subject, firstDomain): %v", err3)
 	}
-	if err4 := fx.domainD.SetTarget(subject, x); err4 != nil {
+	if err4 := fx.domainD.SetTarget(fx.graph, subject, x); err4 != nil {
 		t.Fatalf("SetTarget(subject, x): %v", err4)
 	}
 
@@ -8927,12 +8927,12 @@ func TestDomainPointerRegistryDCheckerCatchesOutOfBandDomainChange(t *testing.T)
 	}
 	// secondDomain deliberately does not contain x.
 
-	m, _, found, err := fx.domainD.metadata.locate(subject)
+	m, _, found, err := fx.domainD.metadata.locate(fx.graph, subject)
 	if err != nil || !found {
 		t.Fatalf("locate(subject): found=%v err=%v", found, err)
 	}
 
-	slot, found, err := fx.domainD.domainSlotFor(m)
+	slot, found, err := fx.domainD.domainSlotFor(fx.graph, m)
 	if err != nil || !found {
 		t.Fatalf("domainSlotFor(m): found=%v err=%v", found, err)
 	}
@@ -8942,7 +8942,7 @@ func TestDomainPointerRegistryDCheckerCatchesOutOfBandDomainChange(t *testing.T)
 		t.Fatalf("bypassing SetDomain() error = %v, want %v", err, ErrTargetOutsideDomain)
 	}
 
-	domain, hasDomain, err := fx.domainD.Domain(subject)
+	domain, hasDomain, err := fx.domainD.Domain(fx.graph, subject)
 	if err != nil {
 		t.Fatalf("Domain(subject): %v", err)
 	}
@@ -9079,11 +9079,11 @@ func TestCrossRoleNodeParticipatesInMultipleStructuresSimultaneously(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err7 := fx.domainD.SetDomain(subject, composite); err7 != nil {
+	if err7 := fx.domainD.SetDomain(fx.graph, subject, composite); err7 != nil {
 		t.Fatalf("SetDomain(subject, composite): %v", err7)
 	}
 
-	if err8 := fx.domainD.SetTarget(subject, m1); err8 != nil {
+	if err8 := fx.domainD.SetTarget(fx.graph, subject, m1); err8 != nil {
 		t.Fatalf("SetTarget(subject, m1) within domain: %v", err8)
 	}
 
@@ -9091,7 +9091,7 @@ func TestCrossRoleNodeParticipatesInMultipleStructuresSimultaneously(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = fx.domainD.SetTarget(subject, outside)
+	err = fx.domainD.SetTarget(fx.graph, subject, outside)
 	if !errors.Is(err, ErrTargetOutsideDomain) {
 		t.Fatalf("SetTarget(subject, outside) error = %v, want %v", err, ErrTargetOutsideDomain)
 	}
@@ -9107,7 +9107,7 @@ func TestCrossRoleNodeParticipatesInMultipleStructuresSimultaneously(t *testing.
 	if _, err9 := fx.sets.Add(fx.graph, s, m3); err9 != nil {
 		t.Fatalf("Add(s, m3): %v", err9)
 	}
-	if err10 := fx.domainD.SetTarget(subject, m3); err10 != nil {
+	if err10 := fx.domainD.SetTarget(fx.graph, subject, m3); err10 != nil {
 		t.Fatalf("SetTarget(subject, m3) after S gained a new member live: %v", err10)
 	}
 }
@@ -9174,13 +9174,13 @@ func TestCrossRoleDomainPointerDetectsCycleIntroducedThroughDomainItself(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err5 := fx.domainD.SetDomain(subject, composite); err5 != nil {
+	if err5 := fx.domainD.SetDomain(fx.graph, subject, composite); err5 != nil {
 		t.Fatalf("SetDomain(subject, composite): %v", err5)
 	}
 
 	// Before the cycle exists, x is legitimately reachable through
 	// composite -> log1 -> s, so this must succeed.
-	if err6 := fx.domainD.SetTarget(subject, x); err6 != nil {
+	if err6 := fx.domainD.SetTarget(fx.graph, subject, x); err6 != nil {
 		t.Fatalf("SetTarget(subject, x) before cycle introduced: %v", err6)
 	}
 
@@ -9202,7 +9202,7 @@ func TestCrossRoleDomainPointerDetectsCycleIntroducedThroughDomainItself(t *test
 	// The domain pointer's own SetTarget must surface the same cycle
 	// error, not silently succeed and not misreport it as
 	// ErrTargetOutsideDomain.
-	err = fx.domainD.SetTarget(subject, x)
+	err = fx.domainD.SetTarget(fx.graph, subject, x)
 	if !errors.Is(err, ErrCompositeSetCycle) {
 		t.Fatalf("SetTarget(subject, x) after cycle introduced: error = %v, want %v", err, ErrCompositeSetCycle)
 	}
@@ -9211,7 +9211,7 @@ func TestCrossRoleDomainPointerDetectsCycleIntroducedThroughDomainItself(t *test
 	// slot's stored target, never evaluates anything, so it must keep
 	// reporting composite regardless of composite's own current
 	// evaluability.
-	domain, hasDomain, err := fx.domainD.Domain(subject)
+	domain, hasDomain, err := fx.domainD.Domain(fx.graph, subject)
 	if err != nil {
 		t.Fatalf("Domain(subject) after cycle introduced: %v", err)
 	}
@@ -9385,10 +9385,10 @@ func TestCrossRoleSetRegistryConflictCheckExercisedWhileSetIsDomainAndOperand(t 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err3 := fx.domainD.SetDomain(subject, c); err3 != nil {
+	if err3 := fx.domainD.SetDomain(fx.graph, subject, c); err3 != nil {
 		t.Fatalf("SetDomain(subject, c): %v", err3)
 	}
-	if err4 := fx.domainD.SetTarget(subject, x); err4 != nil {
+	if err4 := fx.domainD.SetTarget(fx.graph, subject, x); err4 != nil {
 		t.Fatalf("SetTarget(subject, x) within domain c: %v", err4)
 	}
 
@@ -9433,7 +9433,7 @@ func TestCrossRoleSetRegistryConflictCheckExercisedWhileSetIsDomainAndOperand(t 
 	// c's role as subject's domain must likewise be completely
 	// unaffected: subject's existing target is still valid, and a target
 	// outside c's membership is still correctly rejected.
-	target, hasTarget, err := fx.domainD.Target(subject)
+	target, hasTarget, err := fx.domainD.Target(fx.graph, subject)
 	if err != nil {
 		t.Fatalf("Target(subject) after declined TagAsSet: %v", err)
 	}
@@ -9445,7 +9445,7 @@ func TestCrossRoleSetRegistryConflictCheckExercisedWhileSetIsDomainAndOperand(t 
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = fx.domainD.SetTarget(subject, outside)
+	err = fx.domainD.SetTarget(fx.graph, subject, outside)
 	if !errors.Is(err, ErrTargetOutsideDomain) {
 		t.Fatalf("SetTarget(subject, outside) after declined TagAsSet: error = %v, want %v", err, ErrTargetOutsideDomain)
 	}
