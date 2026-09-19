@@ -1826,7 +1826,7 @@ func TestTxnFindNodesReflectsUncommittedCreatesAndRollback(t *testing.T) {
 
 	err = g.Transact(func(tx Tx) error {
 		var txErr error
-		created, txErr = tx.CreateNode()
+		created, txErr = createNodeTx(tx)
 		if txErr != nil {
 			return txErr
 		}
@@ -1920,7 +1920,7 @@ func TestRootGraphInsideGraphActor(t *testing.T) {
 		var txErr error
 		createdVirtualInTx, txErr = tx.AddRelationship(root, a)
 		if txErr != nil {
-			return txErr
+			return wrapInterfaceErr(txErr)
 		}
 
 		deleteRootErr = tx.DeleteNode(root)
@@ -2162,12 +2162,10 @@ func TestRootGraphTransactAndCheckerSeeOverlay(t *testing.T) {
 		var txErr error
 		createdVirtualInTx, txErr = tx.AddRelationship(root, x)
 		if txErr != nil {
-			return txErr
+			return wrapInterfaceErr(txErr)
 		}
 
-		_, txErr = tx.AddRelationship(tag, x)
-
-		return txErr
+		return addRelationshipTx(tx, tag, x)
 	})
 	if err != nil {
 		t.Fatalf("Transact(): %v", err)
@@ -2690,18 +2688,17 @@ func TestTransactCommitsMutationsOnSuccess(t *testing.T) {
 	var a, b NodeID
 	err := g.Transact(func(tx Tx) error {
 		var err error
-		a, err = tx.CreateNode()
+		a, err = createNodeTx(tx)
 		if err != nil {
 			return err
 		}
 
-		b, err = tx.CreateNode()
+		b, err = createNodeTx(tx)
 		if err != nil {
 			return err
 		}
 
-		_, err = tx.AddRelationship(a, b)
-		return err
+		return addRelationshipTx(tx, a, b)
 	})
 	if err != nil {
 		t.Fatalf("Transact() returned error: %v", err)
@@ -2724,12 +2721,12 @@ func TestTransactRollsBackCreateNodeOnLaterFailure(t *testing.T) {
 	var id NodeID
 	err := g.Transact(func(tx Tx) error {
 		var err error
-		id, err = tx.CreateNode()
+		id, err = createNodeTx(tx)
 		if err != nil {
 			return err
 		}
 
-		_, err = tx.AddRelationship(id, nonexistent)
+		err = addRelationshipTx(tx, id, nonexistent)
 		return err
 	})
 
@@ -2763,16 +2760,15 @@ func TestTransactRollsBackRelationshipsInLIFOOrder(t *testing.T) {
 	const nonexistent NodeID = 999999
 
 	err = g.Transact(func(tx Tx) error {
-		if _, err2 := tx.AddRelationship(a, b); err2 != nil {
+		if err2 := addRelationshipTx(tx, a, b); err2 != nil {
 			return err2
 		}
 
-		if _, err3 := tx.AddRelationship(a, c); err3 != nil {
+		if err3 := addRelationshipTx(tx, a, c); err3 != nil {
 			return err3
 		}
 
-		_, err4 := tx.AddRelationship(a, nonexistent)
-		return err4
+		return addRelationshipTx(tx, a, nonexistent)
 	})
 
 	if !errors.Is(err, ErrNodeNotFound) {
@@ -2808,12 +2804,11 @@ func TestTransactRollsBackRemoveRelationshipOnLaterFailure(t *testing.T) {
 	const nonexistent NodeID = 999999
 
 	err = g.Transact(func(tx Tx) error {
-		if _, err3 := tx.RemoveRelationship(a, b); err3 != nil {
+		if err3 := removeRelationshipTx(tx, a, b); err3 != nil {
 			return err3
 		}
 
-		_, err4 := tx.AddRelationship(a, nonexistent)
-		return err4
+		return addRelationshipTx(tx, a, nonexistent)
 	})
 
 	if !errors.Is(err, ErrNodeNotFound) {
@@ -2850,14 +2845,13 @@ func TestTransactDoesNotUndoPreexistingRelationship(t *testing.T) {
 		// transaction did not itself create.
 		created, err3 := tx.AddRelationship(a, b)
 		if err3 != nil {
-			return err3
+			return wrapInterfaceErr(err3)
 		}
 		if created {
 			t.Fatal("AddRelationship() reported creating an already-existing relationship")
 		}
 
-		_, err3 = tx.AddRelationship(a, nonexistent)
-		return err3
+		return addRelationshipTx(tx, a, nonexistent)
 	})
 
 	if !errors.Is(err, ErrNodeNotFound) {
@@ -2882,7 +2876,7 @@ func TestTransactRollsBackOnPanic(t *testing.T) {
 
 		if err := g.Transact(func(tx Tx) error {
 			var err error
-			id, err = tx.CreateNode()
+			id, err = createNodeTx(tx)
 			if err != nil {
 				t.Fatalf("CreateNode(): %v", err)
 			}
@@ -4717,11 +4711,10 @@ func TestListRegistryCheckerCatchesInvalidStructureAtCommitTime(t *testing.T) {
 	// non-capsule node as list's head and links it in as a child,
 	// entirely through one Graph.Transact call.
 	err = g.Transact(func(tx Tx) error {
-		if _, err2 := tx.AddRelationship(list, bogus); err2 != nil {
+		if err2 := addRelationshipTx(tx, list, bogus); err2 != nil {
 			return err2
 		}
-		_, err2 := tx.AddRelationship(lists.allHeads, bogus)
-		return err2
+		return addRelationshipTx(tx, lists.allHeads, bogus)
 	})
 
 	if !errors.Is(err, ErrInvalidListStructure) {
@@ -7671,24 +7664,19 @@ func TestCompositeSetRegistryCheckerCatchesMalformedDescriptorAtCommitTime(t *te
 	// descriptor with both operation-kind tags at once, entirely through
 	// one Graph.Transact call.
 	err = g.Transact(func(tx Tx) error {
-		u, err2 := tx.CreateNode()
+		u, err2 := createNodeTx(tx)
 		if err2 != nil {
 			return err2
 		}
-		if _, err2 = tx.AddRelationship(composites.allAdditiveOp, u); err2 != nil {
-			return err2
+		for _, tag := range []NodeID{composites.allAdditiveOp, composites.allSubtractiveOp, composites.allScalarOperand} {
+			if err3 := addRelationshipTx(tx, tag, u); err3 != nil {
+				return err3
+			}
 		}
-		if _, err2 = tx.AddRelationship(composites.allSubtractiveOp, u); err2 != nil {
-			return err2
+		if err3 := addRelationshipTx(tx, u, x); err3 != nil {
+			return err3
 		}
-		if _, err2 = tx.AddRelationship(composites.allScalarOperand, u); err2 != nil {
-			return err2
-		}
-		if _, err2 = tx.AddRelationship(u, x); err2 != nil {
-			return err2
-		}
-		_, err2 = tx.AddRelationship(set, u)
-		return err2
+		return addRelationshipTx(tx, set, u)
 	})
 
 	if !errors.Is(err, ErrInvalidOperandDescriptor) {
@@ -8655,11 +8643,10 @@ func TestCompositeSetLogRegistrySharesListStructureChecker(t *testing.T) {
 	}
 
 	err = g.Transact(func(tx Tx) error {
-		if _, err2 := tx.AddRelationship(log, bogus); err2 != nil {
+		if err2 := addRelationshipTx(tx, log, bogus); err2 != nil {
 			return err2
 		}
-		_, err2 := tx.AddRelationship(logs.lists.allHeads, bogus)
-		return err2
+		return addRelationshipTx(tx, logs.lists.allHeads, bogus)
 	})
 
 	if !errors.Is(err, ErrInvalidListStructure) {
@@ -10082,12 +10069,12 @@ func TestGraphActorTransactRollsBackOnFailure(t *testing.T) {
 	var id NodeID
 	err := actor.Transact(func(tx Tx) error {
 		var err error
-		id, err = tx.CreateNode()
+		id, err = createNodeTx(tx)
 		if err != nil {
 			return err
 		}
 
-		_, err = tx.AddRelationship(id, nonexistent)
+		err = addRelationshipTx(tx, id, nonexistent)
 		return err
 	})
 

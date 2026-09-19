@@ -1333,6 +1333,18 @@ NodeID-keyed structure outside the primitive graph.
  TestNewRootGraphRejectsGraphActor, and
  TestRootFindRelationshipsWithoutRootNodeEmitsNoVirtualRelationships.
 
+28. Fixed a lint regression from item 27: once Transact's closure took
+ the Tx interface instead of the concrete *Txn, wrapcheck began flagging
+ every error returned unwrapped from a tx method (in main.go and in
+ tests). Added wrap helpers createNodeTx / addRelationshipTx /
+ removeRelationshipTx / deleteNodeTx (all built on wrapInterfaceErr,
+ which preserves errors.Is), and untagAndDeleteNodeTx, which DRYs the
+ identical "remove tag(s), then delete" tail of DeleteList / DeleteSet /
+ DeleteCompositeSet / DeleteCompositeSetLog. tagNodeTx,
+ createTaggedNodeTx and setPointerTargetTx now delegate to them.
+ DeleteCapsule's eight repeated RemoveRelationship blocks became one
+ table-driven loop. No behavior change.
+
 Currently unaddressed yet:
 - Txn does not support nesting one Graph.Transact call inside another
   (Txn.DeleteNode is supported -- see item 15). Nesting is not needed by

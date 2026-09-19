@@ -1804,7 +1804,7 @@ func (r *NameRegistry) CreateNamedNode(graph GraphAPI, name string) (NodeID, err
 
 	err := graph.Transact(func(tx Tx) error {
 		var err error
-		id, err = tx.CreateNode()
+		id, err = createNodeTx(tx)
 		if err != nil {
 			return err
 		}
@@ -2650,8 +2650,53 @@ func wrapInterfaceErr(err error) error {
 // e.g. CompositeSetRegistry.AddOperand's operand descriptors, which carry
 // two independent axis tags on the same freshly created node.
 func tagNodeTx(tx txOps, tag, id NodeID) error {
-	_, err := tx.AddRelationship(tag, id)
+	return addRelationshipTx(tx, tag, id)
+}
+
+// createNodeTx is tx.CreateNode with its error wrapped via
+// wrapInterfaceErr. Every helper and Transact closure in this file
+// should create nodes through this rather than returning an error
+// straight from the interface method, which wrapcheck flags.
+func createNodeTx(tx txOps) (NodeID, error) {
+	id, err := tx.CreateNode()
+	return id, wrapInterfaceErr(err)
+}
+
+// addRelationshipTx is tx.AddRelationship with its error wrapped and its
+// created bool discarded. Use it wherever the caller does not care
+// whether the relationship already existed.
+func addRelationshipTx(tx txOps, from, to NodeID) error {
+	_, err := tx.AddRelationship(from, to)
 	return wrapInterfaceErr(err)
+}
+
+// removeRelationshipTx is tx.RemoveRelationship with its error wrapped
+// and its removed bool discarded.
+func removeRelationshipTx(tx txOps, from, to NodeID) error {
+	_, err := tx.RemoveRelationship(from, to)
+	return wrapInterfaceErr(err)
+}
+
+// deleteNodeTx is tx.DeleteNode with its error wrapped. The wrapping
+// preserves errors.Is, so callers can still test for ErrNodeNotEmpty.
+func deleteNodeTx(tx txOps, id NodeID) error {
+	return wrapInterfaceErr(tx.DeleteNode(id))
+}
+
+// untagAndDeleteNodeTx removes each (tag, node) relationship and then
+// deletes node, all against tx. The tags are ordinary relationships
+// *into* node, so they must go before the delete can succeed; if the
+// delete then fails (e.g. ErrNodeNotEmpty), the enclosing Transact's
+// rollback restores every tag. Shared by DeleteList, DeleteSet,
+// DeleteCompositeSet and DeleteCompositeSetLog.
+func untagAndDeleteNodeTx(tx txOps, node NodeID, tags ...NodeID) error {
+	for _, tag := range tags {
+		if err := removeRelationshipTx(tx, tag, node); err != nil {
+			return err
+		}
+	}
+
+	return deleteNodeTx(tx, node)
 }
 
 // createTaggedNodeTx creates a fresh node and tags it via (tag, id),
@@ -2661,13 +2706,13 @@ func tagNodeTx(tx txOps, tag, id NodeID) error {
 // metadata / target-slot creation inside ensureMetadataWithSubjectSlot
 // and PointerMetadataRegistryD.SetTarget.
 func createTaggedNodeTx(tx txOps, tag NodeID) (NodeID, error) {
-	id, err := tx.CreateNode()
+	id, err := createNodeTx(tx)
 	if err != nil {
-		return 0, wrapInterfaceErr(err)
+		return 0, err
 	}
 
-	if err := tagNodeTx(tx, tag, id); err != nil {
-		return 0, err
+	if err2 := tagNodeTx(tx, tag, id); err2 != nil {
+		return 0, err2
 	}
 
 	return id, nil
@@ -2693,13 +2738,12 @@ func newPointerTx(tx txOps, allPointers NodeID) (NodeID, error) {
 // this, exactly as PointerRegistry.SetTarget already does.
 func setPointerTargetTx(tx txOps, id, current NodeID, hasCurrent bool, target NodeID) error {
 	if hasCurrent {
-		if _, err := tx.RemoveRelationship(id, current); err != nil {
-			return wrapInterfaceErr(err)
+		if err := removeRelationshipTx(tx, id, current); err != nil {
+			return err
 		}
 	}
 
-	_, err := tx.AddRelationship(id, target)
-	return wrapInterfaceErr(err)
+	return addRelationshipTx(tx, id, target)
 }
 
 // singleChildTargetSetTx sets node's single "target" child -- under the
@@ -3237,7 +3281,7 @@ func ensureMetadataWithSubjectSlot(g GraphAPI, subject, allPointerMetadata, allS
 		if err2 != nil {
 			return err2
 		}
-		if _, err3 := tx.AddRelationship(subjectSlot, subject); err3 != nil {
+		if err3 := addRelationshipTx(tx, subjectSlot, subject); err3 != nil {
 			return err3
 		}
 
@@ -3246,8 +3290,7 @@ func ensureMetadataWithSubjectSlot(g GraphAPI, subject, allPointerMetadata, allS
 			return err2
 		}
 
-		_, err2 = tx.AddRelationship(metadata, subjectSlot)
-		return err2
+		return addRelationshipTx(tx, metadata, subjectSlot)
 	})
 	if err != nil {
 		return 0, 0, wrapInterfaceErr(err)
@@ -3707,11 +3750,10 @@ func (m *PointerMetadataRegistryD) SetTarget(graph GraphAPI, subject, target Nod
 			if txErr != nil {
 				return txErr
 			}
-			if _, txErr = tx.AddRelationship(metadata, slot); txErr != nil {
+			if txErr = addRelationshipTx(tx, metadata, slot); txErr != nil {
 				return txErr
 			}
-			_, txErr = tx.AddRelationship(slot, target)
-			return txErr
+			return addRelationshipTx(tx, slot, target)
 		}))
 	}
 
@@ -4415,42 +4457,34 @@ func (c *CapsuleRegistry) DeleteCapsule(graph GraphAPI, capsule NodeID) error {
 			return err
 		}
 
-		if _, err := tx.RemoveRelationship(capsule, prevSlot); err != nil {
-			return err
+		// Every relationship here is one buildCapsuleTx itself created.
+		// prevSlot/nextSlot's own targets are deliberately absent: see
+		// the DeleteCapsule doc comment.
+		edges := []Relationship{
+			{From: capsule, To: prevSlot},
+			{From: c.prevSlots.allPointers, To: prevSlot},
+			{From: capsule, To: valueSlot},
+			{From: c.valueSlots.allPointers, To: valueSlot},
+			{From: capsule, To: nextSlot},
+			{From: c.nextSlots.allPointers, To: nextSlot},
+			{From: c.allElementCapsules, To: capsule},
 		}
-		if _, err := tx.RemoveRelationship(c.prevSlots.allPointers, prevSlot); err != nil {
-			return err
-		}
-
 		if hasValue {
-			if _, err := tx.RemoveRelationship(valueSlot, value); err != nil {
-				return err
+			edges = append(edges, Relationship{From: valueSlot, To: value})
+		}
+
+		for _, edge := range edges {
+			if err2 := removeRelationshipTx(tx, edge.From, edge.To); err2 != nil {
+				return err2
 			}
-		}
-		if _, err := tx.RemoveRelationship(capsule, valueSlot); err != nil {
-			return err
-		}
-		if _, err := tx.RemoveRelationship(c.valueSlots.allPointers, valueSlot); err != nil {
-			return err
-		}
-
-		if _, err := tx.RemoveRelationship(capsule, nextSlot); err != nil {
-			return err
-		}
-		if _, err := tx.RemoveRelationship(c.nextSlots.allPointers, nextSlot); err != nil {
-			return err
-		}
-
-		if _, err := tx.RemoveRelationship(c.allElementCapsules, capsule); err != nil {
-			return err
 		}
 
 		for _, node := range []NodeID{prevSlot, valueSlot, nextSlot, capsule} {
-			if err := tx.DeleteNode(node); err != nil {
-				if errors.Is(err, ErrNodeNotEmpty) {
+			if err2 := deleteNodeTx(tx, node); err2 != nil {
+				if errors.Is(err2, ErrNodeNotEmpty) {
 					return ErrCapsuleNotEmpty
 				}
-				return err
+				return err2
 			}
 		}
 
@@ -4756,7 +4790,7 @@ func (l *ListRegistry) Prepend(graph GraphAPI, list, value NodeID) (NodeID, erro
 			return err
 		}
 
-		if _, err2 := tx.AddRelationship(list, capsule); err2 != nil {
+		if err2 := addRelationshipTx(tx, list, capsule); err2 != nil {
 			return err2
 		}
 
@@ -4767,17 +4801,16 @@ func (l *ListRegistry) Prepend(graph GraphAPI, list, value NodeID) (NodeID, erro
 			if err4 := l.capsules.setPrevTx(tx, oldHead, capsule); err4 != nil {
 				return err4
 			}
-			if _, err5 := tx.RemoveRelationship(l.allHeads, oldHead); err5 != nil {
+			if err5 := removeRelationshipTx(tx, l.allHeads, oldHead); err5 != nil {
 				return err5
 			}
 		} else {
-			if _, err6 := tx.AddRelationship(l.allTails, capsule); err6 != nil {
+			if err6 := addRelationshipTx(tx, l.allTails, capsule); err6 != nil {
 				return err6
 			}
 		}
 
-		_, err = tx.AddRelationship(l.allHeads, capsule)
-		return err
+		return addRelationshipTx(tx, l.allHeads, capsule)
 	})
 	if err != nil {
 		return 0, wrapInterfaceErr(err)
@@ -4828,7 +4861,7 @@ func (l *ListRegistry) InsertAfter(graph GraphAPI, list, afterCapsule, value Nod
 			return err
 		}
 
-		if _, err2 := tx.AddRelationship(list, capsule); err2 != nil {
+		if err2 := addRelationshipTx(tx, list, capsule); err2 != nil {
 			return err2
 		}
 
@@ -4849,11 +4882,10 @@ func (l *ListRegistry) InsertAfter(graph GraphAPI, list, afterCapsule, value Nod
 			return nil
 		}
 
-		if _, err7 := tx.RemoveRelationship(l.allTails, afterCapsule); err7 != nil {
+		if err7 := removeRelationshipTx(tx, l.allTails, afterCapsule); err7 != nil {
 			return err7
 		}
-		_, err = tx.AddRelationship(l.allTails, capsule)
-		return err
+		return addRelationshipTx(tx, l.allTails, capsule)
 	})
 	if err != nil {
 		return 0, wrapInterfaceErr(err)
@@ -5159,10 +5191,10 @@ func (l *ListRegistry) RemoveWithoutDeletingCapsule(graph GraphAPI, list, capsul
 			if _, err4 := l.capsules.removeNextTx(tx, prev); err4 != nil {
 				return err4
 			}
-			if _, err5 := tx.RemoveRelationship(l.allTails, capsule); err5 != nil {
+			if err5 := removeRelationshipTx(tx, l.allTails, capsule); err5 != nil {
 				return err5
 			}
-			if _, err6 := tx.AddRelationship(l.allTails, prev); err6 != nil {
+			if err6 := addRelationshipTx(tx, l.allTails, prev); err6 != nil {
 				return err6
 			}
 
@@ -5171,19 +5203,19 @@ func (l *ListRegistry) RemoveWithoutDeletingCapsule(graph GraphAPI, list, capsul
 			if _, err7 := l.capsules.removePrevTx(tx, next); err7 != nil {
 				return err7
 			}
-			if _, err8 := tx.RemoveRelationship(l.allHeads, capsule); err8 != nil {
+			if err8 := removeRelationshipTx(tx, l.allHeads, capsule); err8 != nil {
 				return err8
 			}
-			if _, err9 := tx.AddRelationship(l.allHeads, next); err9 != nil {
+			if err9 := addRelationshipTx(tx, l.allHeads, next); err9 != nil {
 				return err9
 			}
 
 		default:
 			// capsule was the sole element: the list becomes empty.
-			if _, err10 := tx.RemoveRelationship(l.allHeads, capsule); err10 != nil {
+			if err10 := removeRelationshipTx(tx, l.allHeads, capsule); err10 != nil {
 				return err10
 			}
-			if _, err11 := tx.RemoveRelationship(l.allTails, capsule); err11 != nil {
+			if err11 := removeRelationshipTx(tx, l.allTails, capsule); err11 != nil {
 				return err11
 			}
 		}
@@ -5195,8 +5227,7 @@ func (l *ListRegistry) RemoveWithoutDeletingCapsule(graph GraphAPI, list, capsul
 			return err13
 		}
 
-		_, err = tx.RemoveRelationship(list, capsule)
-		return err
+		return removeRelationshipTx(tx, list, capsule)
 	}))
 }
 
@@ -5288,22 +5319,11 @@ func (l *ListRegistry) DeleteList(graph GraphAPI, list NodeID) error {
 	}
 
 	return wrapInterfaceErr(graph.Transact(func(tx Tx) error {
-		if _, err := tx.RemoveRelationship(l.allLists, list); err != nil {
-			return err
-		}
-
-		// tx.DeleteNode is used here (not a direct l.graph.DeleteNode
-		// call) purely for consistency with every other multi-step
-		// registry operation's txOps discipline in this file, now that
-		// Txn.DeleteNode exists (theorystate.md section 78). This
-		// is the last step in the sequence, so behavior is unchanged
-		// either way: DeleteNode either succeeds outright or fails
-		// without mutating anything, in which case returning its error
-		// from this closure triggers Transact's normal rollback of the
-		// tag-removal step above -- but going through tx means this
-		// method no longer needs its own special-cased exception to a
-		// pattern the rest of the file follows uniformly.
-		return tx.DeleteNode(list)
+		// Tag removal and delete are steps of this one transaction: if
+		// the delete fails (e.g. ErrNodeNotEmpty), Transact's rollback
+		// restores the (AllLists, list) tag. See untagAndDeleteNodeTx and
+		// theorystate.md section 78.
+		return untagAndDeleteNodeTx(tx, list, l.allLists)
 	}))
 }
 
@@ -5575,11 +5595,7 @@ func (s *SetRegistry) DeleteSet(graph GraphAPI, set NodeID) error {
 	}
 
 	return wrapInterfaceErr(graph.Transact(func(tx Tx) error {
-		if _, err := tx.RemoveRelationship(s.allSets, set); err != nil {
-			return err
-		}
-
-		return tx.DeleteNode(set)
+		return untagAndDeleteNodeTx(tx, set, s.allSets)
 	}))
 }
 
@@ -6112,8 +6128,7 @@ func (c *CompositeSetRegistry) AddOperand(graph GraphAPI, set, operand NodeID, a
 			return err2
 		}
 
-		_, err2 = tx.AddRelationship(set, u)
-		return err2
+		return addRelationshipTx(tx, set, u)
 	})
 	if err != nil {
 		return 0, wrapInterfaceErr(err)
@@ -6156,8 +6171,8 @@ func (c *CompositeSetRegistry) RemoveOperand(graph GraphAPI, set, u NodeID) erro
 	}
 
 	return wrapInterfaceErr(graph.Transact(func(tx Tx) error {
-		if _, err := tx.RemoveRelationship(set, u); err != nil {
-			return err
+		if err2 := removeRelationshipTx(tx, set, u); err2 != nil {
+			return err2
 		}
 
 		return deleteOperandDescriptorTx(tx, operand, hasOperand, operationTag, operandTag, u)
@@ -6367,11 +6382,7 @@ func (c *CompositeSetRegistry) DeleteCompositeSet(graph GraphAPI, set NodeID) er
 	}
 
 	return wrapInterfaceErr(graph.Transact(func(tx Tx) error {
-		if _, err := tx.RemoveRelationship(c.allCompositeSets, set); err != nil {
-			return err
-		}
-
-		return tx.DeleteNode(set)
+		return untagAndDeleteNodeTx(tx, set, c.allCompositeSets)
 	}))
 }
 
@@ -6924,14 +6935,7 @@ func (c *CompositeSetLogRegistry) DeleteCompositeSetLog(graph GraphAPI, log Node
 	}
 
 	return wrapInterfaceErr(graph.Transact(func(tx Tx) error {
-		if _, err := tx.RemoveRelationship(c.allCompositeSetLogs, log); err != nil {
-			return err
-		}
-		if _, err := tx.RemoveRelationship(c.lists.allLists, log); err != nil {
-			return err
-		}
-
-		return tx.DeleteNode(log)
+		return untagAndDeleteNodeTx(tx, log, c.allCompositeSetLogs, c.lists.allLists)
 	}))
 }
 
@@ -7021,11 +7025,10 @@ func (d *domainConstraint) SetDomain(graph GraphAPI, anchor, domain NodeID) erro
 			if err2 != nil {
 				return err2
 			}
-			if _, err3 := tx.AddRelationship(anchor, newSlot); err3 != nil {
+			if err3 := addRelationshipTx(tx, anchor, newSlot); err3 != nil {
 				return err3
 			}
-			_, err4 := tx.AddRelationship(newSlot, domain)
-			return err4
+			return addRelationshipTx(tx, newSlot, domain)
 		}))
 	}
 
@@ -7214,8 +7217,7 @@ func (b *DomainPointerRegistryB) NewDomainPointer(graph GraphAPI, anchor NodeID)
 			return err2
 		}
 
-		_, err2 = tx.AddRelationship(anchor, u)
-		return err2
+		return addRelationshipTx(tx, anchor, u)
 	}))
 }
 
