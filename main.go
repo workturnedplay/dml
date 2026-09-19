@@ -2327,8 +2327,8 @@ func (s rootStore) CreateNode() (NodeID, error) {
 // is virtual and not physically stored, so adding one is an idempotent
 // no-op. Relationships pointing to ROOT are ordinary and are stored.
 func (s rootStore) AddRelationship(from, to NodeID) (created bool, err error) {
-	if err = s.requireExist(from, to); err != nil {
-		return false, err
+	if existErr := s.requireExist(from, to); existErr != nil {
+		return false, existErr
 	}
 
 	if from == s.root {
@@ -2345,8 +2345,8 @@ func (s rootStore) AddRelationship(from, to NodeID) (created bool, err error) {
 // RemoveRelationship removes an ordinary relationship. Virtual ROOT
 // relationships cannot be removed, so removing (ROOT, X) is a no-op.
 func (s rootStore) RemoveRelationship(from, to NodeID) (removed bool, err error) {
-	if err = s.requireExist(from, to); err != nil {
-		return false, err
+	if existErr := s.requireExist(from, to); existErr != nil {
+		return false, existErr
 	}
 
 	if from == s.root {
@@ -3750,8 +3750,8 @@ func (m *PointerMetadataRegistryD) SetTarget(graph GraphAPI, subject, target Nod
 			if txErr != nil {
 				return txErr
 			}
-			if txErr = addRelationshipTx(tx, metadata, slot); txErr != nil {
-				return txErr
+			if err2 := addRelationshipTx(tx, metadata, slot); err2 != nil {
+				return err2
 			}
 			return addRelationshipTx(tx, slot, target)
 		}))
