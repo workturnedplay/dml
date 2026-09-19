@@ -636,6 +636,15 @@ self-loop — only by genuine incoming relationships from other nodes, which
 remain ordinary and permitted (ROOT may have parents, per the existing text
 below).
 
+**Symmetry (added with §87b).** The overlay is bidirectional (§4): since
+`(ROOT,X)` is visible for every existing `X != ROOT`, ROOT is also
+reported as a parent of every such `X` by `FindIncoming(X)`, and never as
+a parent of itself. Any *stored* relationship whose source is ROOT is
+ignored in both directions (the overlay represents ROOT's outgoing side
+entirely virtually), so a physically stored `(ROOT,X)` is never reported
+twice. Before §87b the incoming side omitted the virtual edge, which
+contradicted `HasRelationship(ROOT,X)`.
+
 ## 13. Virtual/overlay structures
 
 General concept: a layer can expose a derived universe over the underlying
@@ -2043,7 +2052,8 @@ error)`, `RemoveRelationship(a, b NodeID) (bool, error)`,
 `HasRelationship(a, b NodeID) bool`, `FindRelationship(from, to NodeID)
 (Relationship, bool, error)`, `FindOutgoing(NodeID) ([]Relationship,
 error)`, `FindIncoming(NodeID) ([]Relationship, error)`,
-`FindRelationships() []Relationship`, `DeleteNode(NodeID) error`.
+`FindRelationships() []Relationship`, `FindNodes() []NodeID` (added by
+§87b), `DeleteNode(NodeID) error`.
 `Transact`/`RegisterChecker` are a separate concern from raw storage (see
 §89a) and should not be assumed to belong on the same interface without
 first resolving §89. The existing concrete type (today's `Graph`) would
@@ -2054,43 +2064,85 @@ vice versa); this naming choice is deliberately left open until the
 refactor is actually written, since it has no bearing on the design
 questions below.
 
-## 87b. Node enumeration on the storage interface — DECIDED, implemented (closes §87a's gap)
+## 87b. Node enumeration, and ROOT as a decorator layer of the graph stack — DECIDED, implemented (closes the RootGraph exception)
 
-§87a and §89b/§90 recorded `RootGraph` as the one higher-level type that
-still depended on the concrete `*Graph`: its ROOT overlay must answer
-"every existing node other than ROOT," and no interface method exposed
-"every node that exists," so it read `Graph.nodes` directly. That was a
-missing capability in the storage surface, not a layering violation to
-work around.
+**The gap.** `RootGraph` was the one higher-level type tied to the
+concrete `*Graph`: its overlay had to answer "every existing node other
+than ROOT" and no interface method exposed that, so it read `Graph.nodes`
+directly. The exception was recorded in `GraphAPI`'s doc comment, §89b's
+closing caveat, §90's "Deliberate exceptions" paragraph, and
+implementation_state.md items 24/25. (§87a itself lists only the method
+surface.) Closing it exposed a deeper problem: `RootGraph` was a parallel
+object holding a graph reference, not something the graph is *seen
+through*.
 
-**Decision.** `GraphReader` gains `FindNodes() []NodeID`, the node-level
-counterpart of `FindRelationships()`, returning every existing NodeID
-sorted ascending. The ordering carries no semantic meaning (§5); it
-exists for deterministic output, and lets `RootGraph` emit `(ROOT,X)`
-relationships already sorted by `X`. It is implemented on `Graph`,
-`Txn`, the checker-facing `graphCoreReader`, and `GraphActor`.
-`RootGraph` now depends only on `GraphStore`, so it can be layered over
-`GraphActor` (§89c) as well as a plain `Graph`, and it is now covered by
-the concurrent-access guard (§89b) like every other caller.
+**Decision 1 — `FindNodes`.** `GraphReader` gains `FindNodes() []NodeID`,
+the node-level counterpart of `FindRelationships()`, returning every
+existing NodeID sorted ascending (order has no semantic meaning, §5; it
+exists for determinism). Implemented on `Graph`, `Txn`, the checker-facing
+`graphCoreReader`, `GraphActor`, and the ROOT overlay.
 
-**Supersedes** the `RootGraph` exception stated in §87a, in §89b's final
-caveat paragraph, and in §90's "Deliberate exceptions" paragraph. Only
-`Txn`'s dependency on the concrete `*Graph` (via `resurrectNode`)
-remains, which is deliberate (§89a).
+**Decision 2 — ROOT is a decorator at every seam the graph is seen
+through.** A virtual relationship must be visible everywhere the graph is
+observed — registries, `Transact` closures, and commit-time Checkers —
+or there is a state where the same fact is visible in one place and not
+another. Go embedding cannot provide this: it is promotion, not
+inheritance, so a promoted method's receiver is the embedded value, and
+`Graph.Transact`'s internals would never dispatch to an overriding
+`RootGraph` method. The overlay is therefore applied by decoration at
+the interface seams:
+- `RootGraph` implements `GraphAPI` over any other `GraphAPI`, so it can be
+  used wherever a `Graph` is (registries, `GraphActor`);
+- `Transact` takes the `Tx` interface (a `GraphStore` scoped to one
+  transaction) instead of the concrete `*Txn`, so `RootGraph.Transact`
+  can hand its closure an overlaid handle;
+- `RootGraph.RegisterChecker` wraps each `Check` so it receives an
+  overlaid reader.
+One implementation (`rootReader` for reads, `rootStore` for reads and
+writes) serves all three. This is the first concrete realization of §13's
+"a layer can expose a derived universe over the underlying one".
 
-**Accepted limits, unchanged in kind from §89c.** Over `GraphActor`,
-each individual `RootGraph` call is atomic but a method issuing several
-calls (e.g. `FindRelationships`, which reads primitive relationships and
-the node list separately) is not one atomic snapshot. `RootGraph` also
-stores its graph reference, so it must not be invoked from inside a
-`Transact` closure or `Checker` running on that same `GraphActor` (§90).
+**Decision 3 — stacking order: the `GraphActor` is outermost.** Layers
+that give the graph *meaning* (ROOT) go inside; the single-owner
+concurrency wrapper (§89c) goes outside:
+`NewGraphActor(NewRootGraph(&g, root))`. Two consequences, both of which
+the reverse order got wrong:
+- *Atomicity.* A multi-step overlay method (e.g. `FindRelationships`
+  reads the stored relationships, then the node list) runs as one job on
+  the actor's goroutine, so it is one consistent snapshot. Outside the
+  actor it would be two round trips, and another goroutine could run
+  between them, yielding a result that never held at any single instant.
+- *Reentrancy.* The reference the overlay stores is the raw backend, never
+  the actor, so the deadlock hazard of §90 cannot arise.
+`NewRootGraph` returns `ErrRootGraphOverActor` for a `*GraphActor`, in
+keeping with this document's fail-loud discipline.
 
-**Edge case fixed.** If ROOT itself no longer exists (only possible by
-deleting it through the raw graph, bypassing `ErrCannotDeleteRoot`), the
-overlay reports no virtual relationships, consistent with
-`HasRelationship` reporting false for any relationship whose source does
-not exist. The previous slice-capacity computation (`len(nodes)-1`)
-could panic in that state.
+**Names are deliberately not a layer.** `NameRegistry` maps strings to
+NodeIDs, and strings are not graph facts (§6a, §25): it adds no
+relationships that graph queries must show, so nothing needs overlaying.
+Its only interaction with graph state is deletion coordination (§74).
+ROOT does add relationships, hence belongs in the interface stack.
+
+**Relationship to §90.** §90's rule — no stored graph reference — governs
+*interpretation registries*. A decorator (`GraphActor`, `RootGraph`)
+necessarily holds the backend it wraps; that is what it is. §90's hazard
+arises only when the stored reference is an actor-fronted, outer one,
+which Decision 3 rules out for `RootGraph`.
+
+**Bugs found and fixed while doing this.** (1) `FindIncoming(X)` did not
+include the virtual `(ROOT,X)` edge, contradicting `HasRelationship` and
+`FindOutgoing(ROOT)`; see the §12a symmetry note. (2)
+`RootGraph.FindRelationships` sized a slice with `len(nodes)-1`, which
+panics on an empty graph (reachable by deleting ROOT through the raw
+graph); the overlay now reports no virtual relationships when ROOT does
+not exist.
+
+**Accepted limits.** `Checker.Tags` relevance filtering still consults
+stored facts only, so a Checker whose invariant is derived from ROOT's
+virtual children will not be invoked by node creation alone (the same
+non-locality as §86). Ordinary tag nodes are unaffected. `Txn` still
+depends on the concrete `*Graph` (via `resurrectNode`), which is
+deliberate (§89a).
 
 ## 88. Backend selection timing: fixed at construction vs. swappable at runtime — OPEN, leaning fixed-at-construction
 
@@ -2232,11 +2284,11 @@ bug -- but does not by itself give the full Go memory-model guarantee
 `go test -race` checks (a non-overlapping handoff between goroutines with
 no happens-before synchronization is still technically racy under the
 memory model, even though this guard would never observe any overlap to
-panic on). `RootGraph`'s own pre-existing, separate exception (§87a) is
-also explicitly not covered: its ROOT-overlay `FindOutgoing`/
-`FindRelationships` read `Graph.nodes` directly, bypassing every public
-`Graph` method -- and therefore this guard -- entirely, exactly as they
-already bypass `GraphAPI` itself.
+panic on). `RootGraph` used to be an exception here, since its ROOT
+overlay read `Graph.nodes` directly and so bypassed this guard; that is
+closed (§87b): the overlay now reaches the graph only through the public
+interface, and inside `Transact` through the transaction handle, so it is
+covered like any other caller.
 
 **What this section does not decide.** Whether either etcd or
 SpacetimeDB is ever actually implemented as a backend (no current
@@ -2589,15 +2641,16 @@ call site — including cross-registry calls, e.g.
 `metadata.targetSlot` / `d.checkAllowed`.
 
 **Deliberate exceptions, already documented elsewhere, not addressed by
-this section.** `RootGraph` and `Txn` (via its unexported
-`resurrectNode` call) still hold a concrete `*Graph` reference.
-`RootGraph`'s ROOT-overlay node enumeration needs private-map access no
-`GraphAPI` method exposes yet (§87a); `Txn`'s own undo-log rollback is
-specific to the in-memory backend's own mechanism for satisfying the
-`Transact` contract (§89a). Neither is an instance of the mistake this
+this section.** `Txn` (via its unexported `resurrectNode` call) still
+holds a concrete `*Graph` reference; its undo-log rollback is specific to
+the in-memory backend's own mechanism for satisfying the `Transact`
+contract (§89a). `RootGraph` was formerly listed here too; it no longer
+is (§87b) — it is a decorator over `GraphAPI`, and like `GraphActor` it
+holds the backend it wraps by necessity, which is never an actor (§87b,
+Decision 3). `Txn` is not an instance of the mistake this
 section addresses — reading through a stored reference instead of an
-explicitly supplied one — since both are single-purpose, non-swappable
-low-level types, not higher-level interpretation registries meant to be
+explicitly supplied one — since it is a single-purpose, non-swappable
+low-level type, not a higher-level interpretation registry meant to be
 constructed once and reused across many separately-submitted
 `GraphActor` calls.
 
@@ -2695,10 +2748,12 @@ kept current as sections above resolve or split further.)*
   dedicated goroutine.
 
 - Node enumeration is part of the storage read interface
-  (`GraphReader.FindNodes`), so `RootGraph` depends only on `GraphStore`
-  and can run over `GraphActor`; this closes the last exception to
-  interface-only access other than `Txn`'s deliberate `*Graph`
-  dependency (§87b).
+  (`GraphReader.FindNodes`). ROOT is a decorator layer implementing
+  `GraphAPI` over any `GraphAPI`, applied at every seam (direct calls,
+  `Transact` via the `Tx` interface, and Checkers), never a parallel
+  object. The `GraphActor` is always the outermost layer, so overlay
+  methods are atomic and the stored reference is never the actor
+  (§87b).
 
 ### TENTATIVE
 - Monotonically increasing NodeIDs; serialized first implementation.

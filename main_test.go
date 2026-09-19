@@ -1824,7 +1824,7 @@ func TestTxnFindNodesReflectsUncommittedCreatesAndRollback(t *testing.T) {
 	var created NodeID
 	var inside []NodeID
 
-	err = g.Transact(func(tx *Txn) error {
+	err = g.Transact(func(tx Tx) error {
 		var txErr error
 		created, txErr = tx.CreateNode()
 		if txErr != nil {
@@ -1850,61 +1850,354 @@ func TestTxnFindNodesReflectsUncommittedCreatesAndRollback(t *testing.T) {
 	}
 }
 
-// TestRootGraphOverGraphActor confirms RootGraph, which now depends only
-// on GraphStore (theorystate.md section 87b), works over a GraphActor
-// with no direct *Graph access at all.
-func TestRootGraphOverGraphActor(t *testing.T) {
+// TestRootGraphInsideGraphActor confirms the stacking rule from
+// theorystate.md section 87b: the GraphActor owns the whole stack, and
+// the ROOT overlay is visible both outside and inside Transact.
+func TestRootGraphInsideGraphActor(t *testing.T) {
+	var g Graph
+
+	root, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for ROOT: %v", err)
+	}
+
+	a, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for a: %v", err)
+	}
+
+	b, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for b: %v", err)
+	}
+
+	rootGraph, err := NewRootGraph(&g, root)
+	if err != nil {
+		t.Fatalf("NewRootGraph(): %v", err)
+	}
+
+	// From here on, g must not be touched directly: the actor owns it.
+	actor := NewGraphActor(rootGraph)
+	defer actor.Close()
+
+	gotOutgoing, err := actor.FindOutgoing(root)
+	if err != nil {
+		t.Fatalf("FindOutgoing(ROOT): %v", err)
+	}
+	wantOutgoing := []Relationship{{From: root, To: a}, {From: root, To: b}}
+	if !reflect.DeepEqual(gotOutgoing, wantOutgoing) {
+		t.Fatalf("FindOutgoing(ROOT) = %v, want %v", gotOutgoing, wantOutgoing)
+	}
+
+	if _, err2 := actor.AddRelationship(a, b); err2 != nil {
+		t.Fatalf("AddRelationship(a, b): %v", err2)
+	}
+
+	wantAll := []Relationship{{From: root, To: a}, {From: root, To: b}, {From: a, To: b}}
+	if all := actor.FindRelationships(); !reflect.DeepEqual(all, wantAll) {
+		t.Fatalf("FindRelationships() = %v, want %v", all, wantAll)
+	}
+
+	c, err := actor.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for c: %v", err)
+	}
+	if !actor.HasRelationship(root, c) {
+		t.Fatalf("new node %d is not visible as a ROOT child", c)
+	}
+
+	if err3 := actor.DeleteNode(root); !errors.Is(err3, ErrCannotDeleteRoot) {
+		t.Fatalf("DeleteNode(ROOT) error = %v, want %v", err3, ErrCannotDeleteRoot)
+	}
+
+	// The overlay must also be in force inside a transaction.
+	var sawVirtualInTx, createdVirtualInTx bool
+	var deleteRootErr error
+
+	err = actor.Transact(func(tx Tx) error {
+		sawVirtualInTx = tx.HasRelationship(root, a)
+
+		var txErr error
+		createdVirtualInTx, txErr = tx.AddRelationship(root, a)
+		if txErr != nil {
+			return txErr
+		}
+
+		deleteRootErr = tx.DeleteNode(root)
+
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Transact(): %v", err)
+	}
+
+	if !sawVirtualInTx {
+		t.Fatal("tx.HasRelationship(ROOT, a) = false inside Transact, want true")
+	}
+	if createdVirtualInTx {
+		t.Fatal("tx.AddRelationship(ROOT, a) reported creating a virtual relationship")
+	}
+	if !errors.Is(deleteRootErr, ErrCannotDeleteRoot) {
+		t.Fatalf("tx.DeleteNode(ROOT) error = %v, want %v", deleteRootErr, ErrCannotDeleteRoot)
+	}
+}
+
+// findDanglingRelationship returns the first relationship in snapshot
+// that is not internally consistent for a ROOT view: every relationship
+// not sourced at root must have both endpoints (other than root itself
+// as a target) among that same snapshot's ROOT children.
+func findDanglingRelationship(root NodeID, snapshot []Relationship) (Relationship, bool) {
+	children := make(map[NodeID]struct{})
+	for _, rel := range snapshot {
+		if rel.From == root {
+			children[rel.To] = struct{}{}
+		}
+	}
+
+	for _, rel := range snapshot {
+		if rel.From == root {
+			continue
+		}
+
+		if _, ok := children[rel.From]; !ok {
+			return rel, true
+		}
+
+		if rel.To == root {
+			continue
+		}
+
+		if _, ok := children[rel.To]; !ok {
+			return rel, true
+		}
+	}
+
+	return Relationship{}, false
+}
+
+// TestGraphActorRootGraphFindRelationshipsIsAtomic checks the property
+// the old outside-the-actor layering could not give: a multi-step
+// RootGraph method returns one consistent snapshot even while other
+// goroutines create and delete nodes.
+func TestGraphActorRootGraphFindRelationshipsIsAtomic(t *testing.T) {
+	var g Graph
+
+	root, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for ROOT: %v", err)
+	}
+
+	rootGraph, err := NewRootGraph(&g, root)
+	if err != nil {
+		t.Fatalf("NewRootGraph(): %v", err)
+	}
+
+	actor := NewGraphActor(rootGraph)
+	defer actor.Close()
+
+	const iterations = 200
+
+	churn := func() error {
+		x, err2 := actor.CreateNode()
+		if err2 != nil {
+			return err2
+		}
+
+		y, err3 := actor.CreateNode()
+		if err3 != nil {
+			return err3
+		}
+
+		if _, err4 := actor.AddRelationship(x, y); err4 != nil {
+			return err4
+		}
+
+		if _, err5 := actor.RemoveRelationship(x, y); err5 != nil {
+			return err5
+		}
+
+		if err6 := actor.DeleteNode(x); err6 != nil {
+			return err6
+		}
+
+		return actor.DeleteNode(y)
+	}
+
+	finished := make(chan struct{})
+	var workerErr error
+
+	go func() {
+		defer close(finished)
+
+		for i := 0; i < iterations; i++ {
+			if churnErr := churn(); churnErr != nil {
+				workerErr = churnErr
+				return
+			}
+		}
+	}()
+
+	for running := true; running; {
+		snapshot := actor.FindRelationships()
+
+		if bad, found := findDanglingRelationship(root, snapshot); found {
+			t.Errorf("FindRelationships() returned %v, whose endpoints are not all ROOT children of the same snapshot", bad)
+			running = false
+		}
+
+		select {
+		case <-finished:
+			running = false
+		default:
+		}
+	}
+
+	<-finished
+
+	if workerErr != nil {
+		t.Fatalf("churn worker: %v", workerErr)
+	}
+}
+
+func TestRootFindIncomingIncludesVirtualRootParent(t *testing.T) {
+	var g Graph
+
+	// Creation order makes root < a < b, so results sorted by From
+	// list root first.
+	root, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for ROOT: %v", err)
+	}
+
+	a, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for a: %v", err)
+	}
+
+	b, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for b: %v", err)
+	}
+
+	// A physically stored (ROOT, a) must not produce a duplicate.
+	if _, err2 := g.AddRelationship(root, a); err2 != nil {
+		t.Fatalf("AddRelationship(ROOT, a): %v", err2)
+	}
+	if _, err3 := g.AddRelationship(a, b); err3 != nil {
+		t.Fatalf("AddRelationship(a, b): %v", err3)
+	}
+
+	r, err := NewRootGraph(&g, root)
+	if err != nil {
+		t.Fatalf("NewRootGraph(): %v", err)
+	}
+
+	gotA, err := r.FindIncoming(a)
+	if err != nil {
+		t.Fatalf("FindIncoming(a): %v", err)
+	}
+	if want := []Relationship{{From: root, To: a}}; !reflect.DeepEqual(gotA, want) {
+		t.Fatalf("FindIncoming(a) = %v, want %v", gotA, want)
+	}
+
+	gotB, err := r.FindIncoming(b)
+	if err != nil {
+		t.Fatalf("FindIncoming(b): %v", err)
+	}
+	if want := []Relationship{{From: root, To: b}, {From: a, To: b}}; !reflect.DeepEqual(gotB, want) {
+		t.Fatalf("FindIncoming(b) = %v, want %v", gotB, want)
+	}
+
+	gotRoot, err := r.FindIncoming(root)
+	if err != nil {
+		t.Fatalf("FindIncoming(ROOT): %v", err)
+	}
+	if len(gotRoot) != 0 {
+		t.Fatalf("FindIncoming(ROOT) = %v, want none (ROOT is not its own parent)", gotRoot)
+	}
+}
+
+// TestRootGraphTransactAndCheckerSeeOverlay confirms the overlay is
+// presented inside Transact and to registered Checkers, not only to
+// direct callers.
+func TestRootGraphTransactAndCheckerSeeOverlay(t *testing.T) {
+	var g Graph
+
+	root, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for ROOT: %v", err)
+	}
+
+	tag, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for tag: %v", err)
+	}
+
+	x, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for x: %v", err)
+	}
+
+	r, err := NewRootGraph(&g, root)
+	if err != nil {
+		t.Fatalf("NewRootGraph(): %v", err)
+	}
+
+	var checkerSawVirtual bool
+
+	r.RegisterChecker(Checker{
+		Name: "overlay-probe",
+		Tags: []NodeID{tag},
+		Check: func(view GraphReader, _ map[NodeID]struct{}) error {
+			checkerSawVirtual = view.HasRelationship(root, x)
+			return nil
+		},
+	})
+
+	var sawVirtualInTx, createdVirtualInTx bool
+
+	err = r.Transact(func(tx Tx) error {
+		sawVirtualInTx = tx.HasRelationship(root, x)
+
+		var txErr error
+		createdVirtualInTx, txErr = tx.AddRelationship(root, x)
+		if txErr != nil {
+			return txErr
+		}
+
+		_, txErr = tx.AddRelationship(tag, x)
+
+		return txErr
+	})
+	if err != nil {
+		t.Fatalf("Transact(): %v", err)
+	}
+
+	if !sawVirtualInTx {
+		t.Fatal("tx.HasRelationship(ROOT, x) = false inside Transact, want true")
+	}
+	if createdVirtualInTx {
+		t.Fatal("tx.AddRelationship(ROOT, x) reported creating a virtual relationship")
+	}
+	if !checkerSawVirtual {
+		t.Fatal("the Checker's reader did not present the virtual (ROOT, x) relationship")
+	}
+	if g.HasRelationship(root, x) {
+		t.Fatal("the virtual (ROOT, x) relationship was physically stored")
+	}
+}
+
+func TestNewRootGraphRejectsGraphActor(t *testing.T) {
 	actor := NewGraphActor(&Graph{})
 	defer actor.Close()
 
 	root, err := actor.CreateNode()
 	if err != nil {
-		t.Fatalf("CreateNode() for ROOT: %v", err)
+		t.Fatalf("CreateNode(): %v", err)
 	}
 
-	a, err := actor.CreateNode()
-	if err != nil {
-		t.Fatalf("CreateNode() for a: %v", err)
-	}
-
-	b, err := actor.CreateNode()
-	if err != nil {
-		t.Fatalf("CreateNode() for b: %v", err)
-	}
-
-	r, err := NewRootGraph(actor, root)
-	if err != nil {
-		t.Fatalf("NewRootGraph(): %v", err)
-	}
-
-	got, err := r.FindOutgoing(root)
-	if err != nil {
-		t.Fatalf("FindOutgoing(ROOT): %v", err)
-	}
-	wantOutgoing := []Relationship{{From: root, To: a}, {From: root, To: b}}
-	if !reflect.DeepEqual(got, wantOutgoing) {
-		t.Fatalf("FindOutgoing(ROOT) = %v, want %v", got, wantOutgoing)
-	}
-
-	if _, err2 := r.AddRelationship(a, b); err2 != nil {
-		t.Fatalf("AddRelationship(a, b): %v", err2)
-	}
-
-	wantAll := []Relationship{{From: root, To: a}, {From: root, To: b}, {From: a, To: b}}
-	if all := r.FindRelationships(); !reflect.DeepEqual(all, wantAll) {
-		t.Fatalf("FindRelationships() = %v, want %v", all, wantAll)
-	}
-
-	c, err := r.CreateNode()
-	if err != nil {
-		t.Fatalf("RootGraph.CreateNode(): %v", err)
-	}
-	if !r.HasRelationship(root, c) {
-		t.Fatalf("new node %d is not visible as a ROOT child", c)
-	}
-
-	if err3 := r.DeleteNode(root); !errors.Is(err3, ErrCannotDeleteRoot) {
-		t.Fatalf("DeleteNode(ROOT) error = %v, want %v", err3, ErrCannotDeleteRoot)
+	if _, err2 := NewRootGraph(actor, root); !errors.Is(err2, ErrRootGraphOverActor) {
+		t.Fatalf("NewRootGraph(actor, root) error = %v, want %v", err2, ErrRootGraphOverActor)
 	}
 }
 
@@ -2395,7 +2688,7 @@ func TestTransactCommitsMutationsOnSuccess(t *testing.T) {
 	var g Graph
 
 	var a, b NodeID
-	err := g.Transact(func(tx *Txn) error {
+	err := g.Transact(func(tx Tx) error {
 		var err error
 		a, err = tx.CreateNode()
 		if err != nil {
@@ -2429,7 +2722,7 @@ func TestTransactRollsBackCreateNodeOnLaterFailure(t *testing.T) {
 	const nonexistent NodeID = 999999
 
 	var id NodeID
-	err := g.Transact(func(tx *Txn) error {
+	err := g.Transact(func(tx Tx) error {
 		var err error
 		id, err = tx.CreateNode()
 		if err != nil {
@@ -2469,7 +2762,7 @@ func TestTransactRollsBackRelationshipsInLIFOOrder(t *testing.T) {
 
 	const nonexistent NodeID = 999999
 
-	err = g.Transact(func(tx *Txn) error {
+	err = g.Transact(func(tx Tx) error {
 		if _, err2 := tx.AddRelationship(a, b); err2 != nil {
 			return err2
 		}
@@ -2514,7 +2807,7 @@ func TestTransactRollsBackRemoveRelationshipOnLaterFailure(t *testing.T) {
 
 	const nonexistent NodeID = 999999
 
-	err = g.Transact(func(tx *Txn) error {
+	err = g.Transact(func(tx Tx) error {
 		if _, err3 := tx.RemoveRelationship(a, b); err3 != nil {
 			return err3
 		}
@@ -2551,7 +2844,7 @@ func TestTransactDoesNotUndoPreexistingRelationship(t *testing.T) {
 
 	const nonexistent NodeID = 999999
 
-	err = g.Transact(func(tx *Txn) error {
+	err = g.Transact(func(tx Tx) error {
 		// (a,b) already exists, so this call reports created == false and
 		// must not schedule an undo step for a relationship this
 		// transaction did not itself create.
@@ -2587,7 +2880,7 @@ func TestTransactRollsBackOnPanic(t *testing.T) {
 			}
 		}()
 
-		if err := g.Transact(func(tx *Txn) error {
+		if err := g.Transact(func(tx Tx) error {
 			var err error
 			id, err = tx.CreateNode()
 			if err != nil {
@@ -4423,7 +4716,7 @@ func TestListRegistryCheckerCatchesInvalidStructureAtCommitTime(t *testing.T) {
 	// Simulate a hypothetical buggy composed operation that tags a
 	// non-capsule node as list's head and links it in as a child,
 	// entirely through one Graph.Transact call.
-	err = g.Transact(func(tx *Txn) error {
+	err = g.Transact(func(tx Tx) error {
 		if _, err2 := tx.AddRelationship(list, bogus); err2 != nil {
 			return err2
 		}
@@ -7377,7 +7670,7 @@ func TestCompositeSetRegistryCheckerCatchesMalformedDescriptorAtCommitTime(t *te
 	// Simulate a hypothetical buggy composed operation that wires a
 	// descriptor with both operation-kind tags at once, entirely through
 	// one Graph.Transact call.
-	err = g.Transact(func(tx *Txn) error {
+	err = g.Transact(func(tx Tx) error {
 		u, err2 := tx.CreateNode()
 		if err2 != nil {
 			return err2
@@ -8361,7 +8654,7 @@ func TestCompositeSetLogRegistrySharesListStructureChecker(t *testing.T) {
 		t.Fatalf("CreateNode() for bogus: %v", err)
 	}
 
-	err = g.Transact(func(tx *Txn) error {
+	err = g.Transact(func(tx Tx) error {
 		if _, err2 := tx.AddRelationship(log, bogus); err2 != nil {
 			return err2
 		}
@@ -9787,7 +10080,7 @@ func TestGraphActorTransactRollsBackOnFailure(t *testing.T) {
 	const nonexistent NodeID = 999999
 
 	var id NodeID
-	err := actor.Transact(func(tx *Txn) error {
+	err := actor.Transact(func(tx Tx) error {
 		var err error
 		id, err = tx.CreateNode()
 		if err != nil {
@@ -9825,7 +10118,7 @@ func TestGraphActorTransactPanicPropagatesAndActorSurvives(t *testing.T) {
 		}()
 
 		//nolint:errcheck // because there's no error, it panics
-		_ = actor.Transact(func(_ *Txn) error {
+		_ = actor.Transact(func(_ Tx) error {
 			panic("boom")
 		})
 	}()
@@ -9866,7 +10159,7 @@ func TestGraphActorReentrancyTripwireFiresAndActorSurvives(t *testing.T) {
 		}()
 
 		//nolint:errcheck // the tripwire panics before Transact can return
-		_ = actor.Transact(func(_ *Txn) error {
+		_ = actor.Transact(func(_ Tx) error {
 			// Reentrant: this closure is already running on actor's one
 			// dedicated goroutine, so calling back into the actor here
 			// is exactly the deadlock class the tripwire detects.

@@ -608,12 +608,13 @@ type GraphStore interface {
 // itself -- this is a pure decoupling refactor (theorystate.md section
 // 87).
 //
-// RootGraph is no longer an exception: its ROOT overlay's need to
-// enumerate every existing node is now served by GraphReader.FindNodes,
-// so it depends only on GraphStore (theorystate.md section 87b).
+// RootGraph is not an exception either: it implements GraphAPI itself,
+// as a decorator over any other GraphAPI (using GraphReader.FindNodes to
+// enumerate nodes), so it can stand in for a Graph anywhere a registry or
+// GraphActor takes one (theorystate.md section 87b).
 type GraphAPI interface {
 	GraphStore
-	Transact(fn func(tx *Txn) error) error
+	Transact(fn func(tx Tx) error) error
 	RegisterChecker(c Checker)
 }
 
@@ -621,6 +622,21 @@ type GraphAPI interface {
 // accidental signature drift between Graph's methods and this interface
 // is caught at build time rather than only at some call site far away.
 var _ GraphAPI = (*Graph)(nil)
+
+// Tx is the handle a Transact closure works through: GraphStore's full
+// read/write surface, scoped to one transaction. *Txn is the concrete
+// implementation for the in-memory Graph. Transact takes this interface,
+// not the concrete *Txn, so that a layer decorating a GraphAPI -- most
+// importantly RootGraph -- can hand the closure a handle presenting the
+// same overlaid view inside the transaction as outside it (theorystate.md
+// section 87b). Every helper in this file already takes the narrower
+// txOps/txReader, which Tx satisfies.
+type Tx interface {
+	GraphStore
+}
+
+// Compile-time assertion that *Txn satisfies Tx.
+var _ Tx = (*Txn)(nil)
 
 // Txn groups a sequence of primitive Graph mutations so that, if the
 // function passed to Graph.Transact returns a non-nil error or panics,
@@ -750,7 +766,7 @@ func (tx *Txn) touch(ids ...NodeID) {
 // Graph's unguarded core methods directly rather than through the
 // guarded public API, so this single acquisition is never re-entered by
 // anything Transact itself calls.
-func (g *Graph) Transact(fn func(tx *Txn) error) (err error) {
+func (g *Graph) Transact(fn func(tx Tx) error) (err error) {
 	release := g.guard.acquire()
 	defer release()
 
@@ -1258,8 +1274,10 @@ func currentGoroutineID() (int64, error) {
 	return id, nil
 }
 
-// GraphActor is a concurrency-safe wrapper around a private *Graph,
-// implementing GraphAPI so it can be substituted for a concrete *Graph
+// GraphActor is a concurrency-safe wrapper around a private GraphAPI
+// backend -- a plain *Graph, or a decorator stack over one such as
+// RootGraph (theorystate.md section 87b) -- implementing GraphAPI so it
+// can be substituted for a concrete *Graph
 // anywhere a registry in this file expects one -- with zero change to
 // any registry's own logic, exactly per section 87's decoupling
 // refactor. GraphActor is the CSP/actor-style mechanism explored in
@@ -1333,8 +1351,8 @@ func currentGoroutineID() (int64, error) {
 // "document the assumption explicitly" resolution), not something
 // GraphActor attempts to guard against itself.
 type GraphActor struct {
-	graph     *Graph
-	requests  chan func(*Graph)
+	graph     GraphAPI
+	requests  chan func(GraphAPI)
 	stopped   chan struct{}
 	closeOnce sync.Once
 
@@ -1356,14 +1374,21 @@ type GraphActor struct {
 var _ GraphAPI = (*GraphActor)(nil)
 
 // NewGraphActor starts a GraphActor's dedicated goroutine and returns
-// immediately. graph becomes owned by that goroutine from this point
+// immediately. backend becomes owned by that goroutine from this point
 // on: per the GraphActor doc comment, nothing outside the returned
-// *GraphActor may touch graph directly again -- every future access
-// must go through the returned value's own methods.
-func NewGraphActor(graph *Graph) *GraphActor {
+// *GraphActor may touch backend (or anything it wraps) directly again --
+// every future access must go through the returned value's own methods.
+//
+// backend is normally a plain *Graph, but may be a decorator stack over
+// one, most importantly a RootGraph. In that case the actor must be the
+// OUTERMOST layer: NewGraphActor(NewRootGraph(&g, root)). Inside the
+// actor every overlay method runs as one atomic job, and the overlay's
+// stored reference is the raw backend rather than the actor (see the
+// RootGraph doc comment and theorystate.md section 87b/90).
+func NewGraphActor(backend GraphAPI) *GraphActor {
 	ga := &GraphActor{
-		graph:    graph,
-		requests: make(chan func(*Graph)),
+		graph:    backend,
+		requests: make(chan func(GraphAPI)),
 		stopped:  make(chan struct{}),
 	}
 
@@ -1394,7 +1419,7 @@ func (ga *GraphActor) run() {
 	}
 }
 
-// do submits fn to run against ga's private *Graph, on ga's own
+// do submits fn to run against ga's private backend, on ga's own
 // dedicated goroutine, and blocks until fn has returned. Every exported
 // GraphActor method is built on this one primitive; see the GraphActor
 // doc comment for exactly what this does and does not make atomic. A
@@ -1402,7 +1427,7 @@ func (ga *GraphActor) run() {
 // the actor survives to service future callers), and re-raised here
 // again, back on the calling goroutine, once fn has finished -- see the
 // GraphActor doc comment's panic-handling paragraph.
-func (ga *GraphActor) do(fn func(g *Graph)) {
+func (ga *GraphActor) do(fn func(g GraphAPI)) {
 	if graphActorReentrancyDetectionEnabled.Load() {
 		if callerID, err := currentGoroutineID(); err == nil {
 			if workerID := ga.workerGoroutineID.Load(); workerID != 0 && callerID == workerID {
@@ -1419,7 +1444,7 @@ func (ga *GraphActor) do(fn func(g *Graph)) {
 	var recovered any
 	var panicked bool
 
-	ga.requests <- func(g *Graph) {
+	ga.requests <- func(g GraphAPI) {
 		defer func() {
 			if r := recover(); r != nil {
 				panicked = true
@@ -1451,141 +1476,144 @@ func (ga *GraphActor) Close() {
 	<-ga.stopped
 }
 
-// CreateNode behaves exactly like Graph.CreateNode, routed through ga's
-// dedicated goroutine.
+// CreateNode behaves exactly like the backend's CreateNode, routed
+// through ga's dedicated goroutine.
 func (ga *GraphActor) CreateNode() (id NodeID, err error) {
-	ga.do(func(g *Graph) {
+	ga.do(func(g GraphAPI) {
 		id, err = g.CreateNode()
 	})
 
-	return id, err
+	return id, wrapInterfaceErr(err)
 }
 
-// NodeExists behaves exactly like Graph.NodeExists, routed through ga's
-// dedicated goroutine.
+// NodeExists behaves exactly like the backend's NodeExists, routed
+// through ga's dedicated goroutine.
 func (ga *GraphActor) NodeExists(id NodeID) bool {
 	var exists bool
 
-	ga.do(func(g *Graph) {
+	ga.do(func(g GraphAPI) {
 		exists = g.NodeExists(id)
 	})
 
 	return exists
 }
 
-// AddRelationship behaves exactly like Graph.AddRelationship, routed
-// through ga's dedicated goroutine.
+// AddRelationship behaves exactly like the backend's AddRelationship,
+// routed through ga's dedicated goroutine.
 func (ga *GraphActor) AddRelationship(a, b NodeID) (created bool, err error) {
-	ga.do(func(g *Graph) {
+	ga.do(func(g GraphAPI) {
 		created, err = g.AddRelationship(a, b)
 	})
 
-	return created, err
+	return created, wrapInterfaceErr(err)
 }
 
-// RemoveRelationship behaves exactly like Graph.RemoveRelationship,
-// routed through ga's dedicated goroutine.
+// RemoveRelationship behaves exactly like the backend's
+// RemoveRelationship, routed through ga's dedicated goroutine.
 func (ga *GraphActor) RemoveRelationship(a, b NodeID) (removed bool, err error) {
-	ga.do(func(g *Graph) {
+	ga.do(func(g GraphAPI) {
 		removed, err = g.RemoveRelationship(a, b)
 	})
 
-	return removed, err
+	return removed, wrapInterfaceErr(err)
 }
 
-// HasRelationship behaves exactly like Graph.HasRelationship, routed
-// through ga's dedicated goroutine.
+// HasRelationship behaves exactly like the backend's HasRelationship,
+// routed through ga's dedicated goroutine.
 func (ga *GraphActor) HasRelationship(a, b NodeID) bool {
 	var has bool
 
-	ga.do(func(g *Graph) {
+	ga.do(func(g GraphAPI) {
 		has = g.HasRelationship(a, b)
 	})
 
 	return has
 }
 
-// FindRelationship behaves exactly like Graph.FindRelationship, routed
-// through ga's dedicated goroutine.
+// FindRelationship behaves exactly like the backend's FindRelationship,
+// routed through ga's dedicated goroutine.
 func (ga *GraphActor) FindRelationship(from, to NodeID) (relationship Relationship, exists bool, err error) {
-	ga.do(func(g *Graph) {
+	ga.do(func(g GraphAPI) {
 		relationship, exists, err = g.FindRelationship(from, to)
 	})
 
-	return relationship, exists, err
+	return relationship, exists, wrapInterfaceErr(err)
 }
 
-// FindOutgoing behaves exactly like Graph.FindOutgoing, routed through
-// ga's dedicated goroutine.
+// FindOutgoing behaves exactly like the backend's FindOutgoing, routed
+// through ga's dedicated goroutine.
 func (ga *GraphActor) FindOutgoing(from NodeID) (relationships []Relationship, err error) {
-	ga.do(func(g *Graph) {
+	ga.do(func(g GraphAPI) {
 		relationships, err = g.FindOutgoing(from)
 	})
 
-	return relationships, err
+	return relationships, wrapInterfaceErr(err)
 }
 
-// FindIncoming behaves exactly like Graph.FindIncoming, routed through
-// ga's dedicated goroutine.
+// FindIncoming behaves exactly like the backend's FindIncoming, routed
+// through ga's dedicated goroutine.
 func (ga *GraphActor) FindIncoming(to NodeID) (relationships []Relationship, err error) {
-	ga.do(func(g *Graph) {
+	ga.do(func(g GraphAPI) {
 		relationships, err = g.FindIncoming(to)
 	})
 
-	return relationships, err
+	return relationships, wrapInterfaceErr(err)
 }
 
-// FindRelationships behaves exactly like Graph.FindRelationships, routed
-// through ga's dedicated goroutine.
+// FindRelationships behaves exactly like the backend's
+// FindRelationships, routed through ga's dedicated goroutine. If the
+// backend is a RootGraph, its whole overlay computation runs as this one
+// job, so the result is a single consistent snapshot.
 func (ga *GraphActor) FindRelationships() []Relationship {
 	var relationships []Relationship
 
-	ga.do(func(g *Graph) {
+	ga.do(func(g GraphAPI) {
 		relationships = g.FindRelationships()
 	})
 
 	return relationships
 }
 
-// FindNodes behaves exactly like Graph.FindNodes, routed through ga's
-// dedicated goroutine.
+// FindNodes behaves exactly like the backend's FindNodes, routed through
+// ga's dedicated goroutine.
 func (ga *GraphActor) FindNodes() []NodeID {
 	var ids []NodeID
 
-	ga.do(func(g *Graph) {
+	ga.do(func(g GraphAPI) {
 		ids = g.FindNodes()
 	})
 
 	return ids
 }
 
-// DeleteNode behaves exactly like Graph.DeleteNode, routed through ga's
-// dedicated goroutine.
+// DeleteNode behaves exactly like the backend's DeleteNode, routed
+// through ga's dedicated goroutine.
 func (ga *GraphActor) DeleteNode(id NodeID) (err error) {
-	ga.do(func(g *Graph) {
+	ga.do(func(g GraphAPI) {
 		err = g.DeleteNode(id)
 	})
 
-	return err
+	return wrapInterfaceErr(err)
 }
 
-// Transact behaves exactly like Graph.Transact, with fn's entire body --
-// however many steps it performs against tx -- run as one single job on
-// ga's dedicated goroutine, so nothing else can ever be interleaved with
-// it. See the GraphActor doc comment for what this does and does not
-// make atomic relative to some other, separately-submitted call.
-func (ga *GraphActor) Transact(fn func(tx *Txn) error) (err error) {
-	ga.do(func(g *Graph) {
+// Transact behaves exactly like the backend's Transact, with fn's entire
+// body -- however many steps it performs against tx -- run as one single
+// job on ga's dedicated goroutine, so nothing else can ever be
+// interleaved with it. See the GraphActor doc comment for what this does
+// and does not make atomic relative to some other, separately-submitted
+// call.
+func (ga *GraphActor) Transact(fn func(tx Tx) error) (err error) {
+	ga.do(func(g GraphAPI) {
 		err = g.Transact(fn)
 	})
 
-	return err
+	return wrapInterfaceErr(err)
 }
 
-// RegisterChecker behaves exactly like Graph.RegisterChecker, routed
-// through ga's dedicated goroutine.
+// RegisterChecker behaves exactly like the backend's RegisterChecker,
+// routed through ga's dedicated goroutine.
 func (ga *GraphActor) RegisterChecker(c Checker) {
-	ga.do(func(g *Graph) {
+	ga.do(func(g GraphAPI) {
 		g.RegisterChecker(c)
 	})
 }
@@ -1774,7 +1802,7 @@ func (r *NameRegistry) CreateNamedNode(graph GraphAPI, name string) (NodeID, err
 
 	var id NodeID
 
-	err := graph.Transact(func(tx *Txn) error {
+	err := graph.Transact(func(tx Tx) error {
 		var err error
 		id, err = tx.CreateNode()
 		if err != nil {
@@ -2063,51 +2091,44 @@ var FoundationalNames = []string{
 // here, not merely blocked by leftover relationships.
 var ErrCannotDeleteRoot = errors.New("cannot delete root node")
 
-// RootGraph is the graph layer exposed above the primitive Graph.
+// ErrRootGraphOverActor is returned by NewRootGraph when asked to wrap a
+// *GraphActor. A RootGraph belongs inside a GraphActor, not around one;
+// see the RootGraph doc comment and theorystate.md section 87b.
+var ErrRootGraphOverActor = errors.New("root graph cannot wrap a graph actor; place the root graph inside the actor instead")
+
+// rootReader is the read half of the ROOT overlay, defined over any
+// GraphReader.
 //
-// ROOT is a real NodeID in the underlying Graph. Its relationship to every
-// other existing node is virtual: (ROOT, X) is visible through this layer
-// whenever X exists and X != ROOT, but is not physically stored in Graph.
+// ROOT is a real NodeID in the underlying graph. Its outgoing
+// relationships are entirely virtual: (ROOT, X) is visible whenever both
+// exist and X != ROOT, and any *stored* relationship whose source is ROOT
+// is ignored (including a stored (ROOT, ROOT), which the overlay hides).
+// The overlay is bidirectional (theorystate.md section 4): ROOT is also
+// reported as a parent of every existing X != ROOT. Relationships pointing
+// *to* ROOT from other nodes are ordinary and stored normally.
 //
-// Ordinary relationships, including relationships pointing to ROOT, are
-// stored normally in Graph.
+// If ROOT itself no longer exists -- only reachable by deleting it through
+// the raw graph, bypassing DeleteNode's ErrCannotDeleteRoot -- the
+// overlay reports no virtual relationships at all, consistent with
+// HasRelationship reporting false for any relationship whose source does
+// not exist.
 //
-// RootGraph depends only on GraphStore, so it can be layered over a
-// plain *Graph or a *GraphActor alike. Each RootGraph call is a sequence
-// of GraphStore calls; over a GraphActor, each individual call is atomic
-// but the sequence as a whole is not (e.g. FindRelationships reads the
-// primitive relationships and the node list in two separate round
-// trips). Also, RootGraph stores its graph reference, so its methods
-// must not be called from inside a Transact closure or Checker running
-// on that same GraphActor (theorystate.md section 90's reentrancy
-// hazard); it is a view layer meant to be used from outside.
-type RootGraph struct {
-	graph GraphStore
+// rootReader is used three ways: as the read half of rootStore, and
+// directly to wrap the GraphReader a Checker's Check function receives
+// (see RootGraph.RegisterChecker).
+type rootReader struct {
+	inner GraphReader
 	root  NodeID
 }
 
-// NewRootGraph creates a ROOT layer around an existing primitive node.
-func NewRootGraph(graph GraphStore, root NodeID) (*RootGraph, error) {
-	if !graph.NodeExists(root) {
-		return nil, ErrNodeNotFound
-	}
-
-	return &RootGraph{
-		graph: graph,
-		root:  root,
-	}, nil
-}
-
-// Root returns the NodeID used as ROOT.
-func (r *RootGraph) Root() NodeID {
-	return r.root
-}
+// Compile-time assertion that rootReader satisfies GraphReader.
+var _ GraphReader = rootReader{}
 
 // requireExist returns ErrNodeNotFound if any of ids does not currently
-// exist in the underlying graph.
-func (r *RootGraph) requireExist(ids ...NodeID) error {
+// exist.
+func (v rootReader) requireExist(ids ...NodeID) error {
 	for _, id := range ids {
-		if !r.graph.NodeExists(id) {
+		if !v.inner.NodeExists(id) {
 			return ErrNodeNotFound
 		}
 	}
@@ -2115,30 +2136,24 @@ func (r *RootGraph) requireExist(ids ...NodeID) error {
 	return nil
 }
 
-// virtualRootRelationships returns the virtual (ROOT, X) relationship
-// for every existing X != ROOT, sorted by To (FindNodes is already
-// sorted ascending).
-//
-// If ROOT itself no longer exists -- only reachable by deleting it
-// through the raw graph, bypassing DeleteNode's ErrCannotDeleteRoot
-// protection -- no virtual relationships are reported, consistent with
-// HasRelationship, which reports false for any relationship whose source
-// does not exist.
-func (r *RootGraph) virtualRootRelationships() []Relationship {
-	if !r.graph.NodeExists(r.root) {
+// virtualRootRelationships returns the virtual (ROOT, X) relationship for
+// every existing X != ROOT, sorted by To (FindNodes is already sorted
+// ascending). It returns nothing if ROOT does not exist.
+func (v rootReader) virtualRootRelationships() []Relationship {
+	if !v.inner.NodeExists(v.root) {
 		return nil
 	}
 
-	ids := r.graph.FindNodes()
+	ids := v.inner.FindNodes()
 	relationships := make([]Relationship, 0, len(ids))
 
 	for _, id := range ids {
-		if id == r.root {
+		if id == v.root {
 			continue
 		}
 
 		relationships = append(relationships, Relationship{
-			From: r.root,
+			From: v.root,
 			To:   id,
 		})
 	}
@@ -2146,93 +2161,39 @@ func (r *RootGraph) virtualRootRelationships() []Relationship {
 	return relationships
 }
 
-// CreateNode creates a node in the underlying graph.
-//
-// The newly created node is consequently visible as a virtual child of
-// ROOT through this layer.
-func (r *RootGraph) CreateNode() (NodeID, error) {
-	id, err := r.graph.CreateNode()
-	return id, wrapInterfaceErr(err)
-}
-
 // NodeExists reports whether id exists in the underlying graph.
-func (r *RootGraph) NodeExists(id NodeID) bool {
-	return r.graph.NodeExists(id)
+func (v rootReader) NodeExists(id NodeID) bool {
+	return v.inner.NodeExists(id)
 }
 
-// AddRelationship adds an ordinary relationship to the graph.
-//
-// A relationship from ROOT is virtual and therefore is not physically
-// stored. If the target exists, (ROOT, target) already exists in this
-// layer, so adding it is simply an idempotent no-op.
-//
-// Relationships pointing to ROOT are ordinary relationships and are stored.
-func (r *RootGraph) AddRelationship(from, to NodeID) (created bool, err error) {
-	if err1 := r.requireExist(from, to); err1 != nil {
-		return false, err1
-	}
-
-	if from == r.root {
-		// Whether to == root (the self-loop case, hidden by the ROOT
-		// overlay's irreflexivity) or to != root (already represented
-		// virtually by this layer), there is nothing to physically add
-		// either way.
-		return false, nil
-	}
-
-	created, err2 := r.graph.AddRelationship(from, to)
-	return created, wrapInterfaceErr(err2)
-}
-
-// RemoveRelationship removes an ordinary relationship from the graph.
-//
-// Virtual ROOT relationships cannot be removed because their existence is
-// derived from node existence. Therefore removing (ROOT, X) is a no-op
-// while X exists.
-//
-// Relationships pointing to ROOT are ordinary relationships and can be
-// removed normally.
-func (r *RootGraph) RemoveRelationship(from, to NodeID) (removed bool, err error) {
-	if err1 := r.requireExist(from, to); err1 != nil {
-		return false, err1
-	}
-
-	if from == r.root {
-		// Symmetric with AddRelationship above: whether to == root or
-		// not, there is no physical relationship for this layer to
-		// remove.
-		return false, nil
-	}
-
-	removed, err2 := r.graph.RemoveRelationship(from, to)
-	return removed, wrapInterfaceErr(err2)
+// FindNodes returns every existing node, ROOT included.
+func (v rootReader) FindNodes() []NodeID {
+	return v.inner.FindNodes()
 }
 
 // HasRelationship reports whether the relationship exists in the ROOT
-// layer.
-//
-// ROOT has a virtual relationship to every existing node other than itself.
-// All other relationships are taken from the primitive graph.
-func (r *RootGraph) HasRelationship(from, to NodeID) bool {
-	if !r.graph.NodeExists(from) || !r.graph.NodeExists(to) {
+// view: ROOT has a virtual relationship to every existing node other than
+// itself; every other relationship comes from the underlying graph.
+func (v rootReader) HasRelationship(from, to NodeID) bool {
+	if !v.inner.NodeExists(from) || !v.inner.NodeExists(to) {
 		return false
 	}
 
-	if from == r.root {
-		return to != r.root
+	if from == v.root {
+		return to != v.root
 	}
 
-	return r.graph.HasRelationship(from, to)
+	return v.inner.HasRelationship(from, to)
 }
 
 // FindRelationship reports whether the exact relationship exists in the
-// ROOT layer.
-func (r *RootGraph) FindRelationship(from, to NodeID) (Relationship, bool, error) {
-	if err := r.requireExist(from, to); err != nil {
+// ROOT view.
+func (v rootReader) FindRelationship(from, to NodeID) (Relationship, bool, error) {
+	if err := v.requireExist(from, to); err != nil {
 		return Relationship{}, false, err
 	}
 
-	if !r.HasRelationship(from, to) {
+	if !v.HasRelationship(from, to) {
 		return Relationship{}, false, nil
 	}
 
@@ -2243,81 +2204,79 @@ func (r *RootGraph) FindRelationship(from, to NodeID) (Relationship, bool, error
 }
 
 // FindOutgoing returns every relationship whose source is from in the
-// ROOT layer.
-//
-// For ROOT, this means every existing node other than ROOT.
-// For every other node, it means the ordinary stored relationships.
-func (r *RootGraph) FindOutgoing(from NodeID) ([]Relationship, error) {
-	if !r.graph.NodeExists(from) {
+// ROOT view: for ROOT, every existing node other than ROOT; for every
+// other node, its ordinary stored relationships.
+func (v rootReader) FindOutgoing(from NodeID) ([]Relationship, error) {
+	if !v.inner.NodeExists(from) {
 		return nil, ErrNodeNotFound
 	}
 
-	if from != r.root {
-		relationships, err := r.graph.FindOutgoing(from)
+	if from != v.root {
+		relationships, err := v.inner.FindOutgoing(from)
 		return relationships, wrapInterfaceErr(err)
 	}
 
-	return r.virtualRootRelationships(), nil
+	return v.virtualRootRelationships(), nil
 }
 
 // FindIncoming returns every relationship whose target is to in the ROOT
-// layer.
-//
-// Unlike the previous implementation, ROOT is allowed to have parents.
-// Those relationships are ordinary primitive relationships and are therefore
-// returned normally.
-//
-// The only relationship excluded by the ROOT overlay is (ROOT, ROOT).
-func (r *RootGraph) FindIncoming(to NodeID) ([]Relationship, error) {
-	if !r.graph.NodeExists(to) {
+// view: the stored relationships from nodes other than ROOT, plus the
+// virtual (ROOT, to) relationship when to != ROOT (and ROOT exists).
+// Stored relationships whose source is ROOT are dropped, so a physically
+// stored (ROOT, X) is never reported twice and a stored (ROOT, ROOT) is
+// hidden.
+func (v rootReader) FindIncoming(to NodeID) ([]Relationship, error) {
+	if !v.inner.NodeExists(to) {
 		return nil, ErrNodeNotFound
 	}
 
-	relationships, err := r.graph.FindIncoming(to)
+	stored, err := v.inner.FindIncoming(to)
 	if err != nil {
 		return nil, wrapInterfaceErr(err)
 	}
 
-	if to != r.root {
-		return relationships, nil
-	}
+	relationships := make([]Relationship, 0, len(stored)+1)
 
-	// (ROOT, ROOT) is not a valid relationship in the ROOT view because
-	// ROOT's virtual outgoing relationship excludes itself.
-	for i := range relationships {
-		if relationships[i].From == r.root {
-			relationships = append(relationships[:i], relationships[i+1:]...)
-			break
-		}
-	}
-
-	return relationships, nil
-}
-
-// FindRelationships returns every relationship visible through the ROOT
-// layer.
-//
-// This consists of all stored primitive relationships except relationships
-// whose source is ROOT, plus the virtual ROOT -> X relationship for every
-// existing X != ROOT.
-//
-// A primitive ROOT -> X relationship, if one exists, is ignored because the
-// ROOT layer represents that relationship virtually anyway.
-// The primitive (ROOT, ROOT) relationship is likewise hidden.
-func (r *RootGraph) FindRelationships() []Relationship {
-	primitiveRelationships := r.graph.FindRelationships()
-	virtualRelationships := r.virtualRootRelationships()
-	relationships := make([]Relationship, 0, len(primitiveRelationships)+len(virtualRelationships))
-
-	for _, relationship := range primitiveRelationships {
-		if relationship.From == r.root {
+	for _, relationship := range stored {
+		if relationship.From == v.root {
 			continue
 		}
 
 		relationships = append(relationships, relationship)
 	}
 
-	relationships = append(relationships, virtualRelationships...)
+	if to != v.root && v.inner.NodeExists(v.root) {
+		relationships = append(relationships, Relationship{
+			From: v.root,
+			To:   to,
+		})
+	}
+
+	sort.Slice(relationships, func(i, j int) bool {
+		return relationships[i].From < relationships[j].From
+	})
+
+	return relationships, nil
+}
+
+// FindRelationships returns every relationship visible in the ROOT view:
+// all stored relationships except those whose source is ROOT, plus the
+// virtual ROOT -> X relationship for every existing X != ROOT. A stored
+// ROOT -> X is ignored because the overlay represents it virtually anyway.
+func (v rootReader) FindRelationships() []Relationship {
+	stored := v.inner.FindRelationships()
+	virtual := v.virtualRootRelationships()
+	relationships := make([]Relationship, 0, len(stored)+len(virtual))
+
+	for _, relationship := range stored {
+		if relationship.From == v.root {
+			continue
+		}
+
+		relationships = append(relationships, relationship)
+	}
+
+	relationships = append(relationships, virtual...)
 
 	sort.Slice(relationships, func(i, j int) bool {
 		if relationships[i].From != relationships[j].From {
@@ -2330,23 +2289,175 @@ func (r *RootGraph) FindRelationships() []Relationship {
 	return relationships
 }
 
-// DeleteNode deletes an ordinary node from the underlying graph.
+// rootStore is the full read/write ROOT overlay over any GraphStore. It
+// implements both GraphStore and Tx, which is what lets one
+// implementation serve RootGraph's non-transactional methods and the
+// handle RootGraph.Transact gives its closure (a rootStore wrapped around
+// the underlying transaction's own Tx).
 //
-// ROOT itself cannot be deleted through this layer. This is reported as
-// ErrCannotDeleteRoot, not ErrNodeNotEmpty: ROOT's identity is
-// structurally protected by this layer regardless of whether it currently
-// has any relationships, so this failure cannot be resolved by clearing
-// relationships and retrying, unlike an ordinary ErrNodeNotEmpty failure.
-func (r *RootGraph) DeleteNode(id NodeID) error {
-	if !r.graph.NodeExists(id) {
+// Writes follow the overlay's rules: a relationship whose source is ROOT
+// is virtual, so adding or removing one is a no-op reporting false (after
+// the usual existence checks); ROOT itself can never be deleted.
+// Everything else passes through unchanged.
+type rootStore struct {
+	rootReader
+	store GraphStore
+}
+
+// Compile-time assertion that rootStore satisfies Tx (and therefore
+// GraphStore).
+var _ Tx = rootStore{}
+
+// newRootStore returns the ROOT overlay over store.
+func newRootStore(store GraphStore, root NodeID) rootStore {
+	return rootStore{
+		rootReader: rootReader{inner: store, root: root},
+		store:      store,
+	}
+}
+
+// CreateNode creates a node in the underlying graph. The new node is
+// consequently visible as a virtual child of ROOT.
+func (s rootStore) CreateNode() (NodeID, error) {
+	id, err := s.store.CreateNode()
+	return id, wrapInterfaceErr(err)
+}
+
+// AddRelationship adds an ordinary relationship. A relationship from ROOT
+// is virtual and not physically stored, so adding one is an idempotent
+// no-op. Relationships pointing to ROOT are ordinary and are stored.
+func (s rootStore) AddRelationship(from, to NodeID) (created bool, err error) {
+	if err = s.requireExist(from, to); err != nil {
+		return false, err
+	}
+
+	if from == s.root {
+		// Whether to == root (the self-loop case, hidden by the overlay's
+		// irreflexivity) or to != root (already represented virtually),
+		// there is nothing to physically add either way.
+		return false, nil
+	}
+
+	created, err = s.store.AddRelationship(from, to)
+	return created, wrapInterfaceErr(err)
+}
+
+// RemoveRelationship removes an ordinary relationship. Virtual ROOT
+// relationships cannot be removed, so removing (ROOT, X) is a no-op.
+func (s rootStore) RemoveRelationship(from, to NodeID) (removed bool, err error) {
+	if err = s.requireExist(from, to); err != nil {
+		return false, err
+	}
+
+	if from == s.root {
+		// Symmetric with AddRelationship above.
+		return false, nil
+	}
+
+	removed, err = s.store.RemoveRelationship(from, to)
+	return removed, wrapInterfaceErr(err)
+}
+
+// DeleteNode deletes an ordinary node. ROOT itself cannot be deleted
+// through this layer. This is reported as ErrCannotDeleteRoot, not
+// ErrNodeNotEmpty: ROOT's identity is structurally protected regardless of
+// its relationship count, so this failure cannot be resolved by clearing
+// relationships and retrying (theorystate.md section 18a).
+func (s rootStore) DeleteNode(id NodeID) error {
+	if !s.NodeExists(id) {
 		return ErrNodeNotFound
 	}
 
-	if id == r.root {
+	if id == s.root {
 		return ErrCannotDeleteRoot
 	}
 
-	return wrapInterfaceErr(r.graph.DeleteNode(id))
+	return wrapInterfaceErr(s.store.DeleteNode(id))
+}
+
+// RootGraph is the ROOT overlay as a layer of the graph stack: it
+// implements GraphAPI over any other GraphAPI, so it can be used
+// anywhere a Graph is -- as the graph a registry is constructed over, or
+// as the backend a GraphActor owns.
+//
+// The overlay is applied at every seam the graph is seen through, so
+// there is no place where the virtual (ROOT, X) relationships are visible
+// and another where they are not:
+//   - non-transactional reads and writes: via the embedded rootStore;
+//   - Transact: the closure receives a rootStore wrapped around the
+//     underlying transaction's Tx (which is why Transact takes the Tx
+//     interface rather than the concrete *Txn);
+//   - Checkers: RegisterChecker wraps each Check so it receives a
+//     rootReader over the reader it was given.
+//
+// Go embedding is not inheritance -- a promoted method's receiver is the
+// embedded value -- so this cannot be done by embedding *Graph; it has to
+// be decoration at the interface seams (theorystate.md section 87b).
+//
+// STACKING RULE: put the GraphActor outermost, i.e.
+// NewGraphActor(NewRootGraph(&g, root)), never the reverse. Inside the
+// actor, every RootGraph method (including multi-step ones such as
+// FindRelationships) runs as one job on the actor's goroutine, so it is
+// atomic, and the reference RootGraph stores is the raw backend, never
+// the actor, so the reentrancy hazard of theorystate.md section 90
+// cannot arise. NewRootGraph rejects a *GraphActor to enforce this.
+type RootGraph struct {
+	rootStore
+	api GraphAPI
+}
+
+// Compile-time assertion that *RootGraph satisfies GraphAPI.
+var _ GraphAPI = (*RootGraph)(nil)
+
+// NewRootGraph creates a ROOT layer around an existing primitive node.
+// It returns ErrRootGraphOverActor if graph is a *GraphActor (see the
+// RootGraph stacking rule) and ErrNodeNotFound if root does not exist.
+func NewRootGraph(graph GraphAPI, root NodeID) (*RootGraph, error) {
+	if _, isActor := graph.(*GraphActor); isActor {
+		return nil, ErrRootGraphOverActor
+	}
+
+	if !graph.NodeExists(root) {
+		return nil, ErrNodeNotFound
+	}
+
+	return &RootGraph{
+		rootStore: newRootStore(graph, root),
+		api:       graph,
+	}, nil
+}
+
+// Root returns the NodeID used as ROOT.
+func (r *RootGraph) Root() NodeID {
+	return r.root
+}
+
+// Transact behaves like the underlying graph's Transact, except that fn
+// receives a handle presenting the same ROOT overlay inside the
+// transaction as outside it. Rollback and commit-time Checkers are the
+// underlying graph's own.
+func (r *RootGraph) Transact(fn func(tx Tx) error) error {
+	return wrapInterfaceErr(r.api.Transact(func(tx Tx) error {
+		return fn(newRootStore(tx, r.root))
+	}))
+}
+
+// RegisterChecker registers c on the underlying graph, wrapped so that
+// c.Check receives a reader presenting the ROOT overlay -- the same view
+// the registry that registered it uses everywhere else. Name and Tags are
+// unchanged. Note Tags-based relevance filtering still looks at stored
+// facts only (see theorystate.md section 87b).
+func (r *RootGraph) RegisterChecker(c Checker) {
+	if c.Check != nil {
+		check := c.Check
+		root := r.root
+
+		c.Check = func(g GraphReader, touched map[NodeID]struct{}) error {
+			return check(rootReader{inner: g, root: root}, touched)
+		}
+	}
+
+	r.api.RegisterChecker(c)
 }
 
 var (
@@ -2911,7 +3022,7 @@ func (p *PointerRegistry) SetTarget(graph GraphAPI, id, target NodeID) error {
 		return nil
 	}
 
-	return wrapInterfaceErr(graph.Transact(func(tx *Txn) error {
+	return wrapInterfaceErr(graph.Transact(func(tx Tx) error {
 		return setPointerTargetTx(tx, id, current, hasTarget, target)
 	}))
 }
@@ -2952,7 +3063,7 @@ func (p *PointerRegistry) RemoveTarget(graph GraphAPI, id NodeID) (removed bool,
 func (p *PointerRegistry) NewPointer(graph GraphAPI) (NodeID, error) {
 	var id NodeID
 
-	err := graph.Transact(func(tx *Txn) error {
+	err := graph.Transact(func(tx Tx) error {
 		var err error
 		id, err = newPointerTx(tx, p.allPointers)
 		return err
@@ -3119,7 +3230,7 @@ func ensureMetadataWithSubjectSlot(g GraphAPI, subject, allPointerMetadata, allS
 		return metadata, subjectSlot, nil
 	}
 
-	err = g.Transact(func(tx *Txn) error {
+	err = g.Transact(func(tx Tx) error {
 		var err2 error
 
 		subjectSlot, err2 = createTaggedNodeTx(tx, allSubjectSlots)
@@ -3380,7 +3491,7 @@ func (m *PointerMetadataRegistry) SetTarget(graph GraphAPI, subject, target Node
 		return nil
 	}
 
-	return wrapInterfaceErr(graph.Transact(func(tx *Txn) error {
+	return wrapInterfaceErr(graph.Transact(func(tx Tx) error {
 		return setPointerTargetTx(tx, metadata, current, hasTarget, target)
 	}))
 }
@@ -3590,7 +3701,7 @@ func (m *PointerMetadataRegistryD) SetTarget(graph GraphAPI, subject, target Nod
 	}
 
 	if !found {
-		return wrapInterfaceErr(graph.Transact(func(tx *Txn) error {
+		return wrapInterfaceErr(graph.Transact(func(tx Tx) error {
 			var txErr error
 			slot, txErr = createTaggedNodeTx(tx, m.allTargetSlots)
 			if txErr != nil {
@@ -3613,7 +3724,7 @@ func (m *PointerMetadataRegistryD) SetTarget(graph GraphAPI, subject, target Nod
 		return nil
 	}
 
-	return wrapInterfaceErr(graph.Transact(func(tx *Txn) error {
+	return wrapInterfaceErr(graph.Transact(func(tx Tx) error {
 		return setPointerTargetTx(tx, slot, current, hasTarget, target)
 	}))
 }
@@ -3987,7 +4098,7 @@ func (c *CapsuleRegistry) NewCapsule(graph GraphAPI, value NodeID) (NodeID, erro
 
 	var capsule NodeID
 
-	err := graph.Transact(func(tx *Txn) error {
+	err := graph.Transact(func(tx Tx) error {
 		var err error
 		capsule, err = c.newCapsuleTx(tx, value)
 		return err
@@ -4279,7 +4390,7 @@ func (c *CapsuleRegistry) DeleteCapsule(graph GraphAPI, capsule NodeID) error {
 		return ErrNotCapsule
 	}
 
-	return wrapInterfaceErr(graph.Transact(func(tx *Txn) error {
+	return wrapInterfaceErr(graph.Transact(func(tx Tx) error {
 		prevSlot, hasPrevSlot, err := c.slotFor(tx, capsule, c.prevSlots.allPointers)
 		if err != nil {
 			return err
@@ -4475,7 +4586,7 @@ func (l *ListRegistry) IsList(graph GraphReader, id NodeID) bool {
 func (l *ListRegistry) NewList(graph GraphAPI) (NodeID, error) {
 	var list NodeID
 
-	err := graph.Transact(func(tx *Txn) error {
+	err := graph.Transact(func(tx Tx) error {
 		var err error
 		list, err = createTaggedNodeTx(tx, l.allLists)
 		return err
@@ -4554,7 +4665,7 @@ func (l *ListRegistry) Append(graph GraphAPI, list, value NodeID) (NodeID, error
 
 	var capsule NodeID
 
-	err := graph.Transact(func(tx *Txn) error {
+	err := graph.Transact(func(tx Tx) error {
 		var err error
 		capsule, err = l.appendTx(tx, list, value)
 		return err
@@ -4634,7 +4745,7 @@ func (l *ListRegistry) Prepend(graph GraphAPI, list, value NodeID) (NodeID, erro
 
 	var capsule NodeID
 
-	err := graph.Transact(func(tx *Txn) error {
+	err := graph.Transact(func(tx Tx) error {
 		oldHead, hasHead, err := findUniqueTaggedChild(tx, list, l.allHeads)
 		if err != nil {
 			return err
@@ -4706,7 +4817,7 @@ func (l *ListRegistry) InsertAfter(graph GraphAPI, list, afterCapsule, value Nod
 
 	var capsule NodeID
 
-	err := graph.Transact(func(tx *Txn) error {
+	err := graph.Transact(func(tx Tx) error {
 		oldNext, hasNext, err := l.capsules.Next(tx, afterCapsule)
 		if err != nil {
 			return err
@@ -5021,7 +5132,7 @@ func (l *ListRegistry) RemoveWithoutDeletingCapsule(graph GraphAPI, list, capsul
 		return ErrCapsuleNotInList
 	}
 
-	return wrapInterfaceErr(graph.Transact(func(tx *Txn) error {
+	return wrapInterfaceErr(graph.Transact(func(tx Tx) error {
 		prev, hasPrev, err := l.capsules.Prev(tx, capsule)
 		if err != nil {
 			return err
@@ -5176,7 +5287,7 @@ func (l *ListRegistry) DeleteList(graph GraphAPI, list NodeID) error {
 		return ErrNotList
 	}
 
-	return wrapInterfaceErr(graph.Transact(func(tx *Txn) error {
+	return wrapInterfaceErr(graph.Transact(func(tx Tx) error {
 		if _, err := tx.RemoveRelationship(l.allLists, list); err != nil {
 			return err
 		}
@@ -5298,7 +5409,7 @@ func (s *SetRegistry) IsSet(graph GraphReader, id NodeID) bool {
 func (s *SetRegistry) NewSet(graph GraphAPI) (NodeID, error) {
 	var id NodeID
 
-	err := graph.Transact(func(tx *Txn) error {
+	err := graph.Transact(func(tx Tx) error {
 		var err error
 		id, err = createTaggedNodeTx(tx, s.allSets)
 		return err
@@ -5463,7 +5574,7 @@ func (s *SetRegistry) DeleteSet(graph GraphAPI, set NodeID) error {
 		return ErrNotSet
 	}
 
-	return wrapInterfaceErr(graph.Transact(func(tx *Txn) error {
+	return wrapInterfaceErr(graph.Transact(func(tx Tx) error {
 		if _, err := tx.RemoveRelationship(s.allSets, set); err != nil {
 			return err
 		}
@@ -5946,7 +6057,7 @@ func (c *CompositeSetRegistry) IsCompositeSet(graph GraphReader, id NodeID) bool
 func (c *CompositeSetRegistry) NewCompositeSet(graph GraphAPI) (NodeID, error) {
 	var id NodeID
 
-	err := graph.Transact(func(tx *Txn) error {
+	err := graph.Transact(func(tx Tx) error {
 		var err error
 		id, err = createTaggedNodeTx(tx, c.allCompositeSets)
 		return err
@@ -5994,7 +6105,7 @@ func (c *CompositeSetRegistry) AddOperand(graph GraphAPI, set, operand NodeID, a
 		return 0, ErrInvalidSetOperand
 	}
 
-	err = graph.Transact(func(tx *Txn) error {
+	err = graph.Transact(func(tx Tx) error {
 		var err2 error
 		u, err2 = buildOperandDescriptorTx(tx, c.allAdditiveOp, c.allSubtractiveOp, c.allScalarOperand, c.allSetOperand, operand, additive, expand)
 		if err2 != nil {
@@ -6044,7 +6155,7 @@ func (c *CompositeSetRegistry) RemoveOperand(graph GraphAPI, set, u NodeID) erro
 		return err
 	}
 
-	return wrapInterfaceErr(graph.Transact(func(tx *Txn) error {
+	return wrapInterfaceErr(graph.Transact(func(tx Tx) error {
 		if _, err := tx.RemoveRelationship(set, u); err != nil {
 			return err
 		}
@@ -6255,7 +6366,7 @@ func (c *CompositeSetRegistry) DeleteCompositeSet(graph GraphAPI, set NodeID) er
 		return ErrNotCompositeSet
 	}
 
-	return wrapInterfaceErr(graph.Transact(func(tx *Txn) error {
+	return wrapInterfaceErr(graph.Transact(func(tx Tx) error {
 		if _, err := tx.RemoveRelationship(c.allCompositeSets, set); err != nil {
 			return err
 		}
@@ -6425,7 +6536,7 @@ func (c *CompositeSetLogRegistry) IsCompositeSetLog(graph GraphReader, id NodeID
 func (c *CompositeSetLogRegistry) NewCompositeSetLog(graph GraphAPI) (NodeID, error) {
 	var id NodeID
 
-	err := graph.Transact(func(tx *Txn) error {
+	err := graph.Transact(func(tx Tx) error {
 		var err error
 		id, err = createTaggedNodeTx(tx, c.lists.allLists)
 		if err != nil {
@@ -6472,7 +6583,7 @@ func (c *CompositeSetLogRegistry) AppendOperation(graph GraphAPI, log, operand N
 		return 0, 0, ErrInvalidSetOperand
 	}
 
-	err = graph.Transact(func(tx *Txn) error {
+	err = graph.Transact(func(tx Tx) error {
 		var err2 error
 		u, err2 = buildOperandDescriptorTx(tx, c.allAdditiveOp, c.allSubtractiveOp, c.allScalarOperand, c.allSetOperand, operand, additive, expand)
 		if err2 != nil {
@@ -6553,7 +6664,7 @@ func (c *CompositeSetLogRegistry) RemoveOperation(graph GraphAPI, log, capsule N
 		return err3
 	}
 
-	return wrapInterfaceErr(graph.Transact(func(tx *Txn) error {
+	return wrapInterfaceErr(graph.Transact(func(tx Tx) error {
 		return deleteOperandDescriptorTx(tx, operand, hasOperand, operationTag, operandTag, u)
 	}))
 }
@@ -6812,7 +6923,7 @@ func (c *CompositeSetLogRegistry) DeleteCompositeSetLog(graph GraphAPI, log Node
 		return ErrNotCompositeSetLog
 	}
 
-	return wrapInterfaceErr(graph.Transact(func(tx *Txn) error {
+	return wrapInterfaceErr(graph.Transact(func(tx Tx) error {
 		if _, err := tx.RemoveRelationship(c.allCompositeSetLogs, log); err != nil {
 			return err
 		}
@@ -6905,7 +7016,7 @@ func (d *domainConstraint) SetDomain(graph GraphAPI, anchor, domain NodeID) erro
 	}
 
 	if !found {
-		return wrapInterfaceErr(graph.Transact(func(tx *Txn) error {
+		return wrapInterfaceErr(graph.Transact(func(tx Tx) error {
 			newSlot, err2 := createTaggedNodeTx(tx, d.domainSlots.allPointers)
 			if err2 != nil {
 				return err2
@@ -7097,7 +7208,7 @@ func (b *DomainPointerRegistryB) NewDomainPointer(graph GraphAPI, anchor NodeID)
 		return nil
 	}
 
-	return wrapInterfaceErr(graph.Transact(func(tx *Txn) error {
+	return wrapInterfaceErr(graph.Transact(func(tx Tx) error {
 		u, err2 := newPointerTx(tx, b.pointers.allPointers)
 		if err2 != nil {
 			return err2
