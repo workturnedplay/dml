@@ -2168,8 +2168,8 @@ func (r *RootGraph) NodeExists(id NodeID) bool {
 //
 // Relationships pointing to ROOT are ordinary relationships and are stored.
 func (r *RootGraph) AddRelationship(from, to NodeID) (created bool, err error) {
-	if err = r.requireExist(from, to); err != nil {
-		return false, err
+	if err1 := r.requireExist(from, to); err1 != nil {
+		return false, err1
 	}
 
 	if from == r.root {
@@ -2180,8 +2180,8 @@ func (r *RootGraph) AddRelationship(from, to NodeID) (created bool, err error) {
 		return false, nil
 	}
 
-	created, err = r.graph.AddRelationship(from, to)
-	return created, wrapInterfaceErr(err)
+	created, err2 := r.graph.AddRelationship(from, to)
+	return created, wrapInterfaceErr(err2)
 }
 
 // RemoveRelationship removes an ordinary relationship from the graph.
@@ -2193,8 +2193,8 @@ func (r *RootGraph) AddRelationship(from, to NodeID) (created bool, err error) {
 // Relationships pointing to ROOT are ordinary relationships and can be
 // removed normally.
 func (r *RootGraph) RemoveRelationship(from, to NodeID) (removed bool, err error) {
-	if err = r.requireExist(from, to); err != nil {
-		return false, err
+	if err1 := r.requireExist(from, to); err1 != nil {
+		return false, err1
 	}
 
 	if from == r.root {
@@ -2204,8 +2204,8 @@ func (r *RootGraph) RemoveRelationship(from, to NodeID) (removed bool, err error
 		return false, nil
 	}
 
-	removed, err = r.graph.RemoveRelationship(from, to)
-	return removed, wrapInterfaceErr(err)
+	removed, err2 := r.graph.RemoveRelationship(from, to)
+	return removed, wrapInterfaceErr(err2)
 }
 
 // HasRelationship reports whether the relationship exists in the ROOT
