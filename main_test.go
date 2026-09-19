@@ -9624,18 +9624,15 @@ func TestCrossRoleNodeParticipatesInMultipleStructuresSimultaneously(t *testing.
 // resolveSetOperandGeneric -> CompositeSetLogRegistry.evaluate ->
 // resolveSetOperandGeneric, back into the CompositeSet that started it).
 //
-// This is also a concrete instance of theorystate.md section 86's
-// documented gap: introducing the cycle here (via
-// logs.AppendOperation(log1, composite, ...)) touches only log1 and
-// composite. It never touches subject, subject's metadata node, the
-// domain slot, or the target slot -- so DomainPointerRegistryD's own
-// commit-time Checker (keyed on exactly those two tags) does not and
-// structurally cannot fire on this mutation. The cycle is only ever
-// discovered the next time something -- here, a subsequent SetTarget --
-// actually asks the domain to validate membership. Section 86 already
-// names this non-local-dependency gap for domain-membership changes in
-// general; this test pins down that a cycle is a legitimate, concrete
-// instance of exactly that same gap, not a separate untested case.
+// Introducing the cycle (via logs.AppendOperation(log1, composite, ...))
+// touches only log1 and composite -- never subject, its metadata node,
+// or either slot. Before theorystate.md section 86 was closed, that
+// meant no Checker could fire and the cycle was only discovered by a
+// later SetTarget. The shared domain Checker now reaches subject's
+// pointer through a reverse lookup from the touched log/composite to the
+// domain slot that references them, evaluates the domain, hits the
+// cycle, and declines the commit: the append is rolled back and the
+// domain stays evaluable.
 func TestCrossRoleDomainPointerDetectsCycleIntroducedThroughDomainItself(t *testing.T) {
 	fx := newDomainPointerTestFixture(t)
 
@@ -9681,39 +9678,44 @@ func TestCrossRoleDomainPointerDetectsCycleIntroducedThroughDomainItself(t *test
 		t.Fatalf("SetTarget(subject, x) before cycle introduced: %v", err6)
 	}
 
-	// Introduce the cycle purely through the domain's own structure:
-	// log1 now also expands composite, which itself expands log1.
-	// Neither subject, its metadata, nor either slot is touched by this
-	// call.
-	if _, _, err7 := fx.logs.AppendOperation(fx.graph, log1, composite, true, true); err7 != nil {
-		t.Fatalf("AppendOperation(log1, composite, additive, expand): %v", err7)
+	// Attempt to introduce the cycle purely through the domain's own
+	// structure: log1 would also expand composite, which itself expands
+	// log1. The Checker must decline the commit with the cycle error,
+	// specifically -- not ErrTargetOutsideDomain.
+	_, _, cycleErr := fx.logs.AppendOperation(fx.graph, log1, composite, true, true)
+	if !errors.Is(cycleErr, ErrCompositeSetCycle) {
+		t.Fatalf("AppendOperation(log1, composite, additive, expand) error = %v, want %v", cycleErr, ErrCompositeSetCycle)
 	}
 
-	// A direct, independent confirmation that the underlying composite
-	// machinery itself now reports the cycle -- not something specific
-	// to the domain-pointer wrapper.
-	if _, err8 := fx.composites.Evaluate(fx.graph, composite); !errors.Is(err8, ErrCompositeSetCycle) {
-		t.Fatalf("Evaluate(composite) after introducing cycle: error = %v, want %v", err8, ErrCompositeSetCycle)
+	// The whole append was rolled back: log1 still has its one operation
+	// and the composite still evaluates, without a cycle.
+	operations, err := fx.logs.Operations(fx.graph, log1)
+	if err != nil {
+		t.Fatalf("Operations(log1) after the declined append: %v", err)
+	}
+	if len(operations) != 1 {
+		t.Fatalf("Operations(log1) = %v, want exactly the original operation", operations)
 	}
 
-	// The domain pointer's own SetTarget must surface the same cycle
-	// error, not silently succeed and not misreport it as
-	// ErrTargetOutsideDomain.
-	err = fx.domainD.SetTarget(fx.graph, subject, x)
-	if !errors.Is(err, ErrCompositeSetCycle) {
-		t.Fatalf("SetTarget(subject, x) after cycle introduced: error = %v, want %v", err, ErrCompositeSetCycle)
+	evaluated, err := fx.composites.Evaluate(fx.graph, composite)
+	if err != nil {
+		t.Fatalf("Evaluate(composite) after the declined append: %v", err)
+	}
+	if want := []NodeID{x}; !reflect.DeepEqual(evaluated, want) {
+		t.Fatalf("Evaluate(composite) = %v, want %v", evaluated, want)
 	}
 
-	// Domain() itself must remain unaffected: it only reads the domain
-	// slot's stored target, never evaluates anything, so it must keep
-	// reporting composite regardless of composite's own current
-	// evaluability.
+	// The pointer is fully usable and its domain is untouched.
+	if err2 := fx.domainD.SetTarget(fx.graph, subject, x); err2 != nil {
+		t.Fatalf("SetTarget(subject, x) after the declined append: %v", err2)
+	}
+
 	domain, hasDomain, err := fx.domainD.Domain(fx.graph, subject)
 	if err != nil {
-		t.Fatalf("Domain(subject) after cycle introduced: %v", err)
+		t.Fatalf("Domain(subject) after the declined append: %v", err)
 	}
 	if !hasDomain || domain != composite {
-		t.Fatalf("Domain(subject) = (%d,%v), want (%d,true) -- Domain() must not itself evaluate membership", domain, hasDomain, composite)
+		t.Fatalf("Domain(subject) = (%d,%v), want (%d,true)", domain, hasDomain, composite)
 	}
 }
 
@@ -9945,6 +9947,788 @@ func TestCrossRoleSetRegistryConflictCheckExercisedWhileSetIsDomainAndOperand(t 
 	err = fx.domainD.SetTarget(fx.graph, subject, outside)
 	if !errors.Is(err, ErrTargetOutsideDomain) {
 		t.Fatalf("SetTarget(subject, outside) after declined TagAsSet: error = %v, want %v", err, ErrTargetOutsideDomain)
+	}
+}
+
+// The following tests cover theorystate.md section 86: a domain
+// pointer's validity depends on its domain's membership, so the shared
+// commit-time domain Checker must decline any transaction that would
+// strand a pointer outside its domain, for both Representation B and D.
+
+// newTestNode creates a fresh node in g, failing t on error.
+func newTestNode(t *testing.T, g *Graph) NodeID {
+	t.Helper()
+
+	id, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode(): %v", err)
+	}
+
+	return id
+}
+
+// domainPointerHandle abstracts one domain-constrained pointer so the
+// same staleness scenario can run against Representation B and D.
+type domainPointerHandle struct {
+	setDomain func(domain NodeID) error
+	setTarget func(target NodeID) error
+	target    func() (NodeID, bool, error)
+}
+
+var domainPointerKinds = []struct {
+	name  string
+	build func(t *testing.T, fx *domainPointerTestFixture) domainPointerHandle
+}{
+	{"B", func(t *testing.T, fx *domainPointerTestFixture) domainPointerHandle {
+		t.Helper()
+
+		anchor := newTestNode(t, fx.graph)
+		if err := fx.domainB.NewDomainPointer(fx.graph, anchor); err != nil {
+			t.Fatalf("NewDomainPointer(): %v", err)
+		}
+
+		return domainPointerHandle{
+			setDomain: func(domain NodeID) error { return fx.domainB.SetDomain(fx.graph, anchor, domain) },
+			setTarget: func(target NodeID) error { return fx.domainB.SetTarget(fx.graph, anchor, target) },
+			target:    func() (NodeID, bool, error) { return fx.domainB.Target(fx.graph, anchor) },
+		}
+	}},
+	{"D", func(t *testing.T, fx *domainPointerTestFixture) domainPointerHandle {
+		t.Helper()
+
+		subject := newTestNode(t, fx.graph)
+
+		return domainPointerHandle{
+			setDomain: func(domain NodeID) error { return fx.domainD.SetDomain(fx.graph, subject, domain) },
+			setTarget: func(target NodeID) error { return fx.domainD.SetTarget(fx.graph, subject, target) },
+			target:    func() (NodeID, bool, error) { return fx.domainD.Target(fx.graph, subject) },
+		}
+	}},
+}
+
+// forEachDomainPointerKind runs body once per representation, each in a
+// fresh fixture.
+func forEachDomainPointerKind(t *testing.T, body func(t *testing.T, fx *domainPointerTestFixture, handle domainPointerHandle)) {
+	t.Helper()
+
+	for _, kind := range domainPointerKinds {
+		t.Run(kind.name, func(t *testing.T) {
+			fx := newDomainPointerTestFixture(t)
+			body(t, fx, kind.build(t, fx))
+		})
+	}
+}
+
+func requireSetContains(t *testing.T, fx *domainPointerTestFixture, set, member NodeID, want bool) {
+	t.Helper()
+
+	got, err := fx.sets.Contains(fx.graph, set, member)
+	if err != nil {
+		t.Fatalf("Contains(%d, %d): %v", set, member, err)
+	}
+	if got != want {
+		t.Fatalf("Contains(%d, %d) = %v, want %v", set, member, got, want)
+	}
+}
+
+func requireHandleTarget(t *testing.T, handle domainPointerHandle, want NodeID) {
+	t.Helper()
+
+	target, hasTarget, err := handle.target()
+	if err != nil {
+		t.Fatalf("Target(): %v", err)
+	}
+	if !hasTarget || target != want {
+		t.Fatalf("Target() = (%d,%v), want (%d,true)", target, hasTarget, want)
+	}
+}
+
+func requireCompositeOperandCount(t *testing.T, fx *domainPointerTestFixture, composite NodeID, want int) {
+	t.Helper()
+
+	operands, err := fx.composites.Operands(fx.graph, composite)
+	if err != nil {
+		t.Fatalf("Operands(%d): %v", composite, err)
+	}
+	if len(operands) != want {
+		t.Fatalf("Operands(%d) = %v, want %d operands", composite, operands, want)
+	}
+}
+
+func requireLogOperationCount(t *testing.T, fx *domainPointerTestFixture, log NodeID, want int) {
+	t.Helper()
+
+	operations, err := fx.logs.Operations(fx.graph, log)
+	if err != nil {
+		t.Fatalf("Operations(%d): %v", log, err)
+	}
+	if len(operations) != want {
+		t.Fatalf("Operations(%d) = %v, want %d operations", log, operations, want)
+	}
+}
+
+func TestDomainStalenessPlainSetRemoveOfCurrentTargetIsRejected(t *testing.T) {
+	forEachDomainPointerKind(t, func(t *testing.T, fx *domainPointerTestFixture, handle domainPointerHandle) {
+		domain, err := fx.sets.NewSet(fx.graph)
+		if err != nil {
+			t.Fatalf("NewSet(): %v", err)
+		}
+
+		target := newTestNode(t, fx.graph)
+		spare := newTestNode(t, fx.graph)
+		for _, member := range []NodeID{target, spare} {
+			if _, addErr := fx.sets.Add(fx.graph, domain, member); addErr != nil {
+				t.Fatalf("Add(domain, %d): %v", member, addErr)
+			}
+		}
+
+		if setErr := handle.setDomain(domain); setErr != nil {
+			t.Fatalf("setDomain(): %v", setErr)
+		}
+		if setErr := handle.setTarget(target); setErr != nil {
+			t.Fatalf("setTarget(): %v", setErr)
+		}
+
+		if _, removeErr := fx.sets.Remove(fx.graph, domain, target); !errors.Is(removeErr, ErrTargetOutsideDomain) {
+			t.Fatalf("Remove(domain, target) error = %v, want %v", removeErr, ErrTargetOutsideDomain)
+		}
+		requireSetContains(t, fx, domain, target, true)
+		requireHandleTarget(t, handle, target)
+
+		removed, err := fx.sets.Remove(fx.graph, domain, spare)
+		if err != nil {
+			t.Fatalf("Remove(domain, spare): %v", err)
+		}
+		if !removed {
+			t.Fatal("Remove(domain, spare) reported nothing removed")
+		}
+
+		extra := newTestNode(t, fx.graph)
+		if _, addErr := fx.sets.Add(fx.graph, domain, extra); addErr != nil {
+			t.Fatalf("Add(domain, extra): %v", addErr)
+		}
+	})
+}
+
+func TestDomainStalenessCompositeDomainMutationsThatStrandTargetAreRejected(t *testing.T) {
+	forEachDomainPointerKind(t, func(t *testing.T, fx *domainPointerTestFixture, handle domainPointerHandle) {
+		composite, err := fx.composites.NewCompositeSet(fx.graph)
+		if err != nil {
+			t.Fatalf("NewCompositeSet(): %v", err)
+		}
+
+		target := newTestNode(t, fx.graph)
+		spare := newTestNode(t, fx.graph)
+
+		targetOperand, err := fx.composites.AddOperand(fx.graph, composite, target, true, false)
+		if err != nil {
+			t.Fatalf("AddOperand(target): %v", err)
+		}
+		spareOperand, err := fx.composites.AddOperand(fx.graph, composite, spare, true, false)
+		if err != nil {
+			t.Fatalf("AddOperand(spare): %v", err)
+		}
+
+		if setErr := handle.setDomain(composite); setErr != nil {
+			t.Fatalf("setDomain(): %v", setErr)
+		}
+		if setErr := handle.setTarget(target); setErr != nil {
+			t.Fatalf("setTarget(): %v", setErr)
+		}
+
+		if removeErr := fx.composites.RemoveOperand(fx.graph, composite, targetOperand); !errors.Is(removeErr, ErrTargetOutsideDomain) {
+			t.Fatalf("RemoveOperand(target) error = %v, want %v", removeErr, ErrTargetOutsideDomain)
+		}
+		requireCompositeOperandCount(t, fx, composite, 2)
+
+		if _, subtractErr := fx.composites.AddOperand(fx.graph, composite, target, false, false); !errors.Is(subtractErr, ErrTargetOutsideDomain) {
+			t.Fatalf("AddOperand(target, subtractive) error = %v, want %v", subtractErr, ErrTargetOutsideDomain)
+		}
+		requireCompositeOperandCount(t, fx, composite, 2)
+		requireHandleTarget(t, handle, target)
+
+		if removeErr := fx.composites.RemoveOperand(fx.graph, composite, spareOperand); removeErr != nil {
+			t.Fatalf("RemoveOperand(spare): %v", removeErr)
+		}
+		requireCompositeOperandCount(t, fx, composite, 1)
+	})
+}
+
+func TestDomainStalenessLogDomainMutationsThatStrandTargetAreRejected(t *testing.T) {
+	forEachDomainPointerKind(t, func(t *testing.T, fx *domainPointerTestFixture, handle domainPointerHandle) {
+		log, err := fx.logs.NewCompositeSetLog(fx.graph)
+		if err != nil {
+			t.Fatalf("NewCompositeSetLog(): %v", err)
+		}
+
+		target := newTestNode(t, fx.graph)
+		spare := newTestNode(t, fx.graph)
+
+		_, targetCapsule, err := fx.logs.AppendOperation(fx.graph, log, target, true, false)
+		if err != nil {
+			t.Fatalf("AppendOperation(target): %v", err)
+		}
+		_, spareCapsule, err := fx.logs.AppendOperation(fx.graph, log, spare, true, false)
+		if err != nil {
+			t.Fatalf("AppendOperation(spare): %v", err)
+		}
+
+		if setErr := handle.setDomain(log); setErr != nil {
+			t.Fatalf("setDomain(): %v", setErr)
+		}
+		if setErr := handle.setTarget(target); setErr != nil {
+			t.Fatalf("setTarget(): %v", setErr)
+		}
+
+		if _, _, subtractErr := fx.logs.AppendOperation(fx.graph, log, target, false, false); !errors.Is(subtractErr, ErrTargetOutsideDomain) {
+			t.Fatalf("AppendOperation(target, subtractive) error = %v, want %v", subtractErr, ErrTargetOutsideDomain)
+		}
+		requireLogOperationCount(t, fx, log, 2)
+
+		if removeErr := fx.logs.RemoveOperation(fx.graph, log, targetCapsule); !errors.Is(removeErr, ErrTargetOutsideDomain) {
+			t.Fatalf("RemoveOperation(target) error = %v, want %v", removeErr, ErrTargetOutsideDomain)
+		}
+		requireLogOperationCount(t, fx, log, 2)
+		requireHandleTarget(t, handle, target)
+
+		if removeErr := fx.logs.RemoveOperation(fx.graph, log, spareCapsule); removeErr != nil {
+			t.Fatalf("RemoveOperation(spare): %v", removeErr)
+		}
+		requireLogOperationCount(t, fx, log, 1)
+	})
+}
+
+// TestDomainStalenessNestedSetShrinkIsRejectedThroughDiamond covers a
+// three-level chain (Set -> two composites -> log, with the Set reachable
+// through both composites) whose innermost Set is mutated. The reverse
+// walk must reach the log's domain slot, visit the shared Set once, and
+// terminate.
+func TestDomainStalenessNestedSetShrinkIsRejectedThroughDiamond(t *testing.T) {
+	forEachDomainPointerKind(t, func(t *testing.T, fx *domainPointerTestFixture, handle domainPointerHandle) {
+		inner, err := fx.sets.NewSet(fx.graph)
+		if err != nil {
+			t.Fatalf("NewSet(): %v", err)
+		}
+
+		target := newTestNode(t, fx.graph)
+		spare := newTestNode(t, fx.graph)
+		for _, member := range []NodeID{target, spare} {
+			if _, addErr := fx.sets.Add(fx.graph, inner, member); addErr != nil {
+				t.Fatalf("Add(inner, %d): %v", member, addErr)
+			}
+		}
+
+		log, err := fx.logs.NewCompositeSetLog(fx.graph)
+		if err != nil {
+			t.Fatalf("NewCompositeSetLog(): %v", err)
+		}
+
+		for i := 0; i < 2; i++ {
+			composite, compositeErr := fx.composites.NewCompositeSet(fx.graph)
+			if compositeErr != nil {
+				t.Fatalf("NewCompositeSet(): %v", compositeErr)
+			}
+			if _, operandErr := fx.composites.AddOperand(fx.graph, composite, inner, true, true); operandErr != nil {
+				t.Fatalf("AddOperand(composite, inner): %v", operandErr)
+			}
+			if _, _, appendErr := fx.logs.AppendOperation(fx.graph, log, composite, true, true); appendErr != nil {
+				t.Fatalf("AppendOperation(log, composite): %v", appendErr)
+			}
+		}
+
+		if setErr := handle.setDomain(log); setErr != nil {
+			t.Fatalf("setDomain(): %v", setErr)
+		}
+		if setErr := handle.setTarget(target); setErr != nil {
+			t.Fatalf("setTarget(): %v", setErr)
+		}
+
+		if _, removeErr := fx.sets.Remove(fx.graph, inner, target); !errors.Is(removeErr, ErrTargetOutsideDomain) {
+			t.Fatalf("Remove(inner, target) error = %v, want %v", removeErr, ErrTargetOutsideDomain)
+		}
+		requireSetContains(t, fx, inner, target, true)
+
+		if _, removeErr := fx.sets.Remove(fx.graph, inner, spare); removeErr != nil {
+			t.Fatalf("Remove(inner, spare): %v", removeErr)
+		}
+	})
+}
+
+// TestDomainStalenessOneStrandedPointerRejectsWholeTransactionAcrossRepresentations
+// shares one domain between a B pointer and a D pointer. Removing either
+// pointer's target is rejected, and a single transaction removing both is
+// rejected as a whole, leaving both members in place.
+func TestDomainStalenessOneStrandedPointerRejectsWholeTransactionAcrossRepresentations(t *testing.T) {
+	fx := newDomainPointerTestFixture(t)
+
+	domain, err := fx.sets.NewSet(fx.graph)
+	if err != nil {
+		t.Fatalf("NewSet(): %v", err)
+	}
+
+	bTarget := newTestNode(t, fx.graph)
+	dTarget := newTestNode(t, fx.graph)
+	free := newTestNode(t, fx.graph)
+	for _, member := range []NodeID{bTarget, dTarget, free} {
+		if _, addErr := fx.sets.Add(fx.graph, domain, member); addErr != nil {
+			t.Fatalf("Add(domain, %d): %v", member, addErr)
+		}
+	}
+
+	anchor := newTestNode(t, fx.graph)
+	if newErr := fx.domainB.NewDomainPointer(fx.graph, anchor); newErr != nil {
+		t.Fatalf("NewDomainPointer(): %v", newErr)
+	}
+	if setErr := fx.domainB.SetDomain(fx.graph, anchor, domain); setErr != nil {
+		t.Fatalf("domainB.SetDomain(): %v", setErr)
+	}
+	if setErr := fx.domainB.SetTarget(fx.graph, anchor, bTarget); setErr != nil {
+		t.Fatalf("domainB.SetTarget(): %v", setErr)
+	}
+
+	subject := newTestNode(t, fx.graph)
+	if setErr := fx.domainD.SetDomain(fx.graph, subject, domain); setErr != nil {
+		t.Fatalf("domainD.SetDomain(): %v", setErr)
+	}
+	if setErr := fx.domainD.SetTarget(fx.graph, subject, dTarget); setErr != nil {
+		t.Fatalf("domainD.SetTarget(): %v", setErr)
+	}
+
+	if _, removeErr := fx.sets.Remove(fx.graph, domain, free); removeErr != nil {
+		t.Fatalf("Remove(domain, free): %v", removeErr)
+	}
+	if _, removeErr := fx.sets.Remove(fx.graph, domain, dTarget); !errors.Is(removeErr, ErrTargetOutsideDomain) {
+		t.Fatalf("Remove(domain, dTarget) error = %v, want %v", removeErr, ErrTargetOutsideDomain)
+	}
+	if _, removeErr := fx.sets.Remove(fx.graph, domain, bTarget); !errors.Is(removeErr, ErrTargetOutsideDomain) {
+		t.Fatalf("Remove(domain, bTarget) error = %v, want %v", removeErr, ErrTargetOutsideDomain)
+	}
+
+	err = fx.graph.Transact(func(tx Tx) error {
+		if removeErr := removeRelationshipTx(tx, domain, bTarget); removeErr != nil {
+			return removeErr
+		}
+
+		return removeRelationshipTx(tx, domain, dTarget)
+	})
+	if !errors.Is(err, ErrTargetOutsideDomain) {
+		t.Fatalf("Transact(remove both) error = %v, want %v", err, ErrTargetOutsideDomain)
+	}
+
+	requireSetContains(t, fx, domain, bTarget, true)
+	requireSetContains(t, fx, domain, dTarget, true)
+}
+
+// TestDomainStalenessShrinkThenRetargetInOneTransactionIsAccepted shows
+// the Checker judges the final state of a transaction, not each step: the
+// intermediate state (domain shrunk, pointer not yet retargeted) is
+// stranded, the final state is valid.
+func TestDomainStalenessShrinkThenRetargetInOneTransactionIsAccepted(t *testing.T) {
+	fx := newDomainPointerTestFixture(t)
+
+	domain, err := fx.sets.NewSet(fx.graph)
+	if err != nil {
+		t.Fatalf("NewSet(): %v", err)
+	}
+
+	oldTarget := newTestNode(t, fx.graph)
+	newTarget := newTestNode(t, fx.graph)
+	for _, member := range []NodeID{oldTarget, newTarget} {
+		if _, addErr := fx.sets.Add(fx.graph, domain, member); addErr != nil {
+			t.Fatalf("Add(domain, %d): %v", member, addErr)
+		}
+	}
+
+	anchor := newTestNode(t, fx.graph)
+	if newErr := fx.domainB.NewDomainPointer(fx.graph, anchor); newErr != nil {
+		t.Fatalf("NewDomainPointer(): %v", newErr)
+	}
+	if setErr := fx.domainB.SetDomain(fx.graph, anchor, domain); setErr != nil {
+		t.Fatalf("SetDomain(): %v", setErr)
+	}
+	if setErr := fx.domainB.SetTarget(fx.graph, anchor, oldTarget); setErr != nil {
+		t.Fatalf("SetTarget(oldTarget): %v", setErr)
+	}
+
+	u, found, err := fx.domainB.subPointer(fx.graph, anchor)
+	if err != nil || !found {
+		t.Fatalf("subPointer(): found=%v err=%v", found, err)
+	}
+
+	err = fx.graph.Transact(func(tx Tx) error {
+		if removeErr := removeRelationshipTx(tx, domain, oldTarget); removeErr != nil {
+			return removeErr
+		}
+		if swapErr := removeRelationshipTx(tx, u, oldTarget); swapErr != nil {
+			return swapErr
+		}
+
+		return addRelationshipTx(tx, u, newTarget)
+	})
+	if err != nil {
+		t.Fatalf("Transact(shrink then retarget) error = %v, want nil", err)
+	}
+
+	target, hasTarget, err := fx.domainB.Target(fx.graph, anchor)
+	if err != nil {
+		t.Fatalf("Target(): %v", err)
+	}
+	if !hasTarget || target != newTarget {
+		t.Fatalf("Target() = (%d,%v), want (%d,true)", target, hasTarget, newTarget)
+	}
+	requireSetContains(t, fx, domain, oldTarget, false)
+}
+
+// TestDomainPointerRegistryBCheckerCatchesOutOfBandTargetChange is the
+// Representation B counterpart of
+// TestDomainPointerRegistryDCheckerCatchesOutOfBandTargetChange: bypass
+// the wrapper and mutate the underlying sub-pointer registry directly.
+func TestDomainPointerRegistryBCheckerCatchesOutOfBandTargetChange(t *testing.T) {
+	fx := newDomainPointerTestFixture(t)
+
+	anchor := newTestNode(t, fx.graph)
+	if newErr := fx.domainB.NewDomainPointer(fx.graph, anchor); newErr != nil {
+		t.Fatalf("NewDomainPointer(): %v", newErr)
+	}
+
+	domain, err := fx.sets.NewSet(fx.graph)
+	if err != nil {
+		t.Fatalf("NewSet(): %v", err)
+	}
+	allowed := newTestNode(t, fx.graph)
+	if _, addErr := fx.sets.Add(fx.graph, domain, allowed); addErr != nil {
+		t.Fatalf("Add(): %v", addErr)
+	}
+	if setErr := fx.domainB.SetDomain(fx.graph, anchor, domain); setErr != nil {
+		t.Fatalf("SetDomain(): %v", setErr)
+	}
+
+	u, found, err := fx.domainB.subPointer(fx.graph, anchor)
+	if err != nil || !found {
+		t.Fatalf("subPointer(): found=%v err=%v", found, err)
+	}
+
+	disallowed := newTestNode(t, fx.graph)
+	err = fx.domainB.pointers.SetTarget(fx.graph, u, disallowed)
+	if !errors.Is(err, ErrTargetOutsideDomain) {
+		t.Fatalf("bypassing SetTarget() error = %v, want %v", err, ErrTargetOutsideDomain)
+	}
+
+	target, hasTarget, err := fx.domainB.Target(fx.graph, anchor)
+	if err != nil {
+		t.Fatalf("Target(): %v", err)
+	}
+	if hasTarget {
+		t.Fatalf("Target() = (%d,true), want no target after the Checker declined the bypassing commit", target)
+	}
+}
+
+// TestDomainPointerRegistryBCheckerCatchesOutOfBandDomainChange is the
+// Representation B counterpart of
+// TestDomainPointerRegistryDCheckerCatchesOutOfBandDomainChange.
+func TestDomainPointerRegistryBCheckerCatchesOutOfBandDomainChange(t *testing.T) {
+	fx := newDomainPointerTestFixture(t)
+
+	anchor := newTestNode(t, fx.graph)
+	if newErr := fx.domainB.NewDomainPointer(fx.graph, anchor); newErr != nil {
+		t.Fatalf("NewDomainPointer(): %v", newErr)
+	}
+
+	firstDomain, err := fx.sets.NewSet(fx.graph)
+	if err != nil {
+		t.Fatalf("NewSet(first): %v", err)
+	}
+	x := newTestNode(t, fx.graph)
+	if _, addErr := fx.sets.Add(fx.graph, firstDomain, x); addErr != nil {
+		t.Fatalf("Add(): %v", addErr)
+	}
+	if setErr := fx.domainB.SetDomain(fx.graph, anchor, firstDomain); setErr != nil {
+		t.Fatalf("SetDomain(): %v", setErr)
+	}
+	if setErr := fx.domainB.SetTarget(fx.graph, anchor, x); setErr != nil {
+		t.Fatalf("SetTarget(): %v", setErr)
+	}
+
+	secondDomain, err := fx.sets.NewSet(fx.graph)
+	if err != nil {
+		t.Fatalf("NewSet(second): %v", err)
+	}
+	// secondDomain deliberately does not contain x.
+
+	slot, found, err := fx.domainB.domainSlotFor(fx.graph, anchor)
+	if err != nil || !found {
+		t.Fatalf("domainSlotFor(): found=%v err=%v", found, err)
+	}
+
+	err = fx.domainB.domainSlots.SetTarget(fx.graph, slot, secondDomain)
+	if !errors.Is(err, ErrTargetOutsideDomain) {
+		t.Fatalf("bypassing SetDomain() error = %v, want %v", err, ErrTargetOutsideDomain)
+	}
+
+	domain, hasDomain, err := fx.domainB.Domain(fx.graph, anchor)
+	if err != nil {
+		t.Fatalf("Domain(): %v", err)
+	}
+	if !hasDomain || domain != firstDomain {
+		t.Fatalf("Domain() = (%d,%v), want (%d,true) -- unaffected by the declined bypass", domain, hasDomain, firstDomain)
+	}
+}
+
+// domainBRig holds the registries needed to exercise
+// DomainPointerRegistryB over an arbitrary GraphAPI (a GraphActor, a
+// RootGraph, ...), unlike domainPointerTestFixture, which is fixed to a
+// bare *Graph.
+type domainBRig struct {
+	sets    *SetRegistry
+	domainB *DomainPointerRegistryB
+}
+
+func newDomainBRig(t *testing.T, api GraphAPI) domainBRig {
+	t.Helper()
+
+	names := NewNameRegistry(api)
+	ids, err := names.BootstrapNames(api, FoundationalNames)
+	if err != nil {
+		t.Fatalf("BootstrapNames(): %v", err)
+	}
+
+	sets, err := NewSetRegistry(api, ids[NameAllSets], ids[NameAllCompositeSets], ids[NameAllCompositeSetLogs])
+	if err != nil {
+		t.Fatalf("NewSetRegistry(): %v", err)
+	}
+
+	composites, err := NewCompositeSetRegistry(
+		api,
+		sets,
+		ids[NameAllCompositeSets],
+		ids[NameAllAdditiveOp],
+		ids[NameAllSubtractiveOp],
+		ids[NameAllScalarOperand],
+		ids[NameAllSetOperand],
+	)
+	if err != nil {
+		t.Fatalf("NewCompositeSetRegistry(): %v", err)
+	}
+
+	subPointers, err := NewPointerRegistry(api, ids[NameAllSubPointers])
+	if err != nil {
+		t.Fatalf("NewPointerRegistry(AllSubPointers): %v", err)
+	}
+
+	domainSlots, err := NewPointerRegistry(api, ids[NameAllDomainSlot])
+	if err != nil {
+		t.Fatalf("NewPointerRegistry(AllDomainSlot): %v", err)
+	}
+
+	return domainBRig{
+		sets:    sets,
+		domainB: NewDomainPointerRegistryB(api, subPointers, domainSlots, sets, composites, nil),
+	}
+}
+
+// TestDomainPointerRegistryBCheckerToleratesUniversalRootParent runs two
+// domain-constrained B pointers under a RootGraph, where ROOT is a virtual
+// parent of every slot. Without addSlotOwners' universal-parent skip, ROOT
+// would be treated as an anchor and its forward lookups would see both
+// slots and report ambiguity, rejecting unrelated transactions. Staleness
+// must still be detected.
+func TestDomainPointerRegistryBCheckerToleratesUniversalRootParent(t *testing.T) {
+	var g Graph
+
+	root := newTestNode(t, &g)
+	rootGraph, err := NewRootGraph(&g, root)
+	if err != nil {
+		t.Fatalf("NewRootGraph(): %v", err)
+	}
+
+	rig := newDomainBRig(t, rootGraph)
+
+	type pointerCase struct {
+		domain, target, spare NodeID
+	}
+
+	cases := make([]pointerCase, 2)
+	for i := range cases {
+		anchor, createErr := rootGraph.CreateNode()
+		if createErr != nil {
+			t.Fatalf("CreateNode(anchor): %v", createErr)
+		}
+		if newErr := rig.domainB.NewDomainPointer(rootGraph, anchor); newErr != nil {
+			t.Fatalf("NewDomainPointer(): %v", newErr)
+		}
+
+		domain, setErr := rig.sets.NewSet(rootGraph)
+		if setErr != nil {
+			t.Fatalf("NewSet(): %v", setErr)
+		}
+
+		target, targetErr := rootGraph.CreateNode()
+		if targetErr != nil {
+			t.Fatalf("CreateNode(target): %v", targetErr)
+		}
+		spare, spareErr := rootGraph.CreateNode()
+		if spareErr != nil {
+			t.Fatalf("CreateNode(spare): %v", spareErr)
+		}
+
+		for _, member := range []NodeID{target, spare} {
+			if _, addErr := rig.sets.Add(rootGraph, domain, member); addErr != nil {
+				t.Fatalf("Add(domain, %d): %v", member, addErr)
+			}
+		}
+		if domainErr := rig.domainB.SetDomain(rootGraph, anchor, domain); domainErr != nil {
+			t.Fatalf("SetDomain(): %v", domainErr)
+		}
+		if pointErr := rig.domainB.SetTarget(rootGraph, anchor, target); pointErr != nil {
+			t.Fatalf("SetTarget(): %v", pointErr)
+		}
+
+		cases[i] = pointerCase{domain: domain, target: target, spare: spare}
+	}
+
+	for _, c := range cases {
+		if _, removeErr := rig.sets.Remove(rootGraph, c.domain, c.spare); removeErr != nil {
+			t.Fatalf("Remove(domain, spare) error = %v, want nil", removeErr)
+		}
+		if _, removeErr := rig.sets.Remove(rootGraph, c.domain, c.target); !errors.Is(removeErr, ErrTargetOutsideDomain) {
+			t.Fatalf("Remove(domain, target) error = %v, want %v", removeErr, ErrTargetOutsideDomain)
+		}
+	}
+}
+
+// TestDomainPointerRegistryBSetTargetRacingDomainShrinkNeverStrandsPointerUnderGraphActor
+// races SetTarget against removal of the same member from the domain,
+// entirely through one GraphActor. Each is read-then-commit across
+// separate round trips, so they can interleave; the property under test
+// is that the pointer never ends up targeting a non-member -- the losing
+// side is declined with ErrTargetOutsideDomain (write-time or by the
+// Checker), never committed stale.
+func TestDomainPointerRegistryBSetTargetRacingDomainShrinkNeverStrandsPointerUnderGraphActor(t *testing.T) {
+	actor := NewGraphActor(&Graph{})
+	defer actor.Close()
+
+	rig := newDomainBRig(t, actor)
+
+	anchor, err := actor.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode(anchor): %v", err)
+	}
+	if newErr := rig.domainB.NewDomainPointer(actor, anchor); newErr != nil {
+		t.Fatalf("NewDomainPointer(): %v", newErr)
+	}
+
+	domain, err := rig.sets.NewSet(actor)
+	if err != nil {
+		t.Fatalf("NewSet(): %v", err)
+	}
+	if setErr := rig.domainB.SetDomain(actor, anchor, domain); setErr != nil {
+		t.Fatalf("SetDomain(): %v", setErr)
+	}
+
+	const rounds = 100
+
+	for round := 0; round < rounds; round++ {
+		candidate, createErr := actor.CreateNode()
+		if createErr != nil {
+			t.Fatalf("round %d: CreateNode(): %v", round, createErr)
+		}
+		if _, addErr := rig.sets.Add(actor, domain, candidate); addErr != nil {
+			t.Fatalf("round %d: Add(): %v", round, addErr)
+		}
+
+		var wg sync.WaitGroup
+		var setErr, removeErr error
+
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			setErr = rig.domainB.SetTarget(actor, anchor, candidate)
+		}()
+		go func() {
+			defer wg.Done()
+			_, removeErr = rig.sets.Remove(actor, domain, candidate)
+		}()
+		wg.Wait()
+
+		for _, opErr := range []error{setErr, removeErr} {
+			if opErr != nil && !errors.Is(opErr, ErrTargetOutsideDomain) {
+				t.Fatalf("round %d: error = %v, want nil or %v", round, opErr, ErrTargetOutsideDomain)
+			}
+		}
+
+		target, hasTarget, targetErr := rig.domainB.Target(actor, anchor)
+		if targetErr != nil {
+			t.Fatalf("round %d: Target(): %v", round, targetErr)
+		}
+		if !hasTarget {
+			continue
+		}
+
+		member, memberErr := rig.sets.Contains(actor, domain, target)
+		if memberErr != nil {
+			t.Fatalf("round %d: Contains(): %v", round, memberErr)
+		}
+		if !member {
+			t.Fatalf("round %d: pointer targets %d, which is no longer in its domain", round, target)
+		}
+	}
+}
+
+// TestSetAddAndRemoveAreVisibleToCommitTimeCheckers pins down that
+// SetRegistry.Add/Remove run through Graph.Transact: a Checker keyed on
+// the AllSets tag can veto either, the change is rolled back, and the
+// reported bool is false.
+func TestSetAddAndRemoveAreVisibleToCommitTimeCheckers(t *testing.T) {
+	g, sets := newSetTestFixture(t)
+
+	set, err := sets.NewSet(g)
+	if err != nil {
+		t.Fatalf("NewSet(): %v", err)
+	}
+	member := newTestNode(t, g)
+
+	errVeto := errors.New("veto")
+	veto := false
+
+	g.RegisterChecker(Checker{
+		Name: "veto",
+		Tags: []NodeID{sets.allSets},
+		Check: func(_ GraphReader, _ map[NodeID]struct{}) error {
+			if veto {
+				return errVeto
+			}
+
+			return nil
+		},
+	})
+
+	veto = true
+	added, err := sets.Add(g, set, member)
+	if !errors.Is(err, errVeto) {
+		t.Fatalf("Add() error = %v, want %v", err, errVeto)
+	}
+	if added {
+		t.Fatal("Add() reported added=true for a vetoed commit")
+	}
+	if g.HasRelationship(set, member) {
+		t.Fatal("member is present after a vetoed Add()")
+	}
+
+	veto = false
+	if _, addErr := sets.Add(g, set, member); addErr != nil {
+		t.Fatalf("Add() without veto: %v", addErr)
+	}
+
+	veto = true
+	removed, err := sets.Remove(g, set, member)
+	if !errors.Is(err, errVeto) {
+		t.Fatalf("Remove() error = %v, want %v", err, errVeto)
+	}
+	if removed {
+		t.Fatal("Remove() reported removed=true for a vetoed commit")
+	}
+	if !g.HasRelationship(set, member) {
+		t.Fatal("member is missing after a vetoed Remove()")
 	}
 }
 

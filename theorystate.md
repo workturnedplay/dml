@@ -253,9 +253,10 @@ order-sensitive fold for the log-based form — see §80–§83, which formalize
 and supersede this section's diagram with a concrete, now fully
 implemented representation.
 
-**§9c — Domains and DomainSets (DECIDED design, not yet implemented —
-see §10c for the Pointer-side wiring, §86 for a known accepted gap).** A
-Domain is not a new primitive kind of thing and does not get its own tag.
+**§9c — Domains and DomainSets (DECIDED, implemented — see §10c for the
+Pointer-side wiring, §86 for how domain-membership staleness is
+enforced).**
+A Domain is not a new primitive kind of thing and does not get its own tag.
 A Domain is simply *any node that already carries one of the three
 existing Set-representation tags* — `AllSets`, `AllCompositeSets`, or
 `AllCompositeSetLogs` (§79) — referenced from a domain-constraining
@@ -382,8 +383,8 @@ C/D's slot tags do), which is what lets a node carry many primitive
 children while a particular processor still considers its own narrower
 structure valid.
 
-**§10c — Domain Pointers (DECIDED design, not yet implemented).** A
-pointer becomes domain-constrained by carrying one additional
+**§10c — Domain Pointers (DECIDED, implemented).**
+A pointer becomes domain-constrained by carrying one additional
 freshly-minted slot child — reusing the same occurrence/role-identity
 pattern as every other slot in this document (§75) and the same "wrap an
 existing PointerRegistry under a new tag" reuse discipline already used
@@ -455,22 +456,22 @@ same `findUniqueTaggedParent` lookup already used one hop further out
 for subject discovery) and re-validates M's current target against M's
 current domain.
 
-Representation B does not get an equivalent Checker, discovered while
-implementing this rather than anticipated when this section was
-originally drafted: its anchor P carries no self-identifying tag in the
-general case (P may be any caller-managed node, tagged however its own
-caller's domain requires or not tagged at all), so reverse-discovering P
-from a touched sub-pointer or domain-slot node would need either an
-untagged single-parent lookup (already rejected elsewhere in this
-project as unsafe, `implementation_state.md` item 13) or a new tag
-applied to every domain-constrained P purely to support this one
-Checker. Deferred, since no current caller needs it (§7) -- this is a
-real, narrower enforcement guarantee for B than for D, recorded here
-rather than silently glossed over.
+Representation B originally got no Checker, because its anchor P
+carries no self-identifying tag (P may be any caller-managed node) and
+reverse-discovering P from a touched sub-pointer or domain-slot node
+seemed to need either an untagged single-parent lookup (rejected as
+unsafe, `implementation_state.md` item 13) or a new tag on every
+domain-constrained P. That was a false dichotomy, resolved in §86: take
+every *parent* of the touched node as a *candidate* anchor, then let the
+forward, tag-based lookups (`AllSubPointers` child, `AllDomainSlot`
+child) accept or reject each candidate. A parent that is not an anchor
+simply has no such child and is skipped -- the same tolerance
+`findUniqueTaggedParent` already gives unrelated parents. No new tag, no
+untagged lookup. B and D now share one Checker builder, differing only
+in which tag marks the target holder and how a target is read.
 
-See §86 for a real, deliberately-accepted gap in this enforcement: domain
-legality can be invalidated by a mutation to the domain node itself,
-which the Checker above cannot see.
+§86 also covers the other enforcement gap: domain legality invalidated
+by a mutation to the domain node itself.
 
 ## 11. Ordered Lists
 
@@ -1944,7 +1945,73 @@ open here, per §7's construct-only-what's-needed discipline: not worth
 designing further until a real caller needs more than the direct approach
 already gives.
 
-## 86. Domain Pointer staleness — an accepted gap, not yet closed
+## 86. Domain Pointer staleness — closed by a commit-time Checker over reverse lookups (DECIDED, implemented)
+
+**Status change.** This section originally recorded an accepted gap
+(option 1 below, kept as history). It is now closed, along with §10c's
+missing Representation B Checker, by one shared mechanism.
+
+**Observation that removed the cost objection to option 2.** Option 2
+was "reverse-index domain → referencing pointers" and was deferred for
+its permanent bookkeeping cost. No index needs to be stored:
+`FindIncoming` already is the reverse index (the same realization that
+resolved `doesElementExist(X)` in §11). From a touched Set-kind node the
+Checker walks *up* and *back*:
+
+- domain → its domain slots: `FindIncoming(domain)` filtered by
+  `AllDomainSlot`;
+- slot → anchor: the slot's parents;
+- Set → containing composites/logs (transitively): `FindIncoming` filtered
+  by `AllSetOperand` gives descriptors; a descriptor's parents give
+  composites; `CapsuleRegistry.CapsulesWithValue` on the descriptor gives
+  capsules, whose parents give logs. A visited set makes diamonds visit
+  once and cycles terminate.
+
+Nothing is stored, so nothing can drift.
+
+**Semantics: reject on strand.** A transaction that would leave any
+domain-constrained pointer with a target outside its domain is declined
+at commit and rolled back, whichever node it touched -- the pointer, its
+slots, the domain, or anything the domain expands. The Checker judges the
+transaction's final state, so shrinking a domain and retargeting in one
+`Transact` is accepted. Errors evaluating the domain (cycle, malformed
+descriptor) also decline the commit, so a cycle introduced through the
+domain structure is now refused at the moment it is introduced rather
+than discovered by a later `SetTarget`. Both B and D use the same Checker
+builder (`domainConstraint.registerChecker`), which also closes the
+TOCTOU window under `GraphActor`: `SetTarget` and a domain shrink are
+read-then-commit across separate round trips, and whichever commits
+second is declined instead of committing a stale decision.
+
+**Prerequisite found while implementing.** `SetRegistry.Add`/`Remove`
+called the raw graph directly, so no Checker ever saw plain-Set
+membership changes. They now run as one-edge `Transact` calls.
+
+**Universal parents.** Under a `RootGraph`, ROOT is a virtual parent of
+every node (§12a). Candidate anchors that have the `AllDomainSlot` hub as
+a child are therefore skipped: a universal parent is never a real anchor,
+and treating it as one produces false ambiguity errors or pairs unrelated
+pointers' targets and domains.
+
+**Residual gaps, accepted.**
+- Raw non-`Transact` mutations bypass every Checker (as documented on
+  `Checker`).
+- Removing a Set-kind tag out-of-band inside a `Transact` is not seen:
+  the node no longer carries the tag the relevance filter keys on.
+- Re-pointing a descriptor's operand out-of-band inside a `Transact`
+  touches the descriptor, which is not Set-kind, and is not seen.
+- A domain already corrupt (e.g. a cycle created by a raw mutation) makes
+  every later transaction touching it fail until repaired in a single
+  transaction that makes it valid.
+- Cost: a commit touching a Set-kind node does one upward walk and one
+  `Contains` per referencing pointer, so a domain shared by many pointers
+  is O(pointers) per commit. Membership is not memoized (§9a/§35); add
+  per-commit memoization only if this proves to matter.
+- If B and D coexist in one graph each registers its own Checker, so
+  domain-slot discovery runs twice; harmless and bounded.
+
+**Historical record of the original analysis (superseded by the above;
+kept unedited below, per this document's practice, e.g. §32, §61, §78):**
 
 **Accepted limitation (DECIDED to defer; option 2 below is the recorded
 future direction, not a promise of when).** Every commit-time invariant
@@ -2378,12 +2445,11 @@ graph immediately after any relevant mutation (§10c), so even if
 under a future concurrent submitter, whichever committed second would be
 caught and rejected if it left the pair inconsistent — because the
 Checker never trusts what an earlier caller read, only what currently
-holds. `DomainPointerRegistryB` has no equivalent Checker (deferred per
-its own doc comment, since its anchor carries no self-identifying tag a
-Checker could reverse-discover it from, §7) and is enforced write-time
-only. Under today's single-threaded execution this asymmetry is
-invisible; under any concurrent submitter it is exactly the shape of gap
-that would surface first. The general fix this illustrates: validate a
+holds. `DomainPointerRegistryB` originally had no equivalent Checker
+and was enforced write-time only, which is exactly the gap that surfaces
+first under a concurrent submitter; it now shares D's Checker builder
+(§86), and a test races `SetTarget` against a domain shrink under one
+`GraphActor`. The general fix this illustrates: validate a
 cross-cutting invariant against live current state at commit time, never
 against whatever a submitter believed when it decided what to send —
 precisely what `Checker` (§73/§77/§83) already does, generalized to a
@@ -2725,9 +2791,9 @@ kept current as sections above resolve or split further.)*
   the domain slot to Representation B or D only, never A or C; D is
   enforced via both write-time validation and a commit-time `Checker`
   keyed on its own existing target-slot tag plus the domain-slot tag,
-  while B is write-time-only for now, since B's anchor carries no
-  self-identifying tag a `Checker` could reverse-discover it from (§10c,
-  implemented as `DomainPointerRegistryB`/`DomainPointerRegistryD`).
+  while B gets the same commit-time enforcement via the shared Checker
+  builder (§10c, §86, implemented as
+  `DomainPointerRegistryB`/`DomainPointerRegistryD`).
 - A storage interface should be extracted matching `Graph`'s existing
   public method surface, so every higher-level registry depends on an
   interface rather than the concrete `Graph` type; this is a pure
@@ -2754,6 +2820,13 @@ kept current as sections above resolve or split further.)*
   object. The `GraphActor` is always the outermost layer, so overlay
   methods are atomic and the stored reference is never the actor
   (§87b).
+
+- Domain Pointer staleness is closed (§86): one shared commit-time
+  Checker, for both Representation B and D, declines any transaction that
+  would leave a domain-constrained pointer with a target outside its
+  domain, finding affected pointers by reverse lookups over
+  `FindIncoming` (no stored index). `SetRegistry.Add`/`Remove` run
+  through `Transact` so Checkers observe Set membership changes.
 
 ### TENTATIVE
 - Monotonically increasing NodeIDs; serialized first implementation.
@@ -2815,15 +2888,10 @@ kept current as sections above resolve or split further.)*
   requiring nesting to express a changeset boundary, since no current
   caller needs to fail and retry only an inner piece of a larger composed
   operation while leaving its other already-applied steps standing.
-- Domain Pointer staleness (§86): whether to build the deferred
-  reverse-index fix (option 2) that would let a domain-node mutation
-  re-validate every pointer referencing it, versus continuing to accept
-  the gap indefinitely.
-- Whether Domain Pointers should ever be supported on a variant of
-  Representation B whose anchor carries a self-identifying tag (making a
-  commit-time Checker possible there too, symmetric with Representation
-  D) -- not pursued now since no current caller needs it
-  (implementation_state.md item 22).
+- Domain Pointer staleness residuals (§86): per-commit memoization of
+  domain membership if the O(pointers-per-domain) validation cost matters,
+  and whether the out-of-band-inside-`Transact` gaps (tag removal,
+  descriptor re-pointing) are worth closing.
 - Generalized "find the bridging node(s) given both path endpoints" query
   for arbitrary, not-necessarily-tag-shaped paths (§85).
 - Backend selection timing: fixed at construction vs. runtime-swappable,

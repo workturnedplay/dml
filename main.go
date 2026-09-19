@@ -3690,6 +3690,24 @@ func (m *PointerMetadataRegistryD) targetSlot(graph GraphReader, metadata NodeID
 	return findUniqueTaggedChild(graph, metadata, m.allTargetSlots)
 }
 
+// targetOfMetadata returns the current target recorded on metadata node
+// metadata, if any: its target-slot's single child. hasTarget is false
+// when metadata has no target-slot yet, or has one with no target set.
+// This is Target's tail once the subject has already been resolved to
+// its metadata node, and is also what the shared domain Checker uses
+// (metadata nodes are its anchors -- see domainConstraint.registerChecker).
+func (m *PointerMetadataRegistryD) targetOfMetadata(graph GraphReader, metadata NodeID) (target NodeID, hasTarget bool, err error) {
+	slot, found, err := m.targetSlot(graph, metadata)
+	if err != nil {
+		return 0, false, err
+	}
+	if !found {
+		return 0, false, nil
+	}
+
+	return singleChildTarget(graph, slot)
+}
+
 // Target returns subject's current target via its metadata/target-slot
 // nodes, if any.
 //
@@ -3710,15 +3728,7 @@ func (m *PointerMetadataRegistryD) Target(graph GraphReader, subject NodeID) (ta
 		return 0, false, nil
 	}
 
-	slot, found, err := m.targetSlot(graph, metadata)
-	if err != nil {
-		return 0, false, err
-	}
-	if !found {
-		return 0, false, nil
-	}
-
-	return singleChildTarget(graph, slot)
+	return m.targetOfMetadata(graph, metadata)
 }
 
 // SetTarget sets subject's target to target, creating subject's metadata
@@ -5346,8 +5356,12 @@ func (l *ListRegistry) DeleteList(graph GraphAPI, list NodeID) error {
 //     registry-level enforcement at all.
 //
 // A member is therefore simply a direct child of S; adding/removing a
-// member is simply Graph.AddRelationship(S, X) / Graph.RemoveRelationship(S, X),
-// tag-gated by requiring S to already be tagged (AllSets, S).
+// member is simply one (S, X) relationship add/remove, tag-gated by
+// requiring S to already be tagged (AllSets, S). Each is performed as a
+// one-step Graph.Transact call rather than a raw Graph call, so that
+// commit-time Checkers observe every membership change: a domain
+// pointer's validity depends on its domain's membership
+// (theorystate.md section 86), and a raw call would bypass every Checker.
 //
 // Because a Set imposes no cardinality or structural invariant on its
 // children beyond the tag itself, there is no analogue here of the
@@ -5490,8 +5504,17 @@ func (s *SetRegistry) Add(graph GraphAPI, set, member NodeID) (added bool, err e
 		return false, ErrNodeNotFound
 	}
 
-	added, err = graph.AddRelationship(set, member)
-	return added, wrapInterfaceErr(err)
+	err = graph.Transact(func(tx Tx) error {
+		var txErr error
+		added, txErr = tx.AddRelationship(set, member)
+		return wrapInterfaceErr(txErr)
+	})
+	if err != nil {
+		// A declined commit was rolled back, so nothing was added.
+		return false, wrapInterfaceErr(err)
+	}
+
+	return added, nil
 }
 
 // Remove removes member from set, if present.
@@ -5512,8 +5535,17 @@ func (s *SetRegistry) Remove(graph GraphAPI, set, member NodeID) (removed bool, 
 		return false, ErrNodeNotFound
 	}
 
-	removed, err = graph.RemoveRelationship(set, member)
-	return removed, wrapInterfaceErr(err)
+	err = graph.Transact(func(tx Tx) error {
+		var txErr error
+		removed, txErr = tx.RemoveRelationship(set, member)
+		return wrapInterfaceErr(txErr)
+	})
+	if err != nil {
+		// A declined commit was rolled back, so nothing was removed.
+		return false, wrapInterfaceErr(err)
+	}
+
+	return removed, nil
 }
 
 // Contains reports whether member currently belongs to set.
@@ -5597,6 +5629,22 @@ func (s *SetRegistry) DeleteSet(graph GraphAPI, set NodeID) error {
 	return wrapInterfaceErr(graph.Transact(func(tx Tx) error {
 		return untagAndDeleteNodeTx(tx, set, s.allSets)
 	}))
+}
+
+// sortedNodeSet returns the members of set as a slice sorted ascending.
+// The order has no semantic meaning (theorystate.md section 5); it
+// exists only so results are deterministic regardless of Go's map
+// iteration order. Shared by CompositeSetRegistry.evaluate,
+// CompositeSetLogRegistry.evaluate, and domainConstraint.affectedAnchors.
+func sortedNodeSet(set map[NodeID]struct{}) []NodeID {
+	ids := make([]NodeID, 0, len(set))
+	for id := range set {
+		ids = append(ids, id)
+	}
+
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+
+	return ids
 }
 
 // operandDescriptorAxes reads back descriptor node u's current
@@ -6345,13 +6393,7 @@ func (c *CompositeSetRegistry) evaluate(graph GraphReader, set NodeID, visited m
 		}
 	}
 
-	out := make([]NodeID, 0, len(result))
-	for id := range result {
-		out = append(out, id)
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
-
-	return out, nil
+	return sortedNodeSet(result), nil
 }
 
 // resolveOperand returns the set of NodeIDs descriptor u currently
@@ -7075,13 +7117,11 @@ func (d *domainConstraint) validateMembership(graph GraphReader, domain, target 
 // node set yet, always allows any target -- exactly like a Pointer with
 // no domain constraint at all.
 //
-// See theorystate.md section 86 for the known, accepted gap this check
-// does not close: this only validates against the domain's membership
-// as of this call. A domain's own membership changing afterward, via a
-// mutation that never touches anchor or its domain slot, is not
-// detected here or by any Checker -- SetDomain and SetTarget (on
-// whichever of DomainPointerRegistryB/D this is embedded in) are the
-// only two write paths that ever re-validate this relationship.
+// This only validates against the domain's membership as of this call.
+// A domain's membership changing afterward -- through a mutation that
+// never touches anchor or its slots -- is caught by the commit-time
+// Checker built by registerChecker (theorystate.md section 86), which
+// calls this same function for every affected anchor.
 func (d *domainConstraint) checkAllowed(graph GraphReader, anchor, target NodeID) error {
 	domain, hasDomain, err := d.Domain(graph, anchor)
 	if err != nil {
@@ -7092,6 +7132,274 @@ func (d *domainConstraint) checkAllowed(graph GraphReader, anchor, target NodeID
 	}
 
 	return d.validateMembership(graph, domain, target)
+}
+
+// anchorTargetFunc reports the current target of a domain-constrained
+// pointer's anchor: P for Representation B (DomainPointerRegistryB.Target),
+// the metadata node M for Representation D
+// (PointerMetadataRegistryD.targetOfMetadata). It is the only thing that
+// differs between the two representations' commit-time Checkers.
+type anchorTargetFunc func(g GraphReader, anchor NodeID) (target NodeID, hasTarget bool, err error)
+
+// registerChecker registers the commit-time Checker enforcing that no
+// domain-constrained pointer is left with a target outside its domain
+// (theorystate.md section 86). It is shared by DomainPointerRegistryB and
+// DomainPointerRegistryD; they differ only in targetTag (the tag of the
+// node holding the pointer's target: AllSubPointers or
+// AllPointerMetadataTargetSlot) and targetOf.
+//
+// The Checker fires when a transaction touches a domain slot, a target
+// holder, or a node carrying any Set-representation tag. It finds every
+// affected anchor via affectedAnchors, then for each anchor that has both
+// a target and a domain, re-validates membership against live state. Any
+// error from evaluating the domain (cycle, malformed descriptor, ...) is
+// propagated and declines the commit; only an anchor whose target is
+// genuinely outside its domain yields ErrTargetOutsideDomain.
+//
+// The Tags list includes AllCompositeSetLogs only if logs was supplied;
+// as everywhere else, logs must be the same registry wired into
+// composites via CompositeSetRegistry.SetLogs, and must exist before
+// this registry is constructed.
+func (d *domainConstraint) registerChecker(graph GraphAPI, name string, targetTag NodeID, targetOf anchorTargetFunc) {
+	tags := []NodeID{d.domainSlots.allPointers, targetTag, d.sets.allSets, d.composites.allCompositeSets}
+	if d.logs != nil {
+		tags = append(tags, d.logs.allCompositeSetLogs)
+	}
+
+	graph.RegisterChecker(Checker{
+		Name: name,
+		Tags: tags,
+		Check: func(g GraphReader, touched map[NodeID]struct{}) error {
+			anchors, err := d.affectedAnchors(g, targetTag, touched)
+			if err != nil {
+				return err
+			}
+
+			for _, anchor := range anchors {
+				target, hasTarget, targetErr := targetOf(g, anchor)
+				if targetErr != nil {
+					return targetErr
+				}
+				if !hasTarget {
+					continue
+				}
+
+				if allowedErr := d.checkAllowed(g, anchor, target); allowedErr != nil {
+					return allowedErr
+				}
+			}
+
+			return nil
+		},
+	})
+}
+
+// affectedAnchors returns, sorted, every anchor whose domain-pointer
+// validity a transaction touching touched could have changed. An anchor
+// is affected when:
+//   - a touched node is a domain slot or a target holder (targetTag):
+//     its owners are affected; or
+//   - a touched node is Set-kind (any of the three representations):
+//     that node, and every composite/log that transitively expands it,
+//     may be some pointer's domain, so the owners of every domain slot
+//     referencing any of them are affected.
+//
+// Candidates are collected via reverse lookups only (Graph.incoming is
+// the reverse index -- nothing is stored or kept in sync; see
+// theorystate.md section 86). They are candidates, not verified anchors:
+// the caller's targetOf and Domain lookups reject non-anchors by finding
+// no target or no domain slot. Deleted touched nodes are skipped.
+func (d *domainConstraint) affectedAnchors(g GraphReader, targetTag NodeID, touched map[NodeID]struct{}) ([]NodeID, error) {
+	anchors := make(map[NodeID]struct{})
+
+	for node := range touched {
+		if !g.NodeExists(node) {
+			continue
+		}
+
+		if d.domainSlots.IsPointer(g, node) || g.HasRelationship(targetTag, node) {
+			if slotErr := d.addSlotOwners(g, node, targetTag, anchors); slotErr != nil {
+				return nil, slotErr
+			}
+		}
+
+		if !operandCarriesKnownSetTag(g, d.sets, d.composites, d.logs, node) {
+			continue
+		}
+
+		containers, containersErr := d.transitiveSetContainers(g, node)
+		if containersErr != nil {
+			return nil, containersErr
+		}
+
+		for _, candidate := range append([]NodeID{node}, containers...) {
+			slots, slotsErr := d.domainSlotsOf(g, candidate)
+			if slotsErr != nil {
+				return nil, slotsErr
+			}
+
+			for _, slot := range slots {
+				if ownersErr := d.addSlotOwners(g, slot, targetTag, anchors); ownersErr != nil {
+					return nil, ownersErr
+				}
+			}
+		}
+	}
+
+	return sortedNodeSet(anchors), nil
+}
+
+// addSlotOwners adds every candidate owner (parent) of slot to anchors.
+//
+// Two kinds of parent are skipped. The tag hubs (AllDomainSlot,
+// targetTag) would make the later forward lookup O(every slot). And any
+// parent that itself has the AllDomainSlot hub as a child is a universal
+// parent -- ROOT under a RootGraph, which is a virtual parent of every
+// node (theorystate.md section 12a) -- never a real anchor; treating it
+// as one would make its forward lookups see every slot in the graph as
+// its own and misreport ambiguity or pair unrelated pointers' targets and
+// domains.
+func (d *domainConstraint) addSlotOwners(g GraphReader, slot, targetTag NodeID, anchors map[NodeID]struct{}) error {
+	incoming, err := g.FindIncoming(slot)
+	if err != nil {
+		return wrapInterfaceErr(err)
+	}
+
+	for _, rel := range incoming {
+		owner := rel.From
+		if owner == d.domainSlots.allPointers || owner == targetTag || g.HasRelationship(owner, d.domainSlots.allPointers) {
+			continue
+		}
+
+		anchors[owner] = struct{}{}
+	}
+
+	return nil
+}
+
+// domainSlotsOf returns every domain slot whose target is domain: a
+// reverse lookup over FindIncoming(domain), filtered by the AllDomainSlot
+// tag.
+func (d *domainConstraint) domainSlotsOf(g GraphReader, domain NodeID) ([]NodeID, error) {
+	incoming, err := g.FindIncoming(domain)
+	if err != nil {
+		return nil, wrapInterfaceErr(err)
+	}
+
+	slots := make([]NodeID, 0, len(incoming))
+	for _, rel := range incoming {
+		if d.domainSlots.IsPointer(g, rel.From) {
+			slots = append(slots, rel.From)
+		}
+	}
+
+	return slots, nil
+}
+
+// transitiveSetContainers returns every composite/log that expands node
+// as a set operand, directly or through any chain of such composites/logs
+// (excluding node itself). It is a breadth-first walk over
+// setOperandContainers with a visited set, so shared sub-expressions
+// (diamonds) are visited once and cycles -- legal in a corrupted graph --
+// terminate.
+func (d *domainConstraint) transitiveSetContainers(g GraphReader, node NodeID) ([]NodeID, error) {
+	visited := map[NodeID]struct{}{node: {}}
+	queue := []NodeID{node}
+	var containers []NodeID
+
+	for len(queue) > 0 {
+		current := queue[0]
+		queue = queue[1:]
+
+		direct, err := d.setOperandContainers(g, current)
+		if err != nil {
+			return nil, err
+		}
+
+		for _, container := range direct {
+			if _, seen := visited[container]; seen {
+				continue
+			}
+
+			visited[container] = struct{}{}
+			containers = append(containers, container)
+			queue = append(queue, container)
+		}
+	}
+
+	return containers, nil
+}
+
+// setOperandContainers returns every composite/log that has node as a
+// set-expansion (AllSetOperand) operand, one level up. A descriptor using
+// node as a scalar operand is deliberately ignored: a scalar operand
+// contributes node itself, not node's membership, so a change to node's
+// members cannot change the container's membership.
+func (d *domainConstraint) setOperandContainers(g GraphReader, node NodeID) ([]NodeID, error) {
+	incoming, err := g.FindIncoming(node)
+	if err != nil {
+		return nil, wrapInterfaceErr(err)
+	}
+
+	containers := make([]NodeID, 0, len(incoming))
+	for _, rel := range incoming {
+		if !g.HasRelationship(d.composites.allSetOperand, rel.From) {
+			continue
+		}
+
+		owners, ownersErr := d.descriptorOwners(g, rel.From)
+		if ownersErr != nil {
+			return nil, ownersErr
+		}
+
+		containers = append(containers, owners...)
+	}
+
+	return containers, nil
+}
+
+// descriptorOwners returns the composite(s) having descriptor u as a
+// direct child, plus (if a CompositeSetLogRegistry was supplied) the
+// log(s) having a capsule whose value is u -- the reverse of the two ways
+// an operand descriptor is attached (theorystate.md section 80/82). The
+// log hop reuses CapsuleRegistry.CapsulesWithValue rather than any new
+// index.
+func (d *domainConstraint) descriptorOwners(g GraphReader, u NodeID) ([]NodeID, error) {
+	incoming, err := g.FindIncoming(u)
+	if err != nil {
+		return nil, wrapInterfaceErr(err)
+	}
+
+	owners := make([]NodeID, 0, len(incoming))
+	for _, rel := range incoming {
+		if d.composites.IsCompositeSet(g, rel.From) {
+			owners = append(owners, rel.From)
+		}
+	}
+
+	if d.logs == nil {
+		return owners, nil
+	}
+
+	capsules, err := d.logs.lists.capsules.CapsulesWithValue(g, u)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, capsule := range capsules {
+		capsuleIncoming, capsuleErr := g.FindIncoming(capsule)
+		if capsuleErr != nil {
+			return nil, wrapInterfaceErr(capsuleErr)
+		}
+
+		for _, rel := range capsuleIncoming {
+			if d.logs.IsCompositeSetLog(g, rel.From) {
+				owners = append(owners, rel.From)
+			}
+		}
+	}
+
+	return owners, nil
 }
 
 // DomainPointerRegistryB adds domain-constrained target enforcement on
@@ -7121,25 +7429,20 @@ func (d *domainConstraint) checkAllowed(graph GraphReader, anchor, target NodeID
 // the same tag-based child lookup used throughout this file, rather than
 // requiring callers to separately track and pass U alongside P.
 //
-// Unlike DomainPointerRegistryD, this type registers no commit-time
-// Checker of its own for domain-membership enforcement. Representation
-// D's anchor (M) is self-identifying via its own AllPointerMetadata tag,
-// which is what lets its Checker reverse-discover M from a touched
-// target- or domain-slot node. Representation B's anchor P carries no
-// equivalent distinguishing tag in the general case -- P may be any
-// caller-managed node, tagged however the caller's own domain requires
-// or not tagged at all -- so reverse-discovering P from a touched U or
-// U3 would require either an untagged "find the one parent" lookup
-// (the exact anti-pattern already rejected elsewhere in this file, see
-// CapsulesWithValue's doc comment) or a new bookkeeping tag applied to
-// every domain-constrained P purely to support this one Checker. Given
-// no current caller needs Representation B domain pointers at all yet,
-// this is deferred rather than built ahead of an actual need
-// (theorystate.md section 7) -- domain-membership enforcement for B is
-// therefore write-time only, via SetTarget and SetDomain below; a caller
-// that bypasses this type and mutates the underlying PointerRegistry or
-// domain-slot PointerRegistry directly will not be caught until (or
-// unless) something later reads back through this type.
+// Domain-membership is enforced both at write time (SetTarget/SetDomain
+// below) and at commit time, by the same shared Checker Representation D
+// uses (domainConstraint.registerChecker). B's anchor P carries no
+// self-identifying tag -- P may be any caller-managed node -- so the
+// Checker does not try to reverse-discover P by an untagged single-parent
+// lookup. It enumerates the parents of a touched sub-pointer or
+// domain-slot node as candidates and lets the forward, tag-based
+// lookups (subPointer, domainSlotFor) accept or reject each: a parent
+// that is not an anchor simply has no such child and is skipped, exactly
+// as findUniqueTaggedParent tolerates unrelated parents elsewhere in this
+// file. No new tag is needed. The Checker also catches a domain node's
+// own membership changing later (theorystate.md section 86). Raw,
+// non-Transact Graph mutations still bypass every Checker, as documented
+// on the Checker type.
 type DomainPointerRegistryB struct {
 	domainConstraint
 	pointers *PointerRegistry
@@ -7157,8 +7460,11 @@ type DomainPointerRegistryB struct {
 // a domain pointed at a CompositeSetLog-kind node is then rejected via
 // ErrInvalidSetOperand exactly like any other unrecognized domain kind,
 // until logs is available.
-func NewDomainPointerRegistryB(_ GraphAPI, pointers, domainSlots *PointerRegistry, sets *SetRegistry, composites *CompositeSetRegistry, logs *CompositeSetLogRegistry) *DomainPointerRegistryB {
-	return &DomainPointerRegistryB{
+//
+// This also registers the shared commit-time domain Checker (see
+// domainConstraint.registerChecker), keyed on pointers' own tag.
+func NewDomainPointerRegistryB(graph GraphAPI, pointers, domainSlots *PointerRegistry, sets *SetRegistry, composites *CompositeSetRegistry, logs *CompositeSetLogRegistry) *DomainPointerRegistryB {
+	b := &DomainPointerRegistryB{
 		domainConstraint: domainConstraint{
 			domainSlots: domainSlots,
 			sets:        sets,
@@ -7167,6 +7473,15 @@ func NewDomainPointerRegistryB(_ GraphAPI, pointers, domainSlots *PointerRegistr
 		},
 		pointers: pointers,
 	}
+
+	b.registerChecker(
+		graph,
+		fmt.Sprintf("DomainPointerRegistryB(tag=%d)", domainSlots.allPointers),
+		pointers.allPointers,
+		b.Target,
+	)
+
+	return b
 }
 
 // subPointer returns anchor's Representation B sub-pointer node U -- the
@@ -7306,15 +7621,13 @@ func (b *DomainPointerRegistryB) SetDomain(graph GraphAPI, anchor, domain NodeID
 // remains free to carry any number of additional tagged children --
 // including U3 -- without disturbing either discovery.
 //
-// Unlike DomainPointerRegistryB, this type registers a commit-time
-// Checker (see NewDomainPointerRegistryD) in addition to write-time
-// enforcement in SetTarget/SetDomain below: M is self-identifying via
-// its own AllPointerMetadata tag, which lets the Checker reverse-
-// discover M from either a touched target-slot or a touched domain-slot
-// node, using the exact same findUniqueTaggedParent lookup
-// locateBySubjectSlot already uses one hop further out. See
-// DomainPointerRegistryB's doc comment for why this reverse-discovery
-// path is not available in the general Representation B case.
+// Like DomainPointerRegistryB, this type registers the shared
+// commit-time domain Checker (see domainConstraint.registerChecker) in
+// addition to write-time enforcement in SetTarget/SetDomain below. Here
+// the anchors are metadata nodes M, and a target is read via
+// PointerMetadataRegistryD.targetOfMetadata. The Checker also catches a
+// domain node's own membership changing later (theorystate.md
+// section 86).
 type DomainPointerRegistryD struct {
 	domainConstraint
 	metadata *PointerMetadataRegistryD
@@ -7327,17 +7640,12 @@ type DomainPointerRegistryD struct {
 // should be the same shared instance passed there, if both exist in the
 // same graph.
 //
-// This additionally registers a Checker (see Graph.RegisterChecker)
-// enforcing domain-membership at commit time for any node tagged
-// metadata's own target-slot tag or the shared AllDomainSlot tag: for
-// each such touched node, it reverse-discovers the owning metadata node
-// M (via findUniqueTaggedParent against metadata's own AllPointerMetadata
-// tag -- the same lookup locateBySubjectSlot already performs one hop
-// further out, applied here directly against a slot rather than via a
-// subject), then re-validates M's current target against M's current
-// domain, catching a caller bypassing this type and mutating the
+// This additionally registers the shared commit-time domain Checker (see
+// domainConstraint.registerChecker), keyed on metadata's own target-slot
+// tag. It catches a caller bypassing this type and mutating the
 // underlying PointerMetadataRegistryD or the shared domainSlots registry
-// directly through either one.
+// directly, and a domain node's own membership changing later
+// (theorystate.md section 86).
 func NewDomainPointerRegistryD(graph GraphAPI, metadata *PointerMetadataRegistryD, domainSlots *PointerRegistry, sets *SetRegistry, composites *CompositeSetRegistry, logs *CompositeSetLogRegistry) *DomainPointerRegistryD {
 	d := &DomainPointerRegistryD{
 		domainConstraint: domainConstraint{
@@ -7349,51 +7657,12 @@ func NewDomainPointerRegistryD(graph GraphAPI, metadata *PointerMetadataRegistry
 		metadata: metadata,
 	}
 
-	graph.RegisterChecker(Checker{
-		Name: fmt.Sprintf("DomainPointerRegistryD(tag=%d)", domainSlots.allPointers),
-		Tags: []NodeID{metadata.allTargetSlots, domainSlots.allPointers},
-		Check: func(g GraphReader, touched map[NodeID]struct{}) error {
-			anchors := make(map[NodeID]struct{})
-
-			for node := range touched {
-				if !g.HasRelationship(metadata.allTargetSlots, node) && !g.HasRelationship(domainSlots.allPointers, node) {
-					continue
-				}
-
-				m, found, err := findUniqueTaggedParent(g, node, metadata.allPointerMetadata)
-				if err != nil {
-					return err
-				}
-				if found {
-					anchors[m] = struct{}{}
-				}
-			}
-
-			for m := range anchors {
-				slot, found, err := metadata.targetSlot(g, m)
-				if err != nil {
-					return err
-				}
-				if !found {
-					continue
-				}
-
-				target, hasTarget, err := singleChildTarget(g, slot)
-				if err != nil {
-					return err
-				}
-				if !hasTarget {
-					continue
-				}
-
-				if err := d.checkAllowed(g, m, target); err != nil {
-					return err
-				}
-			}
-
-			return nil
-		},
-	})
+	d.registerChecker(
+		graph,
+		fmt.Sprintf("DomainPointerRegistryD(tag=%d)", domainSlots.allPointers),
+		metadata.allTargetSlots,
+		metadata.targetOfMetadata,
+	)
 
 	return d
 }

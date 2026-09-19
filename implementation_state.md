@@ -1345,14 +1345,56 @@ NodeID-keyed structure outside the primitive graph.
  DeleteCapsule's eight repeated RemoveRelationship blocks became one
  table-driven loop. No behavior change.
 
+29. Closed theorystate.md section 86 (Domain Pointer staleness) and
+ DomainPointerRegistryB's missing commit-time Checker with one shared
+ mechanism. domainConstraint.registerChecker builds the Checker for both
+ representations, parameterized by the tag of the target holder
+ (AllSubPointers for B, AllPointerMetadataTargetSlot for D) and an
+ anchorTargetFunc (DomainPointerRegistryB.Target,
+ PointerMetadataRegistryD.targetOfMetadata). It fires when a transaction
+ touches a domain slot, a target holder, or a node carrying any
+ Set-representation tag, finds affected anchors by reverse lookups
+ (affectedAnchors, addSlotOwners, domainSlotsOf,
+ transitiveSetContainers, setOperandContainers, descriptorOwners --
+ FindIncoming plus CapsulesWithValue, no stored index), and re-runs
+ checkAllowed for each. B needs no new tag: parents of a touched node are
+ candidates, and forward tagged lookups reject non-anchors. Candidates
+ that have the AllDomainSlot hub as a child are skipped (ROOT under a
+ RootGraph is a virtual universal parent).
+
+ Bug found and fixed on the way: SetRegistry.Add/Remove called the raw
+ graph, so no Checker ever saw plain-Set membership changes; they now
+ run as one-edge Transact calls (and report false when a Checker declines
+ the commit). DRY: sortedNodeSet replaces two identical copies in the
+ composite/log evaluate methods; PointerMetadataRegistryD.targetOfMetadata
+ is now shared by Target and the Checker. NewDomainPointerRegistryB's
+ graph parameter is now used (was `_`).
+
+ TestCrossRoleDomainPointerDetectsCycleIntroducedThroughDomainItself
+ previously pinned the section 86 gap (the cycle-introducing append
+ succeeded); it now asserts the append is declined with
+ ErrCompositeSetCycle and rolled back.
+
+ Covered by TestDomainStalenessPlainSetRemoveOfCurrentTargetIsRejected,
+ TestDomainStalenessCompositeDomainMutationsThatStrandTargetAreRejected,
+ TestDomainStalenessLogDomainMutationsThatStrandTargetAreRejected,
+ TestDomainStalenessNestedSetShrinkIsRejectedThroughDiamond,
+ TestDomainStalenessOneStrandedPointerRejectsWholeTransactionAcrossRepresentations,
+ TestDomainStalenessShrinkThenRetargetInOneTransactionIsAccepted,
+ TestDomainPointerRegistryBCheckerCatchesOutOfBandTargetChange,
+ TestDomainPointerRegistryBCheckerCatchesOutOfBandDomainChange,
+ TestDomainPointerRegistryBCheckerToleratesUniversalRootParent,
+ TestDomainPointerRegistryBSetTargetRacingDomainShrinkNeverStrandsPointerUnderGraphActor,
+ and TestSetAddAndRemoveAreVisibleToCommitTimeCheckers.
+
 Currently unaddressed yet:
 - Txn does not support nesting one Graph.Transact call inside another
   (Txn.DeleteNode is supported -- see item 15). Nesting is not needed by
   any current caller; add support if and when one actually needs it.
-- DomainPointerRegistryB's domain-membership invariant is enforced only
-  at write time, not at commit time, for the reasons item 22 records --
-  revisit if a future caller needs Representation B domain pointers to
-  be as defense-in-depth as Representation D's.
+- Domain-pointer staleness residuals (theorystate.md section 86): raw
+  non-Transact mutations, out-of-band tag removal or descriptor
+  re-pointing inside a Transact, and O(pointers-per-domain) validation
+  cost per commit (unmemoized) remain accepted.
 - The in-memory Graph itself still has no protection against concurrent
   goroutine access if used directly (theorystate.md section 89b) --
   unaffected by item 24's interface extraction, since that extraction
