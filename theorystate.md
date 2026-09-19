@@ -2054,6 +2054,44 @@ vice versa); this naming choice is deliberately left open until the
 refactor is actually written, since it has no bearing on the design
 questions below.
 
+## 87b. Node enumeration on the storage interface — DECIDED, implemented (closes §87a's gap)
+
+§87a and §89b/§90 recorded `RootGraph` as the one higher-level type that
+still depended on the concrete `*Graph`: its ROOT overlay must answer
+"every existing node other than ROOT," and no interface method exposed
+"every node that exists," so it read `Graph.nodes` directly. That was a
+missing capability in the storage surface, not a layering violation to
+work around.
+
+**Decision.** `GraphReader` gains `FindNodes() []NodeID`, the node-level
+counterpart of `FindRelationships()`, returning every existing NodeID
+sorted ascending. The ordering carries no semantic meaning (§5); it
+exists for deterministic output, and lets `RootGraph` emit `(ROOT,X)`
+relationships already sorted by `X`. It is implemented on `Graph`,
+`Txn`, the checker-facing `graphCoreReader`, and `GraphActor`.
+`RootGraph` now depends only on `GraphStore`, so it can be layered over
+`GraphActor` (§89c) as well as a plain `Graph`, and it is now covered by
+the concurrent-access guard (§89b) like every other caller.
+
+**Supersedes** the `RootGraph` exception stated in §87a, in §89b's final
+caveat paragraph, and in §90's "Deliberate exceptions" paragraph. Only
+`Txn`'s dependency on the concrete `*Graph` (via `resurrectNode`)
+remains, which is deliberate (§89a).
+
+**Accepted limits, unchanged in kind from §89c.** Over `GraphActor`,
+each individual `RootGraph` call is atomic but a method issuing several
+calls (e.g. `FindRelationships`, which reads primitive relationships and
+the node list separately) is not one atomic snapshot. `RootGraph` also
+stores its graph reference, so it must not be invoked from inside a
+`Transact` closure or `Checker` running on that same `GraphActor` (§90).
+
+**Edge case fixed.** If ROOT itself no longer exists (only possible by
+deleting it through the raw graph, bypassing `ErrCannotDeleteRoot`), the
+overlay reports no virtual relationships, consistent with
+`HasRelationship` reporting false for any relationship whose source does
+not exist. The previous slice-capacity computation (`len(nodes)-1`)
+could panic in that state.
+
 ## 88. Backend selection timing: fixed at construction vs. swappable at runtime — OPEN, leaning fixed-at-construction
 
 **OPEN.** Two options: (a) a program picks one backend when it
@@ -2655,6 +2693,12 @@ kept current as sections above resolve or split further.)*
   remains the supported mechanism for real concurrent access and never
   trips this guard, since it already serializes every access onto one
   dedicated goroutine.
+
+- Node enumeration is part of the storage read interface
+  (`GraphReader.FindNodes`), so `RootGraph` depends only on `GraphStore`
+  and can run over `GraphActor`; this closes the last exception to
+  interface-only access other than `Txn`'s deliberate `*Graph`
+  dependency (§87b).
 
 ### TENTATIVE
 - Monotonically increasing NodeIDs; serialized first implementation.

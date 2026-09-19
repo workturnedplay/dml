@@ -87,14 +87,11 @@ var (
 // to panic on). This is a dynamic safety net for the common case, not a
 // substitute for -race or for GraphActor's actual serialization.
 //
-// RootGraph is a known, separate, pre-existing exception to this guard's
-// coverage: its ROOT-overlay FindOutgoing/FindRelationships read
-// Graph.nodes directly, bypassing every public Graph method (and
-// therefore this guard) entirely, for the reason already documented on
-// GraphAPI itself -- no GraphAPI method exposes "every node that exists"
-// yet (theorystate.md section 87a). This is not a new gap introduced
-// here; it is that same documented exception, now simply also
-// unprotected by this guard specifically.
+// RootGraph used to be a known exception to this guard's coverage: its
+// ROOT overlay read Graph.nodes directly, because no interface method
+// enumerated existing nodes. GraphReader.FindNodes closed that gap
+// (theorystate.md section 87b), so RootGraph now reaches the graph only
+// through the public, guarded API and is covered like any other caller.
 type concurrentAccessGuard struct {
 	held atomic.Bool
 }
@@ -454,6 +451,35 @@ func (g *Graph) findRelationshipsCore() []Relationship {
 	return relationships
 }
 
+// FindNodes returns the NodeID of every existing node, sorted ascending.
+// The ordering has no semantic meaning.
+//
+// This acquires g's concurrentAccessGuard for the duration of the call;
+// see findNodesCore for the actual, unguarded implementation.
+func (g *Graph) FindNodes() []NodeID {
+	release := g.guard.acquire()
+	defer release()
+
+	return g.findNodesCore()
+}
+
+// findNodesCore is FindNodes's unguarded implementation; see
+// createNodeCore's doc comment for why this split exists and who calls
+// it directly.
+func (g *Graph) findNodesCore() []NodeID {
+	ids := make([]NodeID, 0, len(g.nodes))
+
+	for id := range g.nodes {
+		ids = append(ids, id)
+	}
+
+	sort.Slice(ids, func(i, j int) bool {
+		return ids[i] < ids[j]
+	})
+
+	return ids
+}
+
 // DeleteNode deletes a node only when it has no relationships.
 //
 // Cascade deletion is deliberately not part of this primitive API.
@@ -538,6 +564,14 @@ type GraphReader interface {
 	FindOutgoing(from NodeID) ([]Relationship, error)
 	FindIncoming(to NodeID) ([]Relationship, error)
 	FindRelationships() []Relationship
+
+	// FindNodes returns the NodeID of every node that currently exists,
+	// sorted ascending. The order has no semantic meaning (theorystate.md
+	// section 5); it exists only so callers get deterministic output.
+	// This is the node-enumeration counterpart of FindRelationships, and
+	// is what lets RootGraph's ROOT overlay run over any GraphStore
+	// rather than only the concrete *Graph (theorystate.md section 87b).
+	FindNodes() []NodeID
 }
 
 // GraphStore is the complete primitive storage surface -- GraphReader's
@@ -574,14 +608,9 @@ type GraphStore interface {
 // itself -- this is a pure decoupling refactor (theorystate.md section
 // 87).
 //
-// RootGraph is a deliberate, documented exception: its ROOT overlay
-// needs to enumerate every existing node (FindOutgoing/FindRelationships
-// for the ROOT case), which requires reaching into Graph's private
-// nodes map directly, since no GraphAPI method exposes "every node that
-// exists." RootGraph therefore still depends on the concrete *Graph
-// type, not GraphAPI, until (or unless) a node-enumeration method is
-// added to this interface -- a real, newly-identified gap, named here
-// rather than silently worked around.
+// RootGraph is no longer an exception: its ROOT overlay's need to
+// enumerate every existing node is now served by GraphReader.FindNodes,
+// so it depends only on GraphStore (theorystate.md section 87b).
 type GraphAPI interface {
 	GraphStore
 	Transact(fn func(tx *Txn) error) error
@@ -887,7 +916,7 @@ func (tx *Txn) DeleteNode(id NodeID) error {
 }
 
 // NodeExists , HasRelationship, FindRelationship, FindOutgoing,
-// FindIncoming, and FindRelationships below make *Txn satisfy
+// FindIncoming, FindRelationships, and FindNodes below make *Txn satisfy
 // GraphReader, delegating directly to the real, concrete *Graph this Txn
 // is running against -- specifically, to its unexported, unguarded core
 // methods, never to its guarded public ones. Every Txn method exists
@@ -943,6 +972,12 @@ func (tx *Txn) FindIncoming(to NodeID) ([]Relationship, error) {
 // core. See the NodeExists doc comment above.
 func (tx *Txn) FindRelationships() []Relationship {
 	return tx.graph.findRelationshipsCore()
+}
+
+// FindNodes delegates to the real, concrete *Graph's unguarded core.
+// See the NodeExists doc comment above.
+func (tx *Txn) FindNodes() []NodeID {
+	return tx.graph.findNodesCore()
 }
 
 // Compile-time assertion that *Txn satisfies GraphReader, exactly
@@ -1101,6 +1136,12 @@ func (r graphCoreReader) FindIncoming(to NodeID) ([]Relationship, error) {
 // graphCoreReader doc comment.
 func (r graphCoreReader) FindRelationships() []Relationship {
 	return r.graph.findRelationshipsCore()
+}
+
+// FindNodes delegates to graph's unguarded core. See the
+// graphCoreReader doc comment.
+func (r graphCoreReader) FindNodes() []NodeID {
+	return r.graph.findNodesCore()
 }
 
 // Compile-time assertion that graphCoreReader satisfies GraphReader,
@@ -1504,6 +1545,18 @@ func (ga *GraphActor) FindRelationships() []Relationship {
 	})
 
 	return relationships
+}
+
+// FindNodes behaves exactly like Graph.FindNodes, routed through ga's
+// dedicated goroutine.
+func (ga *GraphActor) FindNodes() []NodeID {
+	var ids []NodeID
+
+	ga.do(func(g *Graph) {
+		ids = g.FindNodes()
+	})
+
+	return ids
 }
 
 // DeleteNode behaves exactly like Graph.DeleteNode, routed through ga's
@@ -2018,13 +2071,23 @@ var ErrCannotDeleteRoot = errors.New("cannot delete root node")
 //
 // Ordinary relationships, including relationships pointing to ROOT, are
 // stored normally in Graph.
+//
+// RootGraph depends only on GraphStore, so it can be layered over a
+// plain *Graph or a *GraphActor alike. Each RootGraph call is a sequence
+// of GraphStore calls; over a GraphActor, each individual call is atomic
+// but the sequence as a whole is not (e.g. FindRelationships reads the
+// primitive relationships and the node list in two separate round
+// trips). Also, RootGraph stores its graph reference, so its methods
+// must not be called from inside a Transact closure or Checker running
+// on that same GraphActor (theorystate.md section 90's reentrancy
+// hazard); it is a view layer meant to be used from outside.
 type RootGraph struct {
-	graph *Graph
+	graph GraphStore
 	root  NodeID
 }
 
 // NewRootGraph creates a ROOT layer around an existing primitive node.
-func NewRootGraph(graph *Graph, root NodeID) (*RootGraph, error) {
+func NewRootGraph(graph GraphStore, root NodeID) (*RootGraph, error) {
 	if !graph.NodeExists(root) {
 		return nil, ErrNodeNotFound
 	}
@@ -2040,12 +2103,56 @@ func (r *RootGraph) Root() NodeID {
 	return r.root
 }
 
+// requireExist returns ErrNodeNotFound if any of ids does not currently
+// exist in the underlying graph.
+func (r *RootGraph) requireExist(ids ...NodeID) error {
+	for _, id := range ids {
+		if !r.graph.NodeExists(id) {
+			return ErrNodeNotFound
+		}
+	}
+
+	return nil
+}
+
+// virtualRootRelationships returns the virtual (ROOT, X) relationship
+// for every existing X != ROOT, sorted by To (FindNodes is already
+// sorted ascending).
+//
+// If ROOT itself no longer exists -- only reachable by deleting it
+// through the raw graph, bypassing DeleteNode's ErrCannotDeleteRoot
+// protection -- no virtual relationships are reported, consistent with
+// HasRelationship, which reports false for any relationship whose source
+// does not exist.
+func (r *RootGraph) virtualRootRelationships() []Relationship {
+	if !r.graph.NodeExists(r.root) {
+		return nil
+	}
+
+	ids := r.graph.FindNodes()
+	relationships := make([]Relationship, 0, len(ids))
+
+	for _, id := range ids {
+		if id == r.root {
+			continue
+		}
+
+		relationships = append(relationships, Relationship{
+			From: r.root,
+			To:   id,
+		})
+	}
+
+	return relationships
+}
+
 // CreateNode creates a node in the underlying graph.
 //
 // The newly created node is consequently visible as a virtual child of
 // ROOT through this layer.
 func (r *RootGraph) CreateNode() (NodeID, error) {
-	return r.graph.CreateNode()
+	id, err := r.graph.CreateNode()
+	return id, wrapInterfaceErr(err)
 }
 
 // NodeExists reports whether id exists in the underlying graph.
@@ -2061,12 +2168,8 @@ func (r *RootGraph) NodeExists(id NodeID) bool {
 //
 // Relationships pointing to ROOT are ordinary relationships and are stored.
 func (r *RootGraph) AddRelationship(from, to NodeID) (created bool, err error) {
-	if !r.graph.NodeExists(from) {
-		return false, ErrNodeNotFound
-	}
-
-	if !r.graph.NodeExists(to) {
-		return false, ErrNodeNotFound
+	if err = r.requireExist(from, to); err != nil {
+		return false, err
 	}
 
 	if from == r.root {
@@ -2077,7 +2180,8 @@ func (r *RootGraph) AddRelationship(from, to NodeID) (created bool, err error) {
 		return false, nil
 	}
 
-	return r.graph.AddRelationship(from, to)
+	created, err = r.graph.AddRelationship(from, to)
+	return created, wrapInterfaceErr(err)
 }
 
 // RemoveRelationship removes an ordinary relationship from the graph.
@@ -2089,12 +2193,8 @@ func (r *RootGraph) AddRelationship(from, to NodeID) (created bool, err error) {
 // Relationships pointing to ROOT are ordinary relationships and can be
 // removed normally.
 func (r *RootGraph) RemoveRelationship(from, to NodeID) (removed bool, err error) {
-	if !r.graph.NodeExists(from) {
-		return false, ErrNodeNotFound
-	}
-
-	if !r.graph.NodeExists(to) {
-		return false, ErrNodeNotFound
+	if err = r.requireExist(from, to); err != nil {
+		return false, err
 	}
 
 	if from == r.root {
@@ -2104,7 +2204,8 @@ func (r *RootGraph) RemoveRelationship(from, to NodeID) (removed bool, err error
 		return false, nil
 	}
 
-	return r.graph.RemoveRelationship(from, to)
+	removed, err = r.graph.RemoveRelationship(from, to)
+	return removed, wrapInterfaceErr(err)
 }
 
 // HasRelationship reports whether the relationship exists in the ROOT
@@ -2127,12 +2228,8 @@ func (r *RootGraph) HasRelationship(from, to NodeID) bool {
 // FindRelationship reports whether the exact relationship exists in the
 // ROOT layer.
 func (r *RootGraph) FindRelationship(from, to NodeID) (Relationship, bool, error) {
-	if !r.graph.NodeExists(from) {
-		return Relationship{}, false, ErrNodeNotFound
-	}
-
-	if !r.graph.NodeExists(to) {
-		return Relationship{}, false, ErrNodeNotFound
+	if err := r.requireExist(from, to); err != nil {
+		return Relationship{}, false, err
 	}
 
 	if !r.HasRelationship(from, to) {
@@ -2156,27 +2253,11 @@ func (r *RootGraph) FindOutgoing(from NodeID) ([]Relationship, error) {
 	}
 
 	if from != r.root {
-		return r.graph.FindOutgoing(from)
+		relationships, err := r.graph.FindOutgoing(from)
+		return relationships, wrapInterfaceErr(err)
 	}
 
-	relationships := make([]Relationship, 0, len(r.graph.nodes)-1)
-
-	for id := range r.graph.nodes {
-		if id == r.root {
-			continue
-		}
-
-		relationships = append(relationships, Relationship{
-			From: r.root,
-			To:   id,
-		})
-	}
-
-	sort.Slice(relationships, func(i, j int) bool {
-		return relationships[i].To < relationships[j].To
-	})
-
-	return relationships, nil
+	return r.virtualRootRelationships(), nil
 }
 
 // FindIncoming returns every relationship whose target is to in the ROOT
@@ -2194,7 +2275,7 @@ func (r *RootGraph) FindIncoming(to NodeID) ([]Relationship, error) {
 
 	relationships, err := r.graph.FindIncoming(to)
 	if err != nil {
-		return nil, err
+		return nil, wrapInterfaceErr(err)
 	}
 
 	if to != r.root {
@@ -2225,7 +2306,8 @@ func (r *RootGraph) FindIncoming(to NodeID) ([]Relationship, error) {
 // The primitive (ROOT, ROOT) relationship is likewise hidden.
 func (r *RootGraph) FindRelationships() []Relationship {
 	primitiveRelationships := r.graph.FindRelationships()
-	relationships := make([]Relationship, 0, len(primitiveRelationships)+len(r.graph.nodes)-1)
+	virtualRelationships := r.virtualRootRelationships()
+	relationships := make([]Relationship, 0, len(primitiveRelationships)+len(virtualRelationships))
 
 	for _, relationship := range primitiveRelationships {
 		if relationship.From == r.root {
@@ -2235,16 +2317,7 @@ func (r *RootGraph) FindRelationships() []Relationship {
 		relationships = append(relationships, relationship)
 	}
 
-	for id := range r.graph.nodes {
-		if id == r.root {
-			continue
-		}
-
-		relationships = append(relationships, Relationship{
-			From: r.root,
-			To:   id,
-		})
-	}
+	relationships = append(relationships, virtualRelationships...)
 
 	sort.Slice(relationships, func(i, j int) bool {
 		if relationships[i].From != relationships[j].From {
@@ -2273,7 +2346,7 @@ func (r *RootGraph) DeleteNode(id NodeID) error {
 		return ErrCannotDeleteRoot
 	}
 
-	return r.graph.DeleteNode(id)
+	return wrapInterfaceErr(r.graph.DeleteNode(id))
 }
 
 var (

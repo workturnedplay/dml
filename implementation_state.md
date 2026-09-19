@@ -1139,7 +1139,7 @@ NodeID-keyed structure outside the primitive graph.
  registries by passing &g (a *Graph) where an interface value is now
  expected, which Go accepts automatically without any test-side change.
 
- RootGraph is a deliberate, documented exception, discovered while doing
+ [Since closed -- see item 27.] RootGraph is a deliberate, documented exception, discovered while doing
  this refactor rather than anticipated beforehand: its ROOT-overlay
  FindOutgoing/FindRelationships need to enumerate every existing node,
  which requires reaching into Graph's private nodes map directly -- no
@@ -1289,6 +1289,37 @@ NodeID-keyed structure outside the primitive graph.
  this file now stores a graph reference at all, closing this hazard by
  construction rather than only detecting it after the fact.
 
+27. Closed the GraphAPI node-enumeration gap (theorystate.md section
+ 87b). GraphReader gained FindNodes() []NodeID (every existing NodeID,
+ sorted ascending), implemented on Graph (guarded public method plus
+ unguarded findNodesCore, following the existing split), Txn,
+ graphCoreReader, and GraphActor. RootGraph now depends on GraphStore
+ instead of the concrete *Graph, so it can run over GraphActor; it no
+ longer reads Graph.nodes directly, and is therefore also covered by
+ concurrentAccessGuard. This supersedes the RootGraph exceptions
+ recorded in items 24 and 25 and in the "Currently unaddressed yet"
+ list.
+
+ DRY/bug fixes made along the way: RootGraph's repeated "both nodes must
+ exist" preamble is now requireExist, and the duplicated ROOT-children
+ enumeration in FindOutgoing/FindRelationships is now
+ virtualRootRelationships. RootGraph.FindRelationships previously sized
+ its slice with len(nodes)-1, which panics with a negative capacity on
+ an empty graph (reachable if ROOT is deleted through the raw graph);
+ virtualRootRelationships now reports nothing when ROOT no longer
+ exists, consistent with HasRelationship.
+
+ Known limits, documented on RootGraph: over a GraphActor each
+ individual call is atomic but a multi-call RootGraph method (e.g.
+ FindRelationships) is not one atomic snapshot, and RootGraph stores its
+ graph reference, so it must not be called from inside a Transact
+ closure or Checker running on that same GraphActor (section 90).
+
+ Covered by TestFindNodesReturnsSortedExistingNodes,
+ TestTxnFindNodesReflectsUncommittedCreatesAndRollback,
+ TestGraphActorFindNodes, TestRootGraphOverGraphActor, and
+ TestRootFindRelationshipsWithoutRootNodeEmitsNoVirtualRelationships.
+
 Currently unaddressed yet:
 - Txn does not support nesting one Graph.Transact call inside another
   (Txn.DeleteNode is supported -- see item 15). Nesting is not needed by
@@ -1297,11 +1328,6 @@ Currently unaddressed yet:
   at write time, not at commit time, for the reasons item 22 records --
   revisit if a future caller needs Representation B domain pointers to
   be as defense-in-depth as Representation D's.
-- RootGraph still depends on the concrete *Graph type rather than
-  GraphAPI, since its ROOT-overlay node enumeration needs private map
-  access no GraphAPI method currently exposes (see GraphAPI's own doc
-  comment; theorystate.md section 87a). Revisit if a node-enumeration
-  method is ever added to GraphAPI.
 - The in-memory Graph itself still has no protection against concurrent
   goroutine access if used directly (theorystate.md section 89b) --
   unaffected by item 24's interface extraction, since that extraction

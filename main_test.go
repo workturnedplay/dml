@@ -1778,6 +1778,182 @@ func TestRootPhysicalSelfRelationshipIsHidden(t *testing.T) {
 	}
 }
 
+func TestFindNodesReturnsSortedExistingNodes(t *testing.T) {
+	var g Graph
+
+	if got := g.FindNodes(); len(got) != 0 {
+		t.Fatalf("FindNodes() on an empty graph = %v, want empty", got)
+	}
+
+	a, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for a: %v", err)
+	}
+
+	b, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for b: %v", err)
+	}
+
+	c, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for c: %v", err)
+	}
+
+	if err2 := g.DeleteNode(b); err2 != nil {
+		t.Fatalf("DeleteNode(b): %v", err2)
+	}
+
+	got := g.FindNodes()
+	want := []NodeID{a, c}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("FindNodes() = %v, want %v (sorted, deleted node excluded)", got, want)
+	}
+}
+
+func TestTxnFindNodesReflectsUncommittedCreatesAndRollback(t *testing.T) {
+	var g Graph
+
+	existing, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode(): %v", err)
+	}
+
+	errForcedRollback := errors.New("forced rollback")
+
+	var created NodeID
+	var inside []NodeID
+
+	err = g.Transact(func(tx *Txn) error {
+		var txErr error
+		created, txErr = tx.CreateNode()
+		if txErr != nil {
+			return txErr
+		}
+
+		inside = tx.FindNodes()
+
+		return errForcedRollback
+	})
+	if !errors.Is(err, errForcedRollback) {
+		t.Fatalf("Transact() error = %v, want %v", err, errForcedRollback)
+	}
+
+	wantInside := []NodeID{existing, created}
+	if !reflect.DeepEqual(inside, wantInside) {
+		t.Fatalf("tx.FindNodes() inside the transaction = %v, want %v", inside, wantInside)
+	}
+
+	wantAfter := []NodeID{existing}
+	if got := g.FindNodes(); !reflect.DeepEqual(got, wantAfter) {
+		t.Fatalf("FindNodes() after rollback = %v, want %v", got, wantAfter)
+	}
+}
+
+// TestRootGraphOverGraphActor confirms RootGraph, which now depends only
+// on GraphStore (theorystate.md section 87b), works over a GraphActor
+// with no direct *Graph access at all.
+func TestRootGraphOverGraphActor(t *testing.T) {
+	actor := NewGraphActor(&Graph{})
+	defer actor.Close()
+
+	root, err := actor.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for ROOT: %v", err)
+	}
+
+	a, err := actor.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for a: %v", err)
+	}
+
+	b, err := actor.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for b: %v", err)
+	}
+
+	r, err := NewRootGraph(actor, root)
+	if err != nil {
+		t.Fatalf("NewRootGraph(): %v", err)
+	}
+
+	got, err := r.FindOutgoing(root)
+	if err != nil {
+		t.Fatalf("FindOutgoing(ROOT): %v", err)
+	}
+	wantOutgoing := []Relationship{{From: root, To: a}, {From: root, To: b}}
+	if !reflect.DeepEqual(got, wantOutgoing) {
+		t.Fatalf("FindOutgoing(ROOT) = %v, want %v", got, wantOutgoing)
+	}
+
+	if _, err2 := r.AddRelationship(a, b); err2 != nil {
+		t.Fatalf("AddRelationship(a, b): %v", err2)
+	}
+
+	wantAll := []Relationship{{From: root, To: a}, {From: root, To: b}, {From: a, To: b}}
+	if all := r.FindRelationships(); !reflect.DeepEqual(all, wantAll) {
+		t.Fatalf("FindRelationships() = %v, want %v", all, wantAll)
+	}
+
+	c, err := r.CreateNode()
+	if err != nil {
+		t.Fatalf("RootGraph.CreateNode(): %v", err)
+	}
+	if !r.HasRelationship(root, c) {
+		t.Fatalf("new node %d is not visible as a ROOT child", c)
+	}
+
+	if err3 := r.DeleteNode(root); !errors.Is(err3, ErrCannotDeleteRoot) {
+		t.Fatalf("DeleteNode(ROOT) error = %v, want %v", err3, ErrCannotDeleteRoot)
+	}
+}
+
+// TestRootFindRelationshipsWithoutRootNodeEmitsNoVirtualRelationships
+// covers ROOT having been deleted through the raw graph, bypassing
+// RootGraph.DeleteNode's protection. No virtual relationships may be
+// reported, and nothing may panic.
+func TestRootFindRelationshipsWithoutRootNodeEmitsNoVirtualRelationships(t *testing.T) {
+	var g Graph
+
+	root, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for ROOT: %v", err)
+	}
+
+	a, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for a: %v", err)
+	}
+
+	b, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for b: %v", err)
+	}
+
+	if _, err2 := g.AddRelationship(a, b); err2 != nil {
+		t.Fatalf("AddRelationship(a, b): %v", err2)
+	}
+
+	r, err := NewRootGraph(&g, root)
+	if err != nil {
+		t.Fatalf("NewRootGraph(): %v", err)
+	}
+
+	if err3 := g.DeleteNode(root); err3 != nil {
+		t.Fatalf("raw DeleteNode(ROOT): %v", err3)
+	}
+
+	got := r.FindRelationships()
+	want := []Relationship{{From: a, To: b}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("FindRelationships() = %v, want %v", got, want)
+	}
+
+	if _, err4 := r.FindOutgoing(root); !errors.Is(err4, ErrNodeNotFound) {
+		t.Fatalf("FindOutgoing(deleted ROOT) error = %v, want %v", err4, ErrNodeNotFound)
+	}
+}
+
 // newPointerTestFixture creates a fresh Graph and PointerRegistry with
 // AllPointers already bootstrapped, for use by PointerRegistry tests.
 func newPointerTestFixture(t *testing.T) (*Graph, *PointerRegistry) {
@@ -9576,6 +9752,31 @@ func TestGraphActorBasicOperations(t *testing.T) {
 	}
 	if actor.NodeExists(a) {
 		t.Fatal("node a still exists after DeleteNode()")
+	}
+}
+
+func TestGraphActorFindNodes(t *testing.T) {
+	actor := NewGraphActor(&Graph{})
+	defer actor.Close()
+
+	a, err := actor.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for a: %v", err)
+	}
+
+	b, err := actor.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for b: %v", err)
+	}
+
+	if err2 := actor.DeleteNode(a); err2 != nil {
+		t.Fatalf("DeleteNode(a): %v", err2)
+	}
+
+	got := actor.FindNodes()
+	want := []NodeID{b}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("FindNodes() = %v, want %v", got, want)
 	}
 }
 
