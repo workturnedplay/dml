@@ -11771,7 +11771,7 @@ func TestNameRegistryBindTxIsDiscardedOnRollbackAndAppliedOnCommit(t *testing.T)
 		if txErr != nil {
 			return txErr
 		}
-		if bindErr := names.bindTx(tx, "A", rolledBack); bindErr != nil {
+		if bindErr := names.Bind(tx, "A", rolledBack); bindErr != nil {
 			return bindErr
 		}
 
@@ -11797,7 +11797,7 @@ func TestNameRegistryBindTxIsDiscardedOnRollbackAndAppliedOnCommit(t *testing.T)
 			return txErr
 		}
 
-		return names.bindTx(tx, "A", committed)
+		return names.Bind(tx, "A", committed)
 	})
 	if err != nil {
 		t.Fatalf("Transact() error = %v", err)
@@ -11805,6 +11805,187 @@ func TestNameRegistryBindTxIsDiscardedOnRollbackAndAppliedOnCommit(t *testing.T)
 
 	if found, ok := names.Lookup("A"); !ok || found != committed {
 		t.Fatalf("Lookup(\"A\") = (%d,%v), want (%d,true)", found, ok, committed)
+	}
+}
+
+func requirePointerTarget(t *testing.T, pointers *PointerRegistry, graph GraphReader, p, want NodeID) {
+	t.Helper()
+
+	target, hasTarget, err := pointers.Target(graph, p)
+	if err != nil {
+		t.Fatalf("Target(%d): %v", p, err)
+	}
+	if !hasTarget || target != want {
+		t.Fatalf("Target(%d) = (%d,%v), want (%d,true)", p, target, hasTarget, want)
+	}
+}
+
+func TestPointerRegistrySetTargetComposesInsideOneTransaction(t *testing.T) {
+	g, pointers := newPointerTestFixture(t)
+
+	p, err := pointers.NewPointer(g)
+	if err != nil {
+		t.Fatalf("NewPointer(): %v", err)
+	}
+
+	x := newTestNode(t, g)
+	y := newTestNode(t, g)
+	errOuter := errors.New("outer failure")
+
+	// Two exported calls composed in one transaction commit together.
+	err = g.Transact(func(tx Tx) error {
+		if setErr := pointers.SetTarget(tx, p, x); setErr != nil {
+			return setErr
+		}
+
+		return pointers.SetTarget(tx, p, y)
+	})
+	if err != nil {
+		t.Fatalf("Transact(compose): %v", err)
+	}
+	requirePointerTarget(t, pointers, g, p, y)
+
+	// ...and roll back together when the enclosing transaction fails.
+	err = g.Transact(func(tx Tx) error {
+		if setErr := pointers.SetTarget(tx, p, x); setErr != nil {
+			return setErr
+		}
+
+		return errOuter
+	})
+	if !errors.Is(err, errOuter) {
+		t.Fatalf("Transact(fail) error = %v, want %v", err, errOuter)
+	}
+	requirePointerTarget(t, pointers, g, p, y)
+}
+
+func TestPointerRegistryComposedSetTargetIsUndoneByFailedNestedTransaction(t *testing.T) {
+	g, pointers := newPointerTestFixture(t)
+
+	p, err := pointers.NewPointer(g)
+	if err != nil {
+		t.Fatalf("NewPointer(): %v", err)
+	}
+
+	x := newTestNode(t, g)
+	y := newTestNode(t, g)
+	errInner := errors.New("inner failure")
+
+	err = g.Transact(func(tx Tx) error {
+		if setErr := pointers.SetTarget(tx, p, x); setErr != nil {
+			return setErr
+		}
+
+		innerErr := tx.Transact(func(inner Tx) error {
+			if setErr := pointers.SetTarget(inner, p, y); setErr != nil {
+				return setErr
+			}
+
+			return errInner
+		})
+		if !errors.Is(innerErr, errInner) {
+			t.Errorf("nested Transact() error = %v, want %v", innerErr, errInner)
+		}
+
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Transact(): %v", err)
+	}
+
+	requirePointerTarget(t, pointers, g, p, x)
+}
+
+func TestNameRegistryCreateNamedNodeComposesAndRollsBackWithEnclosingTransaction(t *testing.T) {
+	var g Graph
+	names := NewNameRegistry(&g)
+	errOuter := errors.New("outer failure")
+
+	var rolledBack NodeID
+
+	err := g.Transact(func(tx Tx) error {
+		var createErr error
+		rolledBack, createErr = names.CreateNamedNode(tx, "A")
+		if createErr != nil {
+			return createErr
+		}
+
+		return errOuter
+	})
+	if !errors.Is(err, errOuter) {
+		t.Fatalf("Transact(fail) error = %v, want %v", err, errOuter)
+	}
+	if _, ok := names.Lookup("A"); ok {
+		t.Fatal("name \"A\" is bound after its enclosing transaction rolled back")
+	}
+	if g.NodeExists(rolledBack) {
+		t.Fatalf("node %d survived its enclosing transaction's rollback", rolledBack)
+	}
+
+	var committed NodeID
+
+	err = g.Transact(func(tx Tx) error {
+		var ensureErr error
+		committed, ensureErr = names.EnsureNamedNode(tx, "A")
+		return ensureErr
+	})
+	if err != nil {
+		t.Fatalf("Transact(commit) error = %v", err)
+	}
+	if found, ok := names.Lookup("A"); !ok || found != committed {
+		t.Fatalf("Lookup(\"A\") = (%d,%v), want (%d,true)", found, ok, committed)
+	}
+}
+
+func TestPointerMetadataRegistryDComposedSetTargetRollsBackMetadataCreation(t *testing.T) {
+	g, metadata := newPointerMetadataDTestFixture(t)
+
+	subject := newTestNode(t, g)
+	x := newTestNode(t, g)
+	errOuter := errors.New("outer failure")
+
+	err := g.Transact(func(tx Tx) error {
+		if setErr := metadata.SetTarget(tx, subject, x); setErr != nil {
+			return setErr
+		}
+
+		return errOuter
+	})
+	if !errors.Is(err, errOuter) {
+		t.Fatalf("Transact(fail) error = %v, want %v", err, errOuter)
+	}
+
+	has, hasErr := metadata.HasMetadata(g, subject)
+	if hasErr != nil {
+		t.Fatalf("HasMetadata(): %v", hasErr)
+	}
+	if has {
+		t.Fatal("metadata created by a rolled-back composed SetTarget survived")
+	}
+
+	err = g.Transact(func(tx Tx) error {
+		if setErr := metadata.SetTarget(tx, subject, x); setErr != nil {
+			return setErr
+		}
+
+		removed, removeErr := metadata.RemoveTarget(tx, subject)
+		if removeErr != nil {
+			return removeErr
+		}
+		if !removed {
+			t.Error("RemoveTarget() reported nothing removed right after SetTarget() in the same transaction")
+		}
+
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Transact(compose) error = %v", err)
+	}
+
+	if _, hasTarget, targetErr := metadata.Target(g, subject); targetErr != nil {
+		t.Fatalf("Target(): %v", targetErr)
+	} else if hasTarget {
+		t.Fatal("subject still has a target after the composed SetTarget+RemoveTarget")
 	}
 }
 

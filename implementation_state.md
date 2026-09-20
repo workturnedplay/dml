@@ -1523,10 +1523,37 @@ NodeID-keyed structure outside the primitive graph.
  TestRootGraphNestedTransactPresentsOverlayAndForwardsOnCommit and
  TestGraphActorNestedTransactRollsBackOnlyInnerSteps.
 
+33. Nested transactions, step 2 of 4: NameRegistry and the Pointer family
+ (theorystate.md section 45). Exported mutators now take a Transactor
+ (GraphAPI or Tx) and the tx-composable cores that were only the bodies of
+ thin wrappers are inlined into them: NameRegistry.Bind (bindTx),
+ CreateNamedNode/EnsureNamedNode (namedNode replaces namedNodeTx and
+ transactNamedNode), DeleteNode, BootstrapNames;
+ PointerRegistry.SetTarget/RemoveTarget/NewPointer/TagAsPointer;
+ subjectMetadataBase.EnsureMetadata; PointerMetadataRegistry(D)
+ .SetTarget/RemoveTarget. ensureMetadataTx stays: it returns both the
+ metadata and subject-slot and is a shared helper, not a wrapper's core.
+ Call sites in CapsuleRegistry, ListRegistry and the domain-pointer
+ registries that used the removed cores now call the exported methods, so
+ their helpers' tx parameter widened from txReader to Tx (a Transactor);
+ batches 3 and 4 collapse those helpers themselves. Fixed a stale
+ singleChildTargetRemoveTx doc.
+ Known limitation, documented on NameRegistry.Bind: name bindings are
+ applied on outermost commit, so inside one enclosing transaction a
+ binding is not yet visible to later checks in that transaction; binding
+ the same name or node twice in one transaction is not detected.
+
+ Covered by TestPointerRegistrySetTargetComposesInsideOneTransaction,
+ TestPointerRegistryComposedSetTargetIsUndoneByFailedNestedTransaction,
+ TestNameRegistryCreateNamedNodeComposesAndRollsBackWithEnclosingTransaction
+ and TestPointerMetadataRegistryDComposedSetTargetRollsBackMetadataCreation.
+
 Currently unaddressed yet:
-- Registries still compose through tx-composable *Tx cores; collapsing them
-  into Transactor-taking exported methods is in progress (item 32).
-  Txn.DeleteNode is supported -- see item 15.
+- Registries still compose through tx-composable *Tx cores in
+  CapsuleRegistry, ListRegistry, SetRegistry, the composites/logs and the
+  domain pointers; collapsing them into Transactor-taking exported
+  methods is in progress (items 32-33). Txn.DeleteNode is supported --
+  see item 15.
 - Domain-pointer staleness residuals (theorystate.md section 86): raw
   non-Transact mutations, out-of-band tag removal or descriptor
   re-pointing inside a Transact, and O(pointers-per-domain) validation
