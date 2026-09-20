@@ -11432,6 +11432,307 @@ func TestTxOnCommitRunsOnlyAfterSuccessfulCommit(t *testing.T) {
 	}
 }
 
+func TestNestedTransactCommitsWithOuter(t *testing.T) {
+	var g Graph
+
+	var a, b NodeID
+
+	err := g.Transact(func(tx Tx) error {
+		var txErr error
+		a, txErr = createNodeTx(tx)
+		if txErr != nil {
+			return txErr
+		}
+
+		return wrapInterfaceErr(tx.Transact(func(inner Tx) error {
+			var innerErr error
+			b, innerErr = createNodeTx(inner)
+			if innerErr != nil {
+				return innerErr
+			}
+
+			return addRelationshipTx(inner, a, b)
+		}))
+	})
+	if err != nil {
+		t.Fatalf("Transact() error = %v", err)
+	}
+
+	if !g.NodeExists(a) || !g.NodeExists(b) || !g.HasRelationship(a, b) {
+		t.Fatalf("nodes %d, %d and relationship (%d,%d) must all exist after the outermost commit", a, b, a, b)
+	}
+}
+
+func TestNestedTransactFailureRollsBackOnlyTheInnerSteps(t *testing.T) {
+	var g Graph
+
+	errInner := errors.New("inner failure")
+
+	var kept, dropped NodeID
+	var hooks []string
+
+	err := g.Transact(func(tx Tx) error {
+		var txErr error
+		kept, txErr = createNodeTx(tx)
+		if txErr != nil {
+			return txErr
+		}
+
+		tx.OnCommit(func() { hooks = append(hooks, "outer") })
+
+		innerErr := tx.Transact(func(inner Tx) error {
+			var createErr error
+			dropped, createErr = createNodeTx(inner)
+			if createErr != nil {
+				return createErr
+			}
+
+			if linkErr := addRelationshipTx(inner, kept, dropped); linkErr != nil {
+				return linkErr
+			}
+
+			inner.OnCommit(func() { hooks = append(hooks, "inner") })
+
+			return errInner
+		})
+		if !errors.Is(innerErr, errInner) {
+			t.Errorf("nested Transact() error = %v, want %v", innerErr, errInner)
+		}
+
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Transact() error = %v", err)
+	}
+
+	if !g.NodeExists(kept) {
+		t.Fatal("the outer step was lost although only the nested transaction failed")
+	}
+	if g.NodeExists(dropped) {
+		t.Fatal("the nested step survived its own failed transaction")
+	}
+	if want := []string{"outer"}; !reflect.DeepEqual(hooks, want) {
+		t.Fatalf("commit hooks ran %v, want %v (the failed nested transaction's hook must be discarded)", hooks, want)
+	}
+}
+
+func TestNestedTransactSuccessIsRolledBackWithOuterFailure(t *testing.T) {
+	var g Graph
+
+	errOuter := errors.New("outer failure")
+
+	var id NodeID
+
+	err := g.Transact(func(tx Tx) error {
+		if nestedErr := tx.Transact(func(inner Tx) error {
+			var createErr error
+			id, createErr = createNodeTx(inner)
+			return createErr
+		}); nestedErr != nil {
+			return wrapInterfaceErr(nestedErr)
+		}
+
+		return errOuter
+	})
+	if !errors.Is(err, errOuter) {
+		t.Fatalf("Transact() error = %v, want %v", err, errOuter)
+	}
+
+	if g.NodeExists(id) {
+		t.Fatalf("node %d created by a successful nested transaction survived the outer failure", id)
+	}
+}
+
+func TestNestedTransactRunsCheckersOnlyAtOutermostCommit(t *testing.T) {
+	var g Graph
+
+	flag := newTestNode(t, &g)
+	x := newTestNode(t, &g)
+	okNode := newTestNode(t, &g)
+
+	errUnsatisfied := errors.New("flagged node has no ok edge")
+	runs := 0
+
+	g.RegisterChecker(Checker{
+		Name: "flagged-needs-ok",
+		Tags: []NodeID{flag},
+		Check: func(view GraphReader, touched map[NodeID]struct{}) error {
+			runs++
+
+			for node := range touched {
+				if view.HasRelationship(flag, node) && !view.HasRelationship(node, okNode) {
+					return errUnsatisfied
+				}
+			}
+
+			return nil
+		},
+	})
+
+	// The nested step leaves the invariant violated and the outer step
+	// repairs it before commit: the Checker must judge only the final
+	// state, once.
+	err := g.Transact(func(tx Tx) error {
+		if innerErr := tx.Transact(func(inner Tx) error {
+			return addRelationshipTx(inner, flag, x)
+		}); innerErr != nil {
+			return wrapInterfaceErr(innerErr)
+		}
+
+		return addRelationshipTx(tx, x, okNode)
+	})
+	if err != nil {
+		t.Fatalf("Transact(repaired before commit) error = %v, want nil", err)
+	}
+	if runs != 1 {
+		t.Fatalf("the Checker ran %d times, want exactly 1 (at the outermost commit)", runs)
+	}
+
+	// Nothing repairs this one: the nested call itself succeeds
+	// (provisionally), and the outermost commit declines everything.
+	y := newTestNode(t, &g)
+
+	err = g.Transact(func(tx Tx) error {
+		if innerErr := tx.Transact(func(inner Tx) error {
+			return addRelationshipTx(inner, flag, y)
+		}); innerErr != nil {
+			return wrapInterfaceErr(innerErr)
+		}
+
+		return nil
+	})
+	if !errors.Is(err, errUnsatisfied) {
+		t.Fatalf("Transact(unrepaired) error = %v, want %v", err, errUnsatisfied)
+	}
+	if g.HasRelationship(flag, y) {
+		t.Fatal("a nested step that succeeded provisionally survived the declined outermost commit")
+	}
+}
+
+func TestNestedTransactPanicRollsBackToSavepointAndPropagates(t *testing.T) {
+	var g Graph
+
+	var kept, dropped NodeID
+
+	err := g.Transact(func(tx Tx) error {
+		var txErr error
+		kept, txErr = createNodeTx(tx)
+		if txErr != nil {
+			return txErr
+		}
+
+		func() {
+			defer func() {
+				if r := recover(); r == nil {
+					t.Error("expected the nested panic to reach the enclosing closure")
+				}
+			}()
+
+			//nolint:errcheck // the nested closure panics before Transact can return
+			_ = tx.Transact(func(inner Tx) error {
+				var createErr error
+				dropped, createErr = createNodeTx(inner)
+				if createErr != nil {
+					return createErr
+				}
+
+				panic("boom")
+			})
+		}()
+
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Transact() error = %v", err)
+	}
+
+	if !g.NodeExists(kept) {
+		t.Fatal("the outer step was lost although the enclosing closure recovered the nested panic")
+	}
+	if g.NodeExists(dropped) {
+		t.Fatal("the panicking nested transaction's step survived")
+	}
+}
+
+func TestRootGraphNestedTransactPresentsOverlayAndForwardsOnCommit(t *testing.T) {
+	var g Graph
+
+	root := newTestNode(t, &g)
+	x := newTestNode(t, &g)
+
+	rootGraph, err := NewRootGraph(&g, root)
+	if err != nil {
+		t.Fatalf("NewRootGraph(): %v", err)
+	}
+
+	var sawVirtual, ran bool
+	var deleteRootErr error
+
+	err = rootGraph.Transact(func(tx Tx) error {
+		return wrapInterfaceErr(tx.Transact(func(inner Tx) error {
+			sawVirtual = inner.HasRelationship(root, x)
+			deleteRootErr = inner.DeleteNode(root)
+			inner.OnCommit(func() { ran = true })
+
+			return nil
+		}))
+	})
+	if err != nil {
+		t.Fatalf("Transact() error = %v", err)
+	}
+
+	if !sawVirtual {
+		t.Fatal("the nested transaction did not present the virtual (ROOT, x) relationship")
+	}
+	if !errors.Is(deleteRootErr, ErrCannotDeleteRoot) {
+		t.Fatalf("nested tx.DeleteNode(ROOT) error = %v, want %v", deleteRootErr, ErrCannotDeleteRoot)
+	}
+	if !ran {
+		t.Fatal("a commit hook registered inside the nested transaction did not run")
+	}
+}
+
+func TestGraphActorNestedTransactRollsBackOnlyInnerSteps(t *testing.T) {
+	actor := NewGraphActor(&Graph{})
+	defer actor.Close()
+
+	errInner := errors.New("inner failure")
+
+	var kept, dropped NodeID
+
+	err := actor.Transact(func(tx Tx) error {
+		var txErr error
+		kept, txErr = createNodeTx(tx)
+		if txErr != nil {
+			return txErr
+		}
+
+		if innerErr := tx.Transact(func(inner Tx) error {
+			var createErr error
+			dropped, createErr = createNodeTx(inner)
+			if createErr != nil {
+				return createErr
+			}
+
+			return errInner
+		}); !errors.Is(innerErr, errInner) {
+			t.Errorf("nested Transact() error = %v, want %v", innerErr, errInner)
+		}
+
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Transact() error = %v", err)
+	}
+
+	if !actor.NodeExists(kept) {
+		t.Fatal("the outer step was lost although only the nested transaction failed")
+	}
+	if actor.NodeExists(dropped) {
+		t.Fatal("the nested step survived its own failed transaction")
+	}
+}
+
 func TestRootGraphTransactForwardsOnCommit(t *testing.T) {
 	var g Graph
 

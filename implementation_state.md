@@ -1498,11 +1498,35 @@ NodeID-keyed structure outside the primitive graph.
  TestGraphActorConcurrentListAppendKeepsListValid and
  TestCompositeSetLogRemoveOperationIsAtomicWhenCapsuleCannotBeDeleted.
 
+32. Added nested transactions (theorystate.md section 45), step 1 of 4
+ (the mechanism; registries adopt it in the following steps).
+ Tx gained Transact through a new Transactor interface (also embedded by
+ GraphAPI): on a GraphAPI it opens an outermost transaction, on a Tx a
+ nested one. A nested transaction is a savepoint (Txn.mark/rollbackTo over
+ the shared undo log and commit-hook list), not a transaction of its own:
+ if it fails or panics, only what it did is undone and its OnCommit hooks
+ are discarded, and the enclosing closure may handle the error and
+ continue. Checkers still run only at the outermost commit, since they
+ judge the final state and a step may legitimately be invalid until a
+ later one repairs it; an inner success is provisional until then.
+ Txn.touched is not rewound by a nested rollback (conservative superset).
+ rootTx forwards Transact and re-applies the ROOT overlay to the nested
+ handle. transactValue/transactBool take a Transactor.
+ Still to do: registry mutators take Transactor and the *Tx cores collapse
+ into the exported methods; raw writes leave GraphAPI.
+
+ Covered by TestNestedTransactCommitsWithOuter,
+ TestNestedTransactFailureRollsBackOnlyTheInnerSteps,
+ TestNestedTransactSuccessIsRolledBackWithOuterFailure,
+ TestNestedTransactRunsCheckersOnlyAtOutermostCommit,
+ TestNestedTransactPanicRollsBackToSavepointAndPropagates,
+ TestRootGraphNestedTransactPresentsOverlayAndForwardsOnCommit and
+ TestGraphActorNestedTransactRollsBackOnlyInnerSteps.
+
 Currently unaddressed yet:
-- Txn does not support nesting one Graph.Transact call inside another
-  (Txn.DeleteNode is supported -- see item 15). Multi-step operations
-  compose through tx-composable *Tx cores instead of nesting. Nesting
-  itself is theorystate.md section 45, still OPEN.
+- Registries still compose through tx-composable *Tx cores; collapsing them
+  into Transactor-taking exported methods is in progress (item 32).
+  Txn.DeleteNode is supported -- see item 15.
 - Domain-pointer staleness residuals (theorystate.md section 86): raw
   non-Transact mutations, out-of-band tag removal or descriptor
   re-pointing inside a Transact, and O(pointers-per-domain) validation

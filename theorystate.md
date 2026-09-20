@@ -982,6 +982,8 @@ suffices, is unresolved.
 
 Nested transactional views may provide a useful abstraction for composing higher-level operations and may have structural similarities to isolated/remote views. Investigate later.
 
+**Partly resolved (in-memory backend).** `Tx.Transact` opens a nested transaction as a savepoint inside the enclosing one: a nested failure or panic undoes only the nested steps (and discards its commit hooks), and the enclosing closure may handle the error and continue. Commit-time Checkers run only at the outermost commit, because they judge the final state and an intermediate state may legitimately violate an invariant that a later step repairs; an inner success is provisional until then. What stays OPEN is per-backend realization (a CAS backend would use a child write buffer merged into its parent) and whether some Checkers should be able to run at inner boundaries.
+
 ## 46. Primitive relationships assert existence only, never meaning
 
 *(Formatting bug fixed this revision: this section previously had no `##`
@@ -2754,7 +2756,9 @@ maps from inside the closure.
 2. `fn` reads everything its decisions depend on through `tx`, never
    through a graph value captured from outside.
 3. `fn` has no side effects outside `tx`.
-4. `fn` does not call `Transact`.
+4. `fn` may open a nested transaction only through the `tx` it was given
+   (`tx.Transact`, a savepoint; §45), never through another graph handle.
+   Checkers run once, at the outermost commit.
 
 **Consequence for registries.** A read-decide-write method is atomic as
 a whole only if the read is inside the same transaction as the write.

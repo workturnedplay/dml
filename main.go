@@ -618,10 +618,25 @@ type GraphStore interface {
 // GraphActor takes one (theorystate.md section 87b).
 type GraphAPI interface {
 	GraphStore
+	Transactor
 
+	// RegisterChecker registers c to be consulted after every future
+	// outermost transaction whose changeset could be relevant to it (see
+	// Checker).
+	RegisterChecker(c Checker)
+}
+
+// Transactor is the ability to run a function as one atomic unit. Both
+// GraphAPI and Tx provide it: on a GraphAPI, Transact opens an outermost
+// transaction; on a Tx, it opens a nested transaction inside the one
+// already in progress (theorystate.md section 45). Registry mutators take
+// a Transactor, so one exported method works standalone and also composes
+// inside a larger transaction, with no separate tx-composable core.
+type Transactor interface {
 	// Transact runs fn as one atomic unit: if fn returns an error or
-	// panics, or a relevant Checker declines the result, every mutation
-	// made through tx is undone.
+	// panics, every mutation made through tx is undone. For an outermost
+	// transaction the same happens if a relevant Checker declines the
+	// result.
 	//
 	// Contract every fn must honour (theorystate.md section 91):
 	//   - fn may be executed more than once, and against a state that
@@ -634,9 +649,21 @@ type GraphAPI interface {
 	//   - fn must have no side effects outside tx. State kept outside the
 	//     graph (NameRegistry's maps) is updated with tx.OnCommit, never
 	//     directly from fn.
-	//   - fn must not call Transact on any graph.
+	//   - fn may open a nested transaction only through the tx it was
+	//     given, never through another graph handle (on a GraphActor that
+	//     would deadlock).
+	//
+	// Nested transactions (Transact called on a Tx):
+	//   - They are savepoints inside the enclosing transaction. If the
+	//     nested fn fails or panics, only what it did is undone, including
+	//     the OnCommit hooks it registered; the enclosing fn may handle the
+	//     returned error and carry on.
+	//   - Checkers run once, at the outermost commit, over the whole
+	//     changeset, because they judge the final state and an
+	//     intermediate one may legitimately violate an invariant that a
+	//     later step repairs. A nested call that returns nil is therefore
+	//     provisional until the outermost Transact returns nil.
 	Transact(fn func(tx Tx) error) error
-	RegisterChecker(c Checker)
 }
 
 // Compile-time assertion that *Graph satisfies GraphAPI, so any future
@@ -645,15 +672,17 @@ type GraphAPI interface {
 var _ GraphAPI = (*Graph)(nil)
 
 // Tx is the handle a Transact closure works through: GraphStore's full
-// read/write surface, scoped to one transaction. *Txn is the concrete
-// implementation for the in-memory Graph. Transact takes this interface,
-// not the concrete *Txn, so that a layer decorating a GraphAPI -- most
-// importantly RootGraph -- can hand the closure a handle presenting the
-// same overlaid view inside the transaction as outside it (theorystate.md
-// section 87b). Every helper in this file already takes the narrower
-// txOps/txReader, which Tx satisfies.
+// read/write surface, scoped to one transaction, plus OnCommit and nested
+// Transact (via Transactor). *Txn is the concrete implementation for the
+// in-memory Graph. Transact takes this interface, not the concrete *Txn,
+// so that a layer decorating a GraphAPI -- most importantly RootGraph --
+// can hand the closure a handle presenting the same overlaid view inside
+// the transaction as outside it (theorystate.md section 87b). Every
+// helper in this file already takes the narrower txOps/txReader, which Tx
+// satisfies.
 type Tx interface {
 	GraphStore
+	Transactor
 
 	// OnCommit registers fn to run exactly once, after this
 	// transaction's mutations have been applied and every relevant
@@ -729,11 +758,19 @@ var _ Tx = (*Txn)(nil)
 // helpers read current state through the very same tx they write
 // through; that is what keeps a decision and its write on one state.
 //
-// Nesting one Graph.Transact call inside another is not currently
-// supported or used by anything in this file: an inner Txn has its own
-// independent undo log and knows nothing about an enclosing one. Genuine
-// nested-transaction semantics are theorystate.md section 45, still
-// OPEN; do not rely on nesting until that is deliberately designed.
+// Nested transactions are supported through Txn.Transact (part of the Tx
+// interface, so tx.Transact(fn) inside a closure). A nested transaction
+// is a savepoint in the enclosing one, not a transaction of its own: it
+// shares tx's undo log and commit-hook list and merely remembers where
+// they stood on entry (txMark). If the nested fn fails or panics,
+// everything done since that point is undone and every OnCommit hook
+// registered since then is discarded; the enclosing closure may handle the
+// error and carry on. If it succeeds, nothing more happens and its
+// effects stand or fall with the outermost transaction. Checkers run
+// only once, at the outermost commit, over the whole changeset, because
+// they judge the final state (theorystate.md section 45). An inner
+// success is therefore provisional until the outermost Graph.Transact
+// returns nil.
 type Txn struct {
 	graph *Graph
 	undo  []func()
@@ -839,11 +876,70 @@ func (g *Graph) Transact(fn func(tx Tx) error) (err error) {
 // Undoing in the opposite order would risk DeleteNode failing with
 // ErrNodeNotEmpty.
 func (tx *Txn) rollback() {
-	for i := len(tx.undo) - 1; i >= 0; i-- {
+	tx.rollbackTo(txMark{})
+}
+
+// txMark records how long tx's undo log and commit-hook list were at some
+// point, so a nested transaction can later be rolled back to exactly
+// that point.
+type txMark struct {
+	undo  int
+	hooks int
+}
+
+// mark returns tx's current position, for rollbackTo.
+func (tx *Txn) mark() txMark {
+	return txMark{undo: len(tx.undo), hooks: len(tx.commitHooks)}
+}
+
+// rollbackTo undoes, in reverse (LIFO) order, every mutation recorded on
+// tx since m was taken, and discards every commit hook registered since
+// then. The zero txMark rolls back the whole transaction.
+//
+// tx.touched is deliberately not rewound: it stays a conservative
+// superset of what the transaction changed. A Checker given a node whose
+// change was rolled back simply re-validates a node that is already
+// valid, and every Checker in this file ignores nodes that no longer
+// exist.
+func (tx *Txn) rollbackTo(m txMark) {
+	for i := len(tx.undo) - 1; i >= m.undo; i-- {
 		tx.undo[i]()
 	}
-	tx.undo = nil
-	tx.commitHooks = nil
+
+	clear(tx.undo[m.undo:])
+	tx.undo = tx.undo[:m.undo]
+
+	clear(tx.commitHooks[m.hooks:])
+	tx.commitHooks = tx.commitHooks[:m.hooks]
+}
+
+// Transact implements Transactor for a transaction already in progress:
+// it runs fn as a nested transaction, a savepoint inside tx. fn receives
+// tx itself, since the nested transaction shares tx's state.
+//
+// If fn returns an error, everything fn did through tx and every commit
+// hook it registered is undone or discarded, and the error is returned;
+// the enclosing closure may handle it and continue. If fn panics, the
+// same rollback happens before the panic is re-raised, so an enclosing
+// closure that recovers is left with state as it was before this call. If
+// fn succeeds, nothing more happens: no Checker runs here (they run once,
+// at the outermost commit) and the effects are provisional until then.
+func (tx *Txn) Transact(fn func(nested Tx) error) error {
+	mark := tx.mark()
+
+	defer func() {
+		if r := recover(); r != nil {
+			tx.rollbackTo(mark)
+			panic(r)
+		}
+	}()
+
+	if err := fn(tx); err != nil {
+		tx.rollbackTo(mark)
+		return err
+	}
+
+	return nil
 }
 
 // OnCommit implements Tx.OnCommit: fn runs once, after every Checker has
@@ -2435,7 +2531,7 @@ var _ GraphStore = rootStore{}
 
 // rootTx is the handle RootGraph.Transact gives its closure: the ROOT
 // overlay over the underlying transaction (rootStore) plus that
-// transaction's own OnCommit, so it satisfies Tx.
+// transaction's own OnCommit and nested Transact, so it satisfies Tx.
 type rootTx struct {
 	rootStore
 	tx Tx
@@ -2456,6 +2552,16 @@ func newRootTx(tx Tx, root NodeID) rootTx {
 // registered through the overlay run when that transaction commits.
 func (t rootTx) OnCommit(fn func()) {
 	t.tx.OnCommit(fn)
+}
+
+// Transact forwards to the underlying transaction's nested Transact and
+// hands fn a handle presenting the same ROOT overlay, so the overlay is
+// in force inside nested transactions exactly as it is in the outermost
+// one.
+func (t rootTx) Transact(fn func(nested Tx) error) error {
+	return wrapInterfaceErr(t.tx.Transact(func(inner Tx) error {
+		return fn(newRootTx(inner, t.root))
+	}))
 }
 
 // newRootStore returns the ROOT overlay over store.
@@ -2745,9 +2851,10 @@ var (
 // into a larger enclosing Transact call -- e.g. CapsuleRegistry.NewCapsule
 // composing PointerRegistry's create-and-tag sequence for each of a
 // capsule's three role slots -- without nesting one Graph.Transact call
-// inside another. Txn deliberately does not support nesting (see the Txn
-// doc comment); parameterizing over txOps instead of a concrete *Txn is
-// what lets the same sequence run either standalone or composed.
+// inside another. Tx.Transact now supports nested transactions, so
+// registry methods themselves also compose by nesting; these txOps-based
+// helpers remain as shared, DRY building blocks that run against
+// whatever tx they are given, standalone or composed.
 type txOps interface {
 	CreateNode() (NodeID, error)
 	AddRelationship(a, b NodeID) (created bool, err error)
@@ -2794,13 +2901,14 @@ func wrapInterfaceErr(err error) error {
 	return fmt.Errorf("%w", err)
 }
 
-// transactValue runs step as one Graph.Transact call and returns its
+// transactValue runs step as one Transact call on graph and returns its
 // result, or (zero value, err) if step failed or the transaction was
-// declined and rolled back. step may be run more than once by a retrying
-// backend (see the GraphAPI.Transact contract), so its result is
-// overwritten on every run and only the final, committed run's value is
-// returned.
-func transactValue[T any](graph GraphAPI, step func(tx Tx) (T, error)) (T, error) {
+// declined and rolled back. If graph is a GraphAPI this is an outermost
+// transaction; if it is a Tx, a nested one inside the enclosing
+// transaction. step may be run more than once by a retrying backend (see
+// the Transactor contract), so its result is overwritten on every run and
+// only the final, committed run's value is returned.
+func transactValue[T any](graph Transactor, step func(tx Tx) (T, error)) (T, error) {
 	var result T
 
 	err := graph.Transact(func(tx Tx) error {
@@ -2817,7 +2925,7 @@ func transactValue[T any](graph GraphAPI, step func(tx Tx) (T, error)) (T, error
 }
 
 // transactBool is transactValue for a bool result.
-func transactBool(graph GraphAPI, step func(tx Tx) (bool, error)) (bool, error) {
+func transactBool(graph Transactor, step func(tx Tx) (bool, error)) (bool, error) {
 	return transactValue(graph, step)
 }
 
