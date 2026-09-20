@@ -12164,6 +12164,204 @@ func TestGraphActorConcurrentListAppendKeepsListValid(t *testing.T) {
 // cannot be deleted (something else references its value slot), the
 // operation must stay in the log completely intact instead of ending up
 // unlinked from the log but still holding its descriptor.
+func requireListElements(t *testing.T, lists *ListRegistry, graph GraphReader, list NodeID, want []NodeID) {
+	t.Helper()
+
+	got, err := lists.Elements(graph, list)
+	if err != nil {
+		t.Fatalf("Elements(%d): %v", list, err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("Elements(%d) = %v, want %v", list, got, want)
+	}
+}
+
+func TestListMutatorsComposeInsideOneTransactionAndRollBackTogether(t *testing.T) {
+	g, capsules, lists := newListTestFixture(t)
+
+	list, err := lists.NewList(g)
+	if err != nil {
+		t.Fatalf("NewList(): %v", err)
+	}
+
+	a := newTestNode(t, g)
+	b := newTestNode(t, g)
+	c := newTestNode(t, g)
+
+	capsuleA, err := lists.Append(g, list, a)
+	if err != nil {
+		t.Fatalf("Append(a): %v", err)
+	}
+
+	var capsuleB NodeID
+
+	// Append, Prepend and Remove composed in one transaction commit
+	// together: [a] -> [c, a, b] -> [c, b].
+	err = g.Transact(func(tx Tx) error {
+		var appendErr error
+		capsuleB, appendErr = lists.Append(tx, list, b)
+		if appendErr != nil {
+			return appendErr
+		}
+
+		if _, prependErr := lists.Prepend(tx, list, c); prependErr != nil {
+			return prependErr
+		}
+
+		deleted, removeErr := lists.Remove(tx, list, capsuleA)
+		if removeErr != nil {
+			return removeErr
+		}
+		if !deleted {
+			t.Error("Remove() reported the capsule was not deleted")
+		}
+
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Transact(compose) error = %v", err)
+	}
+
+	requireListElements(t, lists, g, list, []NodeID{c, b})
+	if g.NodeExists(capsuleA) {
+		t.Fatalf("capsule %d survived a Remove() that reported deleting it", capsuleA)
+	}
+
+	errOuter := errors.New("outer failure")
+
+	// The same kind of composition rolls back together, including the
+	// deletion of a capsule and its slots.
+	err = g.Transact(func(tx Tx) error {
+		deleted, removeErr := lists.Remove(tx, list, capsuleB)
+		if removeErr != nil {
+			return removeErr
+		}
+		if !deleted {
+			t.Error("Remove() reported the capsule was not deleted")
+		}
+
+		if _, appendErr := lists.Append(tx, list, a); appendErr != nil {
+			return appendErr
+		}
+
+		return errOuter
+	})
+	if !errors.Is(err, errOuter) {
+		t.Fatalf("Transact(fail) error = %v, want %v", err, errOuter)
+	}
+
+	requireListElements(t, lists, g, list, []NodeID{c, b})
+	if !capsules.IsCapsule(g, capsuleB) || !g.HasRelationship(list, capsuleB) {
+		t.Fatal("capsuleB was not restored by the rollback of the enclosing transaction")
+	}
+}
+
+func TestListAppendInsideFailedNestedTransactionLeavesListValid(t *testing.T) {
+	g, _, lists := newListTestFixture(t)
+
+	list, err := lists.NewList(g)
+	if err != nil {
+		t.Fatalf("NewList(): %v", err)
+	}
+
+	a := newTestNode(t, g)
+	b := newTestNode(t, g)
+	errInner := errors.New("inner failure")
+
+	err = g.Transact(func(tx Tx) error {
+		if _, appendErr := lists.Append(tx, list, a); appendErr != nil {
+			return appendErr
+		}
+
+		innerErr := tx.Transact(func(inner Tx) error {
+			if _, innerAppendErr := lists.Append(inner, list, b); innerAppendErr != nil {
+				return innerAppendErr
+			}
+
+			return errInner
+		})
+		if !errors.Is(innerErr, errInner) {
+			t.Errorf("nested Transact() error = %v, want %v", innerErr, errInner)
+		}
+
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Transact() error = %v", err)
+	}
+
+	// Elements validates head/tail, reciprocal links and reachability, so
+	// this also proves the nested rollback restored every tag and slot.
+	requireListElements(t, lists, g, list, []NodeID{a})
+}
+
+func TestCapsuleLinkAndDeleteComposeAndRollBackWithEnclosingTransaction(t *testing.T) {
+	g, capsules := newCapsuleTestFixture(t)
+
+	v1 := newTestNode(t, g)
+	v2 := newTestNode(t, g)
+
+	c1, err := capsules.NewCapsule(g, v1)
+	if err != nil {
+		t.Fatalf("NewCapsule(v1): %v", err)
+	}
+
+	c2, err := capsules.NewCapsule(g, v2)
+	if err != nil {
+		t.Fatalf("NewCapsule(v2): %v", err)
+	}
+
+	errOuter := errors.New("outer failure")
+
+	err = g.Transact(func(tx Tx) error {
+		if nextErr := capsules.SetNext(tx, c1, c2); nextErr != nil {
+			return nextErr
+		}
+		if prevErr := capsules.SetPrev(tx, c2, c1); prevErr != nil {
+			return prevErr
+		}
+
+		return errOuter
+	})
+	if !errors.Is(err, errOuter) {
+		t.Fatalf("Transact(link, fail) error = %v, want %v", err, errOuter)
+	}
+
+	if _, hasNext, nextErr := capsules.Next(g, c1); nextErr != nil {
+		t.Fatalf("Next(c1): %v", nextErr)
+	} else if hasNext {
+		t.Fatal("c1 kept a next link from a rolled-back transaction")
+	}
+	if _, hasPrev, prevErr := capsules.Prev(g, c2); prevErr != nil {
+		t.Fatalf("Prev(c2): %v", prevErr)
+	} else if hasPrev {
+		t.Fatal("c2 kept a prev link from a rolled-back transaction")
+	}
+
+	err = g.Transact(func(tx Tx) error {
+		if deleteErr := capsules.DeleteCapsule(tx, c2); deleteErr != nil {
+			return deleteErr
+		}
+
+		return errOuter
+	})
+	if !errors.Is(err, errOuter) {
+		t.Fatalf("Transact(delete, fail) error = %v, want %v", err, errOuter)
+	}
+
+	if !g.NodeExists(c2) || !capsules.IsCapsule(g, c2) {
+		t.Fatal("c2 was not restored after its deleting transaction rolled back")
+	}
+
+	value, hasValue, valueErr := capsules.Value(g, c2)
+	if valueErr != nil {
+		t.Fatalf("Value(c2): %v", valueErr)
+	}
+	if !hasValue || value != v2 {
+		t.Fatalf("Value(c2) = (%d,%v), want (%d,true)", value, hasValue, v2)
+	}
+}
+
 func TestCompositeSetLogRemoveOperationIsAtomicWhenCapsuleCannotBeDeleted(t *testing.T) {
 	g, _, _, logs := newCompositeSetLogTestFixture(t)
 

@@ -4283,13 +4283,11 @@ func (c *CapsuleRegistry) wellFormed(graph GraphReader, capsule NodeID) error {
 // buildCapsuleTx creates a fresh capsule NodeID, tags it via
 // (allElementCapsules, capsule), and wires all three of its role slots
 // (prev, value, next) -- each via the shared newPointerTx create-and-tag
-// sequence -- against tx. This is the tx-composable core behind
-// CapsuleRegistry.NewCapsule (via its newCapsuleTx method below),
-// factored out as a free function, parameterized entirely over tag
-// NodeIDs, so a larger composite operation (ListRegistry.Append/Prepend/
-// InsertAfter) can mint a capsule as one step of its own enclosing
-// Graph.Transact call instead of CapsuleRegistry opening a second, nested
-// one.
+// sequence -- against tx. This is the body behind
+// CapsuleRegistry.NewCapsule, factored out as a free function
+// parameterized entirely over tag NodeIDs. Callers that mint a capsule as
+// one step of a larger operation (ListRegistry.Append/Prepend/
+// InsertAfter) call NewCapsule with their own tx, which nests.
 //
 // The value slot's target is set to value immediately, since a freshly
 // created slot trivially satisfies the Pointer invariant (it starts
@@ -4335,91 +4333,60 @@ func buildCapsuleTx(tx txOps, allElementCapsules, allPrevSlot, allValueSlot, all
 	return capsule, nil
 }
 
-// newCapsuleTx is CapsuleRegistry's tx-composable wrapper around
-// buildCapsuleTx, supplying this registry's own tag NodeIDs. Exists so
-// ListRegistry (same package) can mint a capsule as one step of its own
-// enclosing Graph.Transact call.
-func (c *CapsuleRegistry) newCapsuleTx(tx txOps, value NodeID) (NodeID, error) {
-	return buildCapsuleTx(tx, c.allElementCapsules, c.prevSlots.allPointers, c.valueSlots.allPointers, c.nextSlots.allPointers, value)
+// setSlotTarget rewires capsule's role slot -- the one slots is
+// parameterized on (prev, value or next) -- to target, as one
+// transaction (nested if graph is a Tx). The slot is discovered through
+// slotFor, so the ownership check the read accessors apply also guards
+// every write; ErrNotCapsule is returned if capsule has no such slot.
+// This is the shared body behind the exported SetPrev/SetNext/SetValue,
+// so each of them reads the slot and writes it in one transaction.
+func (c *CapsuleRegistry) setSlotTarget(graph Transactor, capsule NodeID, slots *PointerRegistry, target NodeID) error {
+	return wrapInterfaceErr(graph.Transact(func(tx Tx) error {
+		slot, found, err := c.slotFor(tx, capsule, slots.allPointers)
+		if err != nil {
+			return err
+		}
+		if !found {
+			return ErrNotCapsule
+		}
+
+		return slots.SetTarget(tx, slot, target)
+	}))
 }
 
-// setSlotTargetTx rewires capsule's role slot -- the one slots is
-// parameterized on (prev, value or next) -- to target, composed into an
-// existing tx. The slot is discovered through slotFor, so the ownership
-// check the read accessors apply also guards every write; ErrNotCapsule
-// is returned if capsule has no such slot. This is the tx-composable core
-// behind the exported SetPrev/SetNext/SetValue and ListRegistry's
-// rewiring steps, so each of them reads the slot and writes it in one
-// transaction.
-func (c *CapsuleRegistry) setSlotTargetTx(tx Tx, capsule NodeID, slots *PointerRegistry, target NodeID) error {
-	slot, found, err := c.slotFor(tx, capsule, slots.allPointers)
-	if err != nil {
-		return err
-	}
-	if !found {
-		return ErrNotCapsule
-	}
+// removeSlotTarget clears capsule's role slot -- the one slots is
+// parameterized on -- as one transaction (nested if graph is a Tx). The
+// slot is discovered through slotFor (ownership-checked); ErrNotCapsule
+// is returned if capsule has no such slot. This is the shared body behind
+// the exported RemovePrev/RemoveNext, so a capsule's own links can be
+// cleared as part of the same transaction that relinks its neighbors.
+func (c *CapsuleRegistry) removeSlotTarget(graph Transactor, capsule NodeID, slots *PointerRegistry) (removed bool, err error) {
+	return transactBool(graph, func(tx Tx) (bool, error) {
+		slot, found, slotErr := c.slotFor(tx, capsule, slots.allPointers)
+		if slotErr != nil {
+			return false, slotErr
+		}
+		if !found {
+			return false, ErrNotCapsule
+		}
 
-	return slots.SetTarget(tx, slot, target)
-}
-
-// setPrevTx rewires capsule's prev-slot to target, composed into an
-// existing tx. See setSlotTargetTx.
-func (c *CapsuleRegistry) setPrevTx(tx Tx, capsule, target NodeID) error {
-	return c.setSlotTargetTx(tx, capsule, c.prevSlots, target)
-}
-
-// setNextTx rewires capsule's next-slot to target, composed into an
-// existing tx. See setSlotTargetTx.
-func (c *CapsuleRegistry) setNextTx(tx Tx, capsule, target NodeID) error {
-	return c.setSlotTargetTx(tx, capsule, c.nextSlots, target)
-}
-
-// removeSlotTargetTx clears capsule's role slot -- the one slots is
-// parameterized on -- composed into an existing tx. The slot is
-// discovered through slotFor (ownership-checked); ErrNotCapsule is
-// returned if capsule has no such slot. This is the tx-composable core
-// behind the exported RemovePrev/RemoveNext and
-// ListRegistry.removeWithoutDeletingCapsuleTx, so a capsule's own links
-// can be cleared as part of the same transaction that relinks its
-// neighbors.
-func (c *CapsuleRegistry) removeSlotTargetTx(tx Tx, capsule NodeID, slots *PointerRegistry) (removed bool, err error) {
-	slot, found, err := c.slotFor(tx, capsule, slots.allPointers)
-	if err != nil {
-		return false, err
-	}
-	if !found {
-		return false, ErrNotCapsule
-	}
-
-	return slots.RemoveTarget(tx, slot)
-}
-
-// removePrevTx clears capsule's prev-slot, composed into an existing tx.
-// See removeSlotTargetTx.
-func (c *CapsuleRegistry) removePrevTx(tx Tx, capsule NodeID) (bool, error) {
-	return c.removeSlotTargetTx(tx, capsule, c.prevSlots)
-}
-
-// removeNextTx clears capsule's next-slot, composed into an existing tx.
-// See removeSlotTargetTx.
-func (c *CapsuleRegistry) removeNextTx(tx Tx, capsule NodeID) (bool, error) {
-	return c.removeSlotTargetTx(tx, capsule, c.nextSlots)
+		return slots.RemoveTarget(tx, slot)
+	})
 }
 
 // NewCapsule creates a fresh capsule NodeID, tags it
 // (AllElementCapsules, capsule), and wires all three of its role slots
-// (prev, value, next), entirely inside one Graph.Transact call, via
-// newCapsuleTx.
+// (prev, value, next), entirely inside one transaction (nested if graph
+// is a Tx), via buildCapsuleTx.
 //
 // value must already exist.
-func (c *CapsuleRegistry) NewCapsule(graph GraphAPI, value NodeID) (NodeID, error) {
+func (c *CapsuleRegistry) NewCapsule(graph Transactor, value NodeID) (NodeID, error) {
 	return transactValue(graph, func(tx Tx) (NodeID, error) {
 		if !tx.NodeExists(value) {
 			return 0, ErrNodeNotFound
 		}
 
-		return c.newCapsuleTx(tx, value)
+		return buildCapsuleTx(tx, c.allElementCapsules, c.prevSlots.allPointers, c.valueSlots.allPointers, c.nextSlots.allPointers, value)
 	})
 }
 
@@ -4443,10 +4410,8 @@ func (c *CapsuleRegistry) Value(graph GraphReader, capsule NodeID) (value NodeID
 }
 
 // SetValue replaces capsule's value.
-func (c *CapsuleRegistry) SetValue(graph GraphAPI, capsule, value NodeID) error {
-	return wrapInterfaceErr(graph.Transact(func(tx Tx) error {
-		return c.setSlotTargetTx(tx, capsule, c.valueSlots, value)
-	}))
+func (c *CapsuleRegistry) SetValue(graph Transactor, capsule, value NodeID) error {
+	return c.setSlotTarget(graph, capsule, c.valueSlots, value)
 }
 
 // CapsulesWithValue returns every capsule, anywhere in the graph, whose
@@ -4574,17 +4539,13 @@ func (c *CapsuleRegistry) Prev(graph GraphReader, capsule NodeID) (prev NodeID, 
 }
 
 // SetPrev sets capsule's previous-capsule link.
-func (c *CapsuleRegistry) SetPrev(graph GraphAPI, capsule, prev NodeID) error {
-	return wrapInterfaceErr(graph.Transact(func(tx Tx) error {
-		return c.setPrevTx(tx, capsule, prev)
-	}))
+func (c *CapsuleRegistry) SetPrev(graph Transactor, capsule, prev NodeID) error {
+	return c.setSlotTarget(graph, capsule, c.prevSlots, prev)
 }
 
 // RemovePrev clears capsule's previous-capsule link, if any.
-func (c *CapsuleRegistry) RemovePrev(graph GraphAPI, capsule NodeID) (removed bool, err error) {
-	return transactBool(graph, func(tx Tx) (bool, error) {
-		return c.removePrevTx(tx, capsule)
-	})
+func (c *CapsuleRegistry) RemovePrev(graph Transactor, capsule NodeID) (removed bool, err error) {
+	return c.removeSlotTarget(graph, capsule, c.prevSlots)
 }
 
 // Next returns capsule's next-capsule link, if any. hasNext is false for
@@ -4602,17 +4563,13 @@ func (c *CapsuleRegistry) Next(graph GraphReader, capsule NodeID) (next NodeID, 
 }
 
 // SetNext sets capsule's next-capsule link.
-func (c *CapsuleRegistry) SetNext(graph GraphAPI, capsule, next NodeID) error {
-	return wrapInterfaceErr(graph.Transact(func(tx Tx) error {
-		return c.setNextTx(tx, capsule, next)
-	}))
+func (c *CapsuleRegistry) SetNext(graph Transactor, capsule, next NodeID) error {
+	return c.setSlotTarget(graph, capsule, c.nextSlots, next)
 }
 
 // RemoveNext clears capsule's next-capsule link, if any.
-func (c *CapsuleRegistry) RemoveNext(graph GraphAPI, capsule NodeID) (removed bool, err error) {
-	return transactBool(graph, func(tx Tx) (bool, error) {
-		return c.removeNextTx(tx, capsule)
-	})
+func (c *CapsuleRegistry) RemoveNext(graph Transactor, capsule NodeID) (removed bool, err error) {
+	return c.removeSlotTarget(graph, capsule, c.nextSlots)
 }
 
 // DeleteCapsule deletes capsule and all three of its role-slot nodes
@@ -4664,80 +4621,77 @@ func (c *CapsuleRegistry) RemoveNext(graph GraphAPI, capsule NodeID) (removed bo
 // capsule somehow missing one of its three role slots -- only reachable
 // through an out-of-band Graph mutation -- is treated the same as
 // ErrCapsuleNotEmpty rather than guessed about.
-func (c *CapsuleRegistry) DeleteCapsule(graph GraphAPI, capsule NodeID) error {
+//
+// Every existence, tag and slot check runs against tx. If graph is a Tx
+// the call is a nested transaction: if it fails, only what it did is
+// undone (including any DeleteNode calls that had already succeeded),
+// and the enclosing closure may carry on. That is what lets
+// ListRegistry.Remove treat this as a best-effort step inside its own
+// single transaction, and lets CompositeSetLogRegistry.RemoveOperation
+// treat it as one all-or-nothing step of a larger one.
+func (c *CapsuleRegistry) DeleteCapsule(graph Transactor, capsule NodeID) error {
 	return wrapInterfaceErr(graph.Transact(func(tx Tx) error {
-		return c.deleteCapsuleTx(tx, capsule)
-	}))
-}
-
-// deleteCapsuleTx is DeleteCapsule's tx-composable core (see that
-// method's doc comment for the full contract). Every existence, tag and
-// slot check runs against tx, so a caller composing it into a larger
-// transaction -- CompositeSetLogRegistry.removeOperationTx -- gets one
-// all-or-nothing step: if it fails, the enclosing transaction's rollback
-// undoes everything it did, including any DeleteNode calls that had
-// already succeeded.
-func (c *CapsuleRegistry) deleteCapsuleTx(tx txReader, capsule NodeID) error {
-	if requireErr := c.requireCapsule(tx, capsule); requireErr != nil {
-		return requireErr
-	}
-
-	prevSlot, hasPrevSlot, err := c.slotFor(tx, capsule, c.prevSlots.allPointers)
-	if err != nil {
-		return err
-	}
-
-	valueSlot, hasValueSlot, err := c.slotFor(tx, capsule, c.valueSlots.allPointers)
-	if err != nil {
-		return err
-	}
-
-	nextSlot, hasNextSlot, err := c.slotFor(tx, capsule, c.nextSlots.allPointers)
-	if err != nil {
-		return err
-	}
-
-	if !hasPrevSlot || !hasValueSlot || !hasNextSlot {
-		return ErrCapsuleNotEmpty
-	}
-
-	value, hasValue, err := c.valueSlots.Target(tx, valueSlot)
-	if err != nil {
-		return err
-	}
-
-	// Every relationship here is one buildCapsuleTx itself created.
-	// prevSlot/nextSlot's own targets are deliberately absent: see
-	// the DeleteCapsule doc comment.
-	edges := []Relationship{
-		{From: capsule, To: prevSlot},
-		{From: c.prevSlots.allPointers, To: prevSlot},
-		{From: capsule, To: valueSlot},
-		{From: c.valueSlots.allPointers, To: valueSlot},
-		{From: capsule, To: nextSlot},
-		{From: c.nextSlots.allPointers, To: nextSlot},
-		{From: c.allElementCapsules, To: capsule},
-	}
-	if hasValue {
-		edges = append(edges, Relationship{From: valueSlot, To: value})
-	}
-
-	for _, edge := range edges {
-		if err2 := removeRelationshipTx(tx, edge.From, edge.To); err2 != nil {
-			return err2
+		if requireErr := c.requireCapsule(tx, capsule); requireErr != nil {
+			return requireErr
 		}
-	}
 
-	for _, node := range []NodeID{prevSlot, valueSlot, nextSlot, capsule} {
-		if err2 := deleteNodeTx(tx, node); err2 != nil {
-			if errors.Is(err2, ErrNodeNotEmpty) {
-				return ErrCapsuleNotEmpty
+		prevSlot, hasPrevSlot, err := c.slotFor(tx, capsule, c.prevSlots.allPointers)
+		if err != nil {
+			return err
+		}
+
+		valueSlot, hasValueSlot, err := c.slotFor(tx, capsule, c.valueSlots.allPointers)
+		if err != nil {
+			return err
+		}
+
+		nextSlot, hasNextSlot, err := c.slotFor(tx, capsule, c.nextSlots.allPointers)
+		if err != nil {
+			return err
+		}
+
+		if !hasPrevSlot || !hasValueSlot || !hasNextSlot {
+			return ErrCapsuleNotEmpty
+		}
+
+		value, hasValue, err := c.valueSlots.Target(tx, valueSlot)
+		if err != nil {
+			return err
+		}
+
+		// Every relationship here is one buildCapsuleTx itself created.
+		// prevSlot/nextSlot's own targets are deliberately absent: see
+		// the DeleteCapsule doc comment.
+		edges := []Relationship{
+			{From: capsule, To: prevSlot},
+			{From: c.prevSlots.allPointers, To: prevSlot},
+			{From: capsule, To: valueSlot},
+			{From: c.valueSlots.allPointers, To: valueSlot},
+			{From: capsule, To: nextSlot},
+			{From: c.nextSlots.allPointers, To: nextSlot},
+			{From: c.allElementCapsules, To: capsule},
+		}
+		if hasValue {
+			edges = append(edges, Relationship{From: valueSlot, To: value})
+		}
+
+		for _, edge := range edges {
+			if removeErr := removeRelationshipTx(tx, edge.From, edge.To); removeErr != nil {
+				return removeErr
 			}
-			return err2
 		}
-	}
 
-	return nil
+		for _, node := range []NodeID{prevSlot, valueSlot, nextSlot, capsule} {
+			if deleteErr := deleteNodeTx(tx, node); deleteErr != nil {
+				if errors.Is(deleteErr, ErrNodeNotEmpty) {
+					return ErrCapsuleNotEmpty
+				}
+				return deleteErr
+			}
+		}
+
+		return nil
+	}))
 }
 
 // ListRegistry implements Ordered Lists (theorystate.md section 11
@@ -4766,11 +4720,13 @@ func (c *CapsuleRegistry) deleteCapsuleTx(tx txReader, capsule NodeID) error {
 // slot indirection here would be pure unneeded overhead.
 //
 // ListRegistry's mutating operations (NewList, Append, Prepend,
-// InsertAfter) each run entirely inside one Graph.Transact call,
-// composing CapsuleRegistry's tx-composable newCapsuleTx/setPrevTx/
-// setNextTx alongside direct tag (AddRelationship/RemoveRelationship)
-// calls against the same tx -- no nested Graph.Transact calls anywhere,
-// per the txOps discipline established above.
+// InsertAfter, Remove, RemoveWithoutDeletingCapsule, DeleteList) each run
+// as one transaction on the Transactor they are given (nested if it is a
+// Tx), composing CapsuleRegistry's exported NewCapsule/SetPrev/SetNext/
+// RemovePrev/RemoveNext/DeleteCapsule alongside direct tag
+// (AddRelationship/RemoveRelationship) calls against the same tx. Any of
+// them can therefore be called standalone or inside a larger
+// transaction, where it shares that transaction's fate.
 //
 // As with every other registry in this file, list structure is
 // re-derived fresh from the Graph on every call rather than cached.
@@ -4894,19 +4850,10 @@ func (l *ListRegistry) requireListValue(graph GraphReader, list, value NodeID) e
 
 // NewList creates a fresh NodeID and tags it (AllLists, id). The new list
 // starts empty: no head, no tail, no element capsules.
-func (l *ListRegistry) NewList(graph GraphAPI) (NodeID, error) {
-	var list NodeID
-
-	err := graph.Transact(func(tx Tx) error {
-		var err error
-		list, err = createTaggedNodeTx(tx, l.allLists)
-		return err
+func (l *ListRegistry) NewList(graph Transactor) (NodeID, error) {
+	return transactValue(graph, func(tx Tx) (NodeID, error) {
+		return createTaggedNodeTx(tx, l.allLists)
 	})
-	if err != nil {
-		return 0, wrapInterfaceErr(err)
-	}
-
-	return list, nil
 }
 
 // Head returns list's current head capsule, if any. hasHead is false for
@@ -4952,7 +4899,9 @@ func (l *ListRegistry) Tail(graph GraphReader, list NodeID) (tail NodeID, hasTai
 }
 
 // Append creates a fresh capsule holding value and links it as the new
-// tail of list, entirely inside one Graph.Transact call.
+// tail of list, entirely inside one transaction (nested if graph is a
+// Tx, so a larger operation such as CompositeSetLogRegistry.
+// AppendOperation can append as one step of its own transaction).
 //
 // If list is currently empty, the new capsule becomes both head and
 // tail. Otherwise the new capsule is wired in after the current tail
@@ -4960,120 +4909,105 @@ func (l *ListRegistry) Tail(graph GraphReader, list NodeID) (tail NodeID, hasTai
 // old tail loses its AllTails tag, and the new capsule gains it.
 //
 // list must already be tagged (AllLists, list); value must already
-// exist.
-func (l *ListRegistry) Append(graph GraphAPI, list, value NodeID) (NodeID, error) {
+// exist. Both are checked against tx itself, so a caller composing this
+// into a larger transaction cannot act on a stale pre-check.
+func (l *ListRegistry) Append(graph Transactor, list, value NodeID) (NodeID, error) {
 	return transactValue(graph, func(tx Tx) (NodeID, error) {
-		return l.appendTx(tx, list, value)
+		if requireErr := l.requireListValue(tx, list, value); requireErr != nil {
+			return 0, requireErr
+		}
+
+		oldTail, hasTail, err := findUniqueTaggedChild(tx, list, l.allTails)
+		if err != nil {
+			return 0, err
+		}
+
+		capsule, err := l.capsules.NewCapsule(tx, value)
+		if err != nil {
+			return 0, err
+		}
+
+		if linkErr := addRelationshipTx(tx, list, capsule); linkErr != nil {
+			return 0, linkErr
+		}
+
+		if hasTail {
+			if prevErr := l.capsules.SetPrev(tx, capsule, oldTail); prevErr != nil {
+				return 0, prevErr
+			}
+			if nextErr := l.capsules.SetNext(tx, oldTail, capsule); nextErr != nil {
+				return 0, nextErr
+			}
+			if untagErr := removeRelationshipTx(tx, l.allTails, oldTail); untagErr != nil {
+				return 0, untagErr
+			}
+		} else {
+			if headErr := addRelationshipTx(tx, l.allHeads, capsule); headErr != nil {
+				return 0, headErr
+			}
+		}
+
+		if tailErr := addRelationshipTx(tx, l.allTails, capsule); tailErr != nil {
+			return 0, tailErr
+		}
+
+		return capsule, nil
 	})
 }
 
-// appendTx is Append's tx-composable core: mint a fresh capsule holding
-// value and link it as the new tail of list, against tx, without opening
-// its own Graph.Transact call. Factored out so a larger composite
-// operation (CompositeSetLogRegistry.AppendOperation) can append a value
-// as one step of its own enclosing transaction, mirroring the existing
-// newCapsuleTx/setPrevTx/setNextTx composability discipline
-// (implementation_state.md item 11).
-//
-// list must already exist and be tagged (AllLists, list), and value must
-// already exist; appendTx checks both against tx itself, so a caller
-// composing it into a larger transaction cannot act on a stale
-// pre-check.
-func (l *ListRegistry) appendTx(tx Tx, list, value NodeID) (NodeID, error) {
-	if requireErr := l.requireListValue(tx, list, value); requireErr != nil {
-		return 0, requireErr
-	}
-
-	oldTail, hasTail, err := findUniqueTaggedChild(tx, list, l.allTails)
-	if err != nil {
-		return 0, err
-	}
-
-	capsule, err := l.capsules.newCapsuleTx(tx, value)
-	if err != nil {
-		return 0, err
-	}
-
-	if _, err2 := tx.AddRelationship(list, capsule); err2 != nil {
-		return 0, wrapInterfaceErr(err2)
-	}
-
-	if hasTail {
-		if err3 := l.capsules.setPrevTx(tx, capsule, oldTail); err3 != nil {
-			return 0, err3
-		}
-		if err4 := l.capsules.setNextTx(tx, oldTail, capsule); err4 != nil {
-			return 0, err4
-		}
-		if _, err5 := tx.RemoveRelationship(l.allTails, oldTail); err5 != nil {
-			return 0, wrapInterfaceErr(err5)
-		}
-	} else {
-		if _, err6 := tx.AddRelationship(l.allHeads, capsule); err6 != nil {
-			return 0, wrapInterfaceErr(err6)
-		}
-	}
-
-	_, err = tx.AddRelationship(l.allTails, capsule)
-	return capsule, wrapInterfaceErr(err)
-}
-
 // Prepend creates a fresh capsule holding value and links it as the new
-// head of list, entirely inside one Graph.Transact call. Exact mirror of
-// Append, swapping head/tail and prev/next roles.
+// head of list, entirely inside one transaction (nested if graph is a
+// Tx). Exact mirror of Append, swapping head/tail and prev/next roles.
 //
 // list must already be tagged (AllLists, list); value must already
 // exist.
-func (l *ListRegistry) Prepend(graph GraphAPI, list, value NodeID) (NodeID, error) {
-	var capsule NodeID
-
-	err := graph.Transact(func(tx Tx) error {
+func (l *ListRegistry) Prepend(graph Transactor, list, value NodeID) (NodeID, error) {
+	return transactValue(graph, func(tx Tx) (NodeID, error) {
 		if requireErr := l.requireListValue(tx, list, value); requireErr != nil {
-			return requireErr
+			return 0, requireErr
 		}
 
 		oldHead, hasHead, err := findUniqueTaggedChild(tx, list, l.allHeads)
 		if err != nil {
-			return err
+			return 0, err
 		}
 
-		capsule, err = l.capsules.newCapsuleTx(tx, value)
+		capsule, err := l.capsules.NewCapsule(tx, value)
 		if err != nil {
-			return err
+			return 0, err
 		}
 
-		if err2 := addRelationshipTx(tx, list, capsule); err2 != nil {
-			return err2
+		if linkErr := addRelationshipTx(tx, list, capsule); linkErr != nil {
+			return 0, linkErr
 		}
 
 		if hasHead {
-			if err3 := l.capsules.setNextTx(tx, capsule, oldHead); err3 != nil {
-				return err3
+			if nextErr := l.capsules.SetNext(tx, capsule, oldHead); nextErr != nil {
+				return 0, nextErr
 			}
-			if err4 := l.capsules.setPrevTx(tx, oldHead, capsule); err4 != nil {
-				return err4
+			if prevErr := l.capsules.SetPrev(tx, oldHead, capsule); prevErr != nil {
+				return 0, prevErr
 			}
-			if err5 := removeRelationshipTx(tx, l.allHeads, oldHead); err5 != nil {
-				return err5
+			if untagErr := removeRelationshipTx(tx, l.allHeads, oldHead); untagErr != nil {
+				return 0, untagErr
 			}
 		} else {
-			if err6 := addRelationshipTx(tx, l.allTails, capsule); err6 != nil {
-				return err6
+			if tailErr := addRelationshipTx(tx, l.allTails, capsule); tailErr != nil {
+				return 0, tailErr
 			}
 		}
 
-		return addRelationshipTx(tx, l.allHeads, capsule)
-	})
-	if err != nil {
-		return 0, wrapInterfaceErr(err)
-	}
+		if headErr := addRelationshipTx(tx, l.allHeads, capsule); headErr != nil {
+			return 0, headErr
+		}
 
-	return capsule, nil
+		return capsule, nil
+	})
 }
 
 // InsertAfter creates a fresh capsule holding value and links it into
-// list immediately after afterCapsule, entirely inside one
-// Graph.Transact call.
+// list immediately after afterCapsule, entirely inside one transaction
+// (nested if graph is a Tx).
 //
 // If afterCapsule was the tail, the new capsule becomes the new tail.
 // Otherwise the new capsule is spliced in between afterCapsule and
@@ -5083,59 +5017,57 @@ func (l *ListRegistry) Prepend(graph GraphAPI, list, value NodeID) (NodeID, erro
 // already be an element of list (checked via the (list, afterCapsule)
 // containment edge, returning ErrCapsuleNotInList otherwise); value must
 // already exist.
-func (l *ListRegistry) InsertAfter(graph GraphAPI, list, afterCapsule, value NodeID) (NodeID, error) {
-	var capsule NodeID
-
-	err := graph.Transact(func(tx Tx) error {
+func (l *ListRegistry) InsertAfter(graph Transactor, list, afterCapsule, value NodeID) (NodeID, error) {
+	return transactValue(graph, func(tx Tx) (NodeID, error) {
 		if requireErr := l.requireListValue(tx, list, value); requireErr != nil {
-			return requireErr
+			return 0, requireErr
 		}
 
 		if !tx.HasRelationship(list, afterCapsule) {
-			return ErrCapsuleNotInList
+			return 0, ErrCapsuleNotInList
 		}
 
 		oldNext, hasNext, err := l.capsules.Next(tx, afterCapsule)
 		if err != nil {
-			return err
+			return 0, err
 		}
 
-		capsule, err = l.capsules.newCapsuleTx(tx, value)
+		capsule, err := l.capsules.NewCapsule(tx, value)
 		if err != nil {
-			return err
+			return 0, err
 		}
 
-		if err2 := addRelationshipTx(tx, list, capsule); err2 != nil {
-			return err2
+		if linkErr := addRelationshipTx(tx, list, capsule); linkErr != nil {
+			return 0, linkErr
 		}
 
-		if err3 := l.capsules.setPrevTx(tx, capsule, afterCapsule); err3 != nil {
-			return err3
+		if prevErr := l.capsules.SetPrev(tx, capsule, afterCapsule); prevErr != nil {
+			return 0, prevErr
 		}
-		if err4 := l.capsules.setNextTx(tx, afterCapsule, capsule); err4 != nil {
-			return err4
+		if nextErr := l.capsules.SetNext(tx, afterCapsule, capsule); nextErr != nil {
+			return 0, nextErr
 		}
 
 		if hasNext {
-			if err5 := l.capsules.setNextTx(tx, capsule, oldNext); err5 != nil {
-				return err5
+			if oldNextErr := l.capsules.SetNext(tx, capsule, oldNext); oldNextErr != nil {
+				return 0, oldNextErr
 			}
-			if err6 := l.capsules.setPrevTx(tx, oldNext, capsule); err6 != nil {
-				return err6
+			if oldPrevErr := l.capsules.SetPrev(tx, oldNext, capsule); oldPrevErr != nil {
+				return 0, oldPrevErr
 			}
-			return nil
+
+			return capsule, nil
 		}
 
-		if err7 := removeRelationshipTx(tx, l.allTails, afterCapsule); err7 != nil {
-			return err7
+		if untagErr := removeRelationshipTx(tx, l.allTails, afterCapsule); untagErr != nil {
+			return 0, untagErr
 		}
-		return addRelationshipTx(tx, l.allTails, capsule)
+		if tailErr := addRelationshipTx(tx, l.allTails, capsule); tailErr != nil {
+			return 0, tailErr
+		}
+
+		return capsule, nil
 	})
-	if err != nil {
-		return 0, wrapInterfaceErr(err)
-	}
-
-	return capsule, nil
 }
 
 // validateStructure checks the ordered-list invariants that are meaningful
@@ -5395,89 +5327,83 @@ func (l *ListRegistry) Contains(graph GraphReader, list, value NodeID) (capsule 
 // list must already be tagged (AllLists, list); capsule must currently
 // be an element of list (checked via the (list, capsule) containment
 // edge, returning ErrCapsuleNotInList otherwise).
-func (l *ListRegistry) RemoveWithoutDeletingCapsule(graph GraphAPI, list, capsule NodeID) error {
+func (l *ListRegistry) RemoveWithoutDeletingCapsule(graph Transactor, list, capsule NodeID) error {
+	// Membership is checked against tx, so a caller composing this into
+	// a larger transaction (CompositeSetLogRegistry.RemoveOperation)
+	// cannot act on a stale check.
 	return wrapInterfaceErr(graph.Transact(func(tx Tx) error {
-		return l.removeWithoutDeletingCapsuleTx(tx, list, capsule)
+		if requireErr := l.requireList(tx, list); requireErr != nil {
+			return requireErr
+		}
+
+		if !tx.HasRelationship(list, capsule) {
+			return ErrCapsuleNotInList
+		}
+
+		prev, hasPrev, err := l.capsules.Prev(tx, capsule)
+		if err != nil {
+			return err
+		}
+
+		next, hasNext, err := l.capsules.Next(tx, capsule)
+		if err != nil {
+			return err
+		}
+
+		switch {
+		case hasPrev && hasNext:
+			// Removing a middle element: splice prev and next together
+			// directly. Head/tail are unaffected.
+			if err2 := l.capsules.SetNext(tx, prev, next); err2 != nil {
+				return err2
+			}
+			if err3 := l.capsules.SetPrev(tx, next, prev); err3 != nil {
+				return err3
+			}
+
+		case hasPrev:
+			// capsule was the tail: prev becomes the new tail.
+			if _, err4 := l.capsules.RemoveNext(tx, prev); err4 != nil {
+				return err4
+			}
+			if err5 := removeRelationshipTx(tx, l.allTails, capsule); err5 != nil {
+				return err5
+			}
+			if err6 := addRelationshipTx(tx, l.allTails, prev); err6 != nil {
+				return err6
+			}
+
+		case hasNext:
+			// capsule was the head: next becomes the new head.
+			if _, err7 := l.capsules.RemovePrev(tx, next); err7 != nil {
+				return err7
+			}
+			if err8 := removeRelationshipTx(tx, l.allHeads, capsule); err8 != nil {
+				return err8
+			}
+			if err9 := addRelationshipTx(tx, l.allHeads, next); err9 != nil {
+				return err9
+			}
+
+		default:
+			// capsule was the sole element: the list becomes empty.
+			if err10 := removeRelationshipTx(tx, l.allHeads, capsule); err10 != nil {
+				return err10
+			}
+			if err11 := removeRelationshipTx(tx, l.allTails, capsule); err11 != nil {
+				return err11
+			}
+		}
+
+		if _, err12 := l.capsules.RemovePrev(tx, capsule); err12 != nil {
+			return err12
+		}
+		if _, err13 := l.capsules.RemoveNext(tx, capsule); err13 != nil {
+			return err13
+		}
+
+		return removeRelationshipTx(tx, list, capsule)
 	}))
-}
-
-// removeWithoutDeletingCapsuleTx is RemoveWithoutDeletingCapsule's
-// tx-composable core. Membership is checked against tx, so a caller
-// composing it into a larger transaction
-// (CompositeSetLogRegistry.removeOperationTx) cannot act on a stale
-// check.
-func (l *ListRegistry) removeWithoutDeletingCapsuleTx(tx Tx, list, capsule NodeID) error {
-	if requireErr := l.requireList(tx, list); requireErr != nil {
-		return requireErr
-	}
-
-	if !tx.HasRelationship(list, capsule) {
-		return ErrCapsuleNotInList
-	}
-
-	prev, hasPrev, err := l.capsules.Prev(tx, capsule)
-	if err != nil {
-		return err
-	}
-
-	next, hasNext, err := l.capsules.Next(tx, capsule)
-	if err != nil {
-		return err
-	}
-
-	switch {
-	case hasPrev && hasNext:
-		// Removing a middle element: splice prev and next together
-		// directly. Head/tail are unaffected.
-		if err2 := l.capsules.setNextTx(tx, prev, next); err2 != nil {
-			return err2
-		}
-		if err3 := l.capsules.setPrevTx(tx, next, prev); err3 != nil {
-			return err3
-		}
-
-	case hasPrev:
-		// capsule was the tail: prev becomes the new tail.
-		if _, err4 := l.capsules.removeNextTx(tx, prev); err4 != nil {
-			return err4
-		}
-		if err5 := removeRelationshipTx(tx, l.allTails, capsule); err5 != nil {
-			return err5
-		}
-		if err6 := addRelationshipTx(tx, l.allTails, prev); err6 != nil {
-			return err6
-		}
-
-	case hasNext:
-		// capsule was the head: next becomes the new head.
-		if _, err7 := l.capsules.removePrevTx(tx, next); err7 != nil {
-			return err7
-		}
-		if err8 := removeRelationshipTx(tx, l.allHeads, capsule); err8 != nil {
-			return err8
-		}
-		if err9 := addRelationshipTx(tx, l.allHeads, next); err9 != nil {
-			return err9
-		}
-
-	default:
-		// capsule was the sole element: the list becomes empty.
-		if err10 := removeRelationshipTx(tx, l.allHeads, capsule); err10 != nil {
-			return err10
-		}
-		if err11 := removeRelationshipTx(tx, l.allTails, capsule); err11 != nil {
-			return err11
-		}
-	}
-
-	if _, err12 := l.capsules.removePrevTx(tx, capsule); err12 != nil {
-		return err12
-	}
-	if _, err13 := l.capsules.removeNextTx(tx, capsule); err13 != nil {
-		return err13
-	}
-
-	return removeRelationshipTx(tx, list, capsule)
 }
 
 // Remove unlinks capsule from list via RemoveWithoutDeletingCapsule, and
@@ -5489,14 +5415,13 @@ func (l *ListRegistry) removeWithoutDeletingCapsuleTx(tx Tx, list, capsule NodeI
 // an interest in it, there is no reason to leave it behind as an orphan.
 //
 // deleted reports whether the capsule was actually deleted. Deletion is
-// best-effort and deliberately not the same atomic step as removal:
-// RemoveWithoutDeletingCapsule's own step always fully commits on its
-// own terms, exactly as calling it directly would, and DeleteCapsule is
-// then attempted separately immediately afterward. If capsule turns out
-// not to be safely deletable -- some further reference to it or one of
-// its role slots exists beyond what removal itself cleared, e.g. it was
-// also (unusually) referenced by something outside this list -- deleted
-// is false and err is nil: this is not a failure of Remove, it simply
+// best-effort: the removal is this call's own work, and DeleteCapsule
+// runs as a nested transaction (a savepoint). If capsule turns out not
+// to be safely deletable -- some further reference to it or one of its
+// role slots exists beyond what removal itself cleared, e.g. it was also
+// (unusually) referenced by something outside this list -- the nested
+// transaction undoes only itself, the removal still commits, and deleted
+// is false with err nil: this is not a failure of Remove, it simply
 // means capsule was left in place, standalone and still valid, exactly
 // as RemoveWithoutDeletingCapsule already leaves it (see
 // TestListRemoveWithoutDeletingCapsuleClearsCapsuleOwnLinks). err is
@@ -5504,36 +5429,30 @@ func (l *ListRegistry) removeWithoutDeletingCapsuleTx(tx Tx, list, capsule NodeI
 // an element of list, or an unexpected error from either underlying
 // call.
 //
-// These are deliberately two separate Graph.Transact calls (one inside
-// RemoveWithoutDeletingCapsule, one inside DeleteCapsule), not a single
-// joint transaction spanning both, because the contract is "the removal
-// always commits, deletion is best-effort": Transact has no savepoints,
-// so a failed delete inside one joint transaction would roll the removal
-// back too and leave capsule stuck in list merely because something
-// else still references it. Another goroutine (under GraphActor) can run
-// between the two calls, and that is safe: the intermediate state is
-// exactly what RemoveWithoutDeletingCapsule documents -- a valid,
-// standalone, unlinked capsule -- and DeleteCapsule re-validates
-// everything against the state it actually sees. Callers that need
-// removal and deletion to be all-or-nothing compose
-// removeWithoutDeletingCapsuleTx and deleteCapsuleTx into their own
-// transaction instead (see CompositeSetLogRegistry.RemoveOperation).
+// The whole call is one transaction, so no other goroutine can observe
+// the intermediate "unlinked but not yet deleted" state, and if graph is
+// a Tx the removal (and the deletion, if it happens) commit or roll back
+// with the enclosing transaction.
 //
 // list must already be tagged (AllLists, list); capsule must currently
 // be an element of list, exactly like RemoveWithoutDeletingCapsule.
-func (l *ListRegistry) Remove(graph GraphAPI, list, capsule NodeID) (deleted bool, err error) {
-	if err := l.RemoveWithoutDeletingCapsule(graph, list, capsule); err != nil {
-		return false, err
-	}
-
-	if err := l.capsules.DeleteCapsule(graph, capsule); err != nil {
-		if errors.Is(err, ErrCapsuleNotEmpty) {
-			return false, nil
+func (l *ListRegistry) Remove(graph Transactor, list, capsule NodeID) (deleted bool, err error) {
+	return transactBool(graph, func(tx Tx) (bool, error) {
+		if removeErr := l.RemoveWithoutDeletingCapsule(tx, list, capsule); removeErr != nil {
+			return false, removeErr
 		}
-		return false, err
-	}
 
-	return true, nil
+		deleteErr := l.capsules.DeleteCapsule(tx, capsule)
+		if deleteErr != nil {
+			if errors.Is(deleteErr, ErrCapsuleNotEmpty) {
+				return false, nil
+			}
+
+			return false, deleteErr
+		}
+
+		return true, nil
+	})
 }
 
 // DeleteList deletes list from the underlying graph, additionally
@@ -5562,7 +5481,7 @@ func (l *ListRegistry) Remove(graph GraphAPI, list, capsule NodeID) (deleted boo
 // nodes at all.
 //
 // list must currently be tagged (AllLists, list).
-func (l *ListRegistry) DeleteList(graph GraphAPI, list NodeID) error {
+func (l *ListRegistry) DeleteList(graph Transactor, list NodeID) error {
 	return wrapInterfaceErr(graph.Transact(func(tx Tx) error {
 		if requireErr := l.requireList(tx, list); requireErr != nil {
 			return requireErr
@@ -6899,7 +6818,7 @@ func (c *CompositeSetLogRegistry) NewCompositeSetLog(graph GraphAPI) (NodeID, er
 // with U tagged along both axes described in the CompositeSetLogRegistry
 // doc comment. Entirely inside one Graph.Transact call, composing
 // buildOperandDescriptorTx (minting and tagging U) with
-// ListRegistry.appendTx (wiring U in as the new tail element's value).
+// ListRegistry.Append (wiring U in as the new tail element's value).
 //
 // additive/expand mean exactly what they do for
 // CompositeSetRegistry.AddOperand (see its doc comment). If expand is
@@ -6926,7 +6845,7 @@ func (c *CompositeSetLogRegistry) AppendOperation(graph GraphAPI, log, operand N
 			return err2
 		}
 
-		capsule, err2 = c.lists.appendTx(tx, log, u)
+		capsule, err2 = c.lists.Append(tx, log, u)
 		return err2
 	})
 	if err != nil {
@@ -6940,8 +6859,8 @@ func (c *CompositeSetLogRegistry) AppendOperation(graph GraphAPI, log, operand N
 // log entirely.
 //
 // The whole removal is one Graph.Transact call: capsule is unlinked from
-// log (ListRegistry.removeWithoutDeletingCapsuleTx), reclaimed
-// (CapsuleRegistry.deleteCapsuleTx, whose teardown clears capsule's
+// log (ListRegistry.RemoveWithoutDeletingCapsule), reclaimed
+// (CapsuleRegistry.DeleteCapsule, whose teardown clears capsule's
 // value-slot edge into u), and then u's own edges (its operand target and
 // both axis tags) are cleared and u deleted (deleteOperandDescriptorTx,
 // the helper CompositeSetRegistry.RemoveOperand also uses). It is
@@ -6985,11 +6904,11 @@ func (c *CompositeSetLogRegistry) removeOperationTx(tx Tx, log, capsule NodeID) 
 		return err
 	}
 
-	if unlinkErr := c.lists.removeWithoutDeletingCapsuleTx(tx, log, capsule); unlinkErr != nil {
+	if unlinkErr := c.lists.RemoveWithoutDeletingCapsule(tx, log, capsule); unlinkErr != nil {
 		return unlinkErr
 	}
 
-	if deleteErr := c.lists.capsules.deleteCapsuleTx(tx, capsule); deleteErr != nil {
+	if deleteErr := c.lists.capsules.DeleteCapsule(tx, capsule); deleteErr != nil {
 		return deleteErr
 	}
 

@@ -2792,10 +2792,10 @@ retrying backend would not re-run them, so they were moved inside (§7b:
 "a stale check only fails" was not a reason to leave it). Consequences:
 `CompositeSetLogRegistry.RemoveOperation` is one transaction and
 all-or-nothing, and `CapsuleRegistry`'s slot writes use the same
-ownership-checked lookup as its reads. `ListRegistry.Remove` remains two
-transactions on purpose (removal always commits, deletion is best-effort;
-there are no savepoints), and its intermediate state is a valid
-standalone capsule, so interleaving under `GraphActor` is safe.
+ownership-checked lookup as its reads. `ListRegistry.Remove` is one
+transaction: the removal is its own work and the best-effort
+`DeleteCapsule` runs as a nested transaction (a savepoint, §45), so a
+refused deletion undoes only itself and the removal still commits.
 `NameRegistry`'s maps are guarded by an `RWMutex`: `Lookup` and
 `NameForNode` are safe from any goroutine and see only committed
 bindings.

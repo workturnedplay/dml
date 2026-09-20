@@ -1548,11 +1548,33 @@ NodeID-keyed structure outside the primitive graph.
  TestNameRegistryCreateNamedNodeComposesAndRollsBackWithEnclosingTransaction
  and TestPointerMetadataRegistryDComposedSetTargetRollsBackMetadataCreation.
 
+34. Nested transactions, step 3 of 4: CapsuleRegistry and ListRegistry
+ (theorystate.md section 45). NewCapsule/SetValue/SetPrev/SetNext/
+ RemovePrev/RemoveNext/DeleteCapsule and NewList/Append/Prepend/
+ InsertAfter/RemoveWithoutDeletingCapsule/Remove/DeleteList now take a
+ Transactor. Removed: newCapsuleTx, setPrevTx, setNextTx, removePrevTx,
+ removeNextTx, deleteCapsuleTx, appendTx, removeWithoutDeletingCapsuleTx
+ (their bodies live in the exported methods; setSlotTarget and
+ removeSlotTarget are the shared bodies behind the role-specific
+ setters/removers). ListRegistry now mints capsules with NewCapsule and
+ rewires with SetPrev/SetNext, which nest.
+ ListRegistry.Remove is now ONE transaction: the removal is its own work
+ and DeleteCapsule runs as a nested savepoint, so a refused deletion
+ undoes only itself and the removal still commits (this supersedes the
+ "two transactions on purpose" caveat of item 31(b)); no other goroutine
+ can observe the intermediate unlinked-but-not-deleted state.
+ CompositeSetLogRegistry's AppendOperation/removeOperationTx call the
+ exported methods; batch 4 collapses those and the rest.
+
+ Covered by TestListMutatorsComposeInsideOneTransactionAndRollBackTogether,
+ TestListAppendInsideFailedNestedTransactionLeavesListValid and
+ TestCapsuleLinkAndDeleteComposeAndRollBackWithEnclosingTransaction.
+
 Currently unaddressed yet:
 - Registries still compose through tx-composable *Tx cores in
-  CapsuleRegistry, ListRegistry, SetRegistry, the composites/logs and the
+  SetRegistry, CompositeSetRegistry, CompositeSetLogRegistry and the
   domain pointers; collapsing them into Transactor-taking exported
-  methods is in progress (items 32-33). Txn.DeleteNode is supported --
+  methods is in progress (items 32-34). Txn.DeleteNode is supported --
   see item 15.
 - Domain-pointer staleness residuals (theorystate.md section 86): raw
   non-Transact mutations, out-of-band tag removal or descriptor
