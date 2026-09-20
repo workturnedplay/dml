@@ -14,7 +14,11 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-// Package dml - toy implementation for dml
+// Package dml implements the dml graph engine: a primitive directed graph
+// plus the higher-level registries (names, pointers, lists, sets, domain
+// pointers) built on it. It is the foundation the rest of the project is
+// built on; see theorystate.md section 7b for the correctness discipline
+// this code follows.
 package dml
 
 import (
@@ -683,14 +687,14 @@ var _ Tx = (*Txn)(nil)
 // because its old target was removed before the new one could be added.
 // Txn's undo log makes each such sequence atomic with respect to failure.
 //
-// Txn deliberately does NOT provide isolation from concurrent access.
-// The toy implementation is single-threaded/serialized
-// (theorystate.md section 19); nothing can observe a Txn's
-// intermediate state mid-sequence today because nothing else runs
-// between two statements in the same synchronous call. Should real
-// concurrency be introduced later, Txn as written here would need real
-// locking/isolation on top -- that is a separate, still-open problem
-// (theorystate.md section 19), not one Txn tries to solve.
+// Txn does not itself provide isolation; isolation comes from whatever
+// owns the *Graph. A bare *Graph admits one goroutine at a time
+// (concurrentAccessGuard panics on detected overlap, theorystate.md
+// section 89b), and GraphActor runs every transaction on one dedicated
+// goroutine (theorystate.md section 89c), so nothing can observe a Txn's
+// intermediate state mid-sequence. A backend with genuinely concurrent
+// writers needs its own mechanism for the Transact contract
+// (theorystate.md section 89a) instead of this undo log.
 //
 // Txn also does NOT provide durability/crash-atomicity: there is no
 // persistence layer yet, so a process crash mid-transaction is not a
@@ -721,11 +725,9 @@ var _ Tx = (*Txn)(nil)
 // taken over id in the meantime, since that can't happen. See
 // Graph.resurrectNode and Txn.DeleteNode below.
 //
-// Read operations are not wrapped, since every current caller already
-// holds a reference to the underlying Graph (or NameRegistry/
-// PointerRegistry wrapping one) for reads; add read-passthrough methods
-// here if and when a caller actually needs them (theorystate.md
-// section 7's construct-only-what's-needed discipline).
+// Txn also implements GraphReader (see the read methods below), so
+// helpers read current state through the very same tx they write
+// through; that is what keeps a decision and its write on one state.
 //
 // Nesting one Graph.Transact call inside another is not currently
 // supported or used by anything in this file: an inner Txn has its own
@@ -1122,9 +1124,7 @@ type Checker struct {
 // every future transaction whose changeset could plausibly be relevant
 // to it (see Checker.Tags and checkerRelevant). Checkers are consulted
 // in registration order; there is currently no way to unregister one,
-// per the same construct-only-what-is-actually-needed discipline used
-// throughout this file (theorystate.md section 7) -- nothing in this
-// codebase currently needs to remove a Checker once registered.
+// so a Checker stays registered for the lifetime of its graph.
 //
 // Every registry constructor in this file that has a real invariant to
 // enforce (PointerRegistry, PointerMetadataRegistry,
@@ -1707,13 +1707,16 @@ var (
 // storage -- and stay as ordinary receiver fields; only a stored graph
 // reference is the thing being eliminated here.
 //
-// byName/byID are plain, unsynchronized Go maps, with no protection
-// against concurrent access from multiple goroutines -- a known,
-// currently unfixed gap, independent of anything GraphActor protects on
-// the graph itself (theorystate.md section 90, implementation_state.md).
-// No current caller exercises this concurrently, so no synchronization
-// has been added speculatively.
+// byName/byID are guarded by mu, so Lookup and NameForNode may be called
+// from any goroutine at any time, including while a GraphActor is
+// running transactions that bind and delete names. Writers are the
+// commit hooks registered by bindTx/DeleteNode (which run on the
+// goroutine that runs the transaction) and Unbind. Readers see only
+// committed bindings. A returned NodeID is a snapshot: the node may be
+// deleted immediately afterwards, which is what lookupLive's
+// ErrNameBoundToDeletedNode check is for.
 type NameRegistry struct {
+	mu     sync.RWMutex
 	byName map[string]NodeID
 	byID   map[NodeID]string
 }
@@ -1741,6 +1744,9 @@ func NewNameRegistry(_ GraphAPI) *NameRegistry {
 //
 // The bool is false when name has no association.
 func (r *NameRegistry) Lookup(name string) (NodeID, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
 	id, ok := r.byName[name]
 	return id, ok
 }
@@ -1749,6 +1755,9 @@ func (r *NameRegistry) Lookup(name string) (NodeID, bool) {
 //
 // The bool is false when id has no name.
 func (r *NameRegistry) NameForNode(id NodeID) (string, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
 	name, ok := r.byID[id]
 	return name, ok
 }
@@ -1772,7 +1781,7 @@ func (r *NameRegistry) NameForNode(id NodeID) (string, bool) {
 // are raw, side-effect-free bookkeeping queries, not NodeID-issuing
 // operations, and keep their existing simple (value, bool) contract.
 func (r *NameRegistry) lookupLive(graph GraphReader, name string) (id NodeID, bound bool, err error) {
-	id, ok := r.byName[name]
+	id, ok := r.Lookup(name)
 	if !ok {
 		return 0, false, nil
 	}
@@ -1820,7 +1829,7 @@ func (r *NameRegistry) checkBind(graph GraphReader, name string, id NodeID) (alr
 		return false, ErrNameAlreadyBound
 	}
 
-	if _, ok := r.byID[id]; ok {
+	if _, ok := r.NameForNode(id); ok {
 		return false, ErrNodeAlreadyNamed
 	}
 
@@ -1830,13 +1839,16 @@ func (r *NameRegistry) checkBind(graph GraphReader, name string, id NodeID) (alr
 // recordBinding stores the name <-> id association. It must only run
 // once the transaction that justified it has committed (see bindTx).
 func (r *NameRegistry) recordBinding(name string, id NodeID) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
 	r.byName[name] = id
 	r.byID[id] = name
 }
 
-// dropBinding removes the name <-> id association. Shared by Unbind and
-// forgetNode.
-func (r *NameRegistry) dropBinding(name string, id NodeID) {
+// dropBindingLocked removes the name <-> id association. The caller must
+// hold r.mu for writing. Shared by Unbind and forgetNode.
+func (r *NameRegistry) dropBindingLocked(name string, id NodeID) {
 	delete(r.byName, name)
 	delete(r.byID, id)
 }
@@ -1844,8 +1856,11 @@ func (r *NameRegistry) dropBinding(name string, id NodeID) {
 // forgetNode drops any name association for id. It must only run once the
 // deletion of id has committed (see DeleteNode).
 func (r *NameRegistry) forgetNode(id NodeID) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
 	if name, ok := r.byID[id]; ok {
-		r.dropBinding(name, id)
+		r.dropBindingLocked(name, id)
 	}
 }
 
@@ -1958,12 +1973,15 @@ func (r *NameRegistry) EnsureNamedNode(graph GraphAPI, name string) (NodeID, err
 //
 // The bool reports whether an association was removed.
 func (r *NameRegistry) Unbind(name string) (bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
 	id, ok := r.byName[name]
 	if !ok {
 		return false, ErrNameNotFound
 	}
 
-	r.dropBinding(name, id)
+	r.dropBindingLocked(name, id)
 
 	return true, nil
 }
@@ -2776,13 +2794,14 @@ func wrapInterfaceErr(err error) error {
 	return fmt.Errorf("%w", err)
 }
 
-// transactBool runs step as one Graph.Transact call and returns its bool
-// result, or (false, err) if step failed or the transaction was declined
-// and rolled back. step may be run more than once by a retrying backend
-// (see the GraphAPI.Transact contract), so its result is overwritten on
-// every run and only the final, committed run's value is returned.
-func transactBool(graph GraphAPI, step func(tx Tx) (bool, error)) (bool, error) {
-	var result bool
+// transactValue runs step as one Graph.Transact call and returns its
+// result, or (zero value, err) if step failed or the transaction was
+// declined and rolled back. step may be run more than once by a retrying
+// backend (see the GraphAPI.Transact contract), so its result is
+// overwritten on every run and only the final, committed run's value is
+// returned.
+func transactValue[T any](graph GraphAPI, step func(tx Tx) (T, error)) (T, error) {
+	var result T
 
 	err := graph.Transact(func(tx Tx) error {
 		var stepErr error
@@ -2790,10 +2809,16 @@ func transactBool(graph GraphAPI, step func(tx Tx) (bool, error)) (bool, error) 
 		return stepErr
 	})
 	if err != nil {
-		return false, wrapInterfaceErr(err)
+		var zero T
+		return zero, wrapInterfaceErr(err)
 	}
 
 	return result, nil
+}
+
+// transactBool is transactValue for a bool result.
+func transactBool(graph GraphAPI, step func(tx Tx) (bool, error)) (bool, error) {
+	return transactValue(graph, step)
 }
 
 // tagNodeTx adds the tagging relationship (tag, id) against tx. This is
@@ -4116,6 +4141,21 @@ func (c *CapsuleRegistry) IsCapsule(graph GraphReader, id NodeID) bool {
 	return graph.HasRelationship(c.allElementCapsules, id)
 }
 
+// requireCapsule checks that id exists and is tagged
+// (AllElementCapsules, id), returning ErrNodeNotFound or ErrNotCapsule
+// otherwise.
+func (c *CapsuleRegistry) requireCapsule(graph GraphReader, id NodeID) error {
+	if !graph.NodeExists(id) {
+		return ErrNodeNotFound
+	}
+
+	if !c.IsCapsule(graph, id) {
+		return ErrNotCapsule
+	}
+
+	return nil
+}
+
 // slotFor returns capsule's role-slot child tagged via (tag, slot) --
 // e.g. its prev, value, or next slot -- found by tag rather than by
 // position, so a capsule may carry additional, unrelated children later
@@ -4253,15 +4293,16 @@ func (c *CapsuleRegistry) newCapsuleTx(tx txOps, value NodeID) (NodeID, error) {
 	return buildCapsuleTx(tx, c.allElementCapsules, c.prevSlots.allPointers, c.valueSlots.allPointers, c.nextSlots.allPointers, value)
 }
 
-// setSlotTargetTx rewires capsule's role slot -- found via slotTag --
-// to target, composed into an existing tx. capsule must already have the
-// given role slot (true for any capsule created via NewCapsule/
-// newCapsuleTx). This is the tx-composable counterpart of the exported
-// SetPrev/SetNext, for callers (ListRegistry) that need to rewire a
-// capsule's slot as one step of a larger enclosing transaction rather
-// than opening a new Graph.Transact per slot.
-func (c *CapsuleRegistry) setSlotTargetTx(tx txReader, capsule, slotTag, target NodeID) error {
-	slot, found, err := findUniqueTaggedChild(tx, capsule, slotTag)
+// setSlotTargetTx rewires capsule's role slot -- the one slots is
+// parameterized on (prev, value or next) -- to target, composed into an
+// existing tx. The slot is discovered through slotFor, so the ownership
+// check the read accessors apply also guards every write; ErrNotCapsule
+// is returned if capsule has no such slot. This is the tx-composable core
+// behind the exported SetPrev/SetNext/SetValue and ListRegistry's
+// rewiring steps, so each of them reads the slot and writes it in one
+// transaction.
+func (c *CapsuleRegistry) setSlotTargetTx(tx txReader, capsule NodeID, slots *PointerRegistry, target NodeID) error {
+	slot, found, err := c.slotFor(tx, capsule, slots.allPointers)
 	if err != nil {
 		return err
 	}
@@ -4269,30 +4310,31 @@ func (c *CapsuleRegistry) setSlotTargetTx(tx txReader, capsule, slotTag, target 
 		return ErrNotCapsule
 	}
 
-	return singleChildTargetSetTx(tx, tx, slot, target)
+	return slots.setTargetTx(tx, slot, target)
 }
 
 // setPrevTx rewires capsule's prev-slot to target, composed into an
 // existing tx. See setSlotTargetTx.
 func (c *CapsuleRegistry) setPrevTx(tx txReader, capsule, target NodeID) error {
-	return c.setSlotTargetTx(tx, capsule, c.prevSlots.allPointers, target)
+	return c.setSlotTargetTx(tx, capsule, c.prevSlots, target)
 }
 
 // setNextTx rewires capsule's next-slot to target, composed into an
 // existing tx. See setSlotTargetTx.
 func (c *CapsuleRegistry) setNextTx(tx txReader, capsule, target NodeID) error {
-	return c.setSlotTargetTx(tx, capsule, c.nextSlots.allPointers, target)
+	return c.setSlotTargetTx(tx, capsule, c.nextSlots, target)
 }
 
-// removeSlotTargetTx clears capsule's role slot -- found via slotTag --
-// composed into an existing tx. capsule must already have the given role
-// slot. This is the tx-composable counterpart of the exported
-// RemovePrev/RemoveNext (see singleChildTargetRemoveTx for why a
-// separate tx-composable path is needed rather than reusing those
-// directly), used by ListRegistry.Remove so a capsule's own links can be
-// cleared as part of the same transaction that relinks its neighbors.
-func (c *CapsuleRegistry) removeSlotTargetTx(tx txReader, capsule, slotTag NodeID) (removed bool, err error) {
-	slot, found, err := findUniqueTaggedChild(tx, capsule, slotTag)
+// removeSlotTargetTx clears capsule's role slot -- the one slots is
+// parameterized on -- composed into an existing tx. The slot is
+// discovered through slotFor (ownership-checked); ErrNotCapsule is
+// returned if capsule has no such slot. This is the tx-composable core
+// behind the exported RemovePrev/RemoveNext and
+// ListRegistry.removeWithoutDeletingCapsuleTx, so a capsule's own links
+// can be cleared as part of the same transaction that relinks its
+// neighbors.
+func (c *CapsuleRegistry) removeSlotTargetTx(tx txReader, capsule NodeID, slots *PointerRegistry) (removed bool, err error) {
+	slot, found, err := c.slotFor(tx, capsule, slots.allPointers)
 	if err != nil {
 		return false, err
 	}
@@ -4300,19 +4342,19 @@ func (c *CapsuleRegistry) removeSlotTargetTx(tx txReader, capsule, slotTag NodeI
 		return false, ErrNotCapsule
 	}
 
-	return singleChildTargetRemoveTx(tx, tx, slot)
+	return slots.removeTargetTx(tx, slot)
 }
 
 // removePrevTx clears capsule's prev-slot, composed into an existing tx.
 // See removeSlotTargetTx.
 func (c *CapsuleRegistry) removePrevTx(tx txReader, capsule NodeID) (bool, error) {
-	return c.removeSlotTargetTx(tx, capsule, c.prevSlots.allPointers)
+	return c.removeSlotTargetTx(tx, capsule, c.prevSlots)
 }
 
 // removeNextTx clears capsule's next-slot, composed into an existing tx.
 // See removeSlotTargetTx.
 func (c *CapsuleRegistry) removeNextTx(tx txReader, capsule NodeID) (bool, error) {
-	return c.removeSlotTargetTx(tx, capsule, c.nextSlots.allPointers)
+	return c.removeSlotTargetTx(tx, capsule, c.nextSlots)
 }
 
 // NewCapsule creates a fresh capsule NodeID, tags it
@@ -4322,22 +4364,13 @@ func (c *CapsuleRegistry) removeNextTx(tx txReader, capsule NodeID) (bool, error
 //
 // value must already exist.
 func (c *CapsuleRegistry) NewCapsule(graph GraphAPI, value NodeID) (NodeID, error) {
-	if !graph.NodeExists(value) {
-		return 0, ErrNodeNotFound
-	}
+	return transactValue(graph, func(tx Tx) (NodeID, error) {
+		if !tx.NodeExists(value) {
+			return 0, ErrNodeNotFound
+		}
 
-	var capsule NodeID
-
-	err := graph.Transact(func(tx Tx) error {
-		var err error
-		capsule, err = c.newCapsuleTx(tx, value)
-		return err
+		return c.newCapsuleTx(tx, value)
 	})
-	if err != nil {
-		return 0, wrapInterfaceErr(err)
-	}
-
-	return capsule, nil
 }
 
 // Value returns capsule's current value, i.e. its value slot's target.
@@ -4361,15 +4394,9 @@ func (c *CapsuleRegistry) Value(graph GraphReader, capsule NodeID) (value NodeID
 
 // SetValue replaces capsule's value.
 func (c *CapsuleRegistry) SetValue(graph GraphAPI, capsule, value NodeID) error {
-	slot, found, err := c.slotFor(graph, capsule, c.valueSlots.allPointers)
-	if err != nil {
-		return err
-	}
-	if !found {
-		return ErrNotCapsule
-	}
-
-	return c.valueSlots.SetTarget(graph, slot, value)
+	return wrapInterfaceErr(graph.Transact(func(tx Tx) error {
+		return c.setSlotTargetTx(tx, capsule, c.valueSlots, value)
+	}))
 }
 
 // CapsulesWithValue returns every capsule, anywhere in the graph, whose
@@ -4498,28 +4525,16 @@ func (c *CapsuleRegistry) Prev(graph GraphReader, capsule NodeID) (prev NodeID, 
 
 // SetPrev sets capsule's previous-capsule link.
 func (c *CapsuleRegistry) SetPrev(graph GraphAPI, capsule, prev NodeID) error {
-	slot, found, err := c.slotFor(graph, capsule, c.prevSlots.allPointers)
-	if err != nil {
-		return err
-	}
-	if !found {
-		return ErrNotCapsule
-	}
-
-	return c.prevSlots.SetTarget(graph, slot, prev)
+	return wrapInterfaceErr(graph.Transact(func(tx Tx) error {
+		return c.setPrevTx(tx, capsule, prev)
+	}))
 }
 
 // RemovePrev clears capsule's previous-capsule link, if any.
 func (c *CapsuleRegistry) RemovePrev(graph GraphAPI, capsule NodeID) (removed bool, err error) {
-	slot, found, err := c.slotFor(graph, capsule, c.prevSlots.allPointers)
-	if err != nil {
-		return false, err
-	}
-	if !found {
-		return false, ErrNotCapsule
-	}
-
-	return c.prevSlots.RemoveTarget(graph, slot)
+	return transactBool(graph, func(tx Tx) (bool, error) {
+		return c.removePrevTx(tx, capsule)
+	})
 }
 
 // Next returns capsule's next-capsule link, if any. hasNext is false for
@@ -4538,28 +4553,16 @@ func (c *CapsuleRegistry) Next(graph GraphReader, capsule NodeID) (next NodeID, 
 
 // SetNext sets capsule's next-capsule link.
 func (c *CapsuleRegistry) SetNext(graph GraphAPI, capsule, next NodeID) error {
-	slot, found, err := c.slotFor(graph, capsule, c.nextSlots.allPointers)
-	if err != nil {
-		return err
-	}
-	if !found {
-		return ErrNotCapsule
-	}
-
-	return c.nextSlots.SetTarget(graph, slot, next)
+	return wrapInterfaceErr(graph.Transact(func(tx Tx) error {
+		return c.setNextTx(tx, capsule, next)
+	}))
 }
 
 // RemoveNext clears capsule's next-capsule link, if any.
 func (c *CapsuleRegistry) RemoveNext(graph GraphAPI, capsule NodeID) (removed bool, err error) {
-	slot, found, err := c.slotFor(graph, capsule, c.nextSlots.allPointers)
-	if err != nil {
-		return false, err
-	}
-	if !found {
-		return false, ErrNotCapsule
-	}
-
-	return c.nextSlots.RemoveTarget(graph, slot)
+	return transactBool(graph, func(tx Tx) (bool, error) {
+		return c.removeNextTx(tx, capsule)
+	})
 }
 
 // DeleteCapsule deletes capsule and all three of its role-slot nodes
@@ -4612,72 +4615,79 @@ func (c *CapsuleRegistry) RemoveNext(graph GraphAPI, capsule NodeID) (removed bo
 // through an out-of-band Graph mutation -- is treated the same as
 // ErrCapsuleNotEmpty rather than guessed about.
 func (c *CapsuleRegistry) DeleteCapsule(graph GraphAPI, capsule NodeID) error {
-	if !graph.NodeExists(capsule) {
-		return ErrNodeNotFound
-	}
-
-	if !c.IsCapsule(graph, capsule) {
-		return ErrNotCapsule
-	}
-
 	return wrapInterfaceErr(graph.Transact(func(tx Tx) error {
-		prevSlot, hasPrevSlot, err := c.slotFor(tx, capsule, c.prevSlots.allPointers)
-		if err != nil {
-			return err
-		}
-
-		valueSlot, hasValueSlot, err := c.slotFor(tx, capsule, c.valueSlots.allPointers)
-		if err != nil {
-			return err
-		}
-
-		nextSlot, hasNextSlot, err := c.slotFor(tx, capsule, c.nextSlots.allPointers)
-		if err != nil {
-			return err
-		}
-
-		if !hasPrevSlot || !hasValueSlot || !hasNextSlot {
-			return ErrCapsuleNotEmpty
-		}
-
-		value, hasValue, err := c.valueSlots.Target(tx, valueSlot)
-		if err != nil {
-			return err
-		}
-
-		// Every relationship here is one buildCapsuleTx itself created.
-		// prevSlot/nextSlot's own targets are deliberately absent: see
-		// the DeleteCapsule doc comment.
-		edges := []Relationship{
-			{From: capsule, To: prevSlot},
-			{From: c.prevSlots.allPointers, To: prevSlot},
-			{From: capsule, To: valueSlot},
-			{From: c.valueSlots.allPointers, To: valueSlot},
-			{From: capsule, To: nextSlot},
-			{From: c.nextSlots.allPointers, To: nextSlot},
-			{From: c.allElementCapsules, To: capsule},
-		}
-		if hasValue {
-			edges = append(edges, Relationship{From: valueSlot, To: value})
-		}
-
-		for _, edge := range edges {
-			if err2 := removeRelationshipTx(tx, edge.From, edge.To); err2 != nil {
-				return err2
-			}
-		}
-
-		for _, node := range []NodeID{prevSlot, valueSlot, nextSlot, capsule} {
-			if err2 := deleteNodeTx(tx, node); err2 != nil {
-				if errors.Is(err2, ErrNodeNotEmpty) {
-					return ErrCapsuleNotEmpty
-				}
-				return err2
-			}
-		}
-
-		return nil
+		return c.deleteCapsuleTx(tx, capsule)
 	}))
+}
+
+// deleteCapsuleTx is DeleteCapsule's tx-composable core (see that
+// method's doc comment for the full contract). Every existence, tag and
+// slot check runs against tx, so a caller composing it into a larger
+// transaction -- CompositeSetLogRegistry.removeOperationTx -- gets one
+// all-or-nothing step: if it fails, the enclosing transaction's rollback
+// undoes everything it did, including any DeleteNode calls that had
+// already succeeded.
+func (c *CapsuleRegistry) deleteCapsuleTx(tx txReader, capsule NodeID) error {
+	if requireErr := c.requireCapsule(tx, capsule); requireErr != nil {
+		return requireErr
+	}
+
+	prevSlot, hasPrevSlot, err := c.slotFor(tx, capsule, c.prevSlots.allPointers)
+	if err != nil {
+		return err
+	}
+
+	valueSlot, hasValueSlot, err := c.slotFor(tx, capsule, c.valueSlots.allPointers)
+	if err != nil {
+		return err
+	}
+
+	nextSlot, hasNextSlot, err := c.slotFor(tx, capsule, c.nextSlots.allPointers)
+	if err != nil {
+		return err
+	}
+
+	if !hasPrevSlot || !hasValueSlot || !hasNextSlot {
+		return ErrCapsuleNotEmpty
+	}
+
+	value, hasValue, err := c.valueSlots.Target(tx, valueSlot)
+	if err != nil {
+		return err
+	}
+
+	// Every relationship here is one buildCapsuleTx itself created.
+	// prevSlot/nextSlot's own targets are deliberately absent: see
+	// the DeleteCapsule doc comment.
+	edges := []Relationship{
+		{From: capsule, To: prevSlot},
+		{From: c.prevSlots.allPointers, To: prevSlot},
+		{From: capsule, To: valueSlot},
+		{From: c.valueSlots.allPointers, To: valueSlot},
+		{From: capsule, To: nextSlot},
+		{From: c.nextSlots.allPointers, To: nextSlot},
+		{From: c.allElementCapsules, To: capsule},
+	}
+	if hasValue {
+		edges = append(edges, Relationship{From: valueSlot, To: value})
+	}
+
+	for _, edge := range edges {
+		if err2 := removeRelationshipTx(tx, edge.From, edge.To); err2 != nil {
+			return err2
+		}
+	}
+
+	for _, node := range []NodeID{prevSlot, valueSlot, nextSlot, capsule} {
+		if err2 := deleteNodeTx(tx, node); err2 != nil {
+			if errors.Is(err2, ErrNodeNotEmpty) {
+				return ErrCapsuleNotEmpty
+			}
+			return err2
+		}
+	}
+
+	return nil
 }
 
 // ListRegistry implements Ordered Lists (theorystate.md section 11
@@ -4803,6 +4813,35 @@ func (l *ListRegistry) IsList(graph GraphReader, id NodeID) bool {
 	return graph.HasRelationship(l.allLists, id)
 }
 
+// requireList checks that list exists and is tagged (AllLists, list),
+// returning ErrNodeNotFound or ErrNotList otherwise. The mutating
+// methods call it with their tx, so the check and the write see the same
+// state.
+func (l *ListRegistry) requireList(graph GraphReader, list NodeID) error {
+	if !graph.NodeExists(list) {
+		return ErrNodeNotFound
+	}
+
+	if !l.IsList(graph, list) {
+		return ErrNotList
+	}
+
+	return nil
+}
+
+// requireListValue is requireList plus a check that value exists.
+func (l *ListRegistry) requireListValue(graph GraphReader, list, value NodeID) error {
+	if requireErr := l.requireList(graph, list); requireErr != nil {
+		return requireErr
+	}
+
+	if !graph.NodeExists(value) {
+		return ErrNodeNotFound
+	}
+
+	return nil
+}
+
 // NewList creates a fresh NodeID and tags it (AllLists, id). The new list
 // starts empty: no head, no tail, no element capsules.
 func (l *ListRegistry) NewList(graph GraphAPI) (NodeID, error) {
@@ -4873,30 +4912,9 @@ func (l *ListRegistry) Tail(graph GraphReader, list NodeID) (tail NodeID, hasTai
 // list must already be tagged (AllLists, list); value must already
 // exist.
 func (l *ListRegistry) Append(graph GraphAPI, list, value NodeID) (NodeID, error) {
-	if !graph.NodeExists(list) {
-		return 0, ErrNodeNotFound
-	}
-
-	if !l.IsList(graph, list) {
-		return 0, ErrNotList
-	}
-
-	if !graph.NodeExists(value) {
-		return 0, ErrNodeNotFound
-	}
-
-	var capsule NodeID
-
-	err := graph.Transact(func(tx Tx) error {
-		var err error
-		capsule, err = l.appendTx(tx, list, value)
-		return err
+	return transactValue(graph, func(tx Tx) (NodeID, error) {
+		return l.appendTx(tx, list, value)
 	})
-	if err != nil {
-		return 0, wrapInterfaceErr(err)
-	}
-
-	return capsule, nil
 }
 
 // appendTx is Append's tx-composable core: mint a fresh capsule holding
@@ -4907,11 +4925,15 @@ func (l *ListRegistry) Append(graph GraphAPI, list, value NodeID) (NodeID, error
 // newCapsuleTx/setPrevTx/setNextTx composability discipline
 // (implementation_state.md item 11).
 //
-// list is assumed to already be confirmed to exist and be tagged
-// (AllLists, list), and value to already exist -- exactly like every
-// other *Tx helper in this file, callers are responsible for the checks
-// Append itself performs before opening its transaction.
+// list must already exist and be tagged (AllLists, list), and value must
+// already exist; appendTx checks both against tx itself, so a caller
+// composing it into a larger transaction cannot act on a stale
+// pre-check.
 func (l *ListRegistry) appendTx(tx txReader, list, value NodeID) (NodeID, error) {
+	if requireErr := l.requireListValue(tx, list, value); requireErr != nil {
+		return 0, requireErr
+	}
+
 	oldTail, hasTail, err := findUniqueTaggedChild(tx, list, l.allTails)
 	if err != nil {
 		return 0, err
@@ -4953,21 +4975,13 @@ func (l *ListRegistry) appendTx(tx txReader, list, value NodeID) (NodeID, error)
 // list must already be tagged (AllLists, list); value must already
 // exist.
 func (l *ListRegistry) Prepend(graph GraphAPI, list, value NodeID) (NodeID, error) {
-	if !graph.NodeExists(list) {
-		return 0, ErrNodeNotFound
-	}
-
-	if !l.IsList(graph, list) {
-		return 0, ErrNotList
-	}
-
-	if !graph.NodeExists(value) {
-		return 0, ErrNodeNotFound
-	}
-
 	var capsule NodeID
 
 	err := graph.Transact(func(tx Tx) error {
+		if requireErr := l.requireListValue(tx, list, value); requireErr != nil {
+			return requireErr
+		}
+
 		oldHead, hasHead, err := findUniqueTaggedChild(tx, list, l.allHeads)
 		if err != nil {
 			return err
@@ -5020,25 +5034,17 @@ func (l *ListRegistry) Prepend(graph GraphAPI, list, value NodeID) (NodeID, erro
 // containment edge, returning ErrCapsuleNotInList otherwise); value must
 // already exist.
 func (l *ListRegistry) InsertAfter(graph GraphAPI, list, afterCapsule, value NodeID) (NodeID, error) {
-	if !graph.NodeExists(list) {
-		return 0, ErrNodeNotFound
-	}
-
-	if !l.IsList(graph, list) {
-		return 0, ErrNotList
-	}
-
-	if !graph.NodeExists(value) {
-		return 0, ErrNodeNotFound
-	}
-
-	if !graph.HasRelationship(list, afterCapsule) {
-		return 0, ErrCapsuleNotInList
-	}
-
 	var capsule NodeID
 
 	err := graph.Transact(func(tx Tx) error {
+		if requireErr := l.requireListValue(tx, list, value); requireErr != nil {
+			return requireErr
+		}
+
+		if !tx.HasRelationship(list, afterCapsule) {
+			return ErrCapsuleNotInList
+		}
+
 		oldNext, hasNext, err := l.capsules.Next(tx, afterCapsule)
 		if err != nil {
 			return err
@@ -5340,83 +5346,88 @@ func (l *ListRegistry) Contains(graph GraphReader, list, value NodeID) (capsule 
 // be an element of list (checked via the (list, capsule) containment
 // edge, returning ErrCapsuleNotInList otherwise).
 func (l *ListRegistry) RemoveWithoutDeletingCapsule(graph GraphAPI, list, capsule NodeID) error {
-	if !graph.NodeExists(list) {
-		return ErrNodeNotFound
+	return wrapInterfaceErr(graph.Transact(func(tx Tx) error {
+		return l.removeWithoutDeletingCapsuleTx(tx, list, capsule)
+	}))
+}
+
+// removeWithoutDeletingCapsuleTx is RemoveWithoutDeletingCapsule's
+// tx-composable core. Membership is checked against tx, so a caller
+// composing it into a larger transaction
+// (CompositeSetLogRegistry.removeOperationTx) cannot act on a stale
+// check.
+func (l *ListRegistry) removeWithoutDeletingCapsuleTx(tx txReader, list, capsule NodeID) error {
+	if requireErr := l.requireList(tx, list); requireErr != nil {
+		return requireErr
 	}
 
-	if !l.IsList(graph, list) {
-		return ErrNotList
-	}
-
-	if !graph.HasRelationship(list, capsule) {
+	if !tx.HasRelationship(list, capsule) {
 		return ErrCapsuleNotInList
 	}
 
-	return wrapInterfaceErr(graph.Transact(func(tx Tx) error {
-		prev, hasPrev, err := l.capsules.Prev(tx, capsule)
-		if err != nil {
-			return err
+	prev, hasPrev, err := l.capsules.Prev(tx, capsule)
+	if err != nil {
+		return err
+	}
+
+	next, hasNext, err := l.capsules.Next(tx, capsule)
+	if err != nil {
+		return err
+	}
+
+	switch {
+	case hasPrev && hasNext:
+		// Removing a middle element: splice prev and next together
+		// directly. Head/tail are unaffected.
+		if err2 := l.capsules.setNextTx(tx, prev, next); err2 != nil {
+			return err2
+		}
+		if err3 := l.capsules.setPrevTx(tx, next, prev); err3 != nil {
+			return err3
 		}
 
-		next, hasNext, err := l.capsules.Next(tx, capsule)
-		if err != nil {
-			return err
+	case hasPrev:
+		// capsule was the tail: prev becomes the new tail.
+		if _, err4 := l.capsules.removeNextTx(tx, prev); err4 != nil {
+			return err4
+		}
+		if err5 := removeRelationshipTx(tx, l.allTails, capsule); err5 != nil {
+			return err5
+		}
+		if err6 := addRelationshipTx(tx, l.allTails, prev); err6 != nil {
+			return err6
 		}
 
-		switch {
-		case hasPrev && hasNext:
-			// Removing a middle element: splice prev and next together
-			// directly. Head/tail are unaffected.
-			if err2 := l.capsules.setNextTx(tx, prev, next); err2 != nil {
-				return err2
-			}
-			if err3 := l.capsules.setPrevTx(tx, next, prev); err3 != nil {
-				return err3
-			}
-
-		case hasPrev:
-			// capsule was the tail: prev becomes the new tail.
-			if _, err4 := l.capsules.removeNextTx(tx, prev); err4 != nil {
-				return err4
-			}
-			if err5 := removeRelationshipTx(tx, l.allTails, capsule); err5 != nil {
-				return err5
-			}
-			if err6 := addRelationshipTx(tx, l.allTails, prev); err6 != nil {
-				return err6
-			}
-
-		case hasNext:
-			// capsule was the head: next becomes the new head.
-			if _, err7 := l.capsules.removePrevTx(tx, next); err7 != nil {
-				return err7
-			}
-			if err8 := removeRelationshipTx(tx, l.allHeads, capsule); err8 != nil {
-				return err8
-			}
-			if err9 := addRelationshipTx(tx, l.allHeads, next); err9 != nil {
-				return err9
-			}
-
-		default:
-			// capsule was the sole element: the list becomes empty.
-			if err10 := removeRelationshipTx(tx, l.allHeads, capsule); err10 != nil {
-				return err10
-			}
-			if err11 := removeRelationshipTx(tx, l.allTails, capsule); err11 != nil {
-				return err11
-			}
+	case hasNext:
+		// capsule was the head: next becomes the new head.
+		if _, err7 := l.capsules.removePrevTx(tx, next); err7 != nil {
+			return err7
+		}
+		if err8 := removeRelationshipTx(tx, l.allHeads, capsule); err8 != nil {
+			return err8
+		}
+		if err9 := addRelationshipTx(tx, l.allHeads, next); err9 != nil {
+			return err9
 		}
 
-		if _, err12 := l.capsules.removePrevTx(tx, capsule); err12 != nil {
-			return err12
+	default:
+		// capsule was the sole element: the list becomes empty.
+		if err10 := removeRelationshipTx(tx, l.allHeads, capsule); err10 != nil {
+			return err10
 		}
-		if _, err13 := l.capsules.removeNextTx(tx, capsule); err13 != nil {
-			return err13
+		if err11 := removeRelationshipTx(tx, l.allTails, capsule); err11 != nil {
+			return err11
 		}
+	}
 
-		return removeRelationshipTx(tx, list, capsule)
-	}))
+	if _, err12 := l.capsules.removePrevTx(tx, capsule); err12 != nil {
+		return err12
+	}
+	if _, err13 := l.capsules.removeNextTx(tx, capsule); err13 != nil {
+		return err13
+	}
+
+	return removeRelationshipTx(tx, list, capsule)
 }
 
 // Remove unlinks capsule from list via RemoveWithoutDeletingCapsule, and
@@ -5445,14 +5456,18 @@ func (l *ListRegistry) RemoveWithoutDeletingCapsule(graph GraphAPI, list, capsul
 //
 // These are deliberately two separate Graph.Transact calls (one inside
 // RemoveWithoutDeletingCapsule, one inside DeleteCapsule), not a single
-// joint transaction spanning both. Under this codebase's current
-// single-threaded, serialized execution model (theorystate.md
-// section 19), nothing can run between them, so there is no observable
-// intermediate state to protect against -- and keeping them separate is
-// what lets a capsule that legitimately cannot be deleted still be
-// fully, successfully removed from list, rather than the entire
-// operation rolling back and leaving capsule stuck in list merely
-// because it turned out to still be referenced elsewhere.
+// joint transaction spanning both, because the contract is "the removal
+// always commits, deletion is best-effort": Transact has no savepoints,
+// so a failed delete inside one joint transaction would roll the removal
+// back too and leave capsule stuck in list merely because something
+// else still references it. Another goroutine (under GraphActor) can run
+// between the two calls, and that is safe: the intermediate state is
+// exactly what RemoveWithoutDeletingCapsule documents -- a valid,
+// standalone, unlinked capsule -- and DeleteCapsule re-validates
+// everything against the state it actually sees. Callers that need
+// removal and deletion to be all-or-nothing compose
+// removeWithoutDeletingCapsuleTx and deleteCapsuleTx into their own
+// transaction instead (see CompositeSetLogRegistry.RemoveOperation).
 //
 // list must already be tagged (AllLists, list); capsule must currently
 // be an element of list, exactly like RemoveWithoutDeletingCapsule.
@@ -5498,15 +5513,10 @@ func (l *ListRegistry) Remove(graph GraphAPI, list, capsule NodeID) (deleted boo
 //
 // list must currently be tagged (AllLists, list).
 func (l *ListRegistry) DeleteList(graph GraphAPI, list NodeID) error {
-	if !graph.NodeExists(list) {
-		return ErrNodeNotFound
-	}
-
-	if !l.IsList(graph, list) {
-		return ErrNotList
-	}
-
 	return wrapInterfaceErr(graph.Transact(func(tx Tx) error {
+		if requireErr := l.requireList(tx, list); requireErr != nil {
+			return requireErr
+		}
 		// Tag removal and delete are steps of this one transaction: if
 		// the delete fails (e.g. ErrNodeNotEmpty), Transact's rollback
 		// restores the (AllLists, list) tag. See untagAndDeleteNodeTx and
@@ -5616,6 +5626,33 @@ func (s *SetRegistry) IsSet(graph GraphReader, id NodeID) bool {
 	return graph.HasRelationship(s.allSets, id)
 }
 
+// requireSet checks that set exists and is tagged (AllSets, set),
+// returning ErrNodeNotFound or ErrNotSet otherwise.
+func (s *SetRegistry) requireSet(graph GraphReader, set NodeID) error {
+	if !graph.NodeExists(set) {
+		return ErrNodeNotFound
+	}
+
+	if !s.IsSet(graph, set) {
+		return ErrNotSet
+	}
+
+	return nil
+}
+
+// requireSetMember is requireSet plus a check that member exists.
+func (s *SetRegistry) requireSetMember(graph GraphReader, set, member NodeID) error {
+	if requireErr := s.requireSet(graph, set); requireErr != nil {
+		return requireErr
+	}
+
+	if !graph.NodeExists(member) {
+		return ErrNodeNotFound
+	}
+
+	return nil
+}
+
 // NewSet creates a fresh NodeID and tags it (AllSets, id). The new set
 // starts empty.
 func (s *SetRegistry) NewSet(graph GraphAPI) (NodeID, error) {
@@ -5671,21 +5708,14 @@ func (s *SetRegistry) TagAsSet(graph GraphAPI, id NodeID) error {
 // which is permitted (theorystate.md section 2.8) -- is an
 // idempotent no-op reporting added == false on the repeat call.
 func (s *SetRegistry) Add(graph GraphAPI, set, member NodeID) (added bool, err error) {
-	if !graph.NodeExists(set) {
-		return false, ErrNodeNotFound
-	}
-
-	if !s.IsSet(graph, set) {
-		return false, ErrNotSet
-	}
-
-	if !graph.NodeExists(member) {
-		return false, ErrNodeNotFound
-	}
-
-	// A declined commit is rolled back, so transactBool reports false
-	// (nothing was added) in that case.
+	// The checks run inside the transaction, against the same state the
+	// write sees. A declined commit is rolled back, so transactBool
+	// reports false (nothing was added) in that case.
 	return transactBool(graph, func(tx Tx) (bool, error) {
+		if requireErr := s.requireSetMember(tx, set, member); requireErr != nil {
+			return false, requireErr
+		}
+
 		created, txErr := tx.AddRelationship(set, member)
 		return created, wrapInterfaceErr(txErr)
 	})
@@ -5697,21 +5727,14 @@ func (s *SetRegistry) Add(graph GraphAPI, set, member NodeID) (added bool, err e
 // removing a member that was never present is a no-op reporting
 // removed == false, not an error.
 func (s *SetRegistry) Remove(graph GraphAPI, set, member NodeID) (removed bool, err error) {
-	if !graph.NodeExists(set) {
-		return false, ErrNodeNotFound
-	}
-
-	if !s.IsSet(graph, set) {
-		return false, ErrNotSet
-	}
-
-	if !graph.NodeExists(member) {
-		return false, ErrNodeNotFound
-	}
-
-	// A declined commit is rolled back, so transactBool reports false
-	// (nothing was removed) in that case.
+	// The checks run inside the transaction, against the same state the
+	// write sees. A declined commit is rolled back, so transactBool
+	// reports false (nothing was removed) in that case.
 	return transactBool(graph, func(tx Tx) (bool, error) {
+		if requireErr := s.requireSetMember(tx, set, member); requireErr != nil {
+			return false, requireErr
+		}
+
 		dropped, txErr := tx.RemoveRelationship(set, member)
 		return dropped, wrapInterfaceErr(txErr)
 	})
@@ -5787,15 +5810,10 @@ func (s *SetRegistry) Size(graph GraphReader, set NodeID) (int, error) {
 //
 // set must currently be tagged (AllSets, set).
 func (s *SetRegistry) DeleteSet(graph GraphAPI, set NodeID) error {
-	if !graph.NodeExists(set) {
-		return ErrNodeNotFound
-	}
-
-	if !s.IsSet(graph, set) {
-		return ErrNotSet
-	}
-
 	return wrapInterfaceErr(graph.Transact(func(tx Tx) error {
+		if requireErr := s.requireSet(tx, set); requireErr != nil {
+			return requireErr
+		}
 		return untagAndDeleteNodeTx(tx, set, s.allSets)
 	}))
 }
@@ -5955,6 +5973,24 @@ func operandCarriesKnownSetTag(graph GraphReader, sets *SetRegistry, composites 
 		return true
 	}
 	return false
+}
+
+// requireOperand checks, against graph, that operand exists and -- when
+// expand is true -- carries one of the currently-recognized
+// Set-representation tags (see operandCarriesKnownSetTag). Shared by
+// CompositeSetRegistry.addOperandTx and
+// CompositeSetLogRegistry.AppendOperation, which validate an operand
+// identically (theorystate.md section 80).
+func requireOperand(graph GraphReader, sets *SetRegistry, composites *CompositeSetRegistry, logs *CompositeSetLogRegistry, operand NodeID, expand bool) error {
+	if !graph.NodeExists(operand) {
+		return ErrNodeNotFound
+	}
+
+	if expand && !operandCarriesKnownSetTag(graph, sets, composites, logs, operand) {
+		return ErrInvalidSetOperand
+	}
+
+	return nil
 }
 
 // domainContainsGeneric reports whether value currently belongs to
@@ -6273,7 +6309,10 @@ func NewCompositeSetRegistry(graph GraphAPI, sets *SetRegistry, allCompositeSets
 // resolveSetOperandGeneric treats a nil logs exactly like "this operand
 // doesn't carry a recognized Set-representation tag," surfacing
 // ErrInvalidSetOperand rather than panicking. Calling SetLogs again
-// simply replaces the previous value; passing nil un-wires it.
+// simply replaces the previous value; passing nil un-wires it. SetLogs
+// writes an unsynchronized field that every operation reads, so it must
+// be called during setup, before the registry is shared with other
+// goroutines.
 func (c *CompositeSetRegistry) SetLogs(logs *CompositeSetLogRegistry) {
 	c.logs = logs
 }
@@ -6282,6 +6321,21 @@ func (c *CompositeSetRegistry) SetLogs(logs *CompositeSetLogRegistry) {
 // (AllCompositeSets, id).
 func (c *CompositeSetRegistry) IsCompositeSet(graph GraphReader, id NodeID) bool {
 	return graph.HasRelationship(c.allCompositeSets, id)
+}
+
+// requireCompositeSet checks that set exists and is tagged
+// (AllCompositeSets, set), returning ErrNodeNotFound or
+// ErrNotCompositeSet otherwise.
+func (c *CompositeSetRegistry) requireCompositeSet(graph GraphReader, set NodeID) error {
+	if !graph.NodeExists(set) {
+		return ErrNodeNotFound
+	}
+
+	if !c.IsCompositeSet(graph, set) {
+		return ErrNotCompositeSet
+	}
+
+	return nil
 }
 
 // NewCompositeSet creates a fresh NodeID and tags it (AllCompositeSets,
@@ -6324,31 +6378,30 @@ func (c *CompositeSetRegistry) NewCompositeSet(graph GraphAPI) (NodeID, error) {
 // already exist. Per theorystate.md section 85, no existing identical
 // descriptor is searched for or reused -- see the CompositeSetRegistry
 // doc comment.
-func (c *CompositeSetRegistry) AddOperand(graph GraphAPI, set, operand NodeID, additive, expand bool) (u NodeID, err error) {
-	if !graph.NodeExists(set) {
-		return 0, ErrNodeNotFound
-	}
-	if !c.IsCompositeSet(graph, set) {
-		return 0, ErrNotCompositeSet
-	}
-	if !graph.NodeExists(operand) {
-		return 0, ErrNodeNotFound
-	}
-	if expand && !operandCarriesKnownSetTag(graph, c.sets, c, c.logs, operand) {
-		return 0, ErrInvalidSetOperand
-	}
-
-	err = graph.Transact(func(tx Tx) error {
-		var err2 error
-		u, err2 = buildOperandDescriptorTx(tx, c.allAdditiveOp, c.allSubtractiveOp, c.allScalarOperand, c.allSetOperand, operand, additive, expand)
-		if err2 != nil {
-			return err2
-		}
-
-		return addRelationshipTx(tx, set, u)
+func (c *CompositeSetRegistry) AddOperand(graph GraphAPI, set, operand NodeID, additive, expand bool) (NodeID, error) {
+	return transactValue(graph, func(tx Tx) (NodeID, error) {
+		return c.addOperandTx(tx, set, operand, additive, expand)
 	})
+}
+
+// addOperandTx is AddOperand's tx-composable core: every check and the
+// descriptor's creation see the same state.
+func (c *CompositeSetRegistry) addOperandTx(tx txReader, set, operand NodeID, additive, expand bool) (NodeID, error) {
+	if requireErr := c.requireCompositeSet(tx, set); requireErr != nil {
+		return 0, requireErr
+	}
+
+	if requireErr := requireOperand(tx, c.sets, c, c.logs, operand, expand); requireErr != nil {
+		return 0, requireErr
+	}
+
+	u, err := buildOperandDescriptorTx(tx, c.allAdditiveOp, c.allSubtractiveOp, c.allScalarOperand, c.allSetOperand, operand, additive, expand)
 	if err != nil {
-		return 0, wrapInterfaceErr(err)
+		return 0, err
+	}
+
+	if linkErr := addRelationshipTx(tx, set, u); linkErr != nil {
+		return 0, linkErr
 	}
 
 	return u, nil
@@ -6372,28 +6425,33 @@ func (c *CompositeSetRegistry) AddOperand(graph GraphAPI, set, operand NodeID, a
 // never deleted -- only u's own edge to it is removed -- since operand is
 // caller-owned data that may still be referenced elsewhere.
 func (c *CompositeSetRegistry) RemoveOperand(graph GraphAPI, set, u NodeID) error {
-	if !graph.NodeExists(set) {
-		return ErrNodeNotFound
+	return wrapInterfaceErr(graph.Transact(func(tx Tx) error {
+		return c.removeOperandTx(tx, set, u)
+	}))
+}
+
+// removeOperandTx is RemoveOperand's tx-composable core. The descriptor's
+// axes are read through tx too, so the tags it removes are the ones it
+// actually has when the removal happens.
+func (c *CompositeSetRegistry) removeOperandTx(tx txReader, set, u NodeID) error {
+	if requireErr := c.requireCompositeSet(tx, set); requireErr != nil {
+		return requireErr
 	}
-	if !c.IsCompositeSet(graph, set) {
-		return ErrNotCompositeSet
-	}
-	if !graph.HasRelationship(set, u) {
+
+	if !tx.HasRelationship(set, u) {
 		return ErrOperandNotInCompositeSet
 	}
 
-	operand, hasOperand, operationTag, operandTag, err := operandDescriptorAxes(graph, u, c.allAdditiveOp, c.allSubtractiveOp, c.allScalarOperand, c.allSetOperand)
+	operand, hasOperand, operationTag, operandTag, err := operandDescriptorAxes(tx, u, c.allAdditiveOp, c.allSubtractiveOp, c.allScalarOperand, c.allSetOperand)
 	if err != nil {
 		return err
 	}
 
-	return wrapInterfaceErr(graph.Transact(func(tx Tx) error {
-		if err2 := removeRelationshipTx(tx, set, u); err2 != nil {
-			return err2
-		}
+	if removeErr := removeRelationshipTx(tx, set, u); removeErr != nil {
+		return removeErr
+	}
 
-		return deleteOperandDescriptorTx(tx, operand, hasOperand, operationTag, operandTag, u)
-	}))
+	return deleteOperandDescriptorTx(tx, operand, hasOperand, operationTag, operandTag, u)
 }
 
 // Operands returns set's current operand-descriptor nodes -- its direct
@@ -6585,14 +6643,10 @@ func (c *CompositeSetRegistry) resolveOperand(graph GraphReader, u NodeID, visit
 //
 // set must currently be tagged (AllCompositeSets, set).
 func (c *CompositeSetRegistry) DeleteCompositeSet(graph GraphAPI, set NodeID) error {
-	if !graph.NodeExists(set) {
-		return ErrNodeNotFound
-	}
-	if !c.IsCompositeSet(graph, set) {
-		return ErrNotCompositeSet
-	}
-
 	return wrapInterfaceErr(graph.Transact(func(tx Tx) error {
+		if requireErr := c.requireCompositeSet(tx, set); requireErr != nil {
+			return requireErr
+		}
 		return untagAndDeleteNodeTx(tx, set, c.allCompositeSets)
 	}))
 }
@@ -6747,6 +6801,21 @@ func (c *CompositeSetLogRegistry) IsCompositeSetLog(graph GraphReader, id NodeID
 	return graph.HasRelationship(c.allCompositeSetLogs, id)
 }
 
+// requireLog checks that log exists and is tagged
+// (AllCompositeSetLogs, log), returning ErrNodeNotFound or
+// ErrNotCompositeSetLog otherwise.
+func (c *CompositeSetLogRegistry) requireLog(graph GraphReader, log NodeID) error {
+	if !graph.NodeExists(log) {
+		return ErrNodeNotFound
+	}
+
+	if !c.IsCompositeSetLog(graph, log) {
+		return ErrNotCompositeSetLog
+	}
+
+	return nil
+}
+
 // NewCompositeSetLog creates a fresh NodeID and tags it both
 // (AllLists, id) and (AllCompositeSetLogs, id), entirely inside one
 // Graph.Transact call. This deliberately does not call
@@ -6792,20 +6861,15 @@ func (c *CompositeSetLogRegistry) NewCompositeSetLog(graph GraphAPI) (NodeID, er
 // already exist. Per theorystate.md section 85, no existing identical
 // descriptor is searched for or reused, exactly like AddOperand.
 func (c *CompositeSetLogRegistry) AppendOperation(graph GraphAPI, log, operand NodeID, additive, expand bool) (u, capsule NodeID, err error) {
-	if !graph.NodeExists(log) {
-		return 0, 0, ErrNodeNotFound
-	}
-	if !c.IsCompositeSetLog(graph, log) {
-		return 0, 0, ErrNotCompositeSetLog
-	}
-	if !graph.NodeExists(operand) {
-		return 0, 0, ErrNodeNotFound
-	}
-	if expand && !operandCarriesKnownSetTag(graph, c.sets, c.composites, c, operand) {
-		return 0, 0, ErrInvalidSetOperand
-	}
-
 	err = graph.Transact(func(tx Tx) error {
+		if requireErr := c.requireLog(tx, log); requireErr != nil {
+			return requireErr
+		}
+
+		if requireErr := requireOperand(tx, c.sets, c.composites, c, operand, expand); requireErr != nil {
+			return requireErr
+		}
+
 		var err2 error
 		u, err2 = buildOperandDescriptorTx(tx, c.allAdditiveOp, c.allSubtractiveOp, c.allScalarOperand, c.allSetOperand, operand, additive, expand)
 		if err2 != nil {
@@ -6825,47 +6889,40 @@ func (c *CompositeSetLogRegistry) AppendOperation(graph GraphAPI, log, operand N
 // RemoveOperation removes capsule -- and its descriptor value u -- from
 // log entirely.
 //
-// capsule is first unlinked from log via
-// ListRegistry.RemoveWithoutDeletingCapsule (always succeeds once
-// capsule is confirmed to be an element of log), then reclaimed via
-// CapsuleRegistry.DeleteCapsule, whose own atomic teardown clears
-// capsule's value-slot edge into u as part of removing capsule itself.
-// Only once that succeeds does u have no remaining incoming edges at
-// all; u's own edges (its operand target and both axis tags) are then
-// cleared and u itself deleted together, inside one Graph.Transact call,
-// via the same deleteOperandDescriptorTx helper
-// CompositeSetRegistry.RemoveOperand already uses for the identically-
-// shaped final step of its own teardown. Doing this as one Transact call
-// (rather than clearing u's edges in one Transact and then deleting u
-// via a separate, non-transactional Graph.DeleteNode call, as an earlier
-// version of this method did) means a failure at either step -- e.g. an
-// out-of-band mutation unexpectedly giving u a new relationship in the
-// meantime -- rolls back cleanly instead of potentially leaving u
-// half-cleared with no way to undo it.
-//
-// If DeleteCapsule fails (ErrCapsuleNotEmpty, e.g. because some
-// out-of-band mutation gave one of capsule's role slots an unexpected
-// extra reference), this method returns ErrCapsuleNotEmpty without
-// touching u at all: capsule is left unlinked from log but otherwise
-// fully intact, still holding u as its value, exactly as
-// RemoveWithoutDeletingCapsule already leaves an ordinary capsule in the
-// analogous ListRegistry case.
+// The whole removal is one Graph.Transact call: capsule is unlinked from
+// log (ListRegistry.removeWithoutDeletingCapsuleTx), reclaimed
+// (CapsuleRegistry.deleteCapsuleTx, whose teardown clears capsule's
+// value-slot edge into u), and then u's own edges (its operand target and
+// both axis tags) are cleared and u deleted (deleteOperandDescriptorTx,
+// the helper CompositeSetRegistry.RemoveOperand also uses). It is
+// all-or-nothing: if any step fails -- ErrCapsuleNotEmpty because
+// something unexpected still references one of capsule's role slots, or a
+// commit-time Checker declines the resulting state -- every step is
+// rolled back and the log is exactly as it was. An earlier version used
+// three separate transactions, so a failed capsule deletion left capsule
+// unlinked from log but still holding u.
 //
 // capsule must currently be an element of log (checked via the
 // (log,capsule) containment edge, returning ErrCapsuleNotInList
 // otherwise); log must already be tagged (AllCompositeSetLogs, log).
 func (c *CompositeSetLogRegistry) RemoveOperation(graph GraphAPI, log, capsule NodeID) error {
-	if !graph.NodeExists(log) {
-		return ErrNodeNotFound
+	return wrapInterfaceErr(graph.Transact(func(tx Tx) error {
+		return c.removeOperationTx(tx, log, capsule)
+	}))
+}
+
+// removeOperationTx is RemoveOperation's tx-composable core; every read,
+// including the descriptor's axes, goes through tx.
+func (c *CompositeSetLogRegistry) removeOperationTx(tx txReader, log, capsule NodeID) error {
+	if requireErr := c.requireLog(tx, log); requireErr != nil {
+		return requireErr
 	}
-	if !c.IsCompositeSetLog(graph, log) {
-		return ErrNotCompositeSetLog
-	}
-	if !graph.HasRelationship(log, capsule) {
+
+	if !tx.HasRelationship(log, capsule) {
 		return ErrCapsuleNotInList
 	}
 
-	u, hasValue, err := c.lists.capsules.Value(graph, capsule)
+	u, hasValue, err := c.lists.capsules.Value(tx, capsule)
 	if err != nil {
 		return err
 	}
@@ -6873,22 +6930,20 @@ func (c *CompositeSetLogRegistry) RemoveOperation(graph GraphAPI, log, capsule N
 		return ErrInvalidOperandDescriptor
 	}
 
-	operand, hasOperand, operationTag, operandTag, err := operandDescriptorAxes(graph, u, c.allAdditiveOp, c.allSubtractiveOp, c.allScalarOperand, c.allSetOperand)
+	operand, hasOperand, operationTag, operandTag, err := operandDescriptorAxes(tx, u, c.allAdditiveOp, c.allSubtractiveOp, c.allScalarOperand, c.allSetOperand)
 	if err != nil {
 		return err
 	}
 
-	if err2 := c.lists.RemoveWithoutDeletingCapsule(graph, log, capsule); err2 != nil {
-		return err2
+	if unlinkErr := c.lists.removeWithoutDeletingCapsuleTx(tx, log, capsule); unlinkErr != nil {
+		return unlinkErr
 	}
 
-	if err3 := c.lists.capsules.DeleteCapsule(graph, capsule); err3 != nil {
-		return err3
+	if deleteErr := c.lists.capsules.deleteCapsuleTx(tx, capsule); deleteErr != nil {
+		return deleteErr
 	}
 
-	return wrapInterfaceErr(graph.Transact(func(tx Tx) error {
-		return deleteOperandDescriptorTx(tx, operand, hasOperand, operationTag, operandTag, u)
-	}))
+	return deleteOperandDescriptorTx(tx, operand, hasOperand, operationTag, operandTag, u)
 }
 
 // Operations returns log's current operand-descriptor nodes (each
@@ -7138,14 +7193,10 @@ func (c *CompositeSetLogRegistry) operandMentions(graph GraphReader, operand Nod
 //
 // log must currently be tagged (AllCompositeSetLogs, log).
 func (c *CompositeSetLogRegistry) DeleteCompositeSetLog(graph GraphAPI, log NodeID) error {
-	if !graph.NodeExists(log) {
-		return ErrNodeNotFound
-	}
-	if !c.IsCompositeSetLog(graph, log) {
-		return ErrNotCompositeSetLog
-	}
-
 	return wrapInterfaceErr(graph.Transact(func(tx Tx) error {
+		if requireErr := c.requireLog(tx, log); requireErr != nil {
+			return requireErr
+		}
 		return untagAndDeleteNodeTx(tx, log, c.allCompositeSetLogs, c.lists.allLists)
 	}))
 }

@@ -19,7 +19,8 @@
 Project Implementation State
 
 Current implementation:
-- Toy implementation in Go 1.27.
+- Go 1.27 implementation. This is the foundation the project builds on,
+  not a prototype (theorystate.md section 7b).
 - Implementation consolidated into main.go and main_test.go.
 - Primitive Graph implemented and tested.
 - Graph.Transact / Txn implemented and tested, giving failure-atomicity
@@ -68,10 +69,10 @@ active task list):
     theorystate.md section 10a should have described
     from the start; see that section for why Representation C's
     exclusion-based approach doesn't generalize safely (item 8).
-- Open: whether a commit-time interception mechanism (theorystate.md
-  section 73) should eventually replace the re-check-every-call approach
-  used by every registry above; not needed yet since there is exactly one
-  writer and no concurrent mutation.
+- Commit-time interception (theorystate.md section 73) is implemented as
+  Checkers (item 20). Registries also keep their re-derive-on-every-call
+  validation deliberately, because Checkers only see mutations made
+  through Transact.
 - Add further foundational names (AllDomainPointers, AllCapsules,
   allHEADs, allTAILs, ...) to FoundationalNames only when actually
   starting the corresponding representation's implementation, not
@@ -1430,17 +1431,15 @@ NodeID-keyed structure outside the primitive graph.
  (d) NameRegistry now updates byName/byID only from commit hooks
  (bindTx/recordBinding/forgetNode/dropBinding). CreateNamedNode and
  EnsureNamedNode share namedNodeTx/transactNamedNode and are one atomic
- step; Bind and DeleteNode became Transact calls; bindCore is gone. The
- maps themselves are still unsynchronized, so Lookup/NameForNode from
- another goroutine while the actor runs still races (unchanged, see
- NameRegistry's doc comment).
+ step; Bind and DeleteNode became Transact calls; bindCore is gone.
+ (The maps' own synchronization for readers on other goroutines is
+ item 31(c).)
 
- Not converted, deliberately: the existence/tag pre-checks before a
- Transact in ListRegistry (Append/Prepend/InsertAfter/Remove...),
- CompositeSetRegistry and CompositeSetLogRegistry. None reads something a
- write decision depends on beyond validity, and a stale pre-check fails
- with an error or is caught by a Checker. Revisit before a retrying
- backend exists, since a retry would not re-run them.
+ The existence/tag pre-checks in ListRegistry, CapsuleRegistry,
+ SetRegistry, CompositeSetRegistry and CompositeSetLogRegistry were
+ initially left outside their Transact on the grounds that a stale
+ pre-check only fails or is caught by a Checker. That was the wrong
+ call: a retrying backend would not re-run them. Item 31 moved them.
 
  The GraphActor race test now uses staleReadThenSetTarget (the old
  SetTarget shape) to keep exercising the caller-composed hazard and the
@@ -1456,25 +1455,63 @@ NodeID-keyed structure outside the primitive graph.
  TestGraphActorConcurrentCreateNamedNodeSameNameBindsExactlyOnce, and
  TestDomainPointerRegistryDSetDomainFailureRollsBackMetadataCreation.
 
+31. Finished item 30 and withdrew the "no current caller" deferrals
+ behind its leftovers (theorystate.md section 7b).
+
+ (a) Every remaining check-then-write in ListRegistry, CapsuleRegistry,
+ SetRegistry, CompositeSetRegistry and CompositeSetLogRegistry now runs
+ inside its Transact against tx: Append/Prepend/InsertAfter (via
+ requireList/requireListValue), RemoveWithoutDeletingCapsule
+ (removeWithoutDeletingCapsuleTx), DeleteList, NewCapsule, DeleteCapsule
+ (deleteCapsuleTx), SetValue/SetPrev/SetNext/RemovePrev/RemoveNext,
+ SetRegistry.Add/Remove/DeleteSet, CompositeSetRegistry.AddOperand/
+ RemoveOperand/DeleteCompositeSet (addOperandTx/removeOperandTx) and
+ CompositeSetLogRegistry.AppendOperation/DeleteCompositeSetLog.
+ CapsuleRegistry's slot rewiring uses slotFor (ownership-checked) for
+ writes as well as reads; previously the tx helpers used an unchecked
+ findUniqueTaggedChild, so ListRegistry's own writes skipped the check
+ the reads applied. DRY: transactValue (generic; transactBool wraps it),
+ requireList/requireSet/requireCompositeSet/requireLog/requireCapsule/
+ requireOperand.
+
+ (b) CompositeSetLogRegistry.RemoveOperation is one transaction
+ (removeOperationTx). It used three, and a failed DeleteCapsule left the
+ capsule unlinked from the log but still holding its descriptor; it is
+ now all-or-nothing. ListRegistry.Remove deliberately remains two
+ transactions (removal always commits, deletion is best-effort; Transact
+ has no savepoints) and its comment now says why the intermediate state
+ is safe under GraphActor -- the old "nothing can run between them"
+ claim was false.
+
+ (c) NameRegistry guards byName/byID with a sync.RWMutex, so Lookup and
+ NameForNode are safe from any goroutine while a GraphActor binds and
+ deletes names. Unbind takes the write lock. Readers see only committed
+ bindings.
+
+ (d) Comments and docs that justified gaps with "no current caller" or
+ called the code a toy were corrected, along with stale statements
+ (Txn "read operations are not wrapped", Txn isolation, the open
+ "commit-time interception" bullet, the "no protection against
+ concurrent goroutine access" bullet).
+
+ Covered by TestNameRegistryLookupIsSafeWhileGraphActorBindsAndUnbinds,
+ TestGraphActorConcurrentListAppendKeepsListValid and
+ TestCompositeSetLogRemoveOperationIsAtomicWhenCapsuleCannotBeDeleted.
+
 Currently unaddressed yet:
 - Txn does not support nesting one Graph.Transact call inside another
-  (Txn.DeleteNode is supported -- see item 15). Nesting is not needed by
-  any current caller; add support if and when one actually needs it.
+  (Txn.DeleteNode is supported -- see item 15). Multi-step operations
+  compose through tx-composable *Tx cores instead of nesting. Nesting
+  itself is theorystate.md section 45, still OPEN.
 - Domain-pointer staleness residuals (theorystate.md section 86): raw
   non-Transact mutations, out-of-band tag removal or descriptor
   re-pointing inside a Transact, and O(pointers-per-domain) validation
   cost per commit (unmemoized) remain accepted.
-- The in-memory Graph itself still has no protection against concurrent
-  goroutine access if used directly (theorystate.md section 89b) --
-  unaffected by item 24's interface extraction, since that extraction
-  only changes which type callers reference, not Graph's own
-  synchronization. This is now mitigated, not resolved, for callers
-  willing to route every access through GraphActor (item 25,
-  theorystate.md section 89c) instead of holding a *Graph directly:
-  GraphActor makes concurrent multi-goroutine use safe by construction,
-  but a caller who bypasses it and keeps a direct *Graph reference
-  around gets no protection at all, exactly as documented on GraphActor
-  itself.
+- A bare *Graph is not safe for concurrent use. concurrentAccessGuard
+  panics on detected overlap instead of corrupting state (theorystate.md
+  section 89b); it cannot catch a non-overlapping handoff with no
+  happens-before edge, which `go test -race` covers. GraphActor (item 25,
+  section 89c) is the supported way to share a graph between goroutines.
 
 Explored and declined (implementation-level; the theory-level
 counterpart of this list is theorystate.md's own DECIDED/TENTATIVE/OPEN/

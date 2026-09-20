@@ -189,6 +189,26 @@ not a current requirement. §73 later generalizes this into a single
 commit-time interception mechanism rather than one bespoke checker per
 structure.
 
+**§7b — Correctness is not deferred for lack of a caller (DECIDED).**
+This implementation is the foundation of a real system, not a
+prototype. Earlier revisions of this document and of the code comments
+justified leaving several known gaps ("not needed yet", "no current
+caller", "single writer") by invoking §7's construct-only-what-is-needed
+discipline. That was a misapplication and is withdrawn. §7's discipline
+is about *primitives*: do not add a new primitive kind of object when an
+existing construction suffices. It is not a licence to leave a known
+correctness hazard, a violated contract, or an unenforced invariant in
+place. The rule now:
+1. A known correctness gap is fixed. If it genuinely cannot be fixed yet,
+   it is recorded as OPEN with the specific blocker (an unresolved design
+   question, a dependency), never with "no caller" as the reason.
+2. "No current caller" may still be a reason to sequence a new *feature*
+   behind more urgent work. It is never a reason to leave existing code
+   unsafe under a usage its API already permits (for example concurrent
+   use through `GraphActor`).
+3. Code comments follow the same rule: a comment must not present a
+   known gap as intended design.
+
 ## 8. Intermediary/relationship-object nodes
 
 Ordinary nodes whose meaning comes entirely from their relationships.
@@ -1544,7 +1564,7 @@ amended for exported IDs in the distributed case, §40) would reopen
 exactly the ABA-style hazard (§41) this section originally worried
 about, and would need its own, different resolution (generation tagging
 or an explicit reuse-safety proof) before transactional `DeleteNode`
-could be trusted again. This correction applies to the current toy
+could be trusted again. This correction applies to the current
 allocator as built, not to NodeID schemes in general.
 
 ## 79. SetRegistry — the minimal Set interpretation (DECIDED, implemented)
@@ -1941,9 +1961,8 @@ check each candidate against the other known endpoint directly — exactly
 as `findUniqueTaggedParent`/`findUniqueTaggedChild` already do against a
 tag instead of a fixed node. Whether a more general/faster mechanism
 exists for longer or less specifically-shaped paths is left genuinely
-open here, per §7's construct-only-what's-needed discipline: not worth
-designing further until a real caller needs more than the direct approach
-already gives.
+open here: the direct approach is correct, and a faster general
+mechanism needs a concrete path shape to design against (see §7b).
 
 ## 86. Domain Pointer staleness — closed by a commit-time Checker over reverse lookups (DECIDED, implemented)
 
@@ -2102,10 +2121,9 @@ abstraction being invented, and costs nothing today: no new foundational
 name, no new tag, no behavioral change, every existing test continues to
 exercise the same code paths.
 
-**Why do this now, ahead of an actual second backend, when §7's
-discipline says construct only what has a current caller?** Because the
-"current caller" here is not a hypothetical etcd/SpacetimeDB backend — it
-is the ability to substitute a minimal in-memory fake for `*Graph` when
+**Why do this before a second backend exists?** Because the benefit does
+not depend on one: it is the ability to substitute a minimal in-memory
+fake for `*Graph` when
 testing a registry in isolation, and the ability to make the eventual
 §88/§89 questions below answerable in code without first tearing up a
 dozen struct field types. Both of those are real, present-tense benefits
@@ -2229,11 +2247,11 @@ every existing node, relationship, and registered `Checker` from one
 backend's representation to another's, live, while possibly still
 serving reads, is closer in shape to Part C's still-unresolved
 cross-graph correspondence/first-contact material than it is to a simple
-interface swap. There is no current caller motivating (b) — no part of
-this project needs a running program to change its backing store
-mid-execution — so per §7 this is deferred rather than designed now, the
-same way §45 (nested transactions) and §63 (GraphID allocation) are
-named and left open rather than either solved or silently dropped.
+interface swap. (b) is left OPEN because its design depends on unresolved questions --
+migrating live state between backends is closer to Part C's cross-graph
+correspondence problem than to an interface swap -- not because nothing
+could use it. It is named and left open, the same way §45 (nested
+transactions) and §63 (GraphID allocation) are.
 
 ## 89. Concurrency is a per-backend contract, not a universal layer added uniformly on top of all three — DECIDED (design direction), not yet implemented
 
@@ -2763,12 +2781,20 @@ are serialized with every other closure. A hook must not touch the graph
 and must not panic. A retrying backend runs the hooks of the successful
 attempt only.
 
-**Not done.** Existence/tag pre-checks before a `Transact` in
-`ListRegistry`, `CompositeSetRegistry` and `CompositeSetLogRegistry` are
-unchanged: they only gate validity, and a stale result fails or is
-caught by a Checker. They must move inside before a retrying backend
-exists, since a retry would not re-run them. `NameRegistry`'s maps are
-still unsynchronized against readers on other goroutines.
+**Completed follow-up.** The existence/tag pre-checks in `ListRegistry`,
+`CapsuleRegistry`, `SetRegistry`, `CompositeSetRegistry` and
+`CompositeSetLogRegistry` originally stayed outside their `Transact`. A
+retrying backend would not re-run them, so they were moved inside (§7b:
+"a stale check only fails" was not a reason to leave it). Consequences:
+`CompositeSetLogRegistry.RemoveOperation` is one transaction and
+all-or-nothing, and `CapsuleRegistry`'s slot writes use the same
+ownership-checked lookup as its reads. `ListRegistry.Remove` remains two
+transactions on purpose (removal always commits, deletion is best-effort;
+there are no savepoints), and its intermediate state is a valid
+standalone capsule, so interleaving under `GraphActor` is safe.
+`NameRegistry`'s maps are guarded by an `RWMutex`: `Lookup` and
+`NameForNode` are safe from any goroutine and see only committed
+bindings.
 
 ---
 
@@ -2804,7 +2830,7 @@ kept current as sections above resolve or split further.)*
   interpreters are parameterized by the resulting tag NodeID rather than
   branching on it internally (§76).
 - Transactional DeleteNode is fully supported by Txn for the current
-  toy NodeID allocator: undoing it only ever needs to restore "exists,
+  NodeID allocator (a never-reused monotonic counter): undoing it only ever needs to restore "exists,
   with empty relationship maps" (§18's own precondition for DeleteNode
   succeeding), and NodeIDs are never reused (§2.2), so no collision with
   an unrelated node can occur (§78, corrected).
@@ -2882,6 +2908,9 @@ kept current as sections above resolve or split further.)*
   side effects outside `tx`) and `Tx.OnCommit` for keeping state outside
   the graph in step with commits; every registry read-decide-write
   method is a single transaction (§91).
+- Known correctness gaps are fixed, not deferred for lack of a caller;
+  "no current caller" only ever sequences new features (§7b).
+- `NameRegistry` lookups are safe from any goroutine (§91).
 
 ### TENTATIVE
 - Monotonically increasing NodeIDs; serialized first implementation.

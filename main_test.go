@@ -11526,3 +11526,208 @@ func TestDomainPointerRegistryDSetDomainFailureRollsBackMetadataCreation(t *test
 		t.Fatal("a rejected SetDomain left a metadata node behind; it should have rolled back with the rest")
 	}
 }
+
+// TestNameRegistryLookupIsSafeWhileGraphActorBindsAndUnbinds runs readers
+// hammering Lookup/NameForNode while writers create and unbind names
+// through a GraphActor. Its value is under `go test -race`: before
+// NameRegistry guarded its maps, this was a data race.
+func TestNameRegistryLookupIsSafeWhileGraphActorBindsAndUnbinds(t *testing.T) {
+	actor := NewGraphActor(&Graph{})
+	defer actor.Close()
+
+	names := NewNameRegistry(actor)
+
+	const writers = 20
+
+	nameFor := func(i int) string { return strings.Repeat("n", i+1) }
+
+	stop := make(chan struct{})
+
+	var readers sync.WaitGroup
+	for r := 0; r < 4; r++ {
+		readers.Add(1)
+		go func() {
+			defer readers.Done()
+
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+
+				for i := 0; i < writers; i++ {
+					id, ok := names.Lookup(nameFor(i))
+					if ok {
+						names.NameForNode(id)
+					}
+				}
+			}
+		}()
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < writers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+
+			name := nameFor(i)
+
+			id, createErr := names.CreateNamedNode(actor, name)
+			if createErr != nil {
+				t.Errorf("CreateNamedNode(%q): %v", name, createErr)
+				return
+			}
+
+			if found, ok := names.Lookup(name); !ok || found != id {
+				t.Errorf("Lookup(%q) = (%d,%v), want (%d,true)", name, found, ok, id)
+				return
+			}
+
+			if _, unbindErr := names.Unbind(name); unbindErr != nil {
+				t.Errorf("Unbind(%q): %v", name, unbindErr)
+			}
+		}()
+	}
+
+	wg.Wait()
+	close(stop)
+	readers.Wait()
+
+	for i := 0; i < writers; i++ {
+		if _, ok := names.Lookup(nameFor(i)); ok {
+			t.Fatalf("name %q is still bound after Unbind()", nameFor(i))
+		}
+	}
+}
+
+// TestGraphActorConcurrentListAppendKeepsListValid appends from many
+// goroutines to one list through a GraphActor. Append's existence and tag
+// checks now run inside its transaction; Elements validates the resulting
+// structure (head/tail, reciprocal links, reachability).
+func TestGraphActorConcurrentListAppendKeepsListValid(t *testing.T) {
+	actor := NewGraphActor(&Graph{})
+	defer actor.Close()
+
+	names := NewNameRegistry(actor)
+	ids, err := names.BootstrapNames(actor, FoundationalNames)
+	if err != nil {
+		t.Fatalf("BootstrapNames(): %v", err)
+	}
+
+	capsules, err := NewCapsuleRegistry(
+		actor,
+		ids[NameAllElementCapsules],
+		ids[NameAllElementCapsulePrevSlot],
+		ids[NameAllElementCapsuleValueSlot],
+		ids[NameAllElementCapsuleNextSlot],
+	)
+	if err != nil {
+		t.Fatalf("NewCapsuleRegistry(): %v", err)
+	}
+
+	lists, err := NewListRegistry(actor, capsules, ids[NameAllLists], ids[NameAllHeads], ids[NameAllTails])
+	if err != nil {
+		t.Fatalf("NewListRegistry(): %v", err)
+	}
+
+	list, err := lists.NewList(actor)
+	if err != nil {
+		t.Fatalf("NewList(): %v", err)
+	}
+
+	const goroutines = 50
+
+	values := make([]NodeID, goroutines)
+	for i := range values {
+		value, createErr := actor.CreateNode()
+		if createErr != nil {
+			t.Fatalf("CreateNode() for value %d: %v", i, createErr)
+		}
+		values[i] = value
+	}
+
+	var wg sync.WaitGroup
+	errs := make([]error, goroutines)
+
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, errs[i] = lists.Append(actor, list, values[i])
+		}()
+	}
+
+	wg.Wait()
+
+	for i, appendErr := range errs {
+		if appendErr != nil {
+			t.Fatalf("goroutine %d: Append() error = %v", i, appendErr)
+		}
+	}
+
+	elements, err := lists.Elements(actor, list)
+	if err != nil {
+		t.Fatalf("Elements(): %v", err)
+	}
+
+	if !reflect.DeepEqual(sortedNodeIDs(elements), sortedNodeIDs(values)) {
+		t.Fatalf("Elements() = %v, want the %d appended values in some order", elements, goroutines)
+	}
+}
+
+// TestCompositeSetLogRemoveOperationIsAtomicWhenCapsuleCannotBeDeleted
+// covers RemoveOperation now being one transaction: when the capsule
+// cannot be deleted (something else references its value slot), the
+// operation must stay in the log completely intact instead of ending up
+// unlinked from the log but still holding its descriptor.
+func TestCompositeSetLogRemoveOperationIsAtomicWhenCapsuleCannotBeDeleted(t *testing.T) {
+	g, _, _, logs := newCompositeSetLogTestFixture(t)
+
+	log, err := logs.NewCompositeSetLog(g)
+	if err != nil {
+		t.Fatalf("NewCompositeSetLog(): %v", err)
+	}
+
+	x := newTestNode(t, g)
+
+	u, capsule, err := logs.AppendOperation(g, log, x, true, false)
+	if err != nil {
+		t.Fatalf("AppendOperation(): %v", err)
+	}
+
+	capsules := logs.lists.capsules
+
+	valueSlot, found, err := capsules.slotFor(g, capsule, capsules.valueSlots.allPointers)
+	if err != nil || !found {
+		t.Fatalf("slotFor(value): found=%v err=%v", found, err)
+	}
+
+	// Something unrelated referencing the value slot makes deleting the
+	// capsule unsafe.
+	extra := newTestNode(t, g)
+	if _, addErr := g.AddRelationship(extra, valueSlot); addErr != nil {
+		t.Fatalf("AddRelationship(extra, valueSlot): %v", addErr)
+	}
+
+	err = logs.RemoveOperation(g, log, capsule)
+	if !errors.Is(err, ErrCapsuleNotEmpty) {
+		t.Fatalf("RemoveOperation() error = %v, want %v", err, ErrCapsuleNotEmpty)
+	}
+
+	if !g.HasRelationship(log, capsule) {
+		t.Fatal("capsule was unlinked from the log despite the failed RemoveOperation()")
+	}
+	if !g.NodeExists(u) || !g.HasRelationship(u, x) {
+		t.Fatal("descriptor was disturbed by the failed RemoveOperation()")
+	}
+
+	operations, err := logs.Operations(g, log)
+	if err != nil {
+		t.Fatalf("Operations(): %v", err)
+	}
+	if want := []NodeID{u}; !reflect.DeepEqual(operations, want) {
+		t.Fatalf("Operations() = %v, want %v", operations, want)
+	}
+}
