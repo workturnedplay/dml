@@ -1387,6 +1387,75 @@ NodeID-keyed structure outside the primitive graph.
  TestDomainPointerRegistryBSetTargetRacingDomainShrinkNeverStrandsPointerUnderGraphActor,
  and TestSetAddAndRemoveAreVisibleToCommitTimeCheckers.
 
+30. Made registry operations atomic under Transact and added Tx.OnCommit
+ (theorystate.md section 91). Four parts.
+
+ (a) The Transact contract is now written down on GraphAPI.Transact: fn
+ may be re-run against a different state (a future retrying backend
+ will), so it must read everything its decisions depend on through tx,
+ must have no side effects outside tx, and must not call Transact.
+
+ (b) Read-decide-write sequences moved inside their Transact. Two were
+ real bugs under GraphActor, both check-then-create with no Checker
+ protection: ensureMetadataWithSubjectSlot (two goroutines could each
+ create a metadata/subject-slot pair for one subject, after which every
+ lookup failed with ErrAmbiguousPointerMetadata) and
+ DomainPointerRegistryB.NewDomainPointer (two sub-pointers for one
+ anchor). The rest were protected only by Checkers, which turned a lost
+ update into a spurious ErrTooManyPointerTargets or
+ ErrTargetOutsideDomain. Converted: PointerRegistry.SetTarget/
+ RemoveTarget/TagAsPointer, PointerMetadataRegistry(D).SetTarget/
+ RemoveTarget/EnsureMetadata, SetRegistry.TagAsSet, and the
+ DomainPointerRegistryB/D SetTarget/SetDomain/RemoveTarget/RemoveDomain
+ (with domainConstraint.setDomainTx/removeDomainTx). Each now has an
+ unexported *Tx core taking a txReader and the exported method is a thin
+ Transact wrapper. RemoveTarget was previously a raw graph call that no
+ Checker saw; it now runs through Transact. A failed SetTarget/
+ SetDomain on a subject with no metadata now rolls the metadata creation
+ back too. DRY: transactBool, requirePointer, and an exclude variadic on
+ singleChildTargetSetTx/RemoveTx (so Representation C reuses them); the
+ free function ensureMetadataWithSubjectSlot became
+ ensureMetadataWithSubjectSlotTx and subjectMetadataBase.ensureMetadata
+ became ensureMetadataTx.
+
+ (c) Tx gained OnCommit(fn): hooks run once, in order, after every
+ Checker approves and before Transact returns, and are discarded on
+ rollback. Txn implements it; RootGraph.Transact hands its closure a new
+ rootTx (rootStore plus OnCommit forwarding), and rootStore is no longer
+ a Tx itself. This exists because "mutate outside state only after
+ commit" cannot be done by the caller after Transact returns: under
+ GraphActor two goroutines could both pass the unbound check before
+ either recorded its binding.
+
+ (d) NameRegistry now updates byName/byID only from commit hooks
+ (bindTx/recordBinding/forgetNode/dropBinding). CreateNamedNode and
+ EnsureNamedNode share namedNodeTx/transactNamedNode and are one atomic
+ step; Bind and DeleteNode became Transact calls; bindCore is gone. The
+ maps themselves are still unsynchronized, so Lookup/NameForNode from
+ another goroutine while the actor runs still races (unchanged, see
+ NameRegistry's doc comment).
+
+ Not converted, deliberately: the existence/tag pre-checks before a
+ Transact in ListRegistry (Append/Prepend/InsertAfter/Remove...),
+ CompositeSetRegistry and CompositeSetLogRegistry. None reads something a
+ write decision depends on beyond validity, and a stale pre-check fails
+ with an error or is caught by a Checker. Revisit before a retrying
+ backend exists, since a retry would not re-run them.
+
+ The GraphActor race test now uses staleReadThenSetTarget (the old
+ SetTarget shape) to keep exercising the caller-composed hazard and the
+ Checker that catches it; the new TestGraphActorConcurrentSetTargetIsAtomic
+ pins the fixed behaviour.
+
+ Covered by TestTxOnCommitRunsOnlyAfterSuccessfulCommit,
+ TestRootGraphTransactForwardsOnCommit,
+ TestNameRegistryBindTxIsDiscardedOnRollbackAndAppliedOnCommit,
+ TestGraphActorConcurrentSetTargetIsAtomic,
+ TestGraphActorConcurrentEnsureMetadataCreatesExactlyOneMetadataNode,
+ TestGraphActorConcurrentNewDomainPointerCreatesExactlyOneSubPointer,
+ TestGraphActorConcurrentCreateNamedNodeSameNameBindsExactlyOnce, and
+ TestDomainPointerRegistryDSetDomainFailureRollsBackMetadataCreation.
+
 Currently unaddressed yet:
 - Txn does not support nesting one Graph.Transact call inside another
   (Txn.DeleteNode is supported -- see item 15). Nesting is not needed by

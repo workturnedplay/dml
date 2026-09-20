@@ -614,6 +614,23 @@ type GraphStore interface {
 // GraphActor takes one (theorystate.md section 87b).
 type GraphAPI interface {
 	GraphStore
+
+	// Transact runs fn as one atomic unit: if fn returns an error or
+	// panics, or a relevant Checker declines the result, every mutation
+	// made through tx is undone.
+	//
+	// Contract every fn must honour (theorystate.md section 91):
+	//   - fn may be executed more than once, and against a state that
+	//     differs from the one the caller saw earlier (a retrying backend
+	//     re-runs it after a conflict). Nothing fn does may depend on
+	//     having run exactly once.
+	//   - fn must read every piece of graph state its decisions depend on
+	//     through tx, never through a graph value captured from outside;
+	//     a read made before Transact can be stale by the time fn runs.
+	//   - fn must have no side effects outside tx. State kept outside the
+	//     graph (NameRegistry's maps) is updated with tx.OnCommit, never
+	//     directly from fn.
+	//   - fn must not call Transact on any graph.
 	Transact(fn func(tx Tx) error) error
 	RegisterChecker(c Checker)
 }
@@ -633,6 +650,17 @@ var _ GraphAPI = (*Graph)(nil)
 // txOps/txReader, which Tx satisfies.
 type Tx interface {
 	GraphStore
+
+	// OnCommit registers fn to run exactly once, after this
+	// transaction's mutations have been applied and every relevant
+	// Checker has approved, and before Transact returns. If the
+	// transaction is rolled back for any reason, fn is discarded and
+	// never runs. Hooks run in registration order, on the goroutine (and
+	// under the exclusive access) that runs Transact, so a hook may
+	// safely update caller-owned state that must stay in step with the
+	// graph, such as NameRegistry's maps. A hook must not call back into
+	// the graph and must not panic.
+	OnCommit(fn func())
 }
 
 // Compile-time assertion that *Txn satisfies Tx.
@@ -717,6 +745,10 @@ type Txn struct {
 	// deliberately not recorded here, mirroring undo's own "only record
 	// what actually changed" discipline.
 	touched map[NodeID]struct{}
+
+	// commitHooks holds every function registered via OnCommit, run by
+	// Graph.Transact only once the transaction has fully succeeded.
+	commitHooks []func()
 }
 
 // touch records every one of ids as having been involved in this Txn's
@@ -743,8 +775,9 @@ func (tx *Txn) touch(ids ...NodeID) {
 // Checker declines, its error is treated exactly like an error returned
 // by fn itself -- every mutation fn performed is undone, in reverse
 // order, and the Checker's (wrapped) error is returned instead of nil.
-// Only once every relevant Checker has approved does Transact return
-// nil.
+// Only once every relevant Checker has approved does Transact run any
+// commit hooks registered via tx.OnCommit (see Tx) and return nil; on any
+// failure the hooks are discarded unrun.
 //
 // Because every Txn method already applies its mutation directly to g as
 // it happens, there is still no separate "staged" commit step -- a
@@ -790,6 +823,8 @@ func (g *Graph) Transact(fn func(tx Tx) error) (err error) {
 		return err2
 	}
 
+	tx.runCommitHooks()
+
 	return nil
 }
 
@@ -806,6 +841,25 @@ func (tx *Txn) rollback() {
 		tx.undo[i]()
 	}
 	tx.undo = nil
+	tx.commitHooks = nil
+}
+
+// OnCommit implements Tx.OnCommit: fn runs once, after every Checker has
+// approved, and is discarded if the transaction rolls back.
+func (tx *Txn) OnCommit(fn func()) {
+	tx.commitHooks = append(tx.commitHooks, fn)
+}
+
+// runCommitHooks runs and clears every registered commit hook, in
+// registration order. Graph.Transact calls it only after fn and every
+// relevant Checker have succeeded.
+func (tx *Txn) runCommitHooks() {
+	hooks := tx.commitHooks
+	tx.commitHooks = nil
+
+	for _, hook := range hooks {
+		hook()
+	}
 }
 
 // CreateNode behaves exactly like Graph.CreateNode, additionally
@@ -1306,11 +1360,15 @@ func currentGoroutineID() (int64, error) {
 // goroutine before the next queued call is even looked at, so it can
 // never be interleaved with anything else. What is NOT free is grouping
 // more than one separately-submitted call into one larger atomic unit:
-// PointerRegistry.SetTarget, for example, reads the pointer's current
-// target via one call and only later, separately, commits a replacement
-// via Graph.Transact -- two distinct round trips through GraphActor, not
-// one -- so a second goroutine's own SetTarget call on the very same
-// pointer can legitimately land in between them. This is a real,
+// a caller's own read-then-decide-then-write sequence spanning several
+// calls, for example, reads a pointer's Target via one call and only
+// later, separately, commits a replacement via Graph.Transact -- two
+// distinct round trips through GraphActor, not one -- so a second
+// goroutine's own such sequence on the very same pointer can
+// legitimately land in between them. (A single registry method is not
+// exposed to this: since implementation_state.md item 30, every
+// Pointer-family method performs its reads inside the same Transact as
+// its writes.) This is a real,
 // lost-update/write-skew-shaped hazard, not a bug in GraphActor itself
 // (theorystate.md section 89c); it is exactly the same shape of gap
 // DomainPointerRegistryD's own commit-time Checker already exists to
@@ -1735,44 +1793,129 @@ func (r *NameRegistry) lookupLive(graph GraphReader, name string) (id NodeID, bo
 // Binding the exact same name to the exact same NodeID is an idempotent
 // success.
 func (r *NameRegistry) Bind(graph GraphAPI, name string, id NodeID) error {
-	return r.bindCore(graph, name, id)
+	return wrapInterfaceErr(graph.Transact(func(tx Tx) error {
+		return r.bindTx(tx, name, id)
+	}))
 }
 
-// bindCore performs Bind's actual validation and map bookkeeping against
-// graph, without opening any transaction of its own -- graph here is
-// only ever read (NodeExists), never mutated. Shared by the exported
-// Bind (called directly against a caller's GraphAPI) and
-// CreateNamedNode's internal Transact closure (called against tx, so
-// this read happens through the same synchronous call graph.Transact is
-// already running, rather than reaching back out through some separately
-// supplied graph reference -- see theorystate.md section 90 for why that
-// distinction matters specifically under GraphActor).
-func (r *NameRegistry) bindCore(graph GraphReader, name string, id NodeID) error {
+// checkBind validates that name may be bound to id, reading only from
+// graph and never mutating anything -- neither the graph nor this
+// registry's maps. alreadyBound reports that name is already bound to
+// exactly id, so binding it again is an idempotent no-op.
+func (r *NameRegistry) checkBind(graph GraphReader, name string, id NodeID) (alreadyBound bool, err error) {
 	if !graph.NodeExists(id) {
-		return ErrNodeNotFound
+		return false, ErrNodeNotFound
 	}
 
 	existingID, bound, err := r.lookupLive(graph, name)
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	if bound {
 		if existingID == id {
-			return nil
+			return true, nil
 		}
 
-		return ErrNameAlreadyBound
+		return false, ErrNameAlreadyBound
 	}
 
 	if _, ok := r.byID[id]; ok {
-		return ErrNodeAlreadyNamed
+		return false, ErrNodeAlreadyNamed
 	}
 
+	return false, nil
+}
+
+// recordBinding stores the name <-> id association. It must only run
+// once the transaction that justified it has committed (see bindTx).
+func (r *NameRegistry) recordBinding(name string, id NodeID) {
 	r.byName[name] = id
 	r.byID[id] = name
+}
+
+// dropBinding removes the name <-> id association. Shared by Unbind and
+// forgetNode.
+func (r *NameRegistry) dropBinding(name string, id NodeID) {
+	delete(r.byName, name)
+	delete(r.byID, id)
+}
+
+// forgetNode drops any name association for id. It must only run once the
+// deletion of id has committed (see DeleteNode).
+func (r *NameRegistry) forgetNode(id NodeID) {
+	if name, ok := r.byID[id]; ok {
+		r.dropBinding(name, id)
+	}
+}
+
+// bindTx validates binding name to id against tx and, if the binding is
+// new, registers the actual map update as a commit hook. The registry's
+// maps are therefore mutated only after the enclosing transaction has
+// committed -- a rolled-back or Checker-declined transaction leaves them
+// untouched -- and, under GraphActor, the update happens on the actor's
+// own goroutine, serialized with every other closure that reads them.
+func (r *NameRegistry) bindTx(tx Tx, name string, id NodeID) error {
+	alreadyBound, err := r.checkBind(tx, name, id)
+	if err != nil {
+		return err
+	}
+
+	if !alreadyBound {
+		tx.OnCommit(func() { r.recordBinding(name, id) })
+	}
 
 	return nil
+}
+
+// namedNodeTx returns the live node bound to name, or creates and binds
+// a fresh one, entirely against tx. If name is already bound to a live
+// node, that node is returned when allowExisting is true and
+// ErrNameAlreadyBound otherwise; a binding to a deleted node is always
+// ErrNameBoundToDeletedNode (see lookupLive).
+func (r *NameRegistry) namedNodeTx(tx Tx, name string, allowExisting bool) (NodeID, error) {
+	existing, bound, err := r.lookupLive(tx, name)
+	if err != nil {
+		return 0, err
+	}
+
+	if bound {
+		if allowExisting {
+			return existing, nil
+		}
+
+		return 0, ErrNameAlreadyBound
+	}
+
+	id, err := createNodeTx(tx)
+	if err != nil {
+		return 0, err
+	}
+
+	if bindErr := r.bindTx(tx, name, id); bindErr != nil {
+		return 0, bindErr
+	}
+
+	return id, nil
+}
+
+// transactNamedNode runs namedNodeTx as one Graph.Transact call. The
+// lookup, the node creation and the binding are therefore one atomic
+// step, which is what makes concurrent calls for the same name safe
+// under GraphActor.
+func (r *NameRegistry) transactNamedNode(graph GraphAPI, name string, allowExisting bool) (NodeID, error) {
+	var id NodeID
+
+	err := graph.Transact(func(tx Tx) error {
+		var txErr error
+		id, txErr = r.namedNodeTx(tx, name, allowExisting)
+		return txErr
+	})
+	if err != nil {
+		return 0, wrapInterfaceErr(err)
+	}
+
+	return id, nil
 }
 
 // CreateNamedNode creates a new primitive node and immediately gives it name.
@@ -1783,39 +1926,14 @@ func (r *NameRegistry) bindCore(graph GraphReader, name string, id NodeID) error
 // instead, since that is a different, more serious problem than an
 // ordinary already-bound name.
 //
-// Node creation and binding happen inside a Graph.Transact call: if Bind
-// were ever to fail after CreateNode had already succeeded, the freshly
-// created node would otherwise be left permanently orphaned (existing in
-// the graph but never reachable through any name). Transact makes the two
-// steps atomic with respect to that failure. In today's implementation
-// this specific failure is not actually reachable through the public API
-// -- CreateNamedNode's own lookupLive check above already guarantees
-// Bind's checks will pass -- but wrapping it in Transact costs nothing
-// and removes the dependency on that reasoning staying true as this code
-// evolves.
+// The name lookup, the node creation and the binding all happen inside
+// one Graph.Transact call (see transactNamedNode), and the registry's
+// maps are updated only once that transaction has committed (see
+// bindTx). A failure at any step therefore leaves neither an orphaned
+// node nor a stale name association, and two goroutines racing to create
+// the same name under GraphActor cannot both succeed.
 func (r *NameRegistry) CreateNamedNode(graph GraphAPI, name string) (NodeID, error) {
-	if _, bound, err := r.lookupLive(graph, name); err != nil {
-		return 0, err
-	} else if bound {
-		return 0, ErrNameAlreadyBound
-	}
-
-	var id NodeID
-
-	err := graph.Transact(func(tx Tx) error {
-		var err error
-		id, err = createNodeTx(tx)
-		if err != nil {
-			return err
-		}
-
-		return r.bindCore(tx, name, id)
-	})
-	if err != nil {
-		return 0, wrapInterfaceErr(err)
-	}
-
-	return id, nil
+	return r.transactNamedNode(graph, name, false)
 }
 
 // EnsureNamedNode returns the NodeID currently associated with name,
@@ -1833,16 +1951,7 @@ func (r *NameRegistry) CreateNamedNode(graph GraphAPI, name string) (NodeID, err
 // returns ErrNameBoundToDeletedNode (see lookupLive) rather than silently
 // trusting the stale association or silently creating a replacement.
 func (r *NameRegistry) EnsureNamedNode(graph GraphAPI, name string) (NodeID, error) {
-	id, bound, err := r.lookupLive(graph, name)
-	if err != nil {
-		return 0, err
-	}
-
-	if bound {
-		return id, nil
-	}
-
-	return r.CreateNamedNode(graph, name)
+	return r.transactNamedNode(graph, name, true)
 }
 
 // Unbind removes the name association without deleting the NodeID.
@@ -1854,8 +1963,7 @@ func (r *NameRegistry) Unbind(name string) (bool, error) {
 		return false, ErrNameNotFound
 	}
 
-	delete(r.byName, name)
-	delete(r.byID, id)
+	r.dropBinding(name, id)
 
 	return true, nil
 }
@@ -1876,16 +1984,17 @@ func (r *NameRegistry) Unbind(name string) (bool, error) {
 // It is not an error for id to have no name association; this then simply
 // behaves like a plain Graph.DeleteNode.
 func (r *NameRegistry) DeleteNode(graph GraphAPI, id NodeID) error {
-	if err := graph.DeleteNode(id); err != nil {
-		return wrapInterfaceErr(err)
-	}
+	return wrapInterfaceErr(graph.Transact(func(tx Tx) error {
+		if delErr := deleteNodeTx(tx, id); delErr != nil {
+			return delErr
+		}
 
-	if name, ok := r.byID[id]; ok {
-		delete(r.byName, name)
-		delete(r.byID, id)
-	}
+		// The name association is dropped only once the delete has
+		// committed, on the same goroutine as the delete itself.
+		tx.OnCommit(func() { r.forgetNode(id) })
 
-	return nil
+		return nil
+	}))
 }
 
 // BootstrapNames ensures that every name in names has an associated
@@ -2290,10 +2399,9 @@ func (v rootReader) FindRelationships() []Relationship {
 }
 
 // rootStore is the full read/write ROOT overlay over any GraphStore. It
-// implements both GraphStore and Tx, which is what lets one
-// implementation serve RootGraph's non-transactional methods and the
-// handle RootGraph.Transact gives its closure (a rootStore wrapped around
-// the underlying transaction's own Tx).
+// implements GraphStore, which is what lets one implementation serve
+// RootGraph's non-transactional methods and, wrapped in rootTx, the
+// handle RootGraph.Transact gives its closure.
 //
 // Writes follow the overlay's rules: a relationship whose source is ROOT
 // is virtual, so adding or removing one is a no-op reporting false (after
@@ -2304,9 +2412,33 @@ type rootStore struct {
 	store GraphStore
 }
 
-// Compile-time assertion that rootStore satisfies Tx (and therefore
-// GraphStore).
-var _ Tx = rootStore{}
+// Compile-time assertion that rootStore satisfies GraphStore.
+var _ GraphStore = rootStore{}
+
+// rootTx is the handle RootGraph.Transact gives its closure: the ROOT
+// overlay over the underlying transaction (rootStore) plus that
+// transaction's own OnCommit, so it satisfies Tx.
+type rootTx struct {
+	rootStore
+	tx Tx
+}
+
+// Compile-time assertion that rootTx satisfies Tx.
+var _ Tx = rootTx{}
+
+// newRootTx returns the ROOT overlay over the transaction tx.
+func newRootTx(tx Tx, root NodeID) rootTx {
+	return rootTx{
+		rootStore: newRootStore(tx, root),
+		tx:        tx,
+	}
+}
+
+// OnCommit forwards to the underlying transaction, so commit hooks
+// registered through the overlay run when that transaction commits.
+func (t rootTx) OnCommit(fn func()) {
+	t.tx.OnCommit(fn)
+}
 
 // newRootStore returns the ROOT overlay over store.
 func newRootStore(store GraphStore, root NodeID) rootStore {
@@ -2384,7 +2516,7 @@ func (s rootStore) DeleteNode(id NodeID) error {
 // there is no place where the virtual (ROOT, X) relationships are visible
 // and another where they are not:
 //   - non-transactional reads and writes: via the embedded rootStore;
-//   - Transact: the closure receives a rootStore wrapped around the
+//   - Transact: the closure receives a rootTx wrapped around the
 //     underlying transaction's Tx (which is why Transact takes the Tx
 //     interface rather than the concrete *Txn);
 //   - Checkers: RegisterChecker wraps each Check so it receives a
@@ -2438,7 +2570,7 @@ func (r *RootGraph) Root() NodeID {
 // underlying graph's own.
 func (r *RootGraph) Transact(fn func(tx Tx) error) error {
 	return wrapInterfaceErr(r.api.Transact(func(tx Tx) error {
-		return fn(newRootStore(tx, r.root))
+		return fn(newRootTx(tx, r.root))
 	}))
 }
 
@@ -2644,6 +2776,26 @@ func wrapInterfaceErr(err error) error {
 	return fmt.Errorf("%w", err)
 }
 
+// transactBool runs step as one Graph.Transact call and returns its bool
+// result, or (false, err) if step failed or the transaction was declined
+// and rolled back. step may be run more than once by a retrying backend
+// (see the GraphAPI.Transact contract), so its result is overwritten on
+// every run and only the final, committed run's value is returned.
+func transactBool(graph GraphAPI, step func(tx Tx) (bool, error)) (bool, error) {
+	var result bool
+
+	err := graph.Transact(func(tx Tx) error {
+		var stepErr error
+		result, stepErr = step(tx)
+		return stepErr
+	})
+	if err != nil {
+		return false, wrapInterfaceErr(err)
+	}
+
+	return result, nil
+}
+
 // tagNodeTx adds the tagging relationship (tag, id) against tx. This is
 // the single-relationship-add step shared by createTaggedNodeTx below and
 // by any caller that needs to apply more than one tag to a single node --
@@ -2762,8 +2914,12 @@ func setPointerTargetTx(tx txOps, id, current NodeID, hasCurrent bool, target No
 // PointerRegistry.currentTarget performs, since callers here have
 // already located node via a tag-based lookup (e.g.
 // findUniqueTaggedChild) immediately beforehand.
-func singleChildTargetSetTx(tx txOps, graph GraphReader, node, target NodeID) error {
-	current, hasCurrent, err := singleChildTarget(graph, node)
+//
+// exclude has the same meaning as for singleChildTarget: children of
+// node that are structural rather than target candidates
+// (PointerMetadataRegistry's subject-slot).
+func singleChildTargetSetTx(tx txOps, graph GraphReader, node, target NodeID, exclude ...NodeID) error {
+	current, hasCurrent, err := singleChildTarget(graph, node, exclude...)
 	if err != nil {
 		return err
 	}
@@ -2789,8 +2945,9 @@ func singleChildTargetSetTx(tx txOps, graph GraphReader, node, target NodeID) er
 // together with the neighbor-relinking steps around it.
 //
 // removed reports whether a target actually existed and was removed.
-func singleChildTargetRemoveTx(tx txOps, graph GraphReader, node NodeID) (removed bool, err error) {
-	current, hasCurrent, err := singleChildTarget(graph, node)
+// exclude has the same meaning as for singleChildTarget.
+func singleChildTargetRemoveTx(tx txOps, graph GraphReader, node NodeID, exclude ...NodeID) (removed bool, err error) {
+	current, hasCurrent, err := singleChildTarget(graph, node, exclude...)
 	if err != nil {
 		return false, err
 	}
@@ -3010,15 +3167,27 @@ func (p *PointerRegistry) IsPointer(graph GraphReader, id NodeID) bool {
 // primitive Graph -- currentTarget returns ErrTooManyPointerTargets
 // rather than silently picking one of them.
 func (p *PointerRegistry) currentTarget(graph GraphReader, id NodeID) (target NodeID, hasTarget bool, err error) {
-	if !graph.NodeExists(id) {
-		return 0, false, ErrNodeNotFound
-	}
-
-	if !p.IsPointer(graph, id) {
-		return 0, false, ErrNotPointer
+	if requireErr := p.requirePointer(graph, id); requireErr != nil {
+		return 0, false, requireErr
 	}
 
 	return singleChildTarget(graph, id)
+}
+
+// requirePointer checks that id exists and is tagged Pointer-kind,
+// returning ErrNodeNotFound or ErrNotPointer otherwise, without
+// inspecting id's relationships. Shared by currentTarget, setTargetTx and
+// removeTargetTx.
+func (p *PointerRegistry) requirePointer(graph GraphReader, id NodeID) error {
+	if !graph.NodeExists(id) {
+		return ErrNodeNotFound
+	}
+
+	if !p.IsPointer(graph, id) {
+		return ErrNotPointer
+	}
+
+	return nil
 }
 
 // Target returns P's current target.
@@ -3052,23 +3221,29 @@ func (p *PointerRegistry) Target(graph GraphReader, id NodeID) (target NodeID, h
 // Self-targeting, i.e. SetTarget(P, P), is allowed: self-relationships
 // are permitted at the primitive layer (theorystate.md section 2.8)
 // and nothing about the Pointer invariant rules it out.
+//
+// The whole operation -- reading P's current target, validating, and
+// replacing it -- runs inside one Graph.Transact call (see setTargetTx),
+// so it is atomic as a whole under GraphActor, not merely each of its
+// steps.
 func (p *PointerRegistry) SetTarget(graph GraphAPI, id, target NodeID) error {
-	current, hasTarget, err := p.currentTarget(graph, id)
-	if err != nil {
-		return err
+	return wrapInterfaceErr(graph.Transact(func(tx Tx) error {
+		return p.setTargetTx(tx, id, target)
+	}))
+}
+
+// setTargetTx is SetTarget's tx-composable core: every read goes through
+// tx, so the decision and the write see the same state.
+func (p *PointerRegistry) setTargetTx(tx txReader, id, target NodeID) error {
+	if requireErr := p.requirePointer(tx, id); requireErr != nil {
+		return requireErr
 	}
 
-	if !graph.NodeExists(target) {
+	if !tx.NodeExists(target) {
 		return ErrNodeNotFound
 	}
 
-	if hasTarget && current == target {
-		return nil
-	}
-
-	return wrapInterfaceErr(graph.Transact(func(tx Tx) error {
-		return setPointerTargetTx(tx, id, current, hasTarget, target)
-	}))
+	return singleChildTargetSetTx(tx, tx, id, target)
 }
 
 // RemoveTarget clears P's target, if any.
@@ -3080,17 +3255,20 @@ func (p *PointerRegistry) SetTarget(graph GraphAPI, id, target NodeID) error {
 // the same reason given in SetTarget: this registry does not silently
 // repair violations it did not create.
 func (p *PointerRegistry) RemoveTarget(graph GraphAPI, id NodeID) (removed bool, err error) {
-	current, hasTarget, err := p.currentTarget(graph, id)
-	if err != nil {
-		return false, err
+	return transactBool(graph, func(tx Tx) (bool, error) {
+		return p.removeTargetTx(tx, id)
+	})
+}
+
+// removeTargetTx is RemoveTarget's tx-composable core. Running the
+// removal through tx (rather than as a raw graph call) also makes it
+// visible to commit-time Checkers.
+func (p *PointerRegistry) removeTargetTx(tx txReader, id NodeID) (bool, error) {
+	if requireErr := p.requirePointer(tx, id); requireErr != nil {
+		return false, requireErr
 	}
 
-	if !hasTarget {
-		return false, nil
-	}
-
-	removed, err = graph.RemoveRelationship(id, current)
-	return removed, wrapInterfaceErr(err)
+	return singleChildTargetRemoveTx(tx, tx, id)
 }
 
 // NewPointer creates a fresh NodeID and immediately tags it Pointer-kind.
@@ -3134,17 +3312,18 @@ func (p *PointerRegistry) NewPointer(graph GraphAPI) (NodeID, error) {
 // success, exactly like the underlying Graph.AddRelationship being
 // idempotent for an already-existing relationship.
 func (p *PointerRegistry) TagAsPointer(graph GraphAPI, id NodeID) error {
-	outgoing, err := graph.FindOutgoing(id)
-	if err != nil {
-		return wrapInterfaceErr(err)
-	}
+	return wrapInterfaceErr(graph.Transact(func(tx Tx) error {
+		outgoing, txErr := tx.FindOutgoing(id)
+		if txErr != nil {
+			return wrapInterfaceErr(txErr)
+		}
 
-	if len(outgoing) > 1 {
-		return ErrTooManyPointerTargets
-	}
+		if len(outgoing) > 1 {
+			return ErrTooManyPointerTargets
+		}
 
-	_, err = graph.AddRelationship(p.allPointers, id)
-	return wrapInterfaceErr(err)
+		return addRelationshipTx(tx, p.allPointers, id)
+	}))
 }
 
 // findUniqueTaggedParent returns the single parent of node that is tagged
@@ -3257,16 +3436,19 @@ func locateBySubjectSlot(g GraphReader, node, allPointerMetadata, allSubjectSlot
 	return metadata, subjectSlot, true, nil
 }
 
-// ensureMetadataWithSubjectSlot returns subject's existing metadata/
+// ensureMetadataWithSubjectSlotTx returns subject's existing metadata/
 // subject-slot pair (via locateBySubjectSlot), creating a fresh, empty
-// one (M -> S -> subject, both tagged) if none exists yet. Shared by both
-// PointerMetadataRegistry and PointerMetadataRegistryD, which build
-// identical subject-side structure and differ only in how the target
-// side is represented. Callers are responsible for checking that subject
-// itself exists before calling this.
-func ensureMetadataWithSubjectSlot(g GraphAPI, subject, allPointerMetadata, allSubjectSlots NodeID) (metadata, subjectSlot NodeID, err error) {
+// one (M -> S -> subject, both tagged) if none exists yet, entirely
+// against tx. The lookup and the creation happen in the same transaction,
+// so two goroutines cannot both conclude "not found" and both create a
+// pair (which would make every later lookup fail with
+// ErrAmbiguousPointerMetadata). Shared by both PointerMetadataRegistry
+// and PointerMetadataRegistryD, which build identical subject-side
+// structure and differ only in how the target side is represented.
+// Callers are responsible for checking that subject itself exists.
+func ensureMetadataWithSubjectSlotTx(tx txReader, subject, allPointerMetadata, allSubjectSlots NodeID) (metadata, subjectSlot NodeID, err error) {
 	var found bool
-	metadata, subjectSlot, found, err = locateBySubjectSlot(g, subject, allPointerMetadata, allSubjectSlots)
+	metadata, subjectSlot, found, err = locateBySubjectSlot(tx, subject, allPointerMetadata, allSubjectSlots)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -3274,26 +3456,20 @@ func ensureMetadataWithSubjectSlot(g GraphAPI, subject, allPointerMetadata, allS
 		return metadata, subjectSlot, nil
 	}
 
-	err = g.Transact(func(tx Tx) error {
-		var err2 error
-
-		subjectSlot, err2 = createTaggedNodeTx(tx, allSubjectSlots)
-		if err2 != nil {
-			return err2
-		}
-		if err3 := addRelationshipTx(tx, subjectSlot, subject); err3 != nil {
-			return err3
-		}
-
-		metadata, err2 = createTaggedNodeTx(tx, allPointerMetadata)
-		if err2 != nil {
-			return err2
-		}
-
-		return addRelationshipTx(tx, metadata, subjectSlot)
-	})
+	subjectSlot, err = createTaggedNodeTx(tx, allSubjectSlots)
 	if err != nil {
-		return 0, 0, wrapInterfaceErr(err)
+		return 0, 0, err
+	}
+	if linkErr := addRelationshipTx(tx, subjectSlot, subject); linkErr != nil {
+		return 0, 0, linkErr
+	}
+
+	metadata, err = createTaggedNodeTx(tx, allPointerMetadata)
+	if err != nil {
+		return 0, 0, err
+	}
+	if linkErr := addRelationshipTx(tx, metadata, subjectSlot); linkErr != nil {
+		return 0, 0, linkErr
 	}
 
 	return metadata, subjectSlot, nil
@@ -3329,22 +3505,34 @@ func (b *subjectMetadataBase) locate(graph GraphReader, subject NodeID) (metadat
 	return locateBySubjectSlot(graph, subject, b.allPointerMetadata, b.allSubjectSlots)
 }
 
-// ensureMetadata returns subject's existing metadata/subject-slot pair,
+// ensureMetadataTx returns subject's existing metadata/subject-slot pair,
 // creating a fresh, empty one (M -> S -> subject, both tagged) if none
-// exists yet.
-func (b *subjectMetadataBase) ensureMetadata(graph GraphAPI, subject NodeID) (metadata, subjectSlot NodeID, err error) {
-	if !graph.NodeExists(subject) {
+// exists yet, against tx. The registries' SetTarget/SetDomain cores call
+// this so that creating the metadata and setting the target are one
+// atomic step: a later failure rolls the metadata creation back too.
+func (b *subjectMetadataBase) ensureMetadataTx(tx txReader, subject NodeID) (metadata, subjectSlot NodeID, err error) {
+	if !tx.NodeExists(subject) {
 		return 0, 0, ErrNodeNotFound
 	}
 
-	return ensureMetadataWithSubjectSlot(graph, subject, b.allPointerMetadata, b.allSubjectSlots)
+	return ensureMetadataWithSubjectSlotTx(tx, subject, b.allPointerMetadata, b.allSubjectSlots)
 }
 
 // EnsureMetadata returns subject's metadata node, creating an empty one
 // if none exists yet.
 func (b *subjectMetadataBase) EnsureMetadata(graph GraphAPI, subject NodeID) (NodeID, error) {
-	metadata, _, err := b.ensureMetadata(graph, subject)
-	return metadata, err
+	var metadata NodeID
+
+	err := graph.Transact(func(tx Tx) error {
+		var txErr error
+		metadata, _, txErr = b.ensureMetadataTx(tx, subject)
+		return txErr
+	})
+	if err != nil {
+		return 0, wrapInterfaceErr(err)
+	}
+
+	return metadata, nil
 }
 
 // HasMetadata reports whether subject currently has an associated
@@ -3516,27 +3704,25 @@ func (m *PointerMetadataRegistry) Target(graph GraphReader, subject NodeID) (tar
 // PointerMetadataRegistry doc comment for why the subject-slot
 // indirection is what makes this possible.
 func (m *PointerMetadataRegistry) SetTarget(graph GraphAPI, subject, target NodeID) error {
-	if !graph.NodeExists(target) {
+	return wrapInterfaceErr(graph.Transact(func(tx Tx) error {
+		return m.setTargetTx(tx, subject, target)
+	}))
+}
+
+// setTargetTx is SetTarget's tx-composable core: creating the metadata
+// (if needed), reading the current target and replacing it are one
+// atomic step.
+func (m *PointerMetadataRegistry) setTargetTx(tx txReader, subject, target NodeID) error {
+	if !tx.NodeExists(target) {
 		return ErrNodeNotFound
 	}
 
-	metadata, slot, err := m.ensureMetadata(graph, subject)
+	metadata, slot, err := m.ensureMetadataTx(tx, subject)
 	if err != nil {
 		return err
 	}
 
-	current, hasTarget, err := singleChildTarget(graph, metadata, slot)
-	if err != nil {
-		return err
-	}
-
-	if hasTarget && current == target {
-		return nil
-	}
-
-	return wrapInterfaceErr(graph.Transact(func(tx Tx) error {
-		return setPointerTargetTx(tx, metadata, current, hasTarget, target)
-	}))
+	return singleChildTargetSetTx(tx, tx, metadata, target, slot)
 }
 
 // RemoveTarget clears subject's target, if any. The metadata/slot nodes
@@ -3545,11 +3731,18 @@ func (m *PointerMetadataRegistry) SetTarget(graph GraphAPI, subject, target Node
 // deleteNodeAndRelationships); an empty metadata node is a valid,
 // meaningful state, exactly like an empty Pointer in Representation A.
 func (m *PointerMetadataRegistry) RemoveTarget(graph GraphAPI, subject NodeID) (removed bool, err error) {
-	if !graph.NodeExists(subject) {
+	return transactBool(graph, func(tx Tx) (bool, error) {
+		return m.removeTargetTx(tx, subject)
+	})
+}
+
+// removeTargetTx is RemoveTarget's tx-composable core.
+func (m *PointerMetadataRegistry) removeTargetTx(tx txReader, subject NodeID) (bool, error) {
+	if !tx.NodeExists(subject) {
 		return false, ErrNodeNotFound
 	}
 
-	metadata, slot, found, err := m.locate(graph, subject)
+	metadata, slot, found, err := m.locate(tx, subject)
 	if err != nil {
 		return false, err
 	}
@@ -3557,16 +3750,7 @@ func (m *PointerMetadataRegistry) RemoveTarget(graph GraphAPI, subject NodeID) (
 		return false, nil
 	}
 
-	target, hasTarget, err := singleChildTarget(graph, metadata, slot)
-	if err != nil {
-		return false, err
-	}
-	if !hasTarget {
-		return false, nil
-	}
-
-	removed, err = graph.RemoveRelationship(metadata, target)
-	return removed, wrapInterfaceErr(err)
+	return singleChildTargetRemoveTx(tx, tx, metadata, slot)
 }
 
 // PointerMetadataRegistryD implements Representation D, a corrected
@@ -3739,46 +3923,42 @@ func (m *PointerMetadataRegistryD) Target(graph GraphReader, subject NodeID) (ta
 // so U2 -> target can never collide with any other relationship no
 // matter what target equals.
 func (m *PointerMetadataRegistryD) SetTarget(graph GraphAPI, subject, target NodeID) error {
-	if !graph.NodeExists(target) {
+	return wrapInterfaceErr(graph.Transact(func(tx Tx) error {
+		return m.setTargetTx(tx, subject, target)
+	}))
+}
+
+// setTargetTx is SetTarget's tx-composable core: creating the metadata
+// and/or target-slot (if needed), reading the current target and
+// replacing it are one atomic step.
+func (m *PointerMetadataRegistryD) setTargetTx(tx txReader, subject, target NodeID) error {
+	if !tx.NodeExists(target) {
 		return ErrNodeNotFound
 	}
 
-	metadata, _, err := m.ensureMetadata(graph, subject)
+	metadata, _, err := m.ensureMetadataTx(tx, subject)
 	if err != nil {
 		return err
 	}
 
-	slot, found, err := m.targetSlot(graph, metadata)
+	slot, found, err := m.targetSlot(tx, metadata)
 	if err != nil {
 		return err
 	}
 
-	if !found {
-		return wrapInterfaceErr(graph.Transact(func(tx Tx) error {
-			var txErr error
-			slot, txErr = createTaggedNodeTx(tx, m.allTargetSlots)
-			if txErr != nil {
-				return txErr
-			}
-			if err2 := addRelationshipTx(tx, metadata, slot); err2 != nil {
-				return err2
-			}
-			return addRelationshipTx(tx, slot, target)
-		}))
+	if found {
+		return singleChildTargetSetTx(tx, tx, slot, target)
 	}
 
-	current, hasTarget, err := singleChildTarget(graph, slot)
+	newSlot, err := createTaggedNodeTx(tx, m.allTargetSlots)
 	if err != nil {
 		return err
 	}
-
-	if hasTarget && current == target {
-		return nil
+	if linkErr := addRelationshipTx(tx, metadata, newSlot); linkErr != nil {
+		return linkErr
 	}
 
-	return wrapInterfaceErr(graph.Transact(func(tx Tx) error {
-		return setPointerTargetTx(tx, slot, current, hasTarget, target)
-	}))
+	return addRelationshipTx(tx, newSlot, target)
 }
 
 // RemoveTarget clears subject's target, if any. The metadata/subject-
@@ -3787,11 +3967,18 @@ func (m *PointerMetadataRegistryD) SetTarget(graph GraphAPI, subject, target Nod
 // deleteNodeAndRelationships); an empty target-slot -- or no target-slot
 // at all -- is a valid, meaningful state.
 func (m *PointerMetadataRegistryD) RemoveTarget(graph GraphAPI, subject NodeID) (removed bool, err error) {
-	if !graph.NodeExists(subject) {
+	return transactBool(graph, func(tx Tx) (bool, error) {
+		return m.removeTargetTx(tx, subject)
+	})
+}
+
+// removeTargetTx is RemoveTarget's tx-composable core.
+func (m *PointerMetadataRegistryD) removeTargetTx(tx txReader, subject NodeID) (bool, error) {
+	if !tx.NodeExists(subject) {
 		return false, ErrNodeNotFound
 	}
 
-	metadata, _, found, err := m.locate(graph, subject)
+	metadata, _, found, err := m.locate(tx, subject)
 	if err != nil {
 		return false, err
 	}
@@ -3799,7 +3986,7 @@ func (m *PointerMetadataRegistryD) RemoveTarget(graph GraphAPI, subject NodeID) 
 		return false, nil
 	}
 
-	slot, found, err := m.targetSlot(graph, metadata)
+	slot, found, err := m.targetSlot(tx, metadata)
 	if err != nil {
 		return false, err
 	}
@@ -3807,16 +3994,7 @@ func (m *PointerMetadataRegistryD) RemoveTarget(graph GraphAPI, subject NodeID) 
 		return false, nil
 	}
 
-	target, hasTarget, err := singleChildTarget(graph, slot)
-	if err != nil {
-		return false, err
-	}
-	if !hasTarget {
-		return false, nil
-	}
-
-	removed, err = graph.RemoveRelationship(slot, target)
-	return removed, wrapInterfaceErr(err)
+	return singleChildTargetRemoveTx(tx, tx, slot)
 }
 
 // CapsuleRegistry implements the ElementCapsule primitive of Ordered
@@ -5470,18 +5648,19 @@ func (s *SetRegistry) NewSet(graph GraphAPI) (NodeID, error) {
 // ErrSetRepresentationConflict is returned if id already carries any of
 // them.
 func (s *SetRegistry) TagAsSet(graph GraphAPI, id NodeID) error {
-	if !graph.NodeExists(id) {
-		return ErrNodeNotFound
-	}
-
-	for _, tag := range s.otherSetTags {
-		if graph.HasRelationship(tag, id) {
-			return ErrSetRepresentationConflict
+	return wrapInterfaceErr(graph.Transact(func(tx Tx) error {
+		if !tx.NodeExists(id) {
+			return ErrNodeNotFound
 		}
-	}
 
-	_, err := graph.AddRelationship(s.allSets, id)
-	return wrapInterfaceErr(err)
+		for _, tag := range s.otherSetTags {
+			if tx.HasRelationship(tag, id) {
+				return ErrSetRepresentationConflict
+			}
+		}
+
+		return addRelationshipTx(tx, s.allSets, id)
+	}))
 }
 
 // Add adds member to set. Both must already exist, and set must already
@@ -5504,17 +5683,12 @@ func (s *SetRegistry) Add(graph GraphAPI, set, member NodeID) (added bool, err e
 		return false, ErrNodeNotFound
 	}
 
-	err = graph.Transact(func(tx Tx) error {
-		var txErr error
-		added, txErr = tx.AddRelationship(set, member)
-		return wrapInterfaceErr(txErr)
+	// A declined commit is rolled back, so transactBool reports false
+	// (nothing was added) in that case.
+	return transactBool(graph, func(tx Tx) (bool, error) {
+		created, txErr := tx.AddRelationship(set, member)
+		return created, wrapInterfaceErr(txErr)
 	})
-	if err != nil {
-		// A declined commit was rolled back, so nothing was added.
-		return false, wrapInterfaceErr(err)
-	}
-
-	return added, nil
 }
 
 // Remove removes member from set, if present.
@@ -5535,17 +5709,12 @@ func (s *SetRegistry) Remove(graph GraphAPI, set, member NodeID) (removed bool, 
 		return false, ErrNodeNotFound
 	}
 
-	err = graph.Transact(func(tx Tx) error {
-		var txErr error
-		removed, txErr = tx.RemoveRelationship(set, member)
-		return wrapInterfaceErr(txErr)
+	// A declined commit is rolled back, so transactBool reports false
+	// (nothing was removed) in that case.
+	return transactBool(graph, func(tx Tx) (bool, error) {
+		dropped, txErr := tx.RemoveRelationship(set, member)
+		return dropped, wrapInterfaceErr(txErr)
 	})
-	if err != nil {
-		// A declined commit was rolled back, so nothing was removed.
-		return false, wrapInterfaceErr(err)
-	}
-
-	return removed, nil
 }
 
 // Contains reports whether member currently belongs to set.
@@ -7031,7 +7200,10 @@ func (d *domainConstraint) Domain(graph GraphReader, anchor NodeID) (domain Node
 	return d.domainSlots.Target(graph, slot)
 }
 
-// SetDomain sets anchor's domain to domain, creating anchor's domain
+// setDomainTx sets anchor's domain to domain against tx -- so it composes
+// into a larger transaction, e.g. the wrapper-level SetDomain methods on
+// DomainPointerRegistryB/D, which open the Transact and add their own
+// target-side validation -- creating anchor's domain
 // slot first if it does not exist yet. domain must already carry one of
 // the three currently-recognized Set-representation tags
 // (theorystate.md section 9c) -- checked here, at write time, via the
@@ -7045,36 +7217,35 @@ func (d *domainConstraint) Domain(graph GraphReader, anchor NodeID) (domain Node
 // target for its own representation, so that check is performed there,
 // before delegating to this method -- see DomainPointerRegistryB.
 // SetDomain / DomainPointerRegistryD.SetDomain.
-func (d *domainConstraint) SetDomain(graph GraphAPI, anchor, domain NodeID) error {
-	if !graph.NodeExists(anchor) {
+func (d *domainConstraint) setDomainTx(tx txReader, anchor, domain NodeID) error {
+	if !tx.NodeExists(anchor) {
 		return ErrNodeNotFound
 	}
-	if !graph.NodeExists(domain) {
+	if !tx.NodeExists(domain) {
 		return ErrNodeNotFound
 	}
-	if !operandCarriesKnownSetTag(graph, d.sets, d.composites, d.logs, domain) {
+	if !operandCarriesKnownSetTag(tx, d.sets, d.composites, d.logs, domain) {
 		return ErrInvalidSetOperand
 	}
 
-	slot, found, err := d.domainSlotFor(graph, anchor)
+	slot, found, err := d.domainSlotFor(tx, anchor)
 	if err != nil {
 		return err
 	}
 
 	if !found {
-		return wrapInterfaceErr(graph.Transact(func(tx Tx) error {
-			newSlot, err2 := createTaggedNodeTx(tx, d.domainSlots.allPointers)
-			if err2 != nil {
-				return err2
-			}
-			if err3 := addRelationshipTx(tx, anchor, newSlot); err3 != nil {
-				return err3
-			}
-			return addRelationshipTx(tx, newSlot, domain)
-		}))
+		newSlot, createErr := createTaggedNodeTx(tx, d.domainSlots.allPointers)
+		if createErr != nil {
+			return createErr
+		}
+		if linkErr := addRelationshipTx(tx, anchor, newSlot); linkErr != nil {
+			return linkErr
+		}
+
+		return addRelationshipTx(tx, newSlot, domain)
 	}
 
-	return d.domainSlots.SetTarget(graph, slot, domain)
+	return d.domainSlots.setTargetTx(tx, slot, domain)
 }
 
 // RemoveDomain clears anchor's domain, if any. The domain-slot node
@@ -7083,16 +7254,23 @@ func (d *domainConstraint) SetDomain(graph GraphAPI, anchor, domain NodeID) erro
 // valid, meaningful "no constraint" state, exactly like an empty
 // Pointer elsewhere in this file.
 func (d *domainConstraint) RemoveDomain(graph GraphAPI, anchor NodeID) (removed bool, err error) {
-	if !graph.NodeExists(anchor) {
+	return transactBool(graph, func(tx Tx) (bool, error) {
+		return d.removeDomainTx(tx, anchor)
+	})
+}
+
+// removeDomainTx is RemoveDomain's tx-composable core.
+func (d *domainConstraint) removeDomainTx(tx txReader, anchor NodeID) (bool, error) {
+	if !tx.NodeExists(anchor) {
 		return false, ErrNodeNotFound
 	}
 
-	slot, found, err := d.domainSlotFor(graph, anchor)
+	slot, found, err := d.domainSlotFor(tx, anchor)
 	if err != nil || !found {
 		return false, err
 	}
 
-	return d.domainSlots.RemoveTarget(graph, slot)
+	return d.domainSlots.removeTargetTx(tx, slot)
 }
 
 // validateMembership reports whether target currently belongs to
@@ -7513,12 +7691,23 @@ func (b *DomainPointerRegistryB) subPointer(graph GraphReader, anchor NodeID) (u
 // idempotency discipline already followed by
 // PointerRegistry.TagAsPointer and NameRegistry.EnsureNamedNode
 // elsewhere in this file.
+//
+// The existence check and the creation run inside one Graph.Transact
+// call, so concurrent callers under GraphActor cannot both conclude "no
+// sub-pointer yet" and each mint one.
 func (b *DomainPointerRegistryB) NewDomainPointer(graph GraphAPI, anchor NodeID) error {
-	if !graph.NodeExists(anchor) {
+	return wrapInterfaceErr(graph.Transact(func(tx Tx) error {
+		return b.newDomainPointerTx(tx, anchor)
+	}))
+}
+
+// newDomainPointerTx is NewDomainPointer's tx-composable core.
+func (b *DomainPointerRegistryB) newDomainPointerTx(tx txReader, anchor NodeID) error {
+	if !tx.NodeExists(anchor) {
 		return ErrNodeNotFound
 	}
 
-	_, found, err := b.subPointer(graph, anchor)
+	_, found, err := b.subPointer(tx, anchor)
 	if err != nil {
 		return err
 	}
@@ -7526,14 +7715,12 @@ func (b *DomainPointerRegistryB) NewDomainPointer(graph GraphAPI, anchor NodeID)
 		return nil
 	}
 
-	return wrapInterfaceErr(graph.Transact(func(tx Tx) error {
-		u, err2 := newPointerTx(tx, b.pointers.allPointers)
-		if err2 != nil {
-			return err2
-		}
+	u, err := newPointerTx(tx, b.pointers.allPointers)
+	if err != nil {
+		return err
+	}
 
-		return addRelationshipTx(tx, anchor, u)
-	}))
+	return addRelationshipTx(tx, anchor, u)
 }
 
 // Target returns anchor's current target via its sub-pointer node U, if
@@ -7555,15 +7742,23 @@ func (b *DomainPointerRegistryB) Target(graph GraphReader, anchor NodeID) (targe
 // returns ErrNotPointer, mirroring the underlying PointerRegistry's own
 // error for an untagged node.
 func (b *DomainPointerRegistryB) SetTarget(graph GraphAPI, anchor, target NodeID) error {
-	if !graph.NodeExists(target) {
+	return wrapInterfaceErr(graph.Transact(func(tx Tx) error {
+		return b.setTargetTx(tx, anchor, target)
+	}))
+}
+
+// setTargetTx is SetTarget's tx-composable core: the domain check and the
+// write see the same state, so a domain change cannot slip in between.
+func (b *DomainPointerRegistryB) setTargetTx(tx txReader, anchor, target NodeID) error {
+	if !tx.NodeExists(target) {
 		return ErrNodeNotFound
 	}
 
-	if err := b.checkAllowed(graph, anchor, target); err != nil {
-		return err
+	if allowedErr := b.checkAllowed(tx, anchor, target); allowedErr != nil {
+		return allowedErr
 	}
 
-	u, found, err := b.subPointer(graph, anchor)
+	u, found, err := b.subPointer(tx, anchor)
 	if err != nil {
 		return err
 	}
@@ -7571,18 +7766,25 @@ func (b *DomainPointerRegistryB) SetTarget(graph GraphAPI, anchor, target NodeID
 		return ErrNotPointer
 	}
 
-	return b.pointers.SetTarget(graph, u, target)
+	return b.pointers.setTargetTx(tx, u, target)
 }
 
 // RemoveTarget clears anchor's target, if any, via its sub-pointer node
 // U.
 func (b *DomainPointerRegistryB) RemoveTarget(graph GraphAPI, anchor NodeID) (removed bool, err error) {
-	u, found, err := b.subPointer(graph, anchor)
+	return transactBool(graph, func(tx Tx) (bool, error) {
+		return b.removeTargetTx(tx, anchor)
+	})
+}
+
+// removeTargetTx is RemoveTarget's tx-composable core.
+func (b *DomainPointerRegistryB) removeTargetTx(tx txReader, anchor NodeID) (bool, error) {
+	u, found, err := b.subPointer(tx, anchor)
 	if err != nil || !found {
 		return false, err
 	}
 
-	return b.pointers.RemoveTarget(graph, u)
+	return b.pointers.removeTargetTx(tx, u)
 }
 
 // SetDomain sets anchor's domain to domain, additionally validating that
@@ -7591,18 +7793,27 @@ func (b *DomainPointerRegistryB) RemoveTarget(graph GraphAPI, anchor NodeID) (re
 // current domain. See domainConstraint.SetDomain for the shared
 // creation/validation logic this delegates to.
 func (b *DomainPointerRegistryB) SetDomain(graph GraphAPI, anchor, domain NodeID) error {
-	target, hasTarget, err := b.Target(graph, anchor)
+	return wrapInterfaceErr(graph.Transact(func(tx Tx) error {
+		return b.setDomainTx(tx, anchor, domain)
+	}))
+}
+
+// setDomainTx is SetDomain's tx-composable core: reading the current
+// target, validating it against the new domain and writing the domain are
+// one atomic step.
+func (b *DomainPointerRegistryB) setDomainTx(tx txReader, anchor, domain NodeID) error {
+	target, hasTarget, err := b.Target(tx, anchor)
 	if err != nil {
 		return err
 	}
 
 	if hasTarget {
-		if err2 := b.validateMembership(graph, domain, target); err2 != nil {
-			return err2
+		if memberErr := b.validateMembership(tx, domain, target); memberErr != nil {
+			return memberErr
 		}
 	}
 
-	return b.domainConstraint.SetDomain(graph, anchor, domain)
+	return b.domainConstraint.setDomainTx(tx, anchor, domain)
 }
 
 // DomainPointerRegistryD adds domain-constrained target enforcement on
@@ -7684,21 +7895,29 @@ func (d *DomainPointerRegistryD) Target(graph GraphReader, subject NodeID) (targ
 // is nothing to check -- exactly the same "read-only, don't create"
 // discipline PointerMetadataRegistryD.Target itself already follows.
 func (d *DomainPointerRegistryD) SetTarget(graph GraphAPI, subject, target NodeID) error {
-	if !graph.NodeExists(target) {
+	return wrapInterfaceErr(graph.Transact(func(tx Tx) error {
+		return d.setTargetTx(tx, subject, target)
+	}))
+}
+
+// setTargetTx is SetTarget's tx-composable core: the domain check and the
+// write see the same state.
+func (d *DomainPointerRegistryD) setTargetTx(tx txReader, subject, target NodeID) error {
+	if !tx.NodeExists(target) {
 		return ErrNodeNotFound
 	}
 
-	m, _, found, err := d.metadata.locate(graph, subject)
+	m, _, found, err := d.metadata.locate(tx, subject)
 	if err != nil {
 		return err
 	}
 	if found {
-		if err2 := d.checkAllowed(graph, m, target); err2 != nil {
-			return err2
+		if allowedErr := d.checkAllowed(tx, m, target); allowedErr != nil {
+			return allowedErr
 		}
 	}
 
-	return d.metadata.SetTarget(graph, subject, target)
+	return d.metadata.setTargetTx(tx, subject, target)
 }
 
 // RemoveTarget clears subject's target, if any, delegating directly to
@@ -7728,23 +7947,32 @@ func (d *DomainPointerRegistryD) Domain(graph GraphReader, subject NodeID) (doma
 // committing -- symmetric with SetTarget's own validation against the
 // current domain.
 func (d *DomainPointerRegistryD) SetDomain(graph GraphAPI, subject, domain NodeID) error {
-	m, err := d.metadata.EnsureMetadata(graph, subject)
+	return wrapInterfaceErr(graph.Transact(func(tx Tx) error {
+		return d.setDomainTx(tx, subject, domain)
+	}))
+}
+
+// setDomainTx is SetDomain's tx-composable core. Creating subject's
+// metadata, validating its current target and writing the domain are one
+// atomic step, so a rejected SetDomain leaves no metadata behind.
+func (d *DomainPointerRegistryD) setDomainTx(tx txReader, subject, domain NodeID) error {
+	m, _, err := d.metadata.ensureMetadataTx(tx, subject)
 	if err != nil {
 		return err
 	}
 
-	target, hasTarget, err := d.metadata.Target(graph, subject)
+	target, hasTarget, err := d.metadata.targetOfMetadata(tx, m)
 	if err != nil {
 		return err
 	}
 
 	if hasTarget {
-		if err2 := d.validateMembership(graph, domain, target); err2 != nil {
-			return err2
+		if memberErr := d.validateMembership(tx, domain, target); memberErr != nil {
+			return memberErr
 		}
 	}
 
-	return d.domainConstraint.SetDomain(graph, m, domain)
+	return d.domainConstraint.setDomainTx(tx, m, domain)
 }
 
 // RemoveDomain clears subject's domain, if any, resolving subject's
@@ -7752,10 +7980,17 @@ func (d *DomainPointerRegistryD) SetDomain(graph GraphAPI, subject, domain NodeI
 // node at all yet, in addition to domainConstraint.RemoveDomain's own
 // "no domain slot" case.
 func (d *DomainPointerRegistryD) RemoveDomain(graph GraphAPI, subject NodeID) (removed bool, err error) {
-	m, _, found, err := d.metadata.locate(graph, subject)
+	return transactBool(graph, func(tx Tx) (bool, error) {
+		return d.removeDomainTx(tx, subject)
+	})
+}
+
+// removeDomainTx is RemoveDomain's tx-composable core.
+func (d *DomainPointerRegistryD) removeDomainTx(tx txReader, subject NodeID) (bool, error) {
+	m, _, found, err := d.metadata.locate(tx, subject)
 	if err != nil || !found {
 		return false, err
 	}
 
-	return d.domainConstraint.RemoveDomain(graph, m)
+	return d.domainConstraint.removeDomainTx(tx, m)
 }

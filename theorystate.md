@@ -2720,6 +2720,56 @@ low-level type, not a higher-level interpretation registry meant to be
 constructed once and reused across many separately-submitted
 `GraphActor` calls.
 
+## 91. The Transact contract: re-runnable closures, reads through tx, commit hooks (DECIDED, implemented)
+
+**Why this exists.** §89/§89a fixed that a backend may satisfy `Transact`
+by undo-log rollback (in-memory) or by compare-and-swap with retry
+(networked). Retry means the closure may run more than once, against a
+state that differs from what the caller saw earlier. That is only sound
+if the closure is a pure function of `tx`. Until now it was not:
+several registry methods read the graph *before* opening the
+transaction and wrote inside it, and `NameRegistry` mutated in-process
+maps from inside the closure.
+
+**The contract (written on `GraphAPI.Transact`).**
+1. `fn` may be executed more than once and against a different state.
+2. `fn` reads everything its decisions depend on through `tx`, never
+   through a graph value captured from outside.
+3. `fn` has no side effects outside `tx`.
+4. `fn` does not call `Transact`.
+
+**Consequence for registries.** A read-decide-write method is atomic as
+a whole only if the read is inside the same transaction as the write.
+Two methods were real bugs under `GraphActor` (check-then-create with no
+Checker protection): `ensureMetadataWithSubjectSlot` and
+`DomainPointerRegistryB.NewDomainPointer`. The others (`SetTarget`,
+`TagAsPointer`, the domain setters, ...) were protected only by
+Checkers, which converted a lost update into a spurious rejection. All
+are now `*Tx` cores composed inside one `Transact`. This also removes
+the caller-visible read-then-write hazard §89c uses as its example for
+*single registry methods*; the hazard remains for a caller's own
+sequence of several calls, which is what §89c's in-graph
+transaction-descriptor discussion is about.
+
+**State outside the graph: `Tx.OnCommit`.** Rule 3 needs a way to keep
+external state (`NameRegistry`'s maps) in step with the graph. Doing it
+after `Transact` returns is wrong under a single-owner actor: another
+goroutine's closure can run in between. `Tx.OnCommit(fn)` registers a
+hook that runs once, after every Checker has approved and before
+`Transact` returns, and is discarded on rollback. It runs in the same
+exclusive context as the transaction (the actor's goroutine, under the
+`Graph` guard), so validation inside the closure and the state update
+are serialized with every other closure. A hook must not touch the graph
+and must not panic. A retrying backend runs the hooks of the successful
+attempt only.
+
+**Not done.** Existence/tag pre-checks before a `Transact` in
+`ListRegistry`, `CompositeSetRegistry` and `CompositeSetLogRegistry` are
+unchanged: they only gate validity, and a stale result fails or is
+caught by a Checker. They must move inside before a retrying backend
+exists, since a retry would not re-run them. `NameRegistry`'s maps are
+still unsynchronized against readers on other goroutines.
+
 ---
 
 ## PART D — STATUS SUMMARY (consolidated)
@@ -2827,6 +2877,11 @@ kept current as sections above resolve or split further.)*
   domain, finding affected pointers by reverse lookups over
   `FindIncoming` (no stored index). `SetRegistry.Add`/`Remove` run
   through `Transact` so Checkers observe Set membership changes.
+
+- The `Transact` closure contract (re-runnable, reads through `tx`, no
+  side effects outside `tx`) and `Tx.OnCommit` for keeping state outside
+  the graph in step with commits; every registry read-decide-write
+  method is a single transaction (§91).
 
 ### TENTATIVE
 - Monotonically increasing NodeIDs; serialized first implementation.

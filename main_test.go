@@ -11022,13 +11022,13 @@ func TestGraphActorConcurrentCreateNodeProducesUniqueIDs(t *testing.T) {
 
 // TestGraphActorConcurrentSetTargetNeverProducesTooManyTargets exercises
 // the write-skew hazard theorystate.md section 89c names directly: many
-// goroutines racing PointerRegistry.SetTarget on the very same pointer,
-// entirely through one GraphActor, with no direct *Graph access from any
-// of them. PointerRegistry.SetTarget's own read-then-Transact shape
-// (reading the current target, then separately committing a replacement)
-// is not atomic as a whole under GraphActor -- only each of its two
-// round trips is individually serialized -- so two goroutines can
-// legitimately interleave between them.
+// goroutines each running a caller-composed read-then-write sequence on
+// the very same pointer (the shape PointerRegistry.SetTarget itself had
+// before implementation_state.md item 30 made it atomic; see
+// staleReadThenSetTarget), entirely through one GraphActor, with no
+// direct *Graph access from any of them. Each sequence's read (the
+// current target) and its later, separate commit are two round trips,
+// so two goroutines can legitimately interleave between them.
 //
 // This test does not assert which goroutine "wins": that depends on
 // scheduling. It asserts the actual safety property instead: every
@@ -11077,7 +11077,7 @@ func TestGraphActorConcurrentSetTargetNeverProducesTooManyTargets(t *testing.T) 
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			errs[i] = pointers.SetTarget(actor, p, candidates[i])
+			errs[i] = staleReadThenSetTarget(actor, pointers, p, candidates[i])
 		}()
 	}
 
@@ -11114,5 +11114,415 @@ func TestGraphActorConcurrentSetTargetNeverProducesTooManyTargets(t *testing.T) 
 	}
 	if !found {
 		t.Fatalf("Target(p) = %d, want one of the attempted candidates %v", target, candidates)
+	}
+}
+
+// staleReadThenSetTarget reproduces the shape PointerRegistry.SetTarget
+// had before implementation_state.md item 30: read the pointer's current
+// target through one round trip, then commit the replacement through a
+// second, separate one. It exists to keep exercising the hazard a
+// caller-composed sequence still has under GraphActor (and the Checker
+// that catches it), now that SetTarget itself is atomic.
+func staleReadThenSetTarget(api GraphAPI, pointers *PointerRegistry, p, target NodeID) error {
+	current, hasTarget, err := pointers.Target(api, p)
+	if err != nil {
+		return err
+	}
+
+	return wrapInterfaceErr(api.Transact(func(tx Tx) error {
+		return setPointerTargetTx(tx, p, current, hasTarget, target)
+	}))
+}
+
+// newActorPointerFixture builds a GraphActor with a PointerRegistry over
+// AllPointers and one fresh Pointer node. The actor is closed when the
+// test ends.
+func newActorPointerFixture(t *testing.T) (*GraphActor, *PointerRegistry, NodeID) {
+	t.Helper()
+
+	actor := NewGraphActor(&Graph{})
+	t.Cleanup(actor.Close)
+
+	names := NewNameRegistry(actor)
+	ids, err := names.BootstrapNames(actor, FoundationalNames)
+	if err != nil {
+		t.Fatalf("BootstrapNames(): %v", err)
+	}
+
+	pointers, err := NewPointerRegistry(actor, ids[NameAllPointers])
+	if err != nil {
+		t.Fatalf("NewPointerRegistry(): %v", err)
+	}
+
+	p, err := pointers.NewPointer(actor)
+	if err != nil {
+		t.Fatalf("NewPointer(): %v", err)
+	}
+
+	return actor, pointers, p
+}
+
+// TestGraphActorConcurrentSetTargetIsAtomic is the counterpart of
+// TestGraphActorConcurrentSetTargetNeverProducesTooManyTargets: with
+// SetTarget's reads inside its Transact, concurrent calls can no longer
+// produce a stale commit, so every call must succeed (the last commit
+// wins) and exactly one target must survive.
+func TestGraphActorConcurrentSetTargetIsAtomic(t *testing.T) {
+	actor, pointers, p := newActorPointerFixture(t)
+
+	const goroutines = 50
+
+	candidates := make([]NodeID, goroutines)
+	for i := range candidates {
+		candidate, createErr := actor.CreateNode()
+		if createErr != nil {
+			t.Fatalf("CreateNode() for candidate %d: %v", i, createErr)
+		}
+		candidates[i] = candidate
+	}
+
+	var wg sync.WaitGroup
+	errs := make([]error, goroutines)
+
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs[i] = pointers.SetTarget(actor, p, candidates[i])
+		}()
+	}
+
+	wg.Wait()
+
+	for i, setErr := range errs {
+		if setErr != nil {
+			t.Fatalf("goroutine %d: SetTarget() error = %v, want nil (SetTarget is atomic)", i, setErr)
+		}
+	}
+
+	outgoing, err := actor.FindOutgoing(p)
+	if err != nil {
+		t.Fatalf("FindOutgoing(p): %v", err)
+	}
+	if len(outgoing) != 1 {
+		t.Fatalf("FindOutgoing(p) = %v, want exactly one surviving target", outgoing)
+	}
+
+	survivor := outgoing[0].To
+	found := false
+	for _, candidate := range candidates {
+		if candidate == survivor {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("surviving target %d is not one of the attempted candidates %v", survivor, candidates)
+	}
+}
+
+// TestGraphActorConcurrentEnsureMetadataCreatesExactlyOneMetadataNode
+// covers the check-then-create bug in ensureMetadata: before the lookup
+// moved inside the Transact, concurrent callers could each conclude "no
+// metadata yet" and each create one, after which every lookup failed
+// with ErrAmbiguousPointerMetadata.
+func TestGraphActorConcurrentEnsureMetadataCreatesExactlyOneMetadataNode(t *testing.T) {
+	actor := NewGraphActor(&Graph{})
+	defer actor.Close()
+
+	names := NewNameRegistry(actor)
+	ids, err := names.BootstrapNames(actor, FoundationalNames)
+	if err != nil {
+		t.Fatalf("BootstrapNames(): %v", err)
+	}
+
+	metadata, err := NewPointerMetadataRegistryD(actor, ids[NameAllPointerMetadata], ids[NameAllPointerMetadataSubjectSlot], ids[NameAllPointerMetadataTargetSlot])
+	if err != nil {
+		t.Fatalf("NewPointerMetadataRegistryD(): %v", err)
+	}
+
+	subject, err := actor.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode(): %v", err)
+	}
+
+	const goroutines = 50
+
+	var wg sync.WaitGroup
+	got := make([]NodeID, goroutines)
+	errs := make([]error, goroutines)
+
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			got[i], errs[i] = metadata.EnsureMetadata(actor, subject)
+		}()
+	}
+
+	wg.Wait()
+
+	for i := range got {
+		if errs[i] != nil {
+			t.Fatalf("goroutine %d: EnsureMetadata() error = %v", i, errs[i])
+		}
+		if got[i] != got[0] {
+			t.Fatalf("goroutine %d got metadata node %d, goroutine 0 got %d; want one shared node", i, got[i], got[0])
+		}
+	}
+
+	has, hasErr := metadata.HasMetadata(actor, subject)
+	if hasErr != nil {
+		t.Fatalf("HasMetadata(): %v (a second metadata node makes lookups ambiguous)", hasErr)
+	}
+	if !has {
+		t.Fatal("HasMetadata() = false after EnsureMetadata()")
+	}
+}
+
+// TestGraphActorConcurrentNewDomainPointerCreatesExactlyOneSubPointer
+// covers the same check-then-create bug in NewDomainPointer.
+func TestGraphActorConcurrentNewDomainPointerCreatesExactlyOneSubPointer(t *testing.T) {
+	actor := NewGraphActor(&Graph{})
+	defer actor.Close()
+
+	rig := newDomainBRig(t, actor)
+
+	anchor, err := actor.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode(): %v", err)
+	}
+
+	const goroutines = 50
+
+	var wg sync.WaitGroup
+	errs := make([]error, goroutines)
+
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs[i] = rig.domainB.NewDomainPointer(actor, anchor)
+		}()
+	}
+
+	wg.Wait()
+
+	for i, newErr := range errs {
+		if newErr != nil {
+			t.Fatalf("goroutine %d: NewDomainPointer() error = %v", i, newErr)
+		}
+	}
+
+	outgoing, err := actor.FindOutgoing(anchor)
+	if err != nil {
+		t.Fatalf("FindOutgoing(anchor): %v", err)
+	}
+	if len(outgoing) != 1 {
+		t.Fatalf("FindOutgoing(anchor) = %v, want exactly one sub-pointer", outgoing)
+	}
+
+	if _, _, targetErr := rig.domainB.Target(actor, anchor); targetErr != nil {
+		t.Fatalf("Target(): %v", targetErr)
+	}
+}
+
+// TestGraphActorConcurrentCreateNamedNodeSameNameBindsExactlyOnce checks
+// that the lookup, node creation and binding are one atomic step: of many
+// goroutines creating the same name, exactly one wins, the rest get
+// ErrNameAlreadyBound, and only one node is left in the graph.
+func TestGraphActorConcurrentCreateNamedNodeSameNameBindsExactlyOnce(t *testing.T) {
+	actor := NewGraphActor(&Graph{})
+	defer actor.Close()
+
+	names := NewNameRegistry(actor)
+
+	const goroutines = 50
+
+	var wg sync.WaitGroup
+	ids := make([]NodeID, goroutines)
+	errs := make([]error, goroutines)
+
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ids[i], errs[i] = names.CreateNamedNode(actor, "contended")
+		}()
+	}
+
+	wg.Wait()
+
+	winners := 0
+	winner := NodeID(0)
+
+	for i, createErr := range errs {
+		switch {
+		case createErr == nil:
+			winners++
+			winner = ids[i]
+		case !errors.Is(createErr, ErrNameAlreadyBound):
+			t.Fatalf("goroutine %d: CreateNamedNode() error = %v, want nil or %v", i, createErr, ErrNameAlreadyBound)
+		}
+	}
+
+	if winners != 1 {
+		t.Fatalf("%d goroutines created the name, want exactly 1", winners)
+	}
+
+	bound, ok := names.Lookup("contended")
+	if !ok || bound != winner {
+		t.Fatalf("Lookup(\"contended\") = (%d,%v), want (%d,true)", bound, ok, winner)
+	}
+
+	if nodes := actor.FindNodes(); len(nodes) != 1 {
+		t.Fatalf("FindNodes() = %v, want exactly the winning node (losers must roll back)", nodes)
+	}
+}
+
+func TestTxOnCommitRunsOnlyAfterSuccessfulCommit(t *testing.T) {
+	var g Graph
+
+	var order []string
+
+	err := g.Transact(func(tx Tx) error {
+		tx.OnCommit(func() { order = append(order, "first") })
+		tx.OnCommit(func() { order = append(order, "second") })
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Transact() error = %v", err)
+	}
+	if want := []string{"first", "second"}; !reflect.DeepEqual(order, want) {
+		t.Fatalf("hooks ran %v, want %v (registration order)", order, want)
+	}
+
+	errBoom := errors.New("boom")
+
+	err = g.Transact(func(tx Tx) error {
+		tx.OnCommit(func() { order = append(order, "after-error") })
+		return errBoom
+	})
+	if !errors.Is(err, errBoom) {
+		t.Fatalf("Transact() error = %v, want %v", err, errBoom)
+	}
+
+	tag := newTestNode(t, &g)
+	node := newTestNode(t, &g)
+	errVeto := errors.New("veto")
+
+	g.RegisterChecker(Checker{
+		Name: "veto",
+		Tags: []NodeID{tag},
+		Check: func(_ GraphReader, _ map[NodeID]struct{}) error {
+			return errVeto
+		},
+	})
+
+	err = g.Transact(func(tx Tx) error {
+		tx.OnCommit(func() { order = append(order, "after-veto") })
+		return addRelationshipTx(tx, tag, node)
+	})
+	if !errors.Is(err, errVeto) {
+		t.Fatalf("Transact() error = %v, want %v", err, errVeto)
+	}
+
+	if want := []string{"first", "second"}; !reflect.DeepEqual(order, want) {
+		t.Fatalf("hooks ran %v, want %v (hooks of a failed or vetoed transaction must not run)", order, want)
+	}
+}
+
+func TestRootGraphTransactForwardsOnCommit(t *testing.T) {
+	var g Graph
+
+	root := newTestNode(t, &g)
+
+	rootGraph, err := NewRootGraph(&g, root)
+	if err != nil {
+		t.Fatalf("NewRootGraph(): %v", err)
+	}
+
+	ran := false
+
+	err = rootGraph.Transact(func(tx Tx) error {
+		tx.OnCommit(func() { ran = true })
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Transact() error = %v", err)
+	}
+	if !ran {
+		t.Fatal("commit hook registered through the ROOT overlay did not run")
+	}
+}
+
+func TestNameRegistryBindTxIsDiscardedOnRollbackAndAppliedOnCommit(t *testing.T) {
+	var g Graph
+	names := NewNameRegistry(&g)
+
+	errRollback := errors.New("rollback")
+
+	var rolledBack NodeID
+
+	err := g.Transact(func(tx Tx) error {
+		var txErr error
+		rolledBack, txErr = createNodeTx(tx)
+		if txErr != nil {
+			return txErr
+		}
+		if bindErr := names.bindTx(tx, "A", rolledBack); bindErr != nil {
+			return bindErr
+		}
+
+		return errRollback
+	})
+	if !errors.Is(err, errRollback) {
+		t.Fatalf("Transact() error = %v, want %v", err, errRollback)
+	}
+
+	if _, ok := names.Lookup("A"); ok {
+		t.Fatal("name \"A\" is bound after its transaction rolled back")
+	}
+	if _, ok := names.NameForNode(rolledBack); ok {
+		t.Fatalf("node %d has a name after its transaction rolled back", rolledBack)
+	}
+
+	var committed NodeID
+
+	err = g.Transact(func(tx Tx) error {
+		var txErr error
+		committed, txErr = createNodeTx(tx)
+		if txErr != nil {
+			return txErr
+		}
+
+		return names.bindTx(tx, "A", committed)
+	})
+	if err != nil {
+		t.Fatalf("Transact() error = %v", err)
+	}
+
+	if found, ok := names.Lookup("A"); !ok || found != committed {
+		t.Fatalf("Lookup(\"A\") = (%d,%v), want (%d,true)", found, ok, committed)
+	}
+}
+
+func TestDomainPointerRegistryDSetDomainFailureRollsBackMetadataCreation(t *testing.T) {
+	fx := newDomainPointerTestFixture(t)
+
+	subject := newTestNode(t, fx.graph)
+	notASet := newTestNode(t, fx.graph)
+
+	err := fx.domainD.SetDomain(fx.graph, subject, notASet)
+	if !errors.Is(err, ErrInvalidSetOperand) {
+		t.Fatalf("SetDomain(subject, notASet) error = %v, want %v", err, ErrInvalidSetOperand)
+	}
+
+	has, hasErr := fx.domainD.metadata.HasMetadata(fx.graph, subject)
+	if hasErr != nil {
+		t.Fatalf("HasMetadata(): %v", hasErr)
+	}
+	if has {
+		t.Fatal("a rejected SetDomain left a metadata node behind; it should have rolled back with the rest")
 	}
 }
