@@ -648,7 +648,9 @@ type Transactor interface {
 	//     a read made before Transact can be stale by the time fn runs.
 	//   - fn must have no side effects outside tx. State kept outside the
 	//     graph (NameRegistry's maps) is updated with tx.OnCommit, never
-	//     directly from fn.
+	//     directly from fn; if later steps of the same transaction must
+	//     already see the change, stage it and undo the staging with
+	//     tx.OnRollback (see NameRegistry.Bind).
 	//   - fn may open a nested transaction only through the tx it was
 	//     given, never through another graph handle (on a GraphActor that
 	//     would deadlock).
@@ -694,6 +696,20 @@ type Tx interface {
 	// graph, such as NameRegistry's maps. A hook must not call back into
 	// the graph and must not panic.
 	OnCommit(fn func())
+
+	// OnRollback registers fn to run if this transaction, or the nested
+	// transaction in progress when it is registered, is rolled back (an
+	// error, a panic, or a Checker declining the commit). Hooks run in
+	// reverse registration order, interleaved with the undoing of the
+	// graph mutations made around them, so the graph and the state the
+	// hooks maintain are rolled back in step. If the outermost
+	// transaction commits, the hook is discarded and never runs.
+	// Together with OnCommit this lets a caller keep state outside the
+	// graph that later steps of the same transaction can already see,
+	// without publishing it to other readers before commit (see
+	// NameRegistry). A hook must not call back into the graph and must
+	// not panic.
+	OnRollback(fn func())
 }
 
 // Compile-time assertion that *Txn satisfies Tx.
@@ -946,6 +962,15 @@ func (tx *Txn) Transact(fn func(nested Tx) error) error {
 // approved, and is discarded if the transaction rolls back.
 func (tx *Txn) OnCommit(fn func()) {
 	tx.commitHooks = append(tx.commitHooks, fn)
+}
+
+// OnRollback implements Tx.OnRollback. The hook is recorded in the undo
+// log, so it runs in LIFO order with the graph mutations around it when
+// the transaction -- or the nested transaction it was registered in -- is
+// rolled back, and is simply dropped when the outermost transaction
+// commits.
+func (tx *Txn) OnRollback(fn func()) {
+	tx.undo = append(tx.undo, fn)
 }
 
 // runCommitHooks runs and clears every registered commit hook, in
@@ -1811,10 +1836,29 @@ var (
 // committed bindings. A returned NodeID is a snapshot: the node may be
 // deleted immediately afterwards, which is what lookupLive's
 // ErrNameBoundToDeletedNode check is for.
+//
+// Bindings made or dropped by a transaction that has not committed yet
+// are staged in the pending* overlay. Only that transaction's own checks
+// (checkBind, lookupLive) consult the overlay, so inside one transaction
+// a second CreateNamedNode/Bind for the same name or node is rejected,
+// and a deleted node's name can be rebound, while Lookup and NameForNode
+// keep reporting committed bindings only. Every staged change registers
+// an OnCommit hook that publishes it and an OnRollback hook that
+// reverses it, so the overlay is empty whenever no transaction is in
+// flight. A transaction is exclusive (a bare Graph admits one goroutine
+// at a time, a GraphActor runs one closure at a time), so the overlay
+// only ever describes one transaction.
 type NameRegistry struct {
 	mu     sync.RWMutex
 	byName map[string]NodeID
 	byID   map[NodeID]string
+
+	// pendingByName/pendingByID mirror each other: bindings staged by
+	// the transaction in flight. pendingGone holds committed bindings'
+	// nodes that the transaction in flight has deleted.
+	pendingByName map[string]NodeID
+	pendingByID   map[NodeID]string
+	pendingGone   map[NodeID]struct{}
 }
 
 // NewNameRegistry creates an empty name registry.
@@ -1831,8 +1875,11 @@ type NameRegistry struct {
 // actually needs graph access takes it explicitly, per call.
 func NewNameRegistry(_ GraphAPI) *NameRegistry {
 	return &NameRegistry{
-		byName: make(map[string]NodeID),
-		byID:   make(map[NodeID]string),
+		byName:        make(map[string]NodeID),
+		byID:          make(map[NodeID]string),
+		pendingByName: make(map[string]NodeID),
+		pendingByID:   make(map[NodeID]string),
+		pendingGone:   make(map[NodeID]struct{}),
 	}
 }
 
@@ -1877,7 +1924,7 @@ func (r *NameRegistry) NameForNode(id NodeID) (string, bool) {
 // are raw, side-effect-free bookkeeping queries, not NodeID-issuing
 // operations, and keep their existing simple (value, bool) contract.
 func (r *NameRegistry) lookupLive(graph GraphReader, name string) (id NodeID, bound bool, err error) {
-	id, ok := r.Lookup(name)
+	id, ok := r.effectiveLookup(name)
 	if !ok {
 		return 0, false, nil
 	}
@@ -1898,11 +1945,12 @@ func (r *NameRegistry) lookupLive(graph GraphReader, name string) (id NodeID, bo
 // Binding the exact same name to the exact same NodeID is an idempotent
 // success.
 //
-// The registry's maps are updated only once the outermost transaction
-// commits (via OnCommit), so inside one enclosing transaction a binding
-// made by Bind, CreateNamedNode or EnsureNamedNode is not yet visible to
-// later checks in that same transaction. Do not bind the same name, or
-// the same node, twice inside one transaction.
+// The binding is staged inside the transaction and published only when
+// the outermost transaction commits (see NameRegistry): later steps of
+// the same transaction already see it, so binding the same name, or the
+// same node, a second time inside one transaction is rejected exactly as
+// it would be after a commit; Lookup and NameForNode see it only after
+// the commit; and a rollback, nested or outermost, unstages it.
 func (r *NameRegistry) Bind(graph Transactor, name string, id NodeID) error {
 	return wrapInterfaceErr(graph.Transact(func(tx Tx) error {
 		alreadyBound, err := r.checkBind(tx, name, id)
@@ -1910,13 +1958,15 @@ func (r *NameRegistry) Bind(graph Transactor, name string, id NodeID) error {
 			return err
 		}
 
-		// The maps are mutated only after the transaction has committed
-		// -- a rolled-back or Checker-declined transaction leaves them
-		// untouched -- and, under GraphActor, the update happens on the
-		// actor's own goroutine, serialized with every other closure that
-		// reads them.
+		// The binding is staged, not published: Lookup and NameForNode
+		// keep reporting committed bindings only, while later steps of
+		// this same transaction already see it (stageBinding). An
+		// OnCommit hook publishes it and an OnRollback hook unstages it,
+		// so a rolled-back or Checker-declined transaction leaves no
+		// trace and, under GraphActor, both happen on the actor's own
+		// goroutine, serialized with every other closure that reads them.
 		if !alreadyBound {
-			tx.OnCommit(func() { r.recordBinding(name, id) })
+			r.stageBinding(tx, name, id)
 		}
 
 		return nil
@@ -1945,35 +1995,181 @@ func (r *NameRegistry) checkBind(graph GraphReader, name string, id NodeID) (alr
 		return false, ErrNameAlreadyBound
 	}
 
-	if _, ok := r.NameForNode(id); ok {
+	if _, ok := r.effectiveNameFor(id); ok {
 		return false, ErrNodeAlreadyNamed
 	}
 
 	return false, nil
 }
 
-// recordBinding stores the name <-> id association. It must only run
-// once the transaction that justified it has committed (see Bind).
-func (r *NameRegistry) recordBinding(name string, id NodeID) {
+// effectiveLookup returns the NodeID bound to name as seen from inside
+// the transaction in flight: the committed bindings overlaid with that
+// transaction's staged changes (bindings it has made but not yet
+// committed, and committed bindings whose node it has deleted). Lookup,
+// by contrast, reports committed bindings only.
+func (r *NameRegistry) effectiveLookup(name string) (NodeID, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	if id, ok := r.pendingByName[name]; ok {
+		return id, true
+	}
+
+	id, ok := r.byName[name]
+	if !ok {
+		return 0, false
+	}
+
+	if _, gone := r.pendingGone[id]; gone {
+		return 0, false
+	}
+
+	return id, true
+}
+
+// effectiveNameFor is effectiveLookup's counterpart for the node -> name
+// direction.
+func (r *NameRegistry) effectiveNameFor(id NodeID) (string, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	if name, ok := r.pendingByID[id]; ok {
+		return name, true
+	}
+
+	if _, gone := r.pendingGone[id]; gone {
+		return "", false
+	}
+
+	name, ok := r.byID[id]
+
+	return name, ok
+}
+
+// hasPendingLocked reports whether name <-> id is currently staged. The
+// caller must hold r.mu. pendingByName and pendingByID always mirror each
+// other, so checking one is enough (and presence must be tested, since
+// NodeID 0 is a valid id).
+func (r *NameRegistry) hasPendingLocked(name string, id NodeID) bool {
+	pendingID, ok := r.pendingByName[name]
+
+	return ok && pendingID == id
+}
+
+// addPendingLocked stages name <-> id. The caller must hold r.mu.
+func (r *NameRegistry) addPendingLocked(name string, id NodeID) {
+	r.pendingByName[name] = id
+	r.pendingByID[id] = name
+}
+
+// dropPendingLocked unstages name <-> id if it is staged. The caller must
+// hold r.mu.
+func (r *NameRegistry) dropPendingLocked(name string, id NodeID) {
+	if !r.hasPendingLocked(name, id) {
+		return
+	}
+
+	delete(r.pendingByName, name)
+	delete(r.pendingByID, id)
+}
+
+// stageBinding stages name <-> id for the transaction tx and registers
+// the hooks that publish it on commit and unstage it on rollback.
+func (r *NameRegistry) stageBinding(tx Tx, name string, id NodeID) {
+	r.mu.Lock()
+	r.addPendingLocked(name, id)
+	r.mu.Unlock()
+
+	tx.OnRollback(func() { r.restoreStage(name, id, false) })
+	tx.OnCommit(func() { r.commitBinding(name, id) })
+}
+
+// restoreStage reverses (unstage == false path used by a rolled-back
+// binding) or re-applies a staged binding. With stage == true it stages
+// name <-> id again (undoing a DeleteNode of a node whose binding had
+// only been staged); with stage == false it unstages it (undoing the
+// binding itself).
+func (r *NameRegistry) restoreStage(name string, id NodeID, stage bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	if stage {
+		r.addPendingLocked(name, id)
+		return
+	}
+
+	r.dropPendingLocked(name, id)
+}
+
+// commitBinding publishes a staged binding. It runs as an OnCommit hook.
+// If the binding is no longer staged, it was dropped again inside the
+// same transaction (the node was deleted) and there is nothing to
+// publish.
+func (r *NameRegistry) commitBinding(name string, id NodeID) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if !r.hasPendingLocked(name, id) {
+		return
+	}
+
+	r.dropPendingLocked(name, id)
 	r.byName[name] = id
 	r.byID[id] = name
 }
 
-// dropBindingLocked removes the name <-> id association. The caller must
-// hold r.mu for writing. Shared by Unbind and forgetNode.
+// stageForget stages the removal of any name association for the node id
+// that tx has just deleted. A binding that was only staged is unstaged
+// (and restored if tx rolls back); a committed binding is hidden by
+// pendingGone and dropped for real by an OnCommit hook (and unhidden if
+// tx rolls back). A node with no binding needs nothing.
+func (r *NameRegistry) stageForget(tx Tx, id NodeID) {
+	r.mu.Lock()
+	pendingName, pending := r.pendingByID[id]
+	_, committed := r.byID[id]
+
+	switch {
+	case pending:
+		r.dropPendingLocked(pendingName, id)
+	case committed:
+		r.pendingGone[id] = struct{}{}
+	}
+
+	r.mu.Unlock()
+
+	switch {
+	case pending:
+		tx.OnRollback(func() { r.restoreStage(pendingName, id, true) })
+	case committed:
+		tx.OnRollback(func() { r.unhideNode(id) })
+		tx.OnCommit(func() { r.forgetNode(id) })
+	}
+}
+
+// unhideNode undoes stageForget's hiding of a committed binding.
+func (r *NameRegistry) unhideNode(id NodeID) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	delete(r.pendingGone, id)
+}
+
+// dropBindingLocked removes the committed name <-> id association. The
+// caller must hold r.mu for writing. Shared by Unbind and forgetNode.
 func (r *NameRegistry) dropBindingLocked(name string, id NodeID) {
 	delete(r.byName, name)
 	delete(r.byID, id)
 }
 
-// forgetNode drops any name association for id. It must only run once the
-// deletion of id has committed (see DeleteNode).
+// forgetNode drops any committed name association for id and clears its
+// pendingGone marker. It runs as an OnCommit hook, once the deletion of
+// id has committed (see DeleteNode); hooks run in registration order, so
+// a name that the same transaction rebound is published afterwards.
 func (r *NameRegistry) forgetNode(id NodeID) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
+	delete(r.pendingGone, id)
 
 	if name, ok := r.byID[id]; ok {
 		r.dropBindingLocked(name, id)
@@ -2090,9 +2286,11 @@ func (r *NameRegistry) DeleteNode(graph Transactor, id NodeID) error {
 			return delErr
 		}
 
-		// The name association is dropped only once the delete has
-		// committed, on the same goroutine as the delete itself.
-		tx.OnCommit(func() { r.forgetNode(id) })
+		// The name association is staged for removal (the name is free
+		// again for the rest of this transaction) and dropped for real
+		// only once the delete has committed, on the same goroutine as
+		// the delete itself.
+		r.stageForget(tx, id)
 
 		return nil
 	}))
@@ -2520,7 +2718,8 @@ var _ GraphStore = rootStore{}
 
 // rootTx is the handle RootGraph.Transact gives its closure: the ROOT
 // overlay over the underlying transaction (rootStore) plus that
-// transaction's own OnCommit and nested Transact, so it satisfies Tx.
+// transaction's own OnCommit, OnRollback and nested Transact, so it
+// satisfies Tx.
 type rootTx struct {
 	rootStore
 	tx Tx
@@ -2541,6 +2740,12 @@ func newRootTx(tx Tx, root NodeID) rootTx {
 // registered through the overlay run when that transaction commits.
 func (t rootTx) OnCommit(fn func()) {
 	t.tx.OnCommit(fn)
+}
+
+// OnRollback forwards to the underlying transaction, so rollback hooks
+// registered through the overlay run when that transaction rolls back.
+func (t rootTx) OnRollback(fn func()) {
+	t.tx.OnRollback(fn)
 }
 
 // Transact forwards to the underlying transaction's nested Transact and
@@ -5624,19 +5829,10 @@ func (s *SetRegistry) requireSetMember(graph GraphReader, set, member NodeID) er
 
 // NewSet creates a fresh NodeID and tags it (AllSets, id). The new set
 // starts empty.
-func (s *SetRegistry) NewSet(graph GraphAPI) (NodeID, error) {
-	var id NodeID
-
-	err := graph.Transact(func(tx Tx) error {
-		var err error
-		id, err = createTaggedNodeTx(tx, s.allSets)
-		return err
+func (s *SetRegistry) NewSet(graph Transactor) (NodeID, error) {
+	return transactValue(graph, func(tx Tx) (NodeID, error) {
+		return createTaggedNodeTx(tx, s.allSets)
 	})
-	if err != nil {
-		return 0, wrapInterfaceErr(err)
-	}
-
-	return id, nil
 }
 
 // TagAsSet tags an existing node id as Set-kind.
@@ -5653,7 +5849,7 @@ func (s *SetRegistry) NewSet(graph GraphAPI) (NodeID, error) {
 // via otherSetTags, supplied at construction (see NewSetRegistry):
 // ErrSetRepresentationConflict is returned if id already carries any of
 // them.
-func (s *SetRegistry) TagAsSet(graph GraphAPI, id NodeID) error {
+func (s *SetRegistry) TagAsSet(graph Transactor, id NodeID) error {
 	return wrapInterfaceErr(graph.Transact(func(tx Tx) error {
 		if !tx.NodeExists(id) {
 			return ErrNodeNotFound
@@ -5676,10 +5872,12 @@ func (s *SetRegistry) TagAsSet(graph GraphAPI, id NodeID) error {
 // already-present member -- including self-membership, Add(set, set),
 // which is permitted (theorystate.md section 2.8) -- is an
 // idempotent no-op reporting added == false on the repeat call.
-func (s *SetRegistry) Add(graph GraphAPI, set, member NodeID) (added bool, err error) {
+func (s *SetRegistry) Add(graph Transactor, set, member NodeID) (added bool, err error) {
 	// The checks run inside the transaction, against the same state the
-	// write sees. A declined commit is rolled back, so transactBool
-	// reports false (nothing was added) in that case.
+	// write sees. At top level a declined commit is rolled back, so
+	// transactBool reports false (nothing was added) in that case. If
+	// graph is a Tx, Checkers only judge the result at the outermost
+	// commit, so added is provisional until then (see Transactor).
 	return transactBool(graph, func(tx Tx) (bool, error) {
 		if requireErr := s.requireSetMember(tx, set, member); requireErr != nil {
 			return false, requireErr
@@ -5695,10 +5893,12 @@ func (s *SetRegistry) Add(graph GraphAPI, set, member NodeID) (added bool, err e
 // removed reports whether member was actually a member and was removed;
 // removing a member that was never present is a no-op reporting
 // removed == false, not an error.
-func (s *SetRegistry) Remove(graph GraphAPI, set, member NodeID) (removed bool, err error) {
+func (s *SetRegistry) Remove(graph Transactor, set, member NodeID) (removed bool, err error) {
 	// The checks run inside the transaction, against the same state the
-	// write sees. A declined commit is rolled back, so transactBool
-	// reports false (nothing was removed) in that case.
+	// write sees. At top level a declined commit is rolled back, so
+	// transactBool reports false (nothing was removed) in that case. If
+	// graph is a Tx, Checkers only judge the result at the outermost
+	// commit, so removed is provisional until then (see Transactor).
 	return transactBool(graph, func(tx Tx) (bool, error) {
 		if requireErr := s.requireSetMember(tx, set, member); requireErr != nil {
 			return false, requireErr
@@ -5778,7 +5978,7 @@ func (s *SetRegistry) Size(graph GraphReader, set NodeID) (int, error) {
 // outgoing and incoming relationships to be empty.
 //
 // set must currently be tagged (AllSets, set).
-func (s *SetRegistry) DeleteSet(graph GraphAPI, set NodeID) error {
+func (s *SetRegistry) DeleteSet(graph Transactor, set NodeID) error {
 	return wrapInterfaceErr(graph.Transact(func(tx Tx) error {
 		if requireErr := s.requireSet(tx, set); requireErr != nil {
 			return requireErr
@@ -6310,23 +6510,15 @@ func (c *CompositeSetRegistry) requireCompositeSet(graph GraphReader, set NodeID
 // NewCompositeSet creates a fresh NodeID and tags it (AllCompositeSets,
 // id). The new composite set starts with no operands, evaluating to the
 // empty set.
-func (c *CompositeSetRegistry) NewCompositeSet(graph GraphAPI) (NodeID, error) {
-	var id NodeID
-
-	err := graph.Transact(func(tx Tx) error {
-		var err error
-		id, err = createTaggedNodeTx(tx, c.allCompositeSets)
-		return err
+func (c *CompositeSetRegistry) NewCompositeSet(graph Transactor) (NodeID, error) {
+	return transactValue(graph, func(tx Tx) (NodeID, error) {
+		return createTaggedNodeTx(tx, c.allCompositeSets)
 	})
-	if err != nil {
-		return 0, wrapInterfaceErr(err)
-	}
-
-	return id, nil
 }
 
 // AddOperand adds an operand to set, represented by a freshly minted
-// descriptor node U wired entirely inside one Graph.Transact call:
+// descriptor node U wired entirely inside one transaction (nested if
+// graph is a Tx):
 // set -> U -> operand, with U tagged along both axes described in the
 // CompositeSetRegistry doc comment.
 //
@@ -6347,38 +6539,34 @@ func (c *CompositeSetRegistry) NewCompositeSet(graph GraphAPI) (NodeID, error) {
 // already exist. Per theorystate.md section 85, no existing identical
 // descriptor is searched for or reused -- see the CompositeSetRegistry
 // doc comment.
-func (c *CompositeSetRegistry) AddOperand(graph GraphAPI, set, operand NodeID, additive, expand bool) (NodeID, error) {
+func (c *CompositeSetRegistry) AddOperand(graph Transactor, set, operand NodeID, additive, expand bool) (NodeID, error) {
+	// Every check and the descriptor's creation see the same state.
 	return transactValue(graph, func(tx Tx) (NodeID, error) {
-		return c.addOperandTx(tx, set, operand, additive, expand)
+		if requireErr := c.requireCompositeSet(tx, set); requireErr != nil {
+			return 0, requireErr
+		}
+
+		if requireErr := requireOperand(tx, c.sets, c, c.logs, operand, expand); requireErr != nil {
+			return 0, requireErr
+		}
+
+		u, err := buildOperandDescriptorTx(tx, c.allAdditiveOp, c.allSubtractiveOp, c.allScalarOperand, c.allSetOperand, operand, additive, expand)
+		if err != nil {
+			return 0, err
+		}
+
+		if linkErr := addRelationshipTx(tx, set, u); linkErr != nil {
+			return 0, linkErr
+		}
+
+		return u, nil
 	})
-}
-
-// addOperandTx is AddOperand's tx-composable core: every check and the
-// descriptor's creation see the same state.
-func (c *CompositeSetRegistry) addOperandTx(tx txReader, set, operand NodeID, additive, expand bool) (NodeID, error) {
-	if requireErr := c.requireCompositeSet(tx, set); requireErr != nil {
-		return 0, requireErr
-	}
-
-	if requireErr := requireOperand(tx, c.sets, c, c.logs, operand, expand); requireErr != nil {
-		return 0, requireErr
-	}
-
-	u, err := buildOperandDescriptorTx(tx, c.allAdditiveOp, c.allSubtractiveOp, c.allScalarOperand, c.allSetOperand, operand, additive, expand)
-	if err != nil {
-		return 0, err
-	}
-
-	if linkErr := addRelationshipTx(tx, set, u); linkErr != nil {
-		return 0, linkErr
-	}
-
-	return u, nil
 }
 
 // RemoveOperand removes descriptor u from set entirely -- the
 // containment edge (set, u), u's own edge to its operand, and both of u's
-// axis tags -- then deletes u itself, all inside one Graph.Transact call.
+// axis tags -- then deletes u itself, all inside one transaction (nested
+// if graph is a Tx).
 //
 // This is deliberately simpler than CapsuleRegistry.DeleteCapsule: a
 // descriptor node u has no sub-structure of its own (unlike a capsule's
@@ -6393,34 +6581,29 @@ func (c *CompositeSetRegistry) addOperandTx(tx txReader, set, operand NodeID, ad
 // otherwise ErrOperandNotInCompositeSet is returned. operand itself is
 // never deleted -- only u's own edge to it is removed -- since operand is
 // caller-owned data that may still be referenced elsewhere.
-func (c *CompositeSetRegistry) RemoveOperand(graph GraphAPI, set, u NodeID) error {
+func (c *CompositeSetRegistry) RemoveOperand(graph Transactor, set, u NodeID) error {
+	// The descriptor's axes are read through tx too, so the tags removed
+	// are the ones it actually has when the removal happens.
 	return wrapInterfaceErr(graph.Transact(func(tx Tx) error {
-		return c.removeOperandTx(tx, set, u)
+		if requireErr := c.requireCompositeSet(tx, set); requireErr != nil {
+			return requireErr
+		}
+
+		if !tx.HasRelationship(set, u) {
+			return ErrOperandNotInCompositeSet
+		}
+
+		operand, hasOperand, operationTag, operandTag, err := operandDescriptorAxes(tx, u, c.allAdditiveOp, c.allSubtractiveOp, c.allScalarOperand, c.allSetOperand)
+		if err != nil {
+			return err
+		}
+
+		if removeErr := removeRelationshipTx(tx, set, u); removeErr != nil {
+			return removeErr
+		}
+
+		return deleteOperandDescriptorTx(tx, operand, hasOperand, operationTag, operandTag, u)
 	}))
-}
-
-// removeOperandTx is RemoveOperand's tx-composable core. The descriptor's
-// axes are read through tx too, so the tags it removes are the ones it
-// actually has when the removal happens.
-func (c *CompositeSetRegistry) removeOperandTx(tx txReader, set, u NodeID) error {
-	if requireErr := c.requireCompositeSet(tx, set); requireErr != nil {
-		return requireErr
-	}
-
-	if !tx.HasRelationship(set, u) {
-		return ErrOperandNotInCompositeSet
-	}
-
-	operand, hasOperand, operationTag, operandTag, err := operandDescriptorAxes(tx, u, c.allAdditiveOp, c.allSubtractiveOp, c.allScalarOperand, c.allSetOperand)
-	if err != nil {
-		return err
-	}
-
-	if removeErr := removeRelationshipTx(tx, set, u); removeErr != nil {
-		return removeErr
-	}
-
-	return deleteOperandDescriptorTx(tx, operand, hasOperand, operationTag, operandTag, u)
 }
 
 // Operands returns set's current operand-descriptor nodes -- its direct
@@ -6611,7 +6794,7 @@ func (c *CompositeSetRegistry) resolveOperand(graph GraphReader, u NodeID, visit
 // Callers must RemoveOperand every descriptor first.
 //
 // set must currently be tagged (AllCompositeSets, set).
-func (c *CompositeSetRegistry) DeleteCompositeSet(graph GraphAPI, set NodeID) error {
+func (c *CompositeSetRegistry) DeleteCompositeSet(graph Transactor, set NodeID) error {
 	return wrapInterfaceErr(graph.Transact(func(tx Tx) error {
 		if requireErr := c.requireCompositeSet(tx, set); requireErr != nil {
 			return requireErr
@@ -6787,29 +6970,24 @@ func (c *CompositeSetLogRegistry) requireLog(graph GraphReader, log NodeID) erro
 
 // NewCompositeSetLog creates a fresh NodeID and tags it both
 // (AllLists, id) and (AllCompositeSetLogs, id), entirely inside one
-// Graph.Transact call. This deliberately does not call
-// ListRegistry.NewList (which would tag AllLists in its own, separate
-// Graph.Transact call): minting the node and applying both tags together
-// here means there is no intermediate state where id is tagged AllLists
-// but not yet AllCompositeSetLogs. The new log starts empty: no
-// operations, no head, no tail.
-func (c *CompositeSetLogRegistry) NewCompositeSetLog(graph GraphAPI) (NodeID, error) {
-	var id NodeID
-
-	err := graph.Transact(func(tx Tx) error {
-		var err error
-		id, err = createTaggedNodeTx(tx, c.lists.allLists)
+// transaction (nested if graph is a Tx): ListRegistry.NewList mints and
+// tags the list as a nested step and the second tag is applied in the
+// same transaction, so there is no observable intermediate state where id
+// is tagged AllLists but not yet AllCompositeSetLogs. The new log starts
+// empty: no operations, no head, no tail.
+func (c *CompositeSetLogRegistry) NewCompositeSetLog(graph Transactor) (NodeID, error) {
+	return transactValue(graph, func(tx Tx) (NodeID, error) {
+		id, err := c.lists.NewList(tx)
 		if err != nil {
-			return err
+			return 0, err
 		}
 
-		return tagNodeTx(tx, c.allCompositeSetLogs, id)
-	})
-	if err != nil {
-		return 0, wrapInterfaceErr(err)
-	}
+		if tagErr := tagNodeTx(tx, c.allCompositeSetLogs, id); tagErr != nil {
+			return 0, tagErr
+		}
 
-	return id, nil
+		return id, nil
+	})
 }
 
 // AppendOperation appends a new operation to the tail of log, recorded as
@@ -6829,7 +7007,7 @@ func (c *CompositeSetLogRegistry) NewCompositeSetLog(graph GraphAPI) (NodeID, er
 // log must already be tagged (AllCompositeSetLogs, log); operand must
 // already exist. Per theorystate.md section 85, no existing identical
 // descriptor is searched for or reused, exactly like AddOperand.
-func (c *CompositeSetLogRegistry) AppendOperation(graph GraphAPI, log, operand NodeID, additive, expand bool) (u, capsule NodeID, err error) {
+func (c *CompositeSetLogRegistry) AppendOperation(graph Transactor, log, operand NodeID, additive, expand bool) (u, capsule NodeID, err error) {
 	err = graph.Transact(func(tx Tx) error {
 		if requireErr := c.requireLog(tx, log); requireErr != nil {
 			return requireErr
@@ -6874,45 +7052,41 @@ func (c *CompositeSetLogRegistry) AppendOperation(graph GraphAPI, log, operand N
 // capsule must currently be an element of log (checked via the
 // (log,capsule) containment edge, returning ErrCapsuleNotInList
 // otherwise); log must already be tagged (AllCompositeSetLogs, log).
-func (c *CompositeSetLogRegistry) RemoveOperation(graph GraphAPI, log, capsule NodeID) error {
+func (c *CompositeSetLogRegistry) RemoveOperation(graph Transactor, log, capsule NodeID) error {
+	// Every read, including the descriptor's axes, goes through tx. If
+	// graph is a Tx and this fails, only this call is undone.
 	return wrapInterfaceErr(graph.Transact(func(tx Tx) error {
-		return c.removeOperationTx(tx, log, capsule)
+		if requireErr := c.requireLog(tx, log); requireErr != nil {
+			return requireErr
+		}
+
+		if !tx.HasRelationship(log, capsule) {
+			return ErrCapsuleNotInList
+		}
+
+		u, hasValue, err := c.lists.capsules.Value(tx, capsule)
+		if err != nil {
+			return err
+		}
+		if !hasValue {
+			return ErrInvalidOperandDescriptor
+		}
+
+		operand, hasOperand, operationTag, operandTag, err := operandDescriptorAxes(tx, u, c.allAdditiveOp, c.allSubtractiveOp, c.allScalarOperand, c.allSetOperand)
+		if err != nil {
+			return err
+		}
+
+		if unlinkErr := c.lists.RemoveWithoutDeletingCapsule(tx, log, capsule); unlinkErr != nil {
+			return unlinkErr
+		}
+
+		if deleteErr := c.lists.capsules.DeleteCapsule(tx, capsule); deleteErr != nil {
+			return deleteErr
+		}
+
+		return deleteOperandDescriptorTx(tx, operand, hasOperand, operationTag, operandTag, u)
 	}))
-}
-
-// removeOperationTx is RemoveOperation's tx-composable core; every read,
-// including the descriptor's axes, goes through tx.
-func (c *CompositeSetLogRegistry) removeOperationTx(tx Tx, log, capsule NodeID) error {
-	if requireErr := c.requireLog(tx, log); requireErr != nil {
-		return requireErr
-	}
-
-	if !tx.HasRelationship(log, capsule) {
-		return ErrCapsuleNotInList
-	}
-
-	u, hasValue, err := c.lists.capsules.Value(tx, capsule)
-	if err != nil {
-		return err
-	}
-	if !hasValue {
-		return ErrInvalidOperandDescriptor
-	}
-
-	operand, hasOperand, operationTag, operandTag, err := operandDescriptorAxes(tx, u, c.allAdditiveOp, c.allSubtractiveOp, c.allScalarOperand, c.allSetOperand)
-	if err != nil {
-		return err
-	}
-
-	if unlinkErr := c.lists.RemoveWithoutDeletingCapsule(tx, log, capsule); unlinkErr != nil {
-		return unlinkErr
-	}
-
-	if deleteErr := c.lists.capsules.DeleteCapsule(tx, capsule); deleteErr != nil {
-		return deleteErr
-	}
-
-	return deleteOperandDescriptorTx(tx, operand, hasOperand, operationTag, operandTag, u)
 }
 
 // Operations returns log's current operand-descriptor nodes (each
@@ -7161,7 +7335,7 @@ func (c *CompositeSetLogRegistry) operandMentions(graph GraphReader, operand Nod
 // Callers must RemoveOperation every logged operation first.
 //
 // log must currently be tagged (AllCompositeSetLogs, log).
-func (c *CompositeSetLogRegistry) DeleteCompositeSetLog(graph GraphAPI, log NodeID) error {
+func (c *CompositeSetLogRegistry) DeleteCompositeSetLog(graph Transactor, log NodeID) error {
 	return wrapInterfaceErr(graph.Transact(func(tx Tx) error {
 		if requireErr := c.requireLog(tx, log); requireErr != nil {
 			return requireErr
@@ -7220,10 +7394,10 @@ func (d *domainConstraint) Domain(graph GraphReader, anchor NodeID) (domain Node
 	return d.domainSlots.Target(graph, slot)
 }
 
-// setDomainTx sets anchor's domain to domain against tx -- so it composes
-// into a larger transaction, e.g. the wrapper-level SetDomain methods on
-// DomainPointerRegistryB/D, which open the Transact and add their own
-// target-side validation -- creating anchor's domain
+// attachDomain sets anchor's domain to domain as one transaction (nested
+// if graph is a Tx, which is how the wrapper-level SetDomain methods on
+// DomainPointerRegistryB/D use it, after their own target-side
+// validation), creating anchor's domain
 // slot first if it does not exist yet. domain must already carry one of
 // the three currently-recognized Set-representation tags
 // (theorystate.md section 9c) -- checked here, at write time, via the
@@ -7237,35 +7411,37 @@ func (d *domainConstraint) Domain(graph GraphReader, anchor NodeID) (domain Node
 // target for its own representation, so that check is performed there,
 // before delegating to this method -- see DomainPointerRegistryB.
 // SetDomain / DomainPointerRegistryD.SetDomain.
-func (d *domainConstraint) setDomainTx(tx Tx, anchor, domain NodeID) error {
-	if !tx.NodeExists(anchor) {
-		return ErrNodeNotFound
-	}
-	if !tx.NodeExists(domain) {
-		return ErrNodeNotFound
-	}
-	if !operandCarriesKnownSetTag(tx, d.sets, d.composites, d.logs, domain) {
-		return ErrInvalidSetOperand
-	}
-
-	slot, found, err := d.domainSlotFor(tx, anchor)
-	if err != nil {
-		return err
-	}
-
-	if !found {
-		newSlot, createErr := createTaggedNodeTx(tx, d.domainSlots.allPointers)
-		if createErr != nil {
-			return createErr
+func (d *domainConstraint) attachDomain(graph Transactor, anchor, domain NodeID) error {
+	return wrapInterfaceErr(graph.Transact(func(tx Tx) error {
+		if !tx.NodeExists(anchor) {
+			return ErrNodeNotFound
 		}
-		if linkErr := addRelationshipTx(tx, anchor, newSlot); linkErr != nil {
-			return linkErr
+		if !tx.NodeExists(domain) {
+			return ErrNodeNotFound
+		}
+		if !operandCarriesKnownSetTag(tx, d.sets, d.composites, d.logs, domain) {
+			return ErrInvalidSetOperand
 		}
 
-		return addRelationshipTx(tx, newSlot, domain)
-	}
+		slot, found, err := d.domainSlotFor(tx, anchor)
+		if err != nil {
+			return err
+		}
 
-	return d.domainSlots.SetTarget(tx, slot, domain)
+		if !found {
+			newSlot, createErr := createTaggedNodeTx(tx, d.domainSlots.allPointers)
+			if createErr != nil {
+				return createErr
+			}
+			if linkErr := addRelationshipTx(tx, anchor, newSlot); linkErr != nil {
+				return linkErr
+			}
+
+			return addRelationshipTx(tx, newSlot, domain)
+		}
+
+		return d.domainSlots.SetTarget(tx, slot, domain)
+	}))
 }
 
 // RemoveDomain clears anchor's domain, if any. The domain-slot node
@@ -7273,24 +7449,19 @@ func (d *domainConstraint) setDomainTx(tx Tx, anchor, domain NodeID) error {
 // theorystate.md section 18); a domain-slot with no domain set is a
 // valid, meaningful "no constraint" state, exactly like an empty
 // Pointer elsewhere in this file.
-func (d *domainConstraint) RemoveDomain(graph GraphAPI, anchor NodeID) (removed bool, err error) {
+func (d *domainConstraint) RemoveDomain(graph Transactor, anchor NodeID) (removed bool, err error) {
 	return transactBool(graph, func(tx Tx) (bool, error) {
-		return d.removeDomainTx(tx, anchor)
+		if !tx.NodeExists(anchor) {
+			return false, ErrNodeNotFound
+		}
+
+		slot, found, slotErr := d.domainSlotFor(tx, anchor)
+		if slotErr != nil || !found {
+			return false, slotErr
+		}
+
+		return d.domainSlots.RemoveTarget(tx, slot)
 	})
-}
-
-// removeDomainTx is RemoveDomain's tx-composable core.
-func (d *domainConstraint) removeDomainTx(tx Tx, anchor NodeID) (bool, error) {
-	if !tx.NodeExists(anchor) {
-		return false, ErrNodeNotFound
-	}
-
-	slot, found, err := d.domainSlotFor(tx, anchor)
-	if err != nil || !found {
-		return false, err
-	}
-
-	return d.domainSlots.RemoveTarget(tx, slot)
 }
 
 // validateMembership reports whether target currently belongs to
@@ -7715,32 +7886,27 @@ func (b *DomainPointerRegistryB) subPointer(graph GraphReader, anchor NodeID) (u
 // The existence check and the creation run inside one Graph.Transact
 // call, so concurrent callers under GraphActor cannot both conclude "no
 // sub-pointer yet" and each mint one.
-func (b *DomainPointerRegistryB) NewDomainPointer(graph GraphAPI, anchor NodeID) error {
+func (b *DomainPointerRegistryB) NewDomainPointer(graph Transactor, anchor NodeID) error {
 	return wrapInterfaceErr(graph.Transact(func(tx Tx) error {
-		return b.newDomainPointerTx(tx, anchor)
+		if !tx.NodeExists(anchor) {
+			return ErrNodeNotFound
+		}
+
+		_, found, err := b.subPointer(tx, anchor)
+		if err != nil {
+			return err
+		}
+		if found {
+			return nil
+		}
+
+		u, err := newPointerTx(tx, b.pointers.allPointers)
+		if err != nil {
+			return err
+		}
+
+		return addRelationshipTx(tx, anchor, u)
 	}))
-}
-
-// newDomainPointerTx is NewDomainPointer's tx-composable core.
-func (b *DomainPointerRegistryB) newDomainPointerTx(tx txReader, anchor NodeID) error {
-	if !tx.NodeExists(anchor) {
-		return ErrNodeNotFound
-	}
-
-	_, found, err := b.subPointer(tx, anchor)
-	if err != nil {
-		return err
-	}
-	if found {
-		return nil
-	}
-
-	u, err := newPointerTx(tx, b.pointers.allPointers)
-	if err != nil {
-		return err
-	}
-
-	return addRelationshipTx(tx, anchor, u)
 }
 
 // Target returns anchor's current target via its sub-pointer node U, if
@@ -7761,50 +7927,41 @@ func (b *DomainPointerRegistryB) Target(graph GraphReader, anchor NodeID) (targe
 // discoverable sub-pointer node U (see NewDomainPointer); otherwise this
 // returns ErrNotPointer, mirroring the underlying PointerRegistry's own
 // error for an untagged node.
-func (b *DomainPointerRegistryB) SetTarget(graph GraphAPI, anchor, target NodeID) error {
+func (b *DomainPointerRegistryB) SetTarget(graph Transactor, anchor, target NodeID) error {
+	// The domain check and the write see the same state, so a domain
+	// change cannot slip in between.
 	return wrapInterfaceErr(graph.Transact(func(tx Tx) error {
-		return b.setTargetTx(tx, anchor, target)
+		if !tx.NodeExists(target) {
+			return ErrNodeNotFound
+		}
+
+		if allowedErr := b.checkAllowed(tx, anchor, target); allowedErr != nil {
+			return allowedErr
+		}
+
+		u, found, err := b.subPointer(tx, anchor)
+		if err != nil {
+			return err
+		}
+		if !found {
+			return ErrNotPointer
+		}
+
+		return b.pointers.SetTarget(tx, u, target)
 	}))
-}
-
-// setTargetTx is SetTarget's tx-composable core: the domain check and the
-// write see the same state, so a domain change cannot slip in between.
-func (b *DomainPointerRegistryB) setTargetTx(tx Tx, anchor, target NodeID) error {
-	if !tx.NodeExists(target) {
-		return ErrNodeNotFound
-	}
-
-	if allowedErr := b.checkAllowed(tx, anchor, target); allowedErr != nil {
-		return allowedErr
-	}
-
-	u, found, err := b.subPointer(tx, anchor)
-	if err != nil {
-		return err
-	}
-	if !found {
-		return ErrNotPointer
-	}
-
-	return b.pointers.SetTarget(tx, u, target)
 }
 
 // RemoveTarget clears anchor's target, if any, via its sub-pointer node
 // U.
-func (b *DomainPointerRegistryB) RemoveTarget(graph GraphAPI, anchor NodeID) (removed bool, err error) {
+func (b *DomainPointerRegistryB) RemoveTarget(graph Transactor, anchor NodeID) (removed bool, err error) {
 	return transactBool(graph, func(tx Tx) (bool, error) {
-		return b.removeTargetTx(tx, anchor)
+		u, found, subErr := b.subPointer(tx, anchor)
+		if subErr != nil || !found {
+			return false, subErr
+		}
+
+		return b.pointers.RemoveTarget(tx, u)
 	})
-}
-
-// removeTargetTx is RemoveTarget's tx-composable core.
-func (b *DomainPointerRegistryB) removeTargetTx(tx Tx, anchor NodeID) (bool, error) {
-	u, found, err := b.subPointer(tx, anchor)
-	if err != nil || !found {
-		return false, err
-	}
-
-	return b.pointers.RemoveTarget(tx, u)
 }
 
 // SetDomain sets anchor's domain to domain, additionally validating that
@@ -7812,28 +7969,23 @@ func (b *DomainPointerRegistryB) removeTargetTx(tx Tx, anchor NodeID) (bool, err
 // committing -- symmetric with SetTarget's own validation against the
 // current domain. See domainConstraint.SetDomain for the shared
 // creation/validation logic this delegates to.
-func (b *DomainPointerRegistryB) SetDomain(graph GraphAPI, anchor, domain NodeID) error {
+func (b *DomainPointerRegistryB) SetDomain(graph Transactor, anchor, domain NodeID) error {
+	// Reading the current target, validating it against the new domain
+	// and writing the domain are one atomic step.
 	return wrapInterfaceErr(graph.Transact(func(tx Tx) error {
-		return b.setDomainTx(tx, anchor, domain)
-	}))
-}
-
-// setDomainTx is SetDomain's tx-composable core: reading the current
-// target, validating it against the new domain and writing the domain are
-// one atomic step.
-func (b *DomainPointerRegistryB) setDomainTx(tx Tx, anchor, domain NodeID) error {
-	target, hasTarget, err := b.Target(tx, anchor)
-	if err != nil {
-		return err
-	}
-
-	if hasTarget {
-		if memberErr := b.validateMembership(tx, domain, target); memberErr != nil {
-			return memberErr
+		target, hasTarget, err := b.Target(tx, anchor)
+		if err != nil {
+			return err
 		}
-	}
 
-	return b.domainConstraint.setDomainTx(tx, anchor, domain)
+		if hasTarget {
+			if memberErr := b.validateMembership(tx, domain, target); memberErr != nil {
+				return memberErr
+			}
+		}
+
+		return b.domainConstraint.attachDomain(tx, anchor, domain)
+	}))
 }
 
 // DomainPointerRegistryD adds domain-constrained target enforcement on
@@ -7914,35 +8066,30 @@ func (d *DomainPointerRegistryD) Target(graph GraphReader, subject NodeID) (targ
 // rather than forcing metadata into existence merely to discover there
 // is nothing to check -- exactly the same "read-only, don't create"
 // discipline PointerMetadataRegistryD.Target itself already follows.
-func (d *DomainPointerRegistryD) SetTarget(graph GraphAPI, subject, target NodeID) error {
+func (d *DomainPointerRegistryD) SetTarget(graph Transactor, subject, target NodeID) error {
+	// The domain check and the write see the same state.
 	return wrapInterfaceErr(graph.Transact(func(tx Tx) error {
-		return d.setTargetTx(tx, subject, target)
-	}))
-}
-
-// setTargetTx is SetTarget's tx-composable core: the domain check and the
-// write see the same state.
-func (d *DomainPointerRegistryD) setTargetTx(tx Tx, subject, target NodeID) error {
-	if !tx.NodeExists(target) {
-		return ErrNodeNotFound
-	}
-
-	m, _, found, err := d.metadata.locate(tx, subject)
-	if err != nil {
-		return err
-	}
-	if found {
-		if allowedErr := d.checkAllowed(tx, m, target); allowedErr != nil {
-			return allowedErr
+		if !tx.NodeExists(target) {
+			return ErrNodeNotFound
 		}
-	}
 
-	return d.metadata.SetTarget(tx, subject, target)
+		m, _, found, err := d.metadata.locate(tx, subject)
+		if err != nil {
+			return err
+		}
+		if found {
+			if allowedErr := d.checkAllowed(tx, m, target); allowedErr != nil {
+				return allowedErr
+			}
+		}
+
+		return d.metadata.SetTarget(tx, subject, target)
+	}))
 }
 
 // RemoveTarget clears subject's target, if any, delegating directly to
 // the underlying PointerMetadataRegistryD.
-func (d *DomainPointerRegistryD) RemoveTarget(graph GraphAPI, subject NodeID) (removed bool, err error) {
+func (d *DomainPointerRegistryD) RemoveTarget(graph Transactor, subject NodeID) (removed bool, err error) {
 	return d.metadata.RemoveTarget(graph, subject)
 }
 
@@ -7966,51 +8113,42 @@ func (d *DomainPointerRegistryD) Domain(graph GraphReader, subject NodeID) (doma
 // subject's current target (if any) still belongs to domain before
 // committing -- symmetric with SetTarget's own validation against the
 // current domain.
-func (d *DomainPointerRegistryD) SetDomain(graph GraphAPI, subject, domain NodeID) error {
+func (d *DomainPointerRegistryD) SetDomain(graph Transactor, subject, domain NodeID) error {
+	// Creating subject's metadata, validating its current target and
+	// writing the domain are one atomic step, so a rejected SetDomain
+	// leaves no metadata behind.
 	return wrapInterfaceErr(graph.Transact(func(tx Tx) error {
-		return d.setDomainTx(tx, subject, domain)
-	}))
-}
-
-// setDomainTx is SetDomain's tx-composable core. Creating subject's
-// metadata, validating its current target and writing the domain are one
-// atomic step, so a rejected SetDomain leaves no metadata behind.
-func (d *DomainPointerRegistryD) setDomainTx(tx Tx, subject, domain NodeID) error {
-	m, _, err := d.metadata.ensureMetadataTx(tx, subject)
-	if err != nil {
-		return err
-	}
-
-	target, hasTarget, err := d.metadata.targetOfMetadata(tx, m)
-	if err != nil {
-		return err
-	}
-
-	if hasTarget {
-		if memberErr := d.validateMembership(tx, domain, target); memberErr != nil {
-			return memberErr
+		m, _, err := d.metadata.ensureMetadataTx(tx, subject)
+		if err != nil {
+			return err
 		}
-	}
 
-	return d.domainConstraint.setDomainTx(tx, m, domain)
+		target, hasTarget, err := d.metadata.targetOfMetadata(tx, m)
+		if err != nil {
+			return err
+		}
+
+		if hasTarget {
+			if memberErr := d.validateMembership(tx, domain, target); memberErr != nil {
+				return memberErr
+			}
+		}
+
+		return d.domainConstraint.attachDomain(tx, m, domain)
+	}))
 }
 
 // RemoveDomain clears subject's domain, if any, resolving subject's
 // metadata node M first. removed is false if subject has no metadata
 // node at all yet, in addition to domainConstraint.RemoveDomain's own
 // "no domain slot" case.
-func (d *DomainPointerRegistryD) RemoveDomain(graph GraphAPI, subject NodeID) (removed bool, err error) {
+func (d *DomainPointerRegistryD) RemoveDomain(graph Transactor, subject NodeID) (removed bool, err error) {
 	return transactBool(graph, func(tx Tx) (bool, error) {
-		return d.removeDomainTx(tx, subject)
+		m, _, found, locateErr := d.metadata.locate(tx, subject)
+		if locateErr != nil || !found {
+			return false, locateErr
+		}
+
+		return d.domainConstraint.RemoveDomain(tx, m)
 	})
-}
-
-// removeDomainTx is RemoveDomain's tx-composable core.
-func (d *DomainPointerRegistryD) removeDomainTx(tx Tx, subject NodeID) (bool, error) {
-	m, _, found, err := d.metadata.locate(tx, subject)
-	if err != nil || !found {
-		return false, err
-	}
-
-	return d.domainConstraint.removeDomainTx(tx, m)
 }

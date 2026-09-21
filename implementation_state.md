@@ -1570,12 +1570,58 @@ NodeID-keyed structure outside the primitive graph.
  TestListAppendInsideFailedNestedTransactionLeavesListValid and
  TestCapsuleLinkAndDeleteComposeAndRollBackWithEnclosingTransaction.
 
+35. Nested transactions, step 4 of 4: sets, composites, logs, domain
+ pointers, and the NameRegistry staging fix (theorystate.md section 45).
+ SetRegistry (NewSet/TagAsSet/Add/Remove/DeleteSet),
+ CompositeSetRegistry (NewCompositeSet/AddOperand/RemoveOperand/
+ DeleteCompositeSet), CompositeSetLogRegistry (NewCompositeSetLog/
+ AppendOperation/RemoveOperation/DeleteCompositeSetLog) and the domain
+ pointers (DomainPointerRegistryB/D NewDomainPointer/SetTarget/
+ RemoveTarget/SetDomain/RemoveDomain, domainConstraint.RemoveDomain) take
+ a Transactor. Removed: addOperandTx, removeOperandTx, removeOperationTx,
+ newDomainPointerTx, DomainPointerRegistryB/D setTargetTx, removeTargetTx,
+ setDomainTx, removeDomainTx, domainConstraint.setDomainTx/removeDomainTx.
+ domainConstraint.setDomainTx became attachDomain (a shared body, opening
+ its own nested transaction). NewCompositeSetLog now nests
+ ListRegistry.NewList instead of duplicating its tagging. The last
+ exceptions to "exported methods compose" are the constructors, which call
+ RegisterChecker and so keep taking a GraphAPI.
+
+ Tx gained OnRollback(fn): hooks are appended to the undo log, so nested
+ rollbacks run them LIFO with the graph undo steps, and commit drops them.
+ NameRegistry uses it to close the limitation recorded in item 33: a
+ binding is now STAGED in a pending overlay (pendingByName/pendingByID,
+ plus pendingGone for committed bindings whose node the transaction
+ deleted). Only the transaction's own checks (checkBind, lookupLive)
+ consult the overlay, so a second bind of the same name or node inside one
+ transaction is rejected and a deleted node's name can be rebound, while
+ Lookup and NameForNode still report committed state only. Each staged
+ change registers an OnCommit hook that publishes it and an OnRollback hook
+ that reverses it (recordBinding was replaced by stageBinding/
+ commitBinding/stageForget).
+
+ Covered by TestTxOnRollbackRunsInReverseOrderAndOnlyOnRollback,
+ TestTxOnRollbackRunsWhenCheckerDeclinesCommit,
+ TestRootGraphTransactForwardsOnRollback,
+ TestNameRegistryStagedBindingsAreVisibleInsideTheTransactionOnly,
+ TestNameRegistryNestedFailureUnstagesItsBinding,
+ TestNameRegistryDeleteThenRebindSameNameInOneTransaction,
+ TestNameRegistryCreateThenDeleteInOneTransactionLeavesNoBinding,
+ TestSetMutatorsComposeInsideOneTransactionAndRollBackTogether,
+ TestCompositeSetLogNestedRemoveOperationFailureLeavesLogIntactAndOuterContinues
+ and TestDomainStalenessComposedExportedCallsAreJudgedAtOutermostCommit.
+
 Currently unaddressed yet:
-- Registries still compose through tx-composable *Tx cores in
-  SetRegistry, CompositeSetRegistry, CompositeSetLogRegistry and the
-  domain pointers; collapsing them into Transactor-taking exported
-  methods is in progress (items 32-34). Txn.DeleteNode is supported --
-  see item 15.
+- GraphAPI still embeds GraphStore, so raw CreateNode/AddRelationship/
+  RemoveRelationship/DeleteNode are callable outside Transact on *Graph,
+  RootGraph and GraphActor, bypassing Checkers and commit hooks. Planned
+  next: split them out (writes only through Tx), with the adversarial
+  tests using the unexported *Core methods to simulate foreign or loaded
+  data. A "run every Checker over everything at load" pass belongs with
+  any persistence work.
+- Nested transactions are realized for the in-memory backend only
+  (savepoints over the undo log); other backends are theorystate.md
+  section 45 / 89a. Txn.DeleteNode is supported -- see item 15.
 - Domain-pointer staleness residuals (theorystate.md section 86): raw
   non-Transact mutations, out-of-band tag removal or descriptor
   re-pointing inside a Transact, and O(pointers-per-domain) validation
@@ -1627,3 +1673,13 @@ it):
   raw, non-transactional Graph.DeleteNode) -- corrected to one Transact
   call via the shared deleteOperandDescriptorTx helper once the
   atomicity gap this left was found in review. See item 21.
+- An "Immediate" Checker tier (Checkers run at the end of every nested
+  transaction, over the nodes it touched) and a Tx.Verify() to run
+  Checkers early. Not built: inner boundaries are registry-method
+  boundaries and a composed operation may be legitimately invalid halfway
+  through (the domain Checker is the example, see
+  TestDomainStalenessComposedExportedCallsAreJudgedAtOutermostCommit), so
+  every Checker runs once, at the outermost commit. If wanted later, a
+  Checker.Immediate field whose zero value means "deferred" adds the tier
+  without changing any existing Checker. See item 32 and theorystate.md
+  section 45.

@@ -12362,6 +12362,490 @@ func TestCapsuleLinkAndDeleteComposeAndRollBackWithEnclosingTransaction(t *testi
 	}
 }
 
+func TestTxOnRollbackRunsInReverseOrderAndOnlyOnRollback(t *testing.T) {
+	var g Graph
+
+	var order []string
+	errBoom := errors.New("boom")
+
+	err := g.Transact(func(tx Tx) error {
+		tx.OnRollback(func() { order = append(order, "committed") })
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Transact(commit) error = %v", err)
+	}
+	if len(order) != 0 {
+		t.Fatalf("an OnRollback hook ran for a committed transaction: %v", order)
+	}
+
+	err = g.Transact(func(tx Tx) error {
+		tx.OnRollback(func() { order = append(order, "first") })
+
+		nestedErr := tx.Transact(func(inner Tx) error {
+			inner.OnRollback(func() { order = append(order, "nested") })
+			return errBoom
+		})
+		if !errors.Is(nestedErr, errBoom) {
+			t.Errorf("nested Transact() error = %v, want %v", nestedErr, errBoom)
+		}
+
+		tx.OnRollback(func() { order = append(order, "second") })
+
+		return errBoom
+	})
+	if !errors.Is(err, errBoom) {
+		t.Fatalf("Transact(fail) error = %v, want %v", err, errBoom)
+	}
+
+	// The nested hook runs when the nested transaction fails; the others
+	// run, newest first, when the outermost one does.
+	if want := []string{"nested", "second", "first"}; !reflect.DeepEqual(order, want) {
+		t.Fatalf("rollback hooks ran %v, want %v", order, want)
+	}
+}
+
+func TestTxOnRollbackRunsWhenCheckerDeclinesCommit(t *testing.T) {
+	var g Graph
+
+	tag := newTestNode(t, &g)
+	node := newTestNode(t, &g)
+	errVeto := errors.New("veto")
+
+	g.RegisterChecker(Checker{
+		Name: "veto",
+		Tags: []NodeID{tag},
+		Check: func(_ GraphReader, _ map[NodeID]struct{}) error {
+			return errVeto
+		},
+	})
+
+	rolledBack, committed := false, false
+
+	err := g.Transact(func(tx Tx) error {
+		tx.OnRollback(func() { rolledBack = true })
+		tx.OnCommit(func() { committed = true })
+
+		return addRelationshipTx(tx, tag, node)
+	})
+	if !errors.Is(err, errVeto) {
+		t.Fatalf("Transact() error = %v, want %v", err, errVeto)
+	}
+	if !rolledBack || committed {
+		t.Fatalf("rolledBack=%v committed=%v, want true,false after a declined commit", rolledBack, committed)
+	}
+}
+
+func TestRootGraphTransactForwardsOnRollback(t *testing.T) {
+	var g Graph
+
+	root := newTestNode(t, &g)
+
+	rootGraph, err := NewRootGraph(&g, root)
+	if err != nil {
+		t.Fatalf("NewRootGraph(): %v", err)
+	}
+
+	errBoom := errors.New("boom")
+	ran := false
+
+	err = rootGraph.Transact(func(tx Tx) error {
+		tx.OnRollback(func() { ran = true })
+		return errBoom
+	})
+	if !errors.Is(err, errBoom) {
+		t.Fatalf("Transact() error = %v, want %v", err, errBoom)
+	}
+	if !ran {
+		t.Fatal("a rollback hook registered through the ROOT overlay did not run")
+	}
+}
+
+// requireNoStagedNames checks that no transaction's staged overlay is
+// left behind in names.
+func requireNoStagedNames(t *testing.T, names *NameRegistry) {
+	t.Helper()
+
+	if len(names.pendingByName) != 0 || len(names.pendingByID) != 0 || len(names.pendingGone) != 0 {
+		t.Fatalf("staged name overlay not empty: byName=%v byID=%v gone=%v", names.pendingByName, names.pendingByID, names.pendingGone)
+	}
+}
+
+func TestNameRegistryStagedBindingsAreVisibleInsideTheTransactionOnly(t *testing.T) {
+	var g Graph
+	names := NewNameRegistry(&g)
+
+	var first NodeID
+
+	err := g.Transact(func(tx Tx) error {
+		var createErr error
+		first, createErr = names.CreateNamedNode(tx, "A")
+		if createErr != nil {
+			return createErr
+		}
+
+		if _, ok := names.Lookup("A"); ok {
+			t.Error("Lookup() reports a binding that is not committed yet")
+		}
+
+		if _, dupErr := names.CreateNamedNode(tx, "A"); !errors.Is(dupErr, ErrNameAlreadyBound) {
+			t.Errorf("second CreateNamedNode() error = %v, want %v", dupErr, ErrNameAlreadyBound)
+		}
+
+		again, ensureErr := names.EnsureNamedNode(tx, "A")
+		if ensureErr != nil {
+			return ensureErr
+		}
+		if again != first {
+			t.Errorf("EnsureNamedNode() = %d, want the staged node %d", again, first)
+		}
+
+		other, otherErr := createNodeTx(tx)
+		if otherErr != nil {
+			return otherErr
+		}
+		if bindErr := names.Bind(tx, "A", other); !errors.Is(bindErr, ErrNameAlreadyBound) {
+			t.Errorf("Bind(A, other) error = %v, want %v", bindErr, ErrNameAlreadyBound)
+		}
+		if renameErr := names.Bind(tx, "B", first); !errors.Is(renameErr, ErrNodeAlreadyNamed) {
+			t.Errorf("Bind(B, first) error = %v, want %v", renameErr, ErrNodeAlreadyNamed)
+		}
+
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Transact() error = %v", err)
+	}
+
+	if found, ok := names.Lookup("A"); !ok || found != first {
+		t.Fatalf("Lookup(\"A\") = (%d,%v), want (%d,true)", found, ok, first)
+	}
+	if _, ok := names.Lookup("B"); ok {
+		t.Fatal("the rejected Bind bound \"B\"")
+	}
+	requireNoStagedNames(t, names)
+}
+
+func TestNameRegistryNestedFailureUnstagesItsBinding(t *testing.T) {
+	var g Graph
+	names := NewNameRegistry(&g)
+
+	errInner := errors.New("inner failure")
+
+	var committed NodeID
+
+	err := g.Transact(func(tx Tx) error {
+		innerErr := tx.Transact(func(inner Tx) error {
+			if _, stageErr := names.CreateNamedNode(inner, "A"); stageErr != nil {
+				return stageErr
+			}
+
+			return errInner
+		})
+		if !errors.Is(innerErr, errInner) {
+			t.Errorf("nested Transact() error = %v, want %v", innerErr, errInner)
+		}
+
+		// The name is free again after the nested rollback.
+		var createErr error
+		committed, createErr = names.CreateNamedNode(tx, "A")
+
+		return createErr
+	})
+	if err != nil {
+		t.Fatalf("Transact() error = %v", err)
+	}
+
+	if found, ok := names.Lookup("A"); !ok || found != committed {
+		t.Fatalf("Lookup(\"A\") = (%d,%v), want (%d,true)", found, ok, committed)
+	}
+	requireNoStagedNames(t, names)
+}
+
+func TestNameRegistryDeleteThenRebindSameNameInOneTransaction(t *testing.T) {
+	var g Graph
+	names := NewNameRegistry(&g)
+
+	old, err := names.CreateNamedNode(&g, "A")
+	if err != nil {
+		t.Fatalf("CreateNamedNode(): %v", err)
+	}
+
+	var replacement NodeID
+
+	err = g.Transact(func(tx Tx) error {
+		if deleteErr := names.DeleteNode(tx, old); deleteErr != nil {
+			return deleteErr
+		}
+
+		// Other goroutines' view is still the committed one.
+		if found, ok := names.Lookup("A"); !ok || found != old {
+			t.Errorf("Lookup(\"A\") = (%d,%v) inside the transaction, want the committed (%d,true)", found, ok, old)
+		}
+
+		var createErr error
+		replacement, createErr = names.CreateNamedNode(tx, "A")
+
+		return createErr
+	})
+	if err != nil {
+		t.Fatalf("Transact() error = %v", err)
+	}
+
+	if found, ok := names.Lookup("A"); !ok || found != replacement {
+		t.Fatalf("Lookup(\"A\") = (%d,%v), want (%d,true)", found, ok, replacement)
+	}
+	if _, ok := names.NameForNode(old); ok {
+		t.Fatalf("deleted node %d still has a name", old)
+	}
+	requireNoStagedNames(t, names)
+
+	// A rolled-back delete leaves the binding, and the overlay, intact.
+	errOuter := errors.New("outer failure")
+
+	err = g.Transact(func(tx Tx) error {
+		if deleteErr := names.DeleteNode(tx, replacement); deleteErr != nil {
+			return deleteErr
+		}
+
+		return errOuter
+	})
+	if !errors.Is(err, errOuter) {
+		t.Fatalf("Transact(fail) error = %v, want %v", err, errOuter)
+	}
+	requireNoStagedNames(t, names)
+
+	kept, err := names.EnsureNamedNode(&g, "A")
+	if err != nil {
+		t.Fatalf("EnsureNamedNode() after the rolled-back delete: %v", err)
+	}
+	if kept != replacement {
+		t.Fatalf("EnsureNamedNode() = %d, want the surviving %d", kept, replacement)
+	}
+}
+
+func TestNameRegistryCreateThenDeleteInOneTransactionLeavesNoBinding(t *testing.T) {
+	var g Graph
+	names := NewNameRegistry(&g)
+
+	var id NodeID
+
+	err := g.Transact(func(tx Tx) error {
+		var createErr error
+		id, createErr = names.CreateNamedNode(tx, "T")
+		if createErr != nil {
+			return createErr
+		}
+
+		return names.DeleteNode(tx, id)
+	})
+	if err != nil {
+		t.Fatalf("Transact() error = %v", err)
+	}
+
+	if _, ok := names.Lookup("T"); ok {
+		t.Fatal("name \"T\" is bound to a node deleted in the same transaction")
+	}
+	if g.NodeExists(id) {
+		t.Fatalf("node %d survived its own deletion", id)
+	}
+	requireNoStagedNames(t, names)
+}
+
+func TestSetMutatorsComposeInsideOneTransactionAndRollBackTogether(t *testing.T) {
+	g, sets := newSetTestFixture(t)
+
+	member := newTestNode(t, g)
+	errOuter := errors.New("outer failure")
+
+	var set NodeID
+
+	err := g.Transact(func(tx Tx) error {
+		var newErr error
+		set, newErr = sets.NewSet(tx)
+		if newErr != nil {
+			return newErr
+		}
+
+		_, addErr := sets.Add(tx, set, member)
+
+		return addErr
+	})
+	if err != nil {
+		t.Fatalf("Transact(compose) error = %v", err)
+	}
+
+	if found, containsErr := sets.Contains(g, set, member); containsErr != nil || !found {
+		t.Fatalf("Contains() = (%v,%v), want (true,nil)", found, containsErr)
+	}
+
+	err = g.Transact(func(tx Tx) error {
+		if _, removeErr := sets.Remove(tx, set, member); removeErr != nil {
+			return removeErr
+		}
+		if deleteErr := sets.DeleteSet(tx, set); deleteErr != nil {
+			return deleteErr
+		}
+
+		return errOuter
+	})
+	if !errors.Is(err, errOuter) {
+		t.Fatalf("Transact(fail) error = %v, want %v", err, errOuter)
+	}
+
+	if !g.NodeExists(set) || !sets.IsSet(g, set) {
+		t.Fatal("the set was not restored after its deleting transaction rolled back")
+	}
+	if found, containsErr := sets.Contains(g, set, member); containsErr != nil || !found {
+		t.Fatalf("Contains() = (%v,%v) after rollback, want (true,nil)", found, containsErr)
+	}
+}
+
+func TestCompositeSetLogNestedRemoveOperationFailureLeavesLogIntactAndOuterContinues(t *testing.T) {
+	g, _, _, logs := newCompositeSetLogTestFixture(t)
+
+	log, err := logs.NewCompositeSetLog(g)
+	if err != nil {
+		t.Fatalf("NewCompositeSetLog(): %v", err)
+	}
+
+	x := newTestNode(t, g)
+	y := newTestNode(t, g)
+	extra := newTestNode(t, g)
+
+	var u, uY NodeID
+
+	err = g.Transact(func(tx Tx) error {
+		var capsule NodeID
+
+		var appendErr error
+		u, capsule, appendErr = logs.AppendOperation(tx, log, x, true, false)
+		if appendErr != nil {
+			return appendErr
+		}
+
+		capsules := logs.lists.capsules
+
+		valueSlot, found, slotErr := capsules.slotFor(tx, capsule, capsules.valueSlots.allPointers)
+		if slotErr != nil {
+			return slotErr
+		}
+		if !found {
+			return ErrNotCapsule
+		}
+
+		// Something unrelated referencing the value slot makes deleting
+		// the capsule unsafe, so the nested RemoveOperation must fail and
+		// undo only itself.
+		if linkErr := addRelationshipTx(tx, extra, valueSlot); linkErr != nil {
+			return linkErr
+		}
+
+		if removeErr := logs.RemoveOperation(tx, log, capsule); !errors.Is(removeErr, ErrCapsuleNotEmpty) {
+			t.Errorf("nested RemoveOperation() error = %v, want %v", removeErr, ErrCapsuleNotEmpty)
+		}
+
+		var appendYErr error
+		uY, _, appendYErr = logs.AppendOperation(tx, log, y, true, false)
+
+		return appendYErr
+	})
+	if err != nil {
+		t.Fatalf("Transact() error = %v", err)
+	}
+
+	operations, err := logs.Operations(g, log)
+	if err != nil {
+		t.Fatalf("Operations(): %v", err)
+	}
+	if want := []NodeID{u, uY}; !reflect.DeepEqual(operations, want) {
+		t.Fatalf("Operations() = %v, want %v", operations, want)
+	}
+
+	evaluated, err := logs.Evaluate(g, log)
+	if err != nil {
+		t.Fatalf("Evaluate(): %v", err)
+	}
+	if want := sortedNodeIDs([]NodeID{x, y}); !reflect.DeepEqual(sortedNodeIDs(evaluated), want) {
+		t.Fatalf("Evaluate() = %v, want %v", evaluated, want)
+	}
+}
+
+// TestDomainStalenessComposedExportedCallsAreJudgedAtOutermostCommit is
+// the composition the nested-transaction design exists for: exported
+// registry calls chained in one transaction, where an intermediate state
+// strands the pointer and a later call repairs it. The domain Checker
+// judges only the final state, at the outermost commit.
+func TestDomainStalenessComposedExportedCallsAreJudgedAtOutermostCommit(t *testing.T) {
+	fx := newDomainPointerTestFixture(t)
+
+	domain, err := fx.sets.NewSet(fx.graph)
+	if err != nil {
+		t.Fatalf("NewSet(): %v", err)
+	}
+
+	oldTarget := newTestNode(t, fx.graph)
+	newTarget := newTestNode(t, fx.graph)
+	for _, member := range []NodeID{oldTarget, newTarget} {
+		if _, addErr := fx.sets.Add(fx.graph, domain, member); addErr != nil {
+			t.Fatalf("Add(domain, %d): %v", member, addErr)
+		}
+	}
+
+	anchor := newTestNode(t, fx.graph)
+	if newErr := fx.domainB.NewDomainPointer(fx.graph, anchor); newErr != nil {
+		t.Fatalf("NewDomainPointer(): %v", newErr)
+	}
+	if setErr := fx.domainB.SetDomain(fx.graph, anchor, domain); setErr != nil {
+		t.Fatalf("SetDomain(): %v", setErr)
+	}
+	if setErr := fx.domainB.SetTarget(fx.graph, anchor, oldTarget); setErr != nil {
+		t.Fatalf("SetTarget(oldTarget): %v", setErr)
+	}
+
+	// Shrink the domain, then retarget: the state between the two calls
+	// is stranded, the final state is valid, so the commit is accepted.
+	err = fx.graph.Transact(func(tx Tx) error {
+		if _, removeErr := fx.sets.Remove(tx, domain, oldTarget); removeErr != nil {
+			return removeErr
+		}
+
+		return fx.domainB.SetTarget(tx, anchor, newTarget)
+	})
+	if err != nil {
+		t.Fatalf("Transact(shrink then retarget) error = %v, want nil", err)
+	}
+
+	requireSetContains(t, fx, domain, oldTarget, false)
+
+	target, hasTarget, targetErr := fx.domainB.Target(fx.graph, anchor)
+	if targetErr != nil {
+		t.Fatalf("Target(): %v", targetErr)
+	}
+	if !hasTarget || target != newTarget {
+		t.Fatalf("Target() = (%d,%v), want (%d,true)", target, hasTarget, newTarget)
+	}
+
+	// Shrinking alone leaves the pointer stranded: the inner call reports
+	// success provisionally and the outermost commit declines everything.
+	err = fx.graph.Transact(func(tx Tx) error {
+		removed, removeErr := fx.sets.Remove(tx, domain, newTarget)
+		if removeErr != nil {
+			return removeErr
+		}
+		if !removed {
+			t.Error("inner Remove() = false, want a provisional true")
+		}
+
+		return nil
+	})
+	if !errors.Is(err, ErrTargetOutsideDomain) {
+		t.Fatalf("Transact(shrink only) error = %v, want %v", err, ErrTargetOutsideDomain)
+	}
+
+	requireSetContains(t, fx, domain, newTarget, true)
+}
+
 func TestCompositeSetLogRemoveOperationIsAtomicWhenCapsuleCannotBeDeleted(t *testing.T) {
 	g, _, _, logs := newCompositeSetLogTestFixture(t)
 

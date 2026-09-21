@@ -2767,11 +2767,14 @@ Checker protection): `ensureMetadataWithSubjectSlot` and
 `DomainPointerRegistryB.NewDomainPointer`. The others (`SetTarget`,
 `TagAsPointer`, the domain setters, ...) were protected only by
 Checkers, which converted a lost update into a spurious rejection. All
-are now `*Tx` cores composed inside one `Transact`. This also removes
-the caller-visible read-then-write hazard §89c uses as its example for
-*single registry methods*; the hazard remains for a caller's own
-sequence of several calls, which is what §89c's in-graph
-transaction-descriptor discussion is about.
+now read and write inside one `Transact`, and (§45) their exported
+methods take a `Transactor`, so a caller can also compose several of
+them in one transaction by nesting. This removes the caller-visible
+read-then-write hazard §89c uses as its example, both for single
+registry methods and for a caller's own sequence of registry calls
+composed inside one `Transact`; what remains open is a plan whose steps
+are assembled dynamically (§89c's in-graph transaction-descriptor
+discussion).
 
 **State outside the graph: `Tx.OnCommit`.** Rule 3 needs a way to keep
 external state (`NameRegistry`'s maps) in step with the graph. Doing it
@@ -2784,6 +2787,17 @@ exclusive context as the transaction (the actor's goroutine, under the
 are serialized with every other closure. A hook must not touch the graph
 and must not panic. A retrying backend runs the hooks of the successful
 attempt only.
+
+**Staging with `Tx.OnRollback`.** `OnCommit` alone cannot serve state
+that later steps of the *same* transaction must already see: with only a
+commit hook, a second `CreateNamedNode` for the same name inside one
+transaction would not see the first. `Tx.OnRollback(fn)` appends `fn` to
+the undo log, so nested rollbacks run it in LIFO order with the graph
+undo steps and a commit drops it. State outside the graph is then kept in
+a staged overlay that only the transaction's own checks consult, published
+by an `OnCommit` hook and reversed by an `OnRollback` hook, so readers on
+other goroutines still see committed state only. `NameRegistry` does this
+for bindings, including the deletion of a bound node (§45).
 
 **Completed follow-up.** The existence/tag pre-checks in `ListRegistry`,
 `CapsuleRegistry`, `SetRegistry`, `CompositeSetRegistry` and
@@ -2909,9 +2923,16 @@ kept current as sections above resolve or split further.)*
   through `Transact` so Checkers observe Set membership changes.
 
 - The `Transact` closure contract (re-runnable, reads through `tx`, no
-  side effects outside `tx`) and `Tx.OnCommit` for keeping state outside
-  the graph in step with commits; every registry read-decide-write
-  method is a single transaction (§91).
+  side effects outside `tx`), `Tx.OnCommit` and `Tx.OnRollback` for
+  keeping state outside the graph in step with commits and rollbacks;
+  every registry read-decide-write method is a single transaction (§91).
+- Nested transactions are savepoints (`Tx.Transact` via `Transactor`): a
+  nested failure or panic undoes only the nested steps and discards its
+  commit hooks; Checkers run once, at the outermost commit, because they
+  judge the final state and an intermediate one may be legitimately
+  invalid; an inner success is provisional until then. Every registry
+  mutator takes a `Transactor`, so it works standalone and composes
+  inside a larger transaction (§45, §91).
 - Known correctness gaps are fixed, not deferred for lack of a caller;
   "no current caller" only ever sequences new features (§7b).
 - `NameRegistry` lookups are safe from any goroutine (§91).
@@ -2968,14 +2989,13 @@ kept current as sections above resolve or split further.)*
   between graphs.
 - Universal wide IDs vs. cheap-by-default + retroactive proxy — cost
   question only now (§61).
-- Nested transaction semantics (§45); exact cross-graph teardown protocol
-  (§43); rebase algorithm (§24); processor execution semantics.
-- Nested transaction semantics remain OPEN (§45): the current commit-time
-  Checker mechanism (§73/§77, DECIDED and implemented below) deliberately
-  scopes checking to one top-level `Graph.Transact` call rather than
-  requiring nesting to express a changeset boundary, since no current
-  caller needs to fail and retry only an inner piece of a larger composed
-  operation while leaving its other already-applied steps standing.
+- Exact cross-graph teardown protocol (§43); rebase algorithm (§24);
+  processor execution semantics.
+- Nested transactions (§45) beyond the in-memory backend: how a
+  non-memory backend realizes savepoints (a child write buffer merged
+  into its parent), and whether some Checkers should be able to run at
+  inner boundaries. An opt-in "immediate" Checker tier was considered and
+  not built; today every Checker runs once, at the outermost commit.
 - Domain Pointer staleness residuals (§86): per-commit memoization of
   domain membership if the O(pointers-per-domain) validation cost matters,
   and whether the out-of-band-inside-`Transact` gaps (tag removal,
