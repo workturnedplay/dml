@@ -2814,6 +2814,36 @@ refused deletion undoes only itself and the removal still commits.
 `NameForNode` are safe from any goroutine and see only committed
 bindings.
 
+## 92. Mutation only through Transact (DECIDED, implemented)
+
+`GraphAPI` is reads plus `Transactor` plus `RegisterChecker`. The
+mutating operations (`GraphStore`) are reachable only through the `Tx` a
+`Transact` closure receives. Before this, `CreateNode`/`AddRelationship`/
+`RemoveRelationship`/`DeleteNode` were callable directly on `*Graph`,
+`RootGraph` and `GraphActor`, silently bypassing Checkers and commit
+hooks. Once every composition point is a transaction (§45) there is no
+reason to offer them: a raw write is a one-operation transaction that
+skips the invariants.
+
+Reads stay available outside a transaction; each is a snapshot, and a
+decision based on one must be re-read inside the transaction (§91).
+
+`*Graph` therefore exports no write methods (only the unexported cores
+`Txn` calls), `RootGraph` has no non-transactional writes, and
+`GraphActor` forwards none. This refines §87a, which extracted the
+storage surface from `Graph`'s then-public methods, and §89b: the
+fail-fast guard now wraps query methods, `RegisterChecker` and
+`Transact`.
+
+What Checkers still cannot see is state that did not come through this
+process's Checkers: data loaded from storage, written by another client
+(etcd) or an older build, or present before a registry was constructed;
+plus the residuals in §86 and `Checker.Tags` filtering over stored facts
+only. The registries' on-read fail-loud validation stays as the second
+line of defence, and the adversarial tests simulate such data with
+test-only write helpers. A "run every Checker over everything" pass at
+load time belongs with any persistence work.
+
 ---
 
 ## PART D — STATUS SUMMARY (consolidated)
@@ -2933,6 +2963,8 @@ kept current as sections above resolve or split further.)*
   invalid; an inner success is provisional until then. Every registry
   mutator takes a `Transactor`, so it works standalone and composes
   inside a larger transaction (§45, §91).
+- A graph can be mutated only inside a transaction: `GraphAPI` has no raw
+  writes, which are reachable only through `Tx` (§92).
 - Known correctness gaps are fixed, not deferred for lack of a caller;
   "no current caller" only ever sequences new features (§7b).
 - `NameRegistry` lookups are safe from any goroutine (§91).

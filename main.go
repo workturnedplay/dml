@@ -66,8 +66,9 @@ var (
 // currentGoroutineID): no *Graph method ever calls back into another
 // *Graph method through its own public, guarded API while already
 // executing one -- every guarded method's own logic instead runs through
-// an unexported, unguarded "core" counterpart (createNodeCore,
-// addRelationshipCore, and so on), and Txn's methods, runCheckers,
+// an unexported, unguarded "core" counterpart (findOutgoingCore,
+// hasRelationshipCore, and so on; the write operations exist only as
+// cores, reachable through Txn), and Txn's methods, runCheckers,
 // checkerRelevant, and every Checker's Check function (via the
 // graphCoreReader adapter passed to it) all read and write through those
 // same cores directly, never through the guarded public methods. There
@@ -143,34 +144,29 @@ type Graph struct {
 
 	// guard is the fail-fast concurrent-access protection described on
 	// concurrentAccessGuard above (theorystate.md section 89b). Every
-	// public, top-level entry point into a *Graph -- each mutating/query
-	// method, and Transact for its entire duration -- acquires and
-	// releases it; nothing internal to this file ever re-enters it.
+	// public, top-level entry point into a *Graph -- each query method,
+	// RegisterChecker, and Transact for its entire duration -- acquires
+	// and releases it; nothing internal to this file ever re-enters it.
 	guard concurrentAccessGuard
 }
 
-// CreateNode creates a new node and returns its NodeID.
+// createNodeCore creates a new node and returns its NodeID. It is the
+// only implementation of node creation: *Graph deliberately exports no
+// write methods, so a node can be created only through Txn.CreateNode,
+// i.e. from inside Graph.Transact, where commit-time Checkers and commit
+// hooks apply (theorystate.md section 92). The same holds for
+// addRelationshipCore, removeRelationshipCore and deleteNodeCore below.
 //
 // IDs currently increase monotonically. Reuse of deleted IDs is
 // deliberately not implemented yet.
 //
-// This acquires g's concurrentAccessGuard for the duration of the call;
-// see that type's doc comment for what this does and does not protect
-// against, and createNodeCore for the actual, unguarded implementation.
-func (g *Graph) CreateNode() (NodeID, error) {
-	release := g.guard.acquire()
-	defer release()
-
-	return g.createNodeCore()
-}
-
-// createNodeCore is CreateNode's unguarded implementation. It is called
-// directly -- bypassing g's concurrentAccessGuard -- by Txn.CreateNode
-// and by anything else already running inside a single already-guarded
-// Graph.Transact call, so that this same-goroutine nesting is never
-// mistaken for genuine cross-goroutine overlap. See the
-// concurrentAccessGuard doc comment for the full reasoning; every other
-// *Core method below follows this same split for the same reason.
+// Unlike the exported query methods, the *Core methods do not acquire
+// g's concurrentAccessGuard: they are called by Txn and graphCoreReader,
+// which only ever run inside a single already-guarded Graph.Transact
+// call, so that this same-goroutine nesting is never mistaken for
+// genuine cross-goroutine overlap. Every query method has an exported,
+// guarded form and a *Core counterpart following this same split for the
+// same reason (see the concurrentAccessGuard doc comment).
 func (g *Graph) createNodeCore() (NodeID, error) {
 	g.ensureInitialized()
 
@@ -206,25 +202,11 @@ func (g *Graph) NodeExists(id NodeID) bool {
 	return g.nodeExists(id)
 }
 
-// AddRelationship creates the primitive relationship (a, b).
-//
-// Both nodes must already exist.
-//
-// Relationships are unique. Adding the same relationship again simply
-// reports created=false.
-//
-// This acquires g's concurrentAccessGuard for the duration of the call;
-// see addRelationshipCore for the actual, unguarded implementation.
-func (g *Graph) AddRelationship(a, b NodeID) (created bool, err error) {
-	release := g.guard.acquire()
-	defer release()
-
-	return g.addRelationshipCore(a, b)
-}
-
-// addRelationshipCore is AddRelationship's unguarded implementation; see
-// createNodeCore's doc comment for why this split exists and who calls
-// it directly.
+// addRelationshipCore creates the primitive relationship (a, b). Both
+// nodes must already exist. Relationships are unique: adding the same
+// relationship again simply reports created=false. See createNodeCore
+// for why this is unexported and unguarded, and reachable only through
+// Txn.
 func (g *Graph) addRelationshipCore(a, b NodeID) (created bool, err error) {
 	g.ensureInitialized()
 
@@ -245,23 +227,10 @@ func (g *Graph) addRelationshipCore(a, b NodeID) (created bool, err error) {
 	return true, nil
 }
 
-// RemoveRelationship removes the primitive relationship (a, b).
-//
-// The returned bool reports whether a relationship actually existed and
-// was removed.
-//
-// This acquires g's concurrentAccessGuard for the duration of the call;
-// see removeRelationshipCore for the actual, unguarded implementation.
-func (g *Graph) RemoveRelationship(a, b NodeID) (removed bool, err error) {
-	release := g.guard.acquire()
-	defer release()
-
-	return g.removeRelationshipCore(a, b)
-}
-
-// removeRelationshipCore is RemoveRelationship's unguarded
-// implementation; see createNodeCore's doc comment for why this split
-// exists and who calls it directly.
+// removeRelationshipCore removes the primitive relationship (a, b). The
+// returned bool reports whether a relationship actually existed and was
+// removed. See createNodeCore for why this is unexported and unguarded,
+// and reachable only through Txn.
 func (g *Graph) removeRelationshipCore(a, b NodeID) (removed bool, err error) {
 	if !g.nodeExists(a) {
 		return false, ErrNodeNotFound
@@ -484,22 +453,10 @@ func (g *Graph) findNodesCore() []NodeID {
 	return ids
 }
 
-// DeleteNode deletes a node only when it has no relationships.
-//
-// Cascade deletion is deliberately not part of this primitive API.
-//
-// This acquires g's concurrentAccessGuard for the duration of the call;
-// see deleteNodeCore for the actual, unguarded implementation.
-func (g *Graph) DeleteNode(id NodeID) error {
-	release := g.guard.acquire()
-	defer release()
-
-	return g.deleteNodeCore(id)
-}
-
-// deleteNodeCore is DeleteNode's unguarded implementation; see
-// createNodeCore's doc comment for why this split exists and who calls
-// it directly.
+// deleteNodeCore deletes a node only when it has no relationships.
+// Cascade deletion is deliberately not part of this primitive API. See
+// createNodeCore for why this is unexported and unguarded, and reachable
+// only through Txn.
 func (g *Graph) deleteNodeCore(id NodeID) error {
 	if !g.nodeExists(id) {
 		return ErrNodeNotFound
@@ -579,12 +536,14 @@ type GraphReader interface {
 }
 
 // GraphStore is the complete primitive storage surface -- GraphReader's
-// queries plus the mutating operations -- matching Graph's public
-// method set exactly as it already existed before this interface was
-// introduced (theorystate.md section 87/87a). This is the boundary a
-// future non-in-memory backend (etcd, SpacetimeDB) would need to satisfy
-// to stand in for Graph at the storage layer; today Graph is the only
-// implementation.
+// queries plus the mutating operations. It is reachable only through Tx,
+// the handle a Transact closure receives: GraphAPI deliberately does not
+// include it, so a graph can be mutated only inside a transaction, where
+// commit-time Checkers and commit hooks apply (theorystate.md section
+// 92). This refines sections 87/87a, which extracted this surface from
+// Graph's then-public method set; the concrete *Graph no longer exports
+// the mutating methods at all. It is also the surface a future
+// non-in-memory backend would provide to its transaction handle.
 type GraphStore interface {
 	GraphReader
 	CreateNode() (NodeID, error)
@@ -593,16 +552,17 @@ type GraphStore interface {
 	DeleteNode(id NodeID) error
 }
 
-// GraphAPI is GraphStore plus the transactional/commit-time-checking
-// machinery (Transact, RegisterChecker) every registry in this file
-// actually depends on. It is kept as a separate, wider interface from
-// GraphStore rather than folding Transact/RegisterChecker directly into
-// GraphStore, per theorystate.md section 87a/89a: those two methods'
-// atomicity contract is a separate design question from raw storage,
-// deliberately not yet resolved for any backend other than the
-// in-memory one Graph implements, and a future backend satisfying
-// GraphStore's storage contract is not thereby assumed to satisfy
-// GraphAPI's transactional contract the same way.
+// GraphAPI is the root handle of a graph: GraphReader's queries, plus
+// Transactor (the only way to mutate anything) and RegisterChecker every
+// registry constructor needs. It deliberately does NOT include
+// GraphStore's mutating operations: those are reachable only through the
+// Tx a Transact closure receives, so no mutation can bypass commit-time
+// Checkers or commit hooks (theorystate.md section 92). Reads are
+// allowed outside a transaction (each is a snapshot; a decision based on
+// one must still re-read inside the transaction, see the Transactor
+// contract). The transactional contract is deliberately not assumed to
+// be satisfied the same way by every backend (theorystate.md section
+// 87a/89a).
 //
 // Every registry constructor in this file (NewPointerRegistry,
 // NewCapsuleRegistry, NewListRegistry, and so on) takes a GraphAPI
@@ -617,7 +577,7 @@ type GraphStore interface {
 // enumerate nodes), so it can stand in for a Graph anywhere a registry or
 // GraphActor takes one (theorystate.md section 87b).
 type GraphAPI interface {
-	GraphStore
+	GraphReader
 	Transactor
 
 	// RegisterChecker registers c to be consulted after every future
@@ -1204,15 +1164,16 @@ var _ GraphReader = (*Txn)(nil)
 // existing rollback, including Txn.DeleteNode's resurrection,
 // theorystate.md section 78).
 //
-// Checkers only run for mutations made through Graph.Transact. A raw,
-// direct Graph.AddRelationship/RemoveRelationship/DeleteNode call --
-// exactly the kind every existing out-of-band adversarial test in this
-// file already uses -- has no commit boundary at all and therefore
-// bypasses every Checker entirely, same as it already bypasses every
-// registry's own enforcement. Checkers narrow, but do not close, that
-// gap; they exist to catch a violation introduced by a composed,
-// multi-step operation going through Transact, not to retroactively
-// police arbitrary direct Graph mutations.
+// Checkers only run for mutations made through Graph.Transact, and there
+// is no public way to mutate a graph outside one (theorystate.md section
+// 92). What still bypasses them is state that did not come through this
+// process's Checkers: data loaded from storage, written by another
+// client or an older build, or already present when a registry was
+// constructed. The out-of-band adversarial tests in this file simulate
+// exactly that, using the unexported core write methods through
+// test-only helpers. Checkers catch a violation introduced by a
+// composed, multi-step operation; the registries' on-read fail-loud
+// validation remains the second line of defence.
 type Checker struct {
 	// Name identifies this Checker in a declined commit's returned
 	// error, so a caller can tell which specific invariant was violated
@@ -1655,16 +1616,6 @@ func (ga *GraphActor) Close() {
 	<-ga.stopped
 }
 
-// CreateNode behaves exactly like the backend's CreateNode, routed
-// through ga's dedicated goroutine.
-func (ga *GraphActor) CreateNode() (id NodeID, err error) {
-	ga.do(func(g GraphAPI) {
-		id, err = g.CreateNode()
-	})
-
-	return id, wrapInterfaceErr(err)
-}
-
 // NodeExists behaves exactly like the backend's NodeExists, routed
 // through ga's dedicated goroutine.
 func (ga *GraphActor) NodeExists(id NodeID) bool {
@@ -1675,26 +1626,6 @@ func (ga *GraphActor) NodeExists(id NodeID) bool {
 	})
 
 	return exists
-}
-
-// AddRelationship behaves exactly like the backend's AddRelationship,
-// routed through ga's dedicated goroutine.
-func (ga *GraphActor) AddRelationship(a, b NodeID) (created bool, err error) {
-	ga.do(func(g GraphAPI) {
-		created, err = g.AddRelationship(a, b)
-	})
-
-	return created, wrapInterfaceErr(err)
-}
-
-// RemoveRelationship behaves exactly like the backend's
-// RemoveRelationship, routed through ga's dedicated goroutine.
-func (ga *GraphActor) RemoveRelationship(a, b NodeID) (removed bool, err error) {
-	ga.do(func(g GraphAPI) {
-		removed, err = g.RemoveRelationship(a, b)
-	})
-
-	return removed, wrapInterfaceErr(err)
 }
 
 // HasRelationship behaves exactly like the backend's HasRelationship,
@@ -1763,16 +1694,6 @@ func (ga *GraphActor) FindNodes() []NodeID {
 	})
 
 	return ids
-}
-
-// DeleteNode behaves exactly like the backend's DeleteNode, routed
-// through ga's dedicated goroutine.
-func (ga *GraphActor) DeleteNode(id NodeID) (err error) {
-	ga.do(func(g GraphAPI) {
-		err = g.DeleteNode(id)
-	})
-
-	return wrapInterfaceErr(err)
 }
 
 // Transact behaves exactly like the backend's Transact, with fn's entire
@@ -2523,9 +2444,10 @@ var ErrRootGraphOverActor = errors.New("root graph cannot wrap a graph actor; pl
 // HasRelationship reporting false for any relationship whose source does
 // not exist.
 //
-// rootReader is used three ways: as the read half of rootStore, and
-// directly to wrap the GraphReader a Checker's Check function receives
-// (see RootGraph.RegisterChecker).
+// rootReader is used three ways: as RootGraph's own (read-only)
+// non-transactional surface, as the read half of rootStore, and directly
+// to wrap the GraphReader a Checker's Check function receives (see
+// RootGraph.RegisterChecker).
 type rootReader struct {
 	inner GraphReader
 	root  NodeID
@@ -2700,9 +2622,10 @@ func (v rootReader) FindRelationships() []Relationship {
 }
 
 // rootStore is the full read/write ROOT overlay over any GraphStore. It
-// implements GraphStore, which is what lets one implementation serve
-// RootGraph's non-transactional methods and, wrapped in rootTx, the
-// handle RootGraph.Transact gives its closure.
+// implements GraphStore and, wrapped in rootTx, is the handle
+// RootGraph.Transact gives its closure. RootGraph itself has no writes
+// outside a transaction, so its non-transactional methods use only
+// rootReader.
 //
 // Writes follow the overlay's rules: a relationship whose source is ROOT
 // is virtual, so adding or removing one is a no-op reporting false (after
@@ -2833,7 +2756,8 @@ func (s rootStore) DeleteNode(id NodeID) error {
 // The overlay is applied at every seam the graph is seen through, so
 // there is no place where the virtual (ROOT, X) relationships are visible
 // and another where they are not:
-//   - non-transactional reads and writes: via the embedded rootStore;
+//   - non-transactional reads: via the embedded rootReader (RootGraph has
+//     no write methods; writes exist only inside Transact);
 //   - Transact: the closure receives a rootTx wrapped around the
 //     underlying transaction's Tx (which is why Transact takes the Tx
 //     interface rather than the concrete *Txn);
@@ -2852,7 +2776,7 @@ func (s rootStore) DeleteNode(id NodeID) error {
 // the actor, so the reentrancy hazard of theorystate.md section 90
 // cannot arise. NewRootGraph rejects a *GraphActor to enforce this.
 type RootGraph struct {
-	rootStore
+	rootReader
 	api GraphAPI
 }
 
@@ -2872,8 +2796,8 @@ func NewRootGraph(graph GraphAPI, root NodeID) (*RootGraph, error) {
 	}
 
 	return &RootGraph{
-		rootStore: newRootStore(graph, root),
-		api:       graph,
+		rootReader: rootReader{inner: graph, root: root},
+		api:        graph,
 	}, nil
 }
 
@@ -3033,9 +2957,8 @@ var (
 )
 
 // txOps is the minimal mutating surface needed to compose primitive
-// operations atomically, whether directly against a *Graph or inside an
-// existing *Txn. Both *Graph and *Txn satisfy it with their existing
-// method sets, including DeleteNode -- Txn.DeleteNode is itself fully
+// operations atomically inside a transaction. Tx (and the concrete *Txn)
+// satisfies it, including DeleteNode -- Txn.DeleteNode is itself fully
 // undoable (see its doc comment), so a caller composing several deletes
 // into one logical teardown does not need any special pre-verification
 // step of its own; an ordinary Transact rollback already covers it.
@@ -3064,9 +2987,9 @@ type txOps interface {
 // separately threaded txOps and GraphReader parameters, is what makes it
 // impossible for a caller to accidentally supply the read half from a
 // different -- and, under GraphActor, potentially deadlocking -- source
-// than the write half (theorystate.md section 90). *Graph and *Txn both
-// satisfy txReader automatically, since each already independently
-// satisfies both txOps and GraphReader.
+// than the write half (theorystate.md section 90). Tx (and the concrete
+// *Txn) satisfies txReader automatically, since it already satisfies
+// both txOps and GraphReader.
 type txReader interface {
 	txOps
 	GraphReader
@@ -3362,11 +3285,15 @@ outer:
 // it (theorystate.md sections 10 and 73).
 //
 // PointerRegistry does not, and structurally cannot, prevent every path
-// to invariant violation: a caller can always bypass this layer and call
-// Graph.AddRelationship(P, Y) directly, giving a tagged node two or more
-// children. PointerRegistry does not try to intercept arbitrary Graph
-// mutations -- Graph must stay unaware of Pointer semantics, per the same
-// layering discipline already established elsewhere in this file.
+// to invariant violation: a caller can still bypass this layer and give
+// a tagged node two or more children with tx.AddRelationship(P, Y)
+// inside a Transact (the Checker registered by NewPointerRegistry
+// declines that at commit), and data that reached the graph from outside
+// this process's Checkers (loaded from storage, written by an older
+// build) may already violate it. PointerRegistry does not try to
+// intercept arbitrary Graph mutations -- Graph must stay unaware of
+// Pointer semantics, per the same layering discipline already
+// established elsewhere in this file.
 // Instead, every method here re-derives P's current target set fresh from
 // the Graph on every call rather than caching it, and fails loudly with
 // ErrTooManyPointerTargets if that set already has more than one member,
@@ -7984,7 +7911,7 @@ func (b *DomainPointerRegistryB) SetDomain(graph Transactor, anchor, domain Node
 			}
 		}
 
-		return b.domainConstraint.attachDomain(tx, anchor, domain)
+		return b.attachDomain(tx, anchor, domain)
 	}))
 }
 
@@ -8134,7 +8061,7 @@ func (d *DomainPointerRegistryD) SetDomain(graph Transactor, subject, domain Nod
 			}
 		}
 
-		return d.domainConstraint.attachDomain(tx, m, domain)
+		return d.attachDomain(tx, m, domain)
 	}))
 }
 

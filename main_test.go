@@ -38,6 +38,107 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
+// The methods below exist ONLY in test builds. Production code has no
+// way to mutate a graph outside Transact (theorystate.md section 92), but
+// these tests need direct writes for setup and to simulate foreign or
+// loaded data that never passed through this process's Checkers.
+// Defining them here, rather than rewriting every test call site, keeps
+// the production API strict and the escape hatch visibly test-only.
+//
+// On *Graph they call the unexported cores directly, so they bypass
+// Checkers exactly as the old exported methods did (the out-of-band
+// adversarial tests depend on that). *GraphActor and *RootGraph have no
+// core to call, so their versions run as one-operation transactions
+// (Checkers run); on *RootGraph the transaction handle presents the ROOT
+// overlay, so the overlay's write rules are still what these tests
+// exercise.
+
+func (g *Graph) CreateNode() (NodeID, error) {
+	release := g.guard.acquire()
+	defer release()
+
+	return g.createNodeCore()
+}
+
+func (g *Graph) AddRelationship(a, b NodeID) (created bool, err error) {
+	release := g.guard.acquire()
+	defer release()
+
+	return g.addRelationshipCore(a, b)
+}
+
+func (g *Graph) RemoveRelationship(a, b NodeID) (removed bool, err error) {
+	release := g.guard.acquire()
+	defer release()
+
+	return g.removeRelationshipCore(a, b)
+}
+
+func (g *Graph) DeleteNode(id NodeID) error {
+	release := g.guard.acquire()
+	defer release()
+
+	return g.deleteNodeCore(id)
+}
+
+func createNodeVia(graph Transactor) (NodeID, error) {
+	return transactValue(graph, func(tx Tx) (NodeID, error) {
+		return createNodeTx(tx)
+	})
+}
+
+func addRelationshipVia(graph Transactor, a, b NodeID) (bool, error) {
+	return transactBool(graph, func(tx Tx) (bool, error) {
+		created, err := tx.AddRelationship(a, b)
+		return created, wrapInterfaceErr(err)
+	})
+}
+
+func removeRelationshipVia(graph Transactor, a, b NodeID) (bool, error) {
+	return transactBool(graph, func(tx Tx) (bool, error) {
+		removed, err := tx.RemoveRelationship(a, b)
+		return removed, wrapInterfaceErr(err)
+	})
+}
+
+func deleteNodeVia(graph Transactor, id NodeID) error {
+	return wrapInterfaceErr(graph.Transact(func(tx Tx) error {
+		return deleteNodeTx(tx, id)
+	}))
+}
+
+func (ga *GraphActor) CreateNode() (NodeID, error) {
+	return createNodeVia(ga)
+}
+
+func (ga *GraphActor) AddRelationship(a, b NodeID) (bool, error) {
+	return addRelationshipVia(ga, a, b)
+}
+
+func (ga *GraphActor) RemoveRelationship(a, b NodeID) (bool, error) {
+	return removeRelationshipVia(ga, a, b)
+}
+
+func (ga *GraphActor) DeleteNode(id NodeID) error {
+	return deleteNodeVia(ga, id)
+}
+
+func (r *RootGraph) CreateNode() (NodeID, error) {
+	return createNodeVia(r)
+}
+
+func (r *RootGraph) AddRelationship(a, b NodeID) (bool, error) {
+	return addRelationshipVia(r, a, b)
+}
+
+func (r *RootGraph) RemoveRelationship(a, b NodeID) (bool, error) {
+	return removeRelationshipVia(r, a, b)
+}
+
+func (r *RootGraph) DeleteNode(id NodeID) error {
+	return deleteNodeVia(r, id)
+}
+
 // sortedNodeIDs returns a sorted copy of ids, for comparing test results
 // against results whose order is documented as unspecified (e.g.
 // CapsuleRegistry.CapsulesWithValue, ListRegistry.OccurrencesOf).

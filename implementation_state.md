@@ -1611,14 +1611,28 @@ NodeID-keyed structure outside the primitive graph.
  TestCompositeSetLogNestedRemoveOperationFailureLeavesLogIntactAndOuterContinues
  and TestDomainStalenessComposedExportedCallsAreJudgedAtOutermostCommit.
 
+36. Mutation only through Transact (theorystate.md section 92). GraphAPI
+ is now GraphReader + Transactor + RegisterChecker; GraphStore (the
+ writes) is reachable only through Tx. *Graph no longer exports
+ CreateNode/AddRelationship/RemoveRelationship/DeleteNode (only the
+ unexported *Core methods Txn calls remain; the concurrentAccessGuard now
+ wraps queries, RegisterChecker and Transact). RootGraph embeds
+ rootReader instead of rootStore (rootStore remains the write half of
+ rootTx). GraphActor's four delegating write methods are gone. The
+ Checker doc no longer claims a raw write can bypass Checkers; what still
+ bypasses them is data that did not come through this process's Checkers
+ (loaded, foreign, older build, pre-registration).
+ main_test.go defines the four write methods on *Graph, *GraphActor and
+ *RootGraph in test builds only: on *Graph they call the cores directly
+ (raw, bypassing Checkers, as the out-of-band adversarial tests need); on
+ *GraphActor and *RootGraph they run as one-operation transactions, so
+ Checkers now run for those tests' setup writes. No test call site
+ changed. Fixed a stale PointerRegistry doc claiming Graph.AddRelationship
+ could be called directly.
+
 Currently unaddressed yet:
-- GraphAPI still embeds GraphStore, so raw CreateNode/AddRelationship/
-  RemoveRelationship/DeleteNode are callable outside Transact on *Graph,
-  RootGraph and GraphActor, bypassing Checkers and commit hooks. Planned
-  next: split them out (writes only through Tx), with the adversarial
-  tests using the unexported *Core methods to simulate foreign or loaded
-  data. A "run every Checker over everything at load" pass belongs with
-  any persistence work.
+- A "run every Checker over everything at load" pass belongs with any
+  persistence work (item 36).
 - Nested transactions are realized for the in-memory backend only
   (savepoints over the undo log); other backends are theorystate.md
   section 45 / 89a. Txn.DeleteNode is supported -- see item 15.
