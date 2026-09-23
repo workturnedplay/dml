@@ -2846,6 +2846,297 @@ load time belongs with any persistence work.
 
 ---
 
+## PART G — PERSISTENCE AND NETWORKED BACKENDS (new this session)
+
+This part resumes Part F's storage-backend discussion (§87-92) with a
+concrete second backend in mind — an etcd-backed `GraphStore` — used
+throughout as the running example specifically because it is the hard
+case: networked, multi-writer, and CAS-native rather than lock-native
+(§89a already named it as one of two candidate non-memory backends,
+alongside SpacetimeDB). Nothing here is implemented; per §33's
+discipline, SEMANTIC/REPRESENTATION/IMPLEMENTATION concerns and their
+DECIDED/TENTATIVE/OPEN status are kept separate below.
+
+## 93. The in-memory backend is a backend, not a cache in front of one (DECIDED)
+
+§87 already establishes that the concrete `*Graph` type is "one
+implementation of th[e] interface — an in-memory one," not a privileged
+core the interface was extracted from. This section makes explicit a
+consequence that follows directly but was not yet stated: once a durable,
+networked backend (etcd) exists, the in-memory backend must never be
+interposed as a full-graph mirror/cache sitting *in front of* it. Reads
+and writes go directly to whichever backend is configured; there is no
+"warm copy" of the whole graph held in a `*Graph` alongside the real
+store.
+
+Three independent reasons, not one:
+
+1. **It defeats the backend's own concurrency contract.** §89a decided
+   that a CAS-native backend satisfies `Transact` by submitting a
+   compare-and-swap conditioned on the revision it read, with a losing
+   attempt discarded and `fn` re-run (§91). If registries actually read
+   through an in-memory mirror instead of the backend directly, every
+   read inside `fn` is checked for freshness against the *mirror's*
+   revision, not etcd's — the CAS would validate staleness relative to a
+   copy nobody else can see, which can pass even when the real store has
+   moved on. This reintroduces, self-inflicted and with no attacker
+   needed, exactly the write-skew shape theorystate.md sections 68/86/89c
+   already spent real design effort closing.
+2. **It manufactures a second source of truth with no reconciliation
+   story.** §69 accepted permanent, unreconciled truth-fragmentation as
+   an unavoidable cost specific to cross-graph mirrors, where no shared
+   memory and no forced sync point exist between two graphs. Inside a
+   single graph's own storage layer there is no such excuse: a
+   networked backend is already a single source of truth, and mirroring
+   it into local RAM throws that away for zero benefit, recreating §69's
+   problem somewhere it was never forced to exist.
+3. **It does not scale, and is not a hedge worth keeping "just in
+   case."** Holding the entire graph in memory is already named,
+   elsewhere in this document, as motivation for eventually moving off
+   plain Go maps (§89c's persistent/structurally-shared storage
+   discussion); a full mirror in front of etcd would be strictly worse
+   than the in-memory backend used alone, since it pays that same
+   unbounded-memory cost while adding a consistency hazard on top.
+
+**What is not rejected by this section:** a *transaction-scoped* overlay
+— read-your-own-writes for the single `fn` currently in flight, discarded
+the instant that attempt ends (commit or retry) — is a different thing
+entirely from a full-graph mirror, and is in fact required (§94). This is
+exactly the "child write buffer merged into its parent" §45 already left
+OPEN for a non-memory backend's realization of nested transactions; §93's
+prohibition is scoped to a *persistent, cross-attempt* mirror of the
+whole graph, never to a per-attempt buffer bounded by the size of one
+transaction.
+
+## 94. etcd-backed GraphStore — concrete design surface (OPEN, scoped this session)
+
+Five sub-questions, each answerable largely by reusing a decision already
+made elsewhere in this document for a different reason:
+
+**94a. Key encoding.** `outgoing`/`incoming` are already, in the
+in-memory backend, a deliberate *dual index* over the same underlying
+facts (Graph's own doc comment: "implementation indexes... not additional
+semantic primitives," itself echoing §34's storage-deviation principle).
+The same dual-index shape maps directly onto etcd's flat keyspace: an
+`outgoing/{from}/{to}` key and a mirrored `incoming/{to}/{from}` key per
+relationship, each range-scannable by prefix, so `FindOutgoing`/
+`FindIncoming` remain prefix scans rather than full-keyspace scans. This
+is a pure representation choice under §34: as long as no query result is
+observably different, the physical key shape is free to differ from the
+in-memory maps' shape.
+
+**94b. NodeID allocation.** etcd has no autoincrement primitive.
+§42/§42a already specified, for exported cross-graph IDs, precisely the
+mechanism this backend needs for *ordinary* NodeIDs too: a durably
+persisted, batch-reserved, monotonic, never-reset counter, using an
+existence check before finalizing each ID as a defense against
+implementation bugs rather than against the counter's own math. Against
+etcd this is one key holding the high-water mark, advanced via etcd's own
+CAS, reserving a block (e.g. +1000) per round trip rather than paying one
+round trip per `CreateNode`. This is the same mechanism §42a already
+designed, not a new one — only its storage location changes, from
+whatever bootstraps the current toy in-memory counter to an etcd key.
+
+**94c. Write buffering and commit.** Per §93, writes made through `fn` do
+not apply immediately the way `Txn`'s do; they accumulate in a
+transaction-scoped buffer (additions, removals, deletes — the same shape
+`Txn.undo` already tracks the *inverse* of, here tracking the *forward*
+change instead) and are submitted as one etcd `Txn` (compare-and-swap
+against the revisions read) only once `fn` returns successfully and every
+relevant `Checker` approves (§94d). There is no undo log for this
+backend, and none is needed: a losing CAS never applied anything to the
+shared store in the first place, so nothing needs to be undone — only
+retried. This is precisely why §91's `Transact` contract requires `fn` to
+be safely re-runnable and to read everything through `tx`: that
+requirement exists *for* this backend, even though it was written down
+while only the in-memory backend existed.
+
+**94d. Checker timing relative to commit.** See §95 — this is a
+consequence of 94c significant enough to warrant its own numbered
+correction to the `Checker` type's own doc comment, not a fresh design
+question.
+
+**94e. Conflict-detection granularity.** §89c already performed the
+exact analysis this backend's CAS compare-list needs: per-edge for bare
+membership/tag nodes, whole-outgoing-set for any `singleChildTarget`-
+governed node, small-fixed-candidate-set for `exactlyOneTag`-shaped
+checks — derived once, from what each accessor's own query shape and each
+registered `Checker`'s own `Check` body already read. That analysis was
+written for an eventual in-memory MVCC scheme (§89c's option (b)) but
+transfers unchanged to etcd's CAS compare-list: the granularity question
+is backend-independent, since it is really a question about each
+*structure's own invariant*, not about which backend enforces it.
+
+## 95. Checker soundness reasoning is backend-relative, not universal (DECIDED, doc correction owed)
+
+`Checker`'s own doc comment currently states, as if a fact about the
+`Checker` type itself, that `Check` "runs against the real,
+already-mutated Graph... never a staged or partial view," and gives the
+single-threaded, mutate-then-check soundness argument as the reason. That
+argument is correct, but it is a fact about *the in-memory backend's own
+mechanism* (§77's resolution note already scopes it this way: "sound...
+under the current single-threaded execution model"), not a property
+`Checker` itself guarantees across every backend. Under an etcd-backed
+`GraphStore` (§94c), nothing is mutated for real until the final CAS
+commits — `Check` necessarily observes `fn`'s buffered-but-not-yet-
+committed changes layered over the last-read revision, not "the real,
+already-mutated" store, since no such thing exists yet at Check time for
+that backend.
+
+The `Checker` type's contract should be restated backend-neutrally:
+*"Check observes the state `fn`'s mutations would produce, as of the
+moment `fn` reports success — never a state older than that, and never
+one that depends on what happens after this call returns."* The
+in-memory backend's specific, stronger claim ("this is literally the
+real Graph, mutated for real, because nothing else can run in between —
+see §19") stays exactly where it already mostly lives, on
+`Graph.Transact`'s and `runCheckers`'s own doc comments, as a fact about
+*that* backend's soundness, not restated as a universal property of
+`Checker` itself. No behavioral change; a documentation correction, owed
+to the moment a second backend actually exists.
+
+## 96. The in-memory backend's own mechanism stays as-is (DECIDED)
+
+A tempting move, considered and rejected this session: reshape the
+in-memory backend to stage-then-commit (buffer writes, apply only on a
+simulated "compare-and-swap") purely so its internal mechanism visually
+matches what an etcd-backed backend will eventually do, on the theory
+that this would make swapping backends easier later.
+
+This is the same question §89a already asked and answered the other way,
+under the heading "concurrency is a per-backend contract, not a universal
+layer added uniformly on top of all three": each backend earns the right
+to satisfy the `Transact` contract by whichever mechanism is natural to
+it, and forcing one backend to imitate another's internal mechanism
+purely for surface uniformity was exactly the anti-pattern that section
+rejected — this proposal is the same anti-pattern, aimed at the opposite
+backend (in-memory imitating etcd, rather than etcd being forced into an
+undo-log shape). It would also silently re-open §77: that section's
+staged/overlay `Txn` proposal was deliberately not built once it was
+shown unnecessary under single-threaded execution (§19); staging
+in-memory writes now, for no reason internal to that backend, pays back
+exactly the complexity §77 correctly avoided, for zero behavioral
+benefit to the backend paying it.
+
+It also would not deliver the swap-in ergonomics it is meant to buy.
+What actually makes a registry portable across backends is that it only
+ever touches graph state through the `Tx`/`GraphAPI` interface and
+already honors the backend-neutral `Transact` contract (§91: re-runnable,
+reads only through `tx`, no side effects outside `tx`) — a contract
+already stated independently of either backend's internal mechanism.
+Matching internal mechanism on top of an already-sufficient interface
+boundary is redundant, not protective.
+
+**Conclusion:** `Graph`'s mutate-then-check, undo-log mechanism is
+unchanged by this or any future backend's existence. §96 does not
+foreclose §94/95's backend-neutral wording fixes — those correct
+*documentation* that was implicitly written as if only one backend would
+ever exist; §96 rejects *changing the mechanism itself* to look like
+something it structurally is not.
+
+## 97. A test-only staged/conflict-simulating fake backend (proposed, not yet built)
+
+§96 rejects changing `Graph` itself, but does not address a real,
+narrower risk that motivated the proposal: registry code could
+accidentally depend on the in-memory backend's *specific* mechanism —
+seeing its own write applied immediately by some path other than reading
+through `tx`, for instance — in a way that happens to work only because
+nothing else can observe the gap under §19, and would silently break the
+first time it ran against a backend whose writes are not visible until
+final commit. This is a real portability-bug class, and at present the
+only way to find an instance of it is to actually build a second backend
+and hit it.
+
+This codebase already has a precedent for exactly this situation:
+Representation C (`PointerMetadataRegistry`) is kept deliberately
+*stricter than necessary*, specifically because "a stricter-than-necessary
+lower layer is useful for testing higher-layer reactions" (§73, and the
+`PointerMetadataRegistry` doc comment). The same move applies here: rather
+than touching `Graph`, add a small, test-only `GraphAPI` implementation
+that deliberately behaves like a staged/CAS backend even though nothing
+requires it to — buffering every write `fn` makes in a local, per-attempt
+overlay, publishing that overlay to its own backing store only once `fn`
+returns successfully and every relevant Checker approves (mirroring
+94c/95's shape exactly, but still entirely in-process, with no etcd
+dependency), and capable of simulating a lost race by discarding one
+attempt's buffer and re-running `fn` from scratch against a backing store
+that changed underneath it in the meantime — genuinely exercising §91's
+"fn may run more than once" clause, which nothing today actually forces
+to happen even once.
+
+The payoff: the existing registry test suite — every `Test*` in this file
+that already takes a `GraphAPI`/`Transactor`/`Tx` — could, in principle,
+be re-run a second time against this fake in place of `*Graph`, with zero
+change to the registries under test, catching any hidden mechanism-
+dependence years before a real networked backend is built. This is
+recorded here as a design worth pursuing, not yet built; the concrete
+shape of "publish an overlay" (a nested map keyed the same way
+`outgoing`/`incoming` are) and exactly how the test harness would
+parametrize existing tests over two backends are both left open.
+
+## 98. NameRegistry under a shared, multi-process backend (OPEN, newly named)
+
+A gap surfaced by §94's premise (multiple processes genuinely sharing one
+persistent backend) that no existing section addresses: `NameRegistry`'s
+own bindings (§6a) are ordinary in-process bookkeeping — a Go map guarded
+by a `sync.RWMutex`, with pending-transaction staging via `Tx.OnCommit`/
+`Tx.OnRollback` (items 30/35) — sufficient to make binding safe against
+concurrent goroutines *sharing one process's `NameRegistry` value*, but
+not against two independent processes each holding their *own*
+`NameRegistry` instance over the same shared etcd-backed graph. Two such
+processes could each observe "AllPointers has no binding yet" and each
+independently create and bind a node for it, exactly the race item 30
+already closed for goroutines sharing one `NameRegistry` — but here
+neither process's in-memory maps know about the other's decision at all.
+
+This is not automatically solved by anything already decided: `Bind`'s
+own staging mechanism (item 35) only prevents two *sub-transactions of
+the same outer transaction on the same process* from double-binding; it
+says nothing about a second process's independent `NameRegistry`. Closing
+this properly needs binding to become a fact the *shared backend* can
+arbitrate — most plausibly by representing a name→NodeID binding as an
+ordinary tagged graph relationship (in the spirit of §76's "give
+foundational concepts real graph identity" discipline, extended from tag
+*names* to name *bindings* themselves) so that etcd's own CAS, or a
+`Checker`, rejects a second bind the same way it already rejects any
+other structural double-write — rather than continuing to keep bindings
+as bookkeeping entirely outside the graph, which was a deliberate and
+correct choice under §6a's single-process assumption but does not survive
+multiple processes sharing one backend. Left genuinely OPEN: whether
+that redesign is worth the churn versus simply documenting single-writer-
+for-bootstrap as an accepted constraint (mirroring how §38 accepted
+permanent global-discovery limits rather than solving them).
+
+## 99. Load-time reconciliation is backend-relative (extends the existing "run every Checker" note)
+
+`implementation_state.md`'s own "Currently unaddressed yet" list already
+anticipates, for the in-memory backend specifically, that restoring a
+graph from any durable store requires a pass that runs every registered
+`Checker` over the whole loaded state once, since nothing about loading
+raw nodes/relationships back into `Graph`'s maps goes through `Transact`
+and therefore nothing is checked as it loads (the same "what didn't come
+through this process's Checkers" gap §92 already names for foreign/older-
+build data generally).
+
+Under an etcd-backed `GraphStore`, there is no equivalent bulk "load"
+step in the same sense — the data already lives in etcd and is read
+lazily, not slurped into a local structure at startup — but the
+analogous moment still exists: a process must register every `Checker`
+it intends to enforce *before* it accepts its first request, and until
+it does so, any state already written by some other process (or by
+itself, in a previous run) that violates an invariant this process's
+Checkers would enforce goes undetected until something reads it. Whether
+a one-time "verify everything currently in etcd" pass is worth running
+at process start, analogous to the in-memory backend's load-time pass, or
+whether the registries' existing on-read fail-loud validation (§92's
+"second line of defence") is accepted as sufficient given a networked
+backend's data is already durable and shared, is left OPEN — this is a
+smaller version of §98's same underlying question (what one process can
+assume about state introduced by another) and probably wants to be
+decided together with it rather than separately.
+
+---
+
 ## PART D — STATUS SUMMARY (consolidated)
 
 *(This part supersedes the early informal "explicitly not decided" list
@@ -2968,6 +3259,20 @@ kept current as sections above resolve or split further.)*
 - Known correctness gaps are fixed, not deferred for lack of a caller;
   "no current caller" only ever sequences new features (§7b).
 - `NameRegistry` lookups are safe from any goroutine (§91).
+- The in-memory backend must never be used as a full-graph cache/mirror
+  in front of a networked backend; each backend is accessed directly,
+  with only a transaction-scoped (per-attempt) write buffer permitted,
+  never a persistent cross-attempt mirror of the whole graph (§93).
+- The in-memory backend's own mutate-then-check, undo-log mechanism is
+  not changed to imitate a networked backend's stage-then-CAS-commit
+  shape merely for surface uniformity; per-backend mechanism divergence,
+  decided once already in §89a, is reaffirmed (§96).
+- `Checker`'s contract is stated backend-neutrally (Check observes the
+  state fn's mutations would produce, as of the moment fn succeeds); the
+  in-memory backend's stronger "this is the real, already-mutated Graph"
+  reasoning is a fact about that backend specifically, not a universal
+  property of Checker itself (§95) — a documentation correction owed,
+  not a behavior change.
 
 ### TENTATIVE
 - Monotonically increasing NodeIDs; serialized first implementation.
@@ -3058,6 +3363,22 @@ kept current as sections above resolve or split further.)*
   arbitration, or a bounded-retry escape hatch to full serialization —
   for preventing livelock/starvation among repeatedly-conflicting
   optimistic retries (§89c).
+- Concrete etcd-backed GraphStore design: key encoding, NodeID allocation
+  via etcd's own CAS counter, write buffering and CAS-based commit at the
+  end of a transaction attempt, and how Checker timing relates to that
+  commit (§94, extending §87a/§89a).
+- Whether a test-only staged/conflict-simulating fake GraphAPI backend is
+  worth building to catch registry code that accidentally depends on the
+  in-memory backend's specific mechanism before a real networked backend
+  exists (§97).
+- How NameRegistry bindings should be arbitrated once more than one
+  process shares a single persistent backend — representing bindings as
+  ordinary graph structure versus accepting single-writer-for-bootstrap
+  as a documented constraint (§98).
+- Whether an etcd-backed backend needs a process-start "verify everything
+  currently stored" pass analogous to the in-memory backend's already-
+  anticipated load-time Checker pass, or whether on-read fail-loud
+  validation is sufficient (§99).
 
 ### REJECTED FOR NOW
 - Giving primitive relationships their own NodeIDs.
