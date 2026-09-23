@@ -12037,7 +12037,169 @@ func TestStagedGraphCheckerDeclineLeavesNoTrace(t *testing.T) {
 	}
 }
 
-// T
+// TestStagedGraphOnCommitRunsExactlyOnceDespiteForceConflict pins down a
+// correctness property specific to this backend's commit shape
+// (theorystate.md section 94c): OnCommit hooks must run exactly once,
+// only when an attempt is actually published, never once per attempt.
+// Each retry gets a brand-new stagedOverlay (see stagedGraph.Transact),
+// so a discarded attempt's own OnCommit registrations are discarded with
+// it -- without that, a forceConflict-discarded attempt's hook would
+// already have run before the retry that actually commits ran its own,
+// double-firing a hook meant to run exactly once per successful
+// Transact call.
+func TestStagedGraphOnCommitRunsExactlyOnceDespiteForceConflict(t *testing.T) {
+	g := newStagedGraph()
+	g.forceConflict = func(attempt int) bool { return attempt == 1 }
+
+	runs := 0
+
+	err := g.Transact(func(tx Tx) error {
+		tx.OnCommit(func() { runs++ })
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Transact() error = %v", err)
+	}
+
+	if runs != 1 {
+		t.Fatalf("OnCommit hook ran %d time(s), want exactly 1 (once, for the attempt that survives forceConflict and is actually published)", runs)
+	}
+}
+
+// TestStagedGraphPointerRegistryPortability is the payoff theorystate.md
+// section 97 exists for: PointerRegistry and NameRegistry are exercised
+// here completely unchanged -- no special-casing, no backend-specific
+// code path -- against stagedGraph instead of *Graph, confirming that
+// depending only on the Tx/GraphAPI interface, as every registry in this
+// file already does, is sufficient for portability across a structurally
+// different backend mechanism.
+func TestStagedGraphPointerRegistryPortability(t *testing.T) {
+	g := newStagedGraph()
+	names := NewNameRegistry(g)
+
+	ids, err := names.BootstrapNames(g, FoundationalNames)
+	if err != nil {
+		t.Fatalf("BootstrapNames(): %v", err)
+	}
+
+	pointers, err := NewPointerRegistry(g, ids[NameAllPointers])
+	if err != nil {
+		t.Fatalf("NewPointerRegistry(): %v", err)
+	}
+
+	p, err := pointers.NewPointer(g)
+	if err != nil {
+		t.Fatalf("NewPointer(): %v", err)
+	}
+
+	x, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for x: %v", err)
+	}
+
+	if err2 := pointers.SetTarget(g, p, x); err2 != nil {
+		t.Fatalf("SetTarget(p, x): %v", err2)
+	}
+
+	target, hasTarget, err := pointers.Target(g, p)
+	if err != nil {
+		t.Fatalf("Target(p): %v", err)
+	}
+	if !hasTarget || target != x {
+		t.Fatalf("Target(p) = (%d,%v), want (%d,true)", target, hasTarget, x)
+	}
+
+	y, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for y: %v", err)
+	}
+
+	if err3 := pointers.SetTarget(g, p, y); err3 != nil {
+		t.Fatalf("SetTarget(p, y): %v", err3)
+	}
+
+	if g.HasRelationship(p, x) {
+		t.Fatal("old target relationship survived a replacement SetTarget()")
+	}
+
+	target, hasTarget, err = pointers.Target(g, p)
+	if err != nil {
+		t.Fatalf("Target(p) after replace: %v", err)
+	}
+	if !hasTarget || target != y {
+		t.Fatalf("Target(p) = (%d,%v), want (%d,true)", target, hasTarget, y)
+	}
+}
+
+// TestGraphActorOverStagedGraphBasicOperations confirms GraphActor
+// (theorystate.md section 89c) works unchanged over stagedGraph, not
+// only over *Graph: NewGraphActor takes a GraphAPI, and stagedGraph is
+// one, so nothing about GraphActor's own logic should need its backend
+// to be *Graph specifically.
+func TestGraphActorOverStagedGraphBasicOperations(t *testing.T) {
+	actor := NewGraphActor(newStagedGraph())
+	defer actor.Close()
+
+	a, err := actor.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for a: %v", err)
+	}
+
+	b, err := actor.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for b: %v", err)
+	}
+
+	created, err := actor.AddRelationship(a, b)
+	if err != nil {
+		t.Fatalf("AddRelationship(a,b): %v", err)
+	}
+	if !created {
+		t.Fatal("AddRelationship(a,b) reported that nothing was created")
+	}
+
+	if !actor.HasRelationship(a, b) {
+		t.Fatal("HasRelationship(a,b) = false, want true")
+	}
+
+	err2 := actor.DeleteNode(b)
+	if !errors.Is(err2, ErrNodeNotEmpty) {
+		t.Fatalf("DeleteNode(b) error = %v, want %v (b still has an incoming relationship)", err2, ErrNodeNotEmpty)
+	}
+}
+
+// TestRootGraphOverStagedGraphBasicOperations confirms RootGraph
+// (theorystate.md section 87b) also works unchanged over stagedGraph:
+// NewRootGraph takes a GraphAPI and enumerates nodes via the interface's
+// own FindNodes, with no assumption anywhere that the wrapped GraphAPI is
+// *Graph specifically.
+func TestRootGraphOverStagedGraphBasicOperations(t *testing.T) {
+	g := newStagedGraph()
+
+	root, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for ROOT: %v", err)
+	}
+
+	a, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for a: %v", err)
+	}
+
+	r, err := NewRootGraph(g, root)
+	if err != nil {
+		t.Fatalf("NewRootGraph(): %v", err)
+	}
+
+	if !r.HasRelationship(root, a) {
+		t.Fatal("a is not visible as a virtual ROOT child")
+	}
+
+	if r.HasRelationship(root, root) {
+		t.Fatal("ROOT incorrectly has a relationship to itself")
+	}
+}
+
 // a CSP/actor-style wrapper making it safe for multiple goroutines to
 // share one underlying *Graph, none of them ever touching it directly.
 
