@@ -1683,12 +1683,64 @@ could be called directly.
  already proven by TestGraphActorTransactPanicPropagatesAndActorSurvives),
  so one test at the source is sufficient.
 
+38. Added stagedGraph/stagedOverlay (theorystate.md sections 93-97),
+ a second, test-only GraphAPI implementation deliberately built around
+ the opposite mechanism from *Graph's mutate-then-check, undo-log
+ approach: every write made during one Transact attempt is buffered in a
+ local stagedOverlay and only applied to stagedGraph's own backing maps
+ once fn succeeds and every relevant Checker approves, simulating the
+ buffer-then-CAS-commit shape an eventual networked backend (etcd) would
+ use. A forceConflict hook, consulted once per attempt right before
+ publish, can discard the attempt's entire overlay and force Transact to
+ rerun fn from scratch -- exercising the "fn may run more than once"
+ clause of the Transact contract (item 30/theorystate.md section 91)
+ that nothing previously exercised even once. Nested transactions
+ (stagedOverlay.Transact) are savepoints over the same overlay, mirroring
+ Txn's own mark/rollbackTo shape (item 32/theorystate.md section 45).
+
+ checkerRelevant was extracted from a *Graph method into a free function
+ taking a GraphReader, so stagedGraph's own runCheckers shares the exact
+ same relevance-filtering logic as Graph.runCheckers instead of
+ duplicating it; Checker's doc comment was reworded to state its
+ contract backend-neutrally (Check observes the state fn's mutations
+ would produce, as of the moment fn succeeds), with the stronger
+ single-threaded "this is the real, already-mutated Graph" claim moved
+ to live on Graph.Transact's own doc comment as that backend's specific
+ soundness argument rather than restated as if universal. No behavior
+ change to *Graph itself.
+
+ The payoff this exists for: PointerRegistry, NameRegistry, GraphActor,
+ and RootGraph are each exercised against stagedGraph with zero change
+ to their own code, confirming that depending only on the Tx/GraphAPI
+ interface -- already true of every registry in this file -- is
+ sufficient for portability across a structurally different backend
+ mechanism, rather than an untested claim. Covered by
+ TestStagedGraphBasicOperations,
+ TestStagedGraphFailedTransactLeavesNoTrace,
+ TestStagedGraphForceConflictRerunsFn,
+ TestStagedGraphNestedTransactRollsBackOnlyInnerSteps,
+ TestStagedGraphCheckerDeclineLeavesNoTrace,
+ TestStagedGraphOnCommitRunsExactlyOnceDespiteForceConflict,
+ TestStagedGraphPointerRegistryPortability,
+ TestGraphActorOverStagedGraphBasicOperations, and
+ TestRootGraphOverStagedGraphBasicOperations.
+
+ Not addressed by this item: stagedGraph tracks no real per-attempt
+ read-set and detects no genuine conflict of its own (forceConflict is
+ an externally-driven stand-in, not a conflict-detection mechanism); and
+ there is no harness re-running the full existing registry test suite
+ against both backends automatically, only hand-written portability
+ tests against stagedGraph specifically (theorystate.md section 97).
+
 Currently unaddressed yet:
 - A "run every Checker over everything at load" pass belongs with any
   persistence work (item 36).
-- Nested transactions are realized for the in-memory backend only
-  (savepoints over the undo log); other backends are theorystate.md
-  section 45 / 89a. Txn.DeleteNode is supported -- see item 15.
+- Nested transactions as a production-backend feature are realized for
+  the in-memory backend only (savepoints over the undo log); a
+  structurally different, test-only realization also exists for
+  stagedGraph (item 38). A real non-memory production backend's own
+  savepoint mechanism remains theorystate.md section 45 / 89a. Txn.
+  DeleteNode is supported -- see item 15.
 - Domain-pointer staleness residuals (theorystate.md section 86): raw
   non-Transact mutations, out-of-band tag removal or descriptor
   re-pointing inside a Transact, and O(pointers-per-domain) validation

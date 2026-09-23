@@ -3034,45 +3034,98 @@ foreclose §94/95's backend-neutral wording fixes — those correct
 ever exist; §96 rejects *changing the mechanism itself* to look like
 something it structurally is not.
 
-## 97. A test-only staged/conflict-simulating fake backend (proposed, not yet built)
+## 97. stagedGraph — a test-only staged/conflict-simulating fake backend (DECIDED, implemented)
 
-§96 rejects changing `Graph` itself, but does not address a real,
-narrower risk that motivated the proposal: registry code could
-accidentally depend on the in-memory backend's *specific* mechanism —
-seeing its own write applied immediately by some path other than reading
-through `tx`, for instance — in a way that happens to work only because
-nothing else can observe the gap under §19, and would silently break the
-first time it ran against a backend whose writes are not visible until
-final commit. This is a real portability-bug class, and at present the
-only way to find an instance of it is to actually build a second backend
-and hit it.
+§96 rejects changing `Graph` itself, but names a real, narrower risk the
+proposal below closes: registry code could accidentally depend on the
+in-memory backend's *specific* mechanism — seeing its own write applied
+immediately by some path other than reading through `tx`, for instance —
+in a way that happens to work only because nothing else can observe the
+gap under §19, and would silently break the first time it ran against a
+backend whose writes are not visible until final commit. This is a real
+portability-bug class; without a second backend to test against, the only
+way to find an instance of it would have been to build a real networked
+backend and hit it there.
 
-This codebase already has a precedent for exactly this situation:
+This codebase already had a precedent for exactly this situation:
 Representation C (`PointerMetadataRegistry`) is kept deliberately
 *stricter than necessary*, specifically because "a stricter-than-necessary
 lower layer is useful for testing higher-layer reactions" (§73, and the
-`PointerMetadataRegistry` doc comment). The same move applies here: rather
-than touching `Graph`, add a small, test-only `GraphAPI` implementation
-that deliberately behaves like a staged/CAS backend even though nothing
-requires it to — buffering every write `fn` makes in a local, per-attempt
-overlay, publishing that overlay to its own backing store only once `fn`
-returns successfully and every relevant Checker approves (mirroring
-94c/95's shape exactly, but still entirely in-process, with no etcd
-dependency), and capable of simulating a lost race by discarding one
-attempt's buffer and re-running `fn` from scratch against a backing store
-that changed underneath it in the meantime — genuinely exercising §91's
-"fn may run more than once" clause, which nothing today actually forces
-to happen even once.
+`PointerMetadataRegistry` doc comment). The same move is applied here,
+implemented as `stagedGraph`/`stagedOverlay` (test-only, defined in
+main_test.go): a second `GraphAPI` implementation that deliberately
+behaves like a staged/CAS backend even though nothing requires it to.
+Every write `fn` makes is buffered in a local, per-attempt `stagedOverlay`
+and applied to `stagedGraph`'s own backing maps (`stagedGraph.publish`)
+only once `fn` returns successfully and every relevant Checker approves,
+consulted against the overlay's own merged view (`stagedGraph.
+runCheckers`) — exactly §94c/95's shape, entirely in-process, with no
+etcd dependency. `stagedGraph` additionally exposes a `forceConflict`
+hook, consulted once per attempt immediately after Checker approval and
+before publish: returning true discards that attempt's entire overlay,
+exactly as a losing real CAS commit would, and `Transact` reruns `fn`
+from scratch as a fresh attempt against the backing store's current state
+— genuinely exercising §91's "fn may run more than once" clause, which
+nothing before this exercised even once.
 
-The payoff: the existing registry test suite — every `Test*` in this file
-that already takes a `GraphAPI`/`Transactor`/`Tx` — could, in principle,
-be re-run a second time against this fake in place of `*Graph`, with zero
-change to the registries under test, catching any hidden mechanism-
-dependence years before a real networked backend is built. This is
-recorded here as a design worth pursuing, not yet built; the concrete
-shape of "publish an overlay" (a nested map keyed the same way
-`outgoing`/`incoming` are) and exactly how the test harness would
-parametrize existing tests over two backends are both left open.
+Nested transactions (`stagedOverlay.Transact`) are savepoints over the
+same overlay, mirroring `Txn`'s own `mark`/`rollbackTo` shape (§45)
+exactly — the only structural difference from `Txn` is *what* the undo
+log undoes: `Txn`'s reverses mutations already applied to the real
+`Graph`; `stagedOverlay`'s reverses mutations already applied to its own
+local buffer, which was never visible to anything outside the attempt in
+progress in the first place. `OnCommit` hooks are recorded per-overlay
+and run only once an attempt is actually published, never merely once
+`fn` returns nil — otherwise a `forceConflict`-discarded attempt's hook
+would already have fired before the retry that actually commits ran its
+own.
+
+Like `*Graph`, a bare `*stagedGraph` supports only one goroutine at a
+time: it reuses `concurrentAccessGuard` directly (the same type `*Graph`
+uses) rather than duplicating its fail-fast discipline, held for one
+`Transact` call's *entire* duration including every internal retry — the
+same "one call is one atomic unit" discipline `Graph.Transact` already
+follows. `checkerRelevant` (previously a `*Graph` method) was extracted
+into a free function taking a `GraphReader`, so this identical
+relevance-filtering logic is shared by both backends' own Checker-
+consulting code rather than duplicated — the one concrete code change
+§95's "Checker's contract is stated backend-neutrally" principle actually
+required, beyond a doc-comment reword. `Checker`'s own doc comment was
+reworded to match: Check observes the state `fn`'s mutations would
+produce, as of the moment `fn` succeeds; the stronger, single-threaded
+"this is the real, already-mutated Graph" claim now lives on
+`Graph.Transact`'s own doc comment as that backend's specific soundness
+argument, not restated as if it were universal.
+
+**Payoff, confirmed rather than merely claimed.** `PointerRegistry`,
+`NameRegistry`, `GraphActor`, and `RootGraph` are each exercised against
+`stagedGraph` with *zero* change to their own code — no backend-specific
+branch anywhere — confirming §96's claim that depending only on the
+`Tx`/`GraphAPI` interface is sufficient for portability across a
+structurally different backend mechanism, rather than leaving that claim
+untested. Covered by `TestStagedGraphBasicOperations`,
+`TestStagedGraphFailedTransactLeavesNoTrace`,
+`TestStagedGraphForceConflictRerunsFn`,
+`TestStagedGraphNestedTransactRollsBackOnlyInnerSteps`,
+`TestStagedGraphCheckerDeclineLeavesNoTrace`,
+`TestStagedGraphOnCommitRunsExactlyOnceDespiteForceConflict`,
+`TestStagedGraphPointerRegistryPortability`,
+`TestGraphActorOverStagedGraphBasicOperations`, and
+`TestRootGraphOverStagedGraphBasicOperations`.
+
+**What remains genuinely open, not closed by this.** `stagedGraph` tracks
+no actual per-attempt read-set and detects no genuine conflict of its
+own — `forceConflict` is an externally-driven, deterministic stand-in for
+"a real CAS lost," not a conflict-detection mechanism in its own right
+(§94e's conflict-granularity analysis is not implemented anywhere yet).
+There is also no general harness re-running the *entire* existing
+registry test suite against both backends automatically; each
+portability test above was written by hand against `stagedGraph`
+specifically, rather than parametrizing every existing `*Graph`-based
+test over both backends. Building that harness, and giving `stagedGraph`
+a real (rather than externally forced) conflict-detection mechanism, are
+both left for whenever an actual networked backend makes either worth
+the cost.
 
 ## 98. NameRegistry under a shared, multi-process backend (OPEN, newly named)
 
@@ -3273,6 +3326,14 @@ kept current as sections above resolve or split further.)*
   reasoning is a fact about that backend specifically, not a universal
   property of Checker itself (§95) — a documentation correction owed,
   not a behavior change.
+- `stagedGraph`/`stagedOverlay` (test-only) is implemented: a second
+  GraphAPI backend that buffers writes per-attempt and publishes them
+  only on success, with a deterministic `forceConflict` hook standing in
+  for a lost CAS to exercise Transact's "fn may run more than once"
+  clause. `PointerRegistry`, `NameRegistry`, `GraphActor`, and
+  `RootGraph` all run against it unchanged, confirming registries are
+  portable across backend mechanism, not merely documented as if they
+  are (§97).
 
 ### TENTATIVE
 - Monotonically increasing NodeIDs; serialized first implementation.
@@ -3367,10 +3428,11 @@ kept current as sections above resolve or split further.)*
   via etcd's own CAS counter, write buffering and CAS-based commit at the
   end of a transaction attempt, and how Checker timing relates to that
   commit (§94, extending §87a/§89a).
-- Whether a test-only staged/conflict-simulating fake GraphAPI backend is
-  worth building to catch registry code that accidentally depends on the
-  in-memory backend's specific mechanism before a real networked backend
-  exists (§97).
+- Whether to build a harness that automatically re-runs the existing
+  registry test suite against both *Graph and stagedGraph, versus
+  writing portability tests by hand as needed; and whether stagedGraph
+  should ever gain real (rather than externally forced) conflict
+  detection (§97).
 - How NameRegistry bindings should be arbitrated once more than one
   process shares a single persistent backend — representing bindings as
   ordinary graph structure versus accepting single-writer-for-bootstrap
