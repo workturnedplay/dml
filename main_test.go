@@ -18,6 +18,7 @@ package dml
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"reflect"
 	"sort"
@@ -10884,7 +10885,1159 @@ func TestSetAddAndRemoveAreVisibleToCommitTimeCheckers(t *testing.T) {
 	}
 }
 
-// The following tests exercise GraphActor (theorystate.md section 89c):
+// ---------------------------------------------------------------------
+// stagedGraph and stagedOverlay: a test-only GraphAPI implementation
+// deliberately built around the OPPOSITE mechanism from *Graph's
+// mutate-then-check, undo-log approach (theorystate.md sections 93-97).
+// Every write made during one Transact attempt is buffered in a local,
+// per-attempt overlay and never touches stagedGraph's own backing store
+// until that attempt both succeeds and every relevant Checker approves,
+// at which point the overlay is published in one step -- the same
+// buffer-then-commit shape an eventual etcd-backed GraphStore would use
+// (theorystate.md section 94), simulated here entirely in memory with no
+// real network or real optimistic-concurrency conflict detection.
+//
+// The point of this type existing at all: theorystate.md section 96
+// deliberately keeps *Graph's own mechanism unchanged rather than
+// reshaping it to look like a networked backend, on the grounds that a
+// registry which only ever touches graph state through the Tx/GraphAPI
+// interface should already be portable across mechanisms without any
+// special-casing. stagedGraph exists to actually test that claim: every
+// registry constructor and method in this file takes a GraphAPI/
+// Transactor/Tx, never a concrete *Graph, so the existing registries can
+// be, and here are, exercised against this structurally different
+// backend with zero code changes -- catching, before any real networked
+// backend exists, any registry code that accidentally depends on seeing
+// its own writes through some path other than the tx/g value it was
+// actually given, or on fn running exactly once.
+//
+// Like *Graph, a bare *stagedGraph supports only one goroutine at a time
+// -- it reuses concurrentAccessGuard directly rather than duplicating
+// its fail-fast discipline -- and can be wrapped in GraphActor for real
+// concurrent access with no changes, exactly like *Graph, since it
+// already satisfies GraphAPI.
+type stagedGraph struct {
+	guard concurrentAccessGuard
+
+	nodes    map[NodeID]struct{}
+	outgoing map[NodeID]map[NodeID]struct{}
+	incoming map[NodeID]map[NodeID]struct{}
+	nextID   NodeID
+
+	checkers []Checker
+
+	// forceConflict, if set, is called once per Transact attempt,
+	// immediately after fn has returned nil and every relevant Checker
+	// has approved, and before that attempt's overlay would otherwise be
+	// published. attempt is 1 for the first try, 2 for the first retry,
+	// and so on. Returning true discards the attempt's entire overlay --
+	// as a losing real CAS commit would -- and Transact reruns fn from
+	// scratch as a fresh attempt against the backing store's current
+	// state: the theorystate.md section 91 "fn may be executed more than
+	// once" clause, which nothing else in this codebase exercises even
+	// once. This is a deliberate, fully deterministic substitute for real
+	// conflict detection (this type tracks no per-attempt read-set and
+	// detects no genuine conflict against one) -- see the stagedGraph
+	// doc comment.
+	forceConflict func(attempt int) bool
+}
+
+// newStagedGraph returns an empty stagedGraph, ready to use. Unlike
+// *Graph, which supports its zero value directly, a stagedGraph must be
+// constructed this way, since its maps need explicit initialization and
+// no caller needs zero-value support for a test-only type.
+func newStagedGraph() *stagedGraph {
+	return &stagedGraph{
+		nodes:    make(map[NodeID]struct{}),
+		outgoing: make(map[NodeID]map[NodeID]struct{}),
+		incoming: make(map[NodeID]map[NodeID]struct{}),
+	}
+}
+
+// The nodeExistsCore/hasRelationshipCore/findOutgoingCore/
+// findIncomingCore/findRelationshipsCore/findNodesCore methods below are
+// stagedGraph's unguarded core reads, exactly mirroring *Graph's own
+// core/guarded split (see createNodeCore's doc comment on *Graph for why
+// this split exists): stagedGraph.Transact acquires g.guard once for an
+// entire attempt, including running fn and every relevant Checker, so
+// every read a stagedOverlay performs against its own base -- from
+// inside fn or from inside a Checker's Check function -- must go through
+// these unguarded cores rather than the guarded public methods below,
+// or it would panic as if a second goroutine had raced in.
+
+func (g *stagedGraph) nodeExistsCore(id NodeID) bool {
+	_, ok := g.nodes[id]
+	return ok
+}
+
+func (g *stagedGraph) hasRelationshipCore(a, b NodeID) bool {
+	if !g.nodeExistsCore(a) || !g.nodeExistsCore(b) {
+		return false
+	}
+
+	_, ok := g.outgoing[a][b]
+	return ok
+}
+
+func (g *stagedGraph) findOutgoingCore(from NodeID) ([]Relationship, error) {
+	if !g.nodeExistsCore(from) {
+		return nil, ErrNodeNotFound
+	}
+
+	relationships := make([]Relationship, 0, len(g.outgoing[from]))
+	for to := range g.outgoing[from] {
+		relationships = append(relationships, Relationship{From: from, To: to})
+	}
+	sort.Slice(relationships, func(i, j int) bool { return relationships[i].To < relationships[j].To })
+
+	return relationships, nil
+}
+
+func (g *stagedGraph) findIncomingCore(to NodeID) ([]Relationship, error) {
+	if !g.nodeExistsCore(to) {
+		return nil, ErrNodeNotFound
+	}
+
+	relationships := make([]Relationship, 0, len(g.incoming[to]))
+	for from := range g.incoming[to] {
+		relationships = append(relationships, Relationship{From: from, To: to})
+	}
+	sort.Slice(relationships, func(i, j int) bool { return relationships[i].From < relationships[j].From })
+
+	return relationships, nil
+}
+
+func (g *stagedGraph) findRelationshipsCore() []Relationship {
+	total := 0
+	for _, targets := range g.outgoing {
+		total += len(targets)
+	}
+
+	relationships := make([]Relationship, 0, total)
+	for from, targets := range g.outgoing {
+		for to := range targets {
+			relationships = append(relationships, Relationship{From: from, To: to})
+		}
+	}
+	sort.Slice(relationships, func(i, j int) bool {
+		if relationships[i].From != relationships[j].From {
+			return relationships[i].From < relationships[j].From
+		}
+		return relationships[i].To < relationships[j].To
+	})
+
+	return relationships
+}
+
+func (g *stagedGraph) findNodesCore() []NodeID {
+	ids := make([]NodeID, 0, len(g.nodes))
+	for id := range g.nodes {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+
+	return ids
+}
+
+// NodeExists, HasRelationship, FindRelationship, FindOutgoing,
+// FindIncoming, FindRelationships and FindNodes below are stagedGraph's
+// guarded public reads, seeing only committed state -- exactly like
+// *Graph's own public methods, and exactly like a real networked
+// backend's reads see only the last committed revision, never another
+// client's in-flight, not-yet-committed transaction.
+
+func (g *stagedGraph) NodeExists(id NodeID) bool {
+	release := g.guard.acquire()
+	defer release()
+
+	return g.nodeExistsCore(id)
+}
+
+func (g *stagedGraph) HasRelationship(a, b NodeID) bool {
+	release := g.guard.acquire()
+	defer release()
+
+	return g.hasRelationshipCore(a, b)
+}
+
+func (g *stagedGraph) FindRelationship(from, to NodeID) (Relationship, bool, error) {
+	release := g.guard.acquire()
+	defer release()
+
+	if !g.nodeExistsCore(from) {
+		return Relationship{}, false, ErrNodeNotFound
+	}
+	if !g.nodeExistsCore(to) {
+		return Relationship{}, false, ErrNodeNotFound
+	}
+	if !g.hasRelationshipCore(from, to) {
+		return Relationship{}, false, nil
+	}
+
+	return Relationship{From: from, To: to}, true, nil
+}
+
+func (g *stagedGraph) FindOutgoing(from NodeID) ([]Relationship, error) {
+	release := g.guard.acquire()
+	defer release()
+
+	return g.findOutgoingCore(from)
+}
+
+func (g *stagedGraph) FindIncoming(to NodeID) ([]Relationship, error) {
+	release := g.guard.acquire()
+	defer release()
+
+	return g.findIncomingCore(to)
+}
+
+func (g *stagedGraph) FindRelationships() []Relationship {
+	release := g.guard.acquire()
+	defer release()
+
+	return g.findRelationshipsCore()
+}
+
+func (g *stagedGraph) FindNodes() []NodeID {
+	release := g.guard.acquire()
+	defer release()
+
+	return g.findNodesCore()
+}
+
+// RegisterChecker behaves exactly like Graph.RegisterChecker.
+func (g *stagedGraph) RegisterChecker(c Checker) {
+	release := g.guard.acquire()
+	defer release()
+
+	g.checkers = append(g.checkers, c)
+}
+
+// Compile-time assertion that *stagedGraph satisfies GraphAPI, mirroring
+// the existing assertions for *Graph and *GraphActor.
+var _ GraphAPI = (*stagedGraph)(nil)
+
+// reserveID hands out a fresh NodeID immediately, from the shared,
+// monotonic counter -- an unguarded core, only ever called from
+// stagedOverlay.CreateNode while g.guard is already held for the whole
+// enclosing Transact attempt. See theorystate.md section 94b: a real
+// CAS backend's ID reservation is its own small atomic step, independent
+// of whether the rest of the attempt's changes are ever actually
+// published. If this attempt is later discarded (forceConflict, an
+// error, or a declined Checker), the reserved id is simply never used by
+// any node -- an abandoned reservation, exactly as a real batch-reserved
+// counter would abandon an unused block; NodeIDs are never reused in
+// this codebase regardless (theorystate.md section 2.2/2.3), so this can
+// never collide with a later, different node.
+func (g *stagedGraph) reserveID() NodeID {
+	id := g.nextID
+	g.nextID++
+
+	return id
+}
+
+// runCheckers consults every registered checker against ov's merged view
+// -- base as it stood when ov was created, overlaid with everything ov's
+// own attempt has done so far -- exactly the theorystate.md section 95
+// contract: Check observes the state fn's mutations would produce, as of
+// the moment fn succeeds, never stagedGraph's real backing store
+// directly, which has not been touched yet for this backend. Unguarded:
+// only ever called from Transact while g.guard is already held.
+func (g *stagedGraph) runCheckers(ov *stagedOverlay) error {
+	if len(ov.touched) == 0 || len(g.checkers) == 0 {
+		return nil
+	}
+
+	for _, checker := range g.checkers {
+		if !checkerRelevant(ov, checker, ov.touched) {
+			continue
+		}
+
+		if err := checker.Check(ov, ov.touched); err != nil {
+			return fmt.Errorf("%s: %w", checker.Name, err)
+		}
+	}
+
+	return nil
+}
+
+// publish applies every change recorded in ov to g's backing store, in
+// one step -- the "commit" half of this backend's CAS-shaped Transact
+// (theorystate.md section 94c). Unguarded: only ever called from
+// Transact while g.guard is already held, once a whole attempt has
+// succeeded, been approved by every relevant Checker, and survived
+// forceConflict.
+func (g *stagedGraph) publish(ov *stagedOverlay) {
+	for id := range ov.createdNodes {
+		g.nodes[id] = struct{}{}
+		if g.outgoing[id] == nil {
+			g.outgoing[id] = make(map[NodeID]struct{})
+		}
+		if g.incoming[id] == nil {
+			g.incoming[id] = make(map[NodeID]struct{})
+		}
+	}
+
+	for from, tos := range ov.addedEdges {
+		for to := range tos {
+			g.outgoing[from][to] = struct{}{}
+			g.incoming[to][from] = struct{}{}
+		}
+	}
+
+	for from, tos := range ov.removedEdges {
+		for to := range tos {
+			delete(g.outgoing[from], to)
+			delete(g.incoming[to], from)
+		}
+	}
+
+	for id := range ov.deletedNodes {
+		delete(g.nodes, id)
+		delete(g.outgoing, id)
+		delete(g.incoming, id)
+	}
+}
+
+// Transact runs the CAS-shaped attempt/retry loop this backend exists to
+// exercise (theorystate.md sections 94c/97): each attempt runs fn
+// against a fresh, empty stagedOverlay over the backing store's current
+// committed state, and nothing fn does through that overlay is visible
+// anywhere -- including to this same stagedGraph's own other reads --
+// until this attempt both succeeds and is published.
+//
+// g.guard is acquired once for the whole call, including every retry
+// forceConflict causes: from the outside, one Transact call is one
+// atomic unit regardless of how many internal attempts it took, exactly
+// mirroring Graph.Transact's own guard discipline. Unlike Graph.Transact,
+// no rollback step is needed on failure or panic: an attempt's overlay
+// never touches the backing store until publish, so a discarded overlay
+// simply leaves nothing behind to undo.
+func (g *stagedGraph) Transact(fn func(tx Tx) error) error {
+	release := g.guard.acquire()
+	defer release()
+
+	for attempt := 1; ; attempt++ {
+		ov := newStagedOverlay(g)
+
+		if fnErr := fn(ov); fnErr != nil {
+			return fnErr
+		}
+
+		if checkErr := g.runCheckers(ov); checkErr != nil {
+			return checkErr
+		}
+
+		if g.forceConflict != nil && g.forceConflict(attempt) {
+			continue
+		}
+
+		g.publish(ov)
+		ov.runCommitHooks()
+
+		return nil
+	}
+}
+
+// The methods below exist ONLY in test builds, exactly mirroring the
+// test-only CreateNode/AddRelationship/RemoveRelationship/DeleteNode
+// wrappers already defined above for *GraphActor and *RootGraph: GraphAPI
+// itself exposes no raw writes (theorystate.md section 92), so these run
+// as one-operation Transact calls via the same createNodeVia/
+// addRelationshipVia/removeRelationshipVia/deleteNodeVia helpers already
+// used for those two types, meaning Checkers run for these too, exactly
+// like the GraphActor/RootGraph versions (and unlike *Graph's own
+// test-only versions, which deliberately bypass Checkers for the
+// out-of-band adversarial tests).
+
+func (g *stagedGraph) CreateNode() (NodeID, error) {
+	return createNodeVia(g)
+}
+
+func (g *stagedGraph) AddRelationship(a, b NodeID) (bool, error) {
+	return addRelationshipVia(g, a, b)
+}
+
+func (g *stagedGraph) RemoveRelationship(a, b NodeID) (bool, error) {
+	return removeRelationshipVia(g, a, b)
+}
+
+func (g *stagedGraph) DeleteNode(id NodeID) error {
+	return deleteNodeVia(g, id)
+}
+
+// stagedOverlay is the per-attempt handle stagedGraph.Transact gives fn:
+// a local, in-memory buffer of every mutation this attempt has made so
+// far, checked and read through exactly like a real graph would be, but
+// never applied to base until the whole attempt commits (see
+// stagedGraph.publish). Nested transactions (Tx.Transact) are savepoints
+// over this same buffer, mirroring Txn's own mark/rollbackTo shape
+// (theorystate.md section 45) -- the only difference from Txn is WHAT
+// the undo log undoes: Txn's undo log reverses mutations already applied
+// to the real Graph; this overlay's undo log reverses mutations already
+// applied to its own local buffer, which was never visible to anything
+// outside this attempt in the first place.
+type stagedOverlay struct {
+	base *stagedGraph
+
+	// createdNodes/deletedNodes are this attempt's two tombstone-style
+	// sets: a node created by this attempt does not yet exist in base,
+	// so reads must check createdNodes; a node deleted by this attempt
+	// still exists in base (until publish), so reads must check
+	// deletedNodes before falling through to base at all.
+	createdNodes map[NodeID]struct{}
+	deletedNodes map[NodeID]struct{}
+
+	// addedEdges/removedEdges are the relationship-level counterpart,
+	// keyed the same dual-index way base.outgoing/incoming are
+	// (theorystate.md section 94a): addedEdges[a][b] means this attempt
+	// added (a,b); removedEdges[a][b] means this attempt removed a (a,b)
+	// that was visible before this attempt touched it. The two are kept
+	// mutually exclusive for any given (a,b) by AddRelationship/
+	// RemoveRelationship themselves, each clearing the other's entry
+	// before setting its own.
+	addedEdges   map[NodeID]map[NodeID]struct{}
+	removedEdges map[NodeID]map[NodeID]struct{}
+
+	// touched mirrors Txn.touched: every NodeID this attempt's mutations
+	// have involved, for Checker relevance filtering (checkerRelevant).
+	touched map[NodeID]struct{}
+
+	// undo mirrors Txn.undo: one closure per mutation, undoing that
+	// mutation's effect on this overlay's own maps (never on base, which
+	// this attempt has not touched). OnRollback hooks are appended here
+	// too, so they run in LIFO order interleaved with the overlay
+	// mutations around them, exactly like Txn.OnRollback.
+	undo []func()
+
+	// commitHooks holds every function registered via OnCommit, run by
+	// stagedGraph.Transact only once this attempt has actually been
+	// published -- never merely once fn itself returns nil, since a
+	// later forceConflict-triggered retry would otherwise already have
+	// run a hook for an attempt that was in fact discarded.
+	commitHooks []func()
+}
+
+// newStagedOverlay returns an empty overlay over base, ready for one
+// Transact attempt.
+func newStagedOverlay(base *stagedGraph) *stagedOverlay {
+	return &stagedOverlay{
+		base:         base,
+		createdNodes: make(map[NodeID]struct{}),
+		deletedNodes: make(map[NodeID]struct{}),
+		addedEdges:   make(map[NodeID]map[NodeID]struct{}),
+		removedEdges: make(map[NodeID]map[NodeID]struct{}),
+	}
+}
+
+// Compile-time assertions that *stagedOverlay satisfies Tx (and
+// therefore GraphReader), mirroring the existing assertions for *Txn.
+var _ Tx = (*stagedOverlay)(nil)
+var _ GraphReader = (*stagedOverlay)(nil)
+
+func (ov *stagedOverlay) touch(ids ...NodeID) {
+	if ov.touched == nil {
+		ov.touched = make(map[NodeID]struct{}, len(ids))
+	}
+
+	for _, id := range ids {
+		ov.touched[id] = struct{}{}
+	}
+}
+
+// nodeExists reports whether id exists in the state this attempt has
+// produced so far: created-this-attempt nodes exist, deleted-this-
+// attempt nodes do not, and everything else falls through to base's
+// last-committed state, read through base's unguarded core (see the
+// core-methods doc comment on stagedGraph above).
+func (ov *stagedOverlay) nodeExists(id NodeID) bool {
+	if _, deleted := ov.deletedNodes[id]; deleted {
+		return false
+	}
+	if _, created := ov.createdNodes[id]; created {
+		return true
+	}
+
+	return ov.base.nodeExistsCore(id)
+}
+
+func (ov *stagedOverlay) NodeExists(id NodeID) bool {
+	return ov.nodeExists(id)
+}
+
+func (ov *stagedOverlay) hasRelationship(a, b NodeID) bool {
+	if !ov.nodeExists(a) || !ov.nodeExists(b) {
+		return false
+	}
+	if _, removed := ov.removedEdges[a][b]; removed {
+		return false
+	}
+	if _, added := ov.addedEdges[a][b]; added {
+		return true
+	}
+
+	return ov.base.hasRelationshipCore(a, b)
+}
+
+func (ov *stagedOverlay) HasRelationship(a, b NodeID) bool {
+	return ov.hasRelationship(a, b)
+}
+
+func (ov *stagedOverlay) FindRelationship(from, to NodeID) (Relationship, bool, error) {
+	if !ov.nodeExists(from) {
+		return Relationship{}, false, ErrNodeNotFound
+	}
+	if !ov.nodeExists(to) {
+		return Relationship{}, false, ErrNodeNotFound
+	}
+	if !ov.hasRelationship(from, to) {
+		return Relationship{}, false, nil
+	}
+
+	return Relationship{From: from, To: to}, true, nil
+}
+
+// outgoingSet returns from's merged outgoing targets under this overlay:
+// base's own targets (skipped entirely if from was created this attempt,
+// since base then has nothing for it yet), plus this attempt's
+// additions, minus this attempt's removals. Callers must already know
+// from exists under this overlay (ov.nodeExists(from)).
+func (ov *stagedOverlay) outgoingSet(from NodeID) (map[NodeID]struct{}, error) {
+	result := make(map[NodeID]struct{})
+
+	if _, created := ov.createdNodes[from]; !created {
+		baseRels, err := ov.base.findOutgoingCore(from)
+		if err != nil {
+			return nil, err
+		}
+		for _, rel := range baseRels {
+			result[rel.To] = struct{}{}
+		}
+	}
+
+	for to := range ov.addedEdges[from] {
+		result[to] = struct{}{}
+	}
+	for to := range ov.removedEdges[from] {
+		delete(result, to)
+	}
+
+	return result, nil
+}
+
+// incomingSet is outgoingSet's reverse-direction counterpart.
+func (ov *stagedOverlay) incomingSet(to NodeID) (map[NodeID]struct{}, error) {
+	result := make(map[NodeID]struct{})
+
+	if _, created := ov.createdNodes[to]; !created {
+		baseRels, err := ov.base.findIncomingCore(to)
+		if err != nil {
+			return nil, err
+		}
+		for _, rel := range baseRels {
+			result[rel.From] = struct{}{}
+		}
+	}
+
+	for from, tos := range ov.addedEdges {
+		if _, ok := tos[to]; ok {
+			result[from] = struct{}{}
+		}
+	}
+	for from, tos := range ov.removedEdges {
+		if _, ok := tos[to]; ok {
+			delete(result, from)
+		}
+	}
+
+	return result, nil
+}
+
+func (ov *stagedOverlay) FindOutgoing(from NodeID) ([]Relationship, error) {
+	if !ov.nodeExists(from) {
+		return nil, ErrNodeNotFound
+	}
+
+	set, err := ov.outgoingSet(from)
+	if err != nil {
+		return nil, err
+	}
+
+	relationships := make([]Relationship, 0, len(set))
+	for to := range set {
+		relationships = append(relationships, Relationship{From: from, To: to})
+	}
+	sort.Slice(relationships, func(i, j int) bool { return relationships[i].To < relationships[j].To })
+
+	return relationships, nil
+}
+
+func (ov *stagedOverlay) FindIncoming(to NodeID) ([]Relationship, error) {
+	if !ov.nodeExists(to) {
+		return nil, ErrNodeNotFound
+	}
+
+	set, err := ov.incomingSet(to)
+	if err != nil {
+		return nil, err
+	}
+
+	relationships := make([]Relationship, 0, len(set))
+	for from := range set {
+		relationships = append(relationships, Relationship{From: from, To: to})
+	}
+	sort.Slice(relationships, func(i, j int) bool { return relationships[i].From < relationships[j].From })
+
+	return relationships, nil
+}
+
+func (ov *stagedOverlay) FindRelationships() []Relationship {
+	merged := make(map[NodeID]map[NodeID]struct{})
+
+	for _, rel := range ov.base.findRelationshipsCore() {
+		if _, deleted := ov.deletedNodes[rel.From]; deleted {
+			continue
+		}
+		if _, deleted := ov.deletedNodes[rel.To]; deleted {
+			continue
+		}
+		if merged[rel.From] == nil {
+			merged[rel.From] = make(map[NodeID]struct{})
+		}
+		merged[rel.From][rel.To] = struct{}{}
+	}
+
+	for from, tos := range ov.removedEdges {
+		for to := range tos {
+			delete(merged[from], to)
+		}
+	}
+
+	for from, tos := range ov.addedEdges {
+		if merged[from] == nil {
+			merged[from] = make(map[NodeID]struct{})
+		}
+		for to := range tos {
+			merged[from][to] = struct{}{}
+		}
+	}
+
+	relationships := make([]Relationship, 0)
+	for from, tos := range merged {
+		for to := range tos {
+			relationships = append(relationships, Relationship{From: from, To: to})
+		}
+	}
+	sort.Slice(relationships, func(i, j int) bool {
+		if relationships[i].From != relationships[j].From {
+			return relationships[i].From < relationships[j].From
+		}
+		return relationships[i].To < relationships[j].To
+	})
+
+	return relationships
+}
+
+func (ov *stagedOverlay) FindNodes() []NodeID {
+	merged := make(map[NodeID]struct{})
+	for _, id := range ov.base.findNodesCore() {
+		merged[id] = struct{}{}
+	}
+	for id := range ov.deletedNodes {
+		delete(merged, id)
+	}
+	for id := range ov.createdNodes {
+		merged[id] = struct{}{}
+	}
+
+	ids := make([]NodeID, 0, len(merged))
+	for id := range merged {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+
+	return ids
+}
+
+// CreateNode reserves a fresh NodeID from the shared backing counter
+// immediately (see stagedGraph.reserveID) and records it as created by
+// this attempt.
+func (ov *stagedOverlay) CreateNode() (NodeID, error) {
+	id := ov.base.reserveID()
+
+	ov.createdNodes[id] = struct{}{}
+	ov.touch(id)
+
+	ov.undo = append(ov.undo, func() {
+		delete(ov.createdNodes, id)
+	})
+
+	return id, nil
+}
+
+// AddRelationship records (a,b) as added by this attempt, if it is not
+// already visible (from base or an earlier step of this same attempt).
+func (ov *stagedOverlay) AddRelationship(a, b NodeID) (created bool, err error) {
+	if !ov.nodeExists(a) {
+		return false, ErrNodeNotFound
+	}
+	if !ov.nodeExists(b) {
+		return false, ErrNodeNotFound
+	}
+	if ov.hasRelationship(a, b) {
+		return false, nil
+	}
+
+	if ov.addedEdges[a] == nil {
+		ov.addedEdges[a] = make(map[NodeID]struct{})
+	}
+	ov.addedEdges[a][b] = struct{}{}
+
+	wasRemoved := false
+	if _, ok := ov.removedEdges[a][b]; ok {
+		delete(ov.removedEdges[a], b)
+		wasRemoved = true
+	}
+
+	ov.touch(a, b)
+
+	ov.undo = append(ov.undo, func() {
+		delete(ov.addedEdges[a], b)
+		if wasRemoved {
+			if ov.removedEdges[a] == nil {
+				ov.removedEdges[a] = make(map[NodeID]struct{})
+			}
+			ov.removedEdges[a][b] = struct{}{}
+		}
+	})
+
+	return true, nil
+}
+
+// RemoveRelationship records (a,b) as removed by this attempt, if it is
+// currently visible, symmetric with AddRelationship above.
+func (ov *stagedOverlay) RemoveRelationship(a, b NodeID) (removed bool, err error) {
+	if !ov.nodeExists(a) {
+		return false, ErrNodeNotFound
+	}
+	if !ov.nodeExists(b) {
+		return false, ErrNodeNotFound
+	}
+	if !ov.hasRelationship(a, b) {
+		return false, nil
+	}
+
+	wasAdded := false
+	if _, ok := ov.addedEdges[a][b]; ok {
+		delete(ov.addedEdges[a], b)
+		wasAdded = true
+	}
+
+	if ov.removedEdges[a] == nil {
+		ov.removedEdges[a] = make(map[NodeID]struct{})
+	}
+	ov.removedEdges[a][b] = struct{}{}
+
+	ov.touch(a, b)
+
+	ov.undo = append(ov.undo, func() {
+		delete(ov.removedEdges[a], b)
+		if wasAdded {
+			if ov.addedEdges[a] == nil {
+				ov.addedEdges[a] = make(map[NodeID]struct{})
+			}
+			ov.addedEdges[a][b] = struct{}{}
+		}
+	})
+
+	return true, nil
+}
+
+// DeleteNode records id as deleted by this attempt, requiring id to
+// currently have zero relationships in either direction under this
+// overlay's own merged view -- exactly Graph.DeleteNode's own
+// precondition (theorystate.md section 18), just checked against the
+// state this attempt would produce rather than against a real graph
+// directly.
+func (ov *stagedOverlay) DeleteNode(id NodeID) error {
+	if !ov.nodeExists(id) {
+		return ErrNodeNotFound
+	}
+
+	outgoing, err := ov.outgoingSet(id)
+	if err != nil {
+		return err
+	}
+	if len(outgoing) != 0 {
+		return ErrNodeNotEmpty
+	}
+
+	incoming, err := ov.incomingSet(id)
+	if err != nil {
+		return err
+	}
+	if len(incoming) != 0 {
+		return ErrNodeNotEmpty
+	}
+
+	ov.touch(id)
+
+	if _, created := ov.createdNodes[id]; created {
+		delete(ov.createdNodes, id)
+
+		ov.undo = append(ov.undo, func() {
+			ov.createdNodes[id] = struct{}{}
+		})
+
+		return nil
+	}
+
+	ov.deletedNodes[id] = struct{}{}
+
+	ov.undo = append(ov.undo, func() {
+		delete(ov.deletedNodes, id)
+	})
+
+	return nil
+}
+
+// stagedMark records how long ov's undo log and commit-hook list were at
+// some point, so a nested transaction can later be rolled back to
+// exactly that point -- the overlay-level counterpart of Txn's txMark.
+type stagedMark struct {
+	undo  int
+	hooks int
+}
+
+func (ov *stagedOverlay) mark() stagedMark {
+	return stagedMark{undo: len(ov.undo), hooks: len(ov.commitHooks)}
+}
+
+// rollbackTo undoes, in reverse (LIFO) order, every mutation recorded on
+// ov's own buffer since m was taken, and discards every commit hook
+// registered since then -- the overlay-level counterpart of
+// Txn.rollbackTo, operating on this attempt's local maps rather than on
+// a real graph.
+func (ov *stagedOverlay) rollbackTo(m stagedMark) {
+	for i := len(ov.undo) - 1; i >= m.undo; i-- {
+		ov.undo[i]()
+	}
+
+	clear(ov.undo[m.undo:])
+	ov.undo = ov.undo[:m.undo]
+
+	clear(ov.commitHooks[m.hooks:])
+	ov.commitHooks = ov.commitHooks[:m.hooks]
+}
+
+// Transact implements Transactor for a staged attempt already in
+// progress: fn runs as a nested transaction, a savepoint over this same
+// overlay, mirroring Txn.Transact exactly (theorystate.md section 45) --
+// only what fn did since this call is undone on failure or panic, and
+// Checkers never run here (only once, at the outermost
+// stagedGraph.Transact commit).
+func (ov *stagedOverlay) Transact(fn func(nested Tx) error) error {
+	mark := ov.mark()
+
+	defer func() {
+		if r := recover(); r != nil {
+			ov.rollbackTo(mark)
+			panic(r)
+		}
+	}()
+
+	if err := fn(ov); err != nil {
+		ov.rollbackTo(mark)
+		return err
+	}
+
+	return nil
+}
+
+// OnCommit registers fn to run once this attempt is actually published
+// to the backing store (see stagedGraph.publish) -- never merely once fn
+// itself returns nil, since a later forceConflict-triggered retry would
+// otherwise already have run a hook for an attempt that was in fact
+// discarded.
+func (ov *stagedOverlay) OnCommit(fn func()) {
+	ov.commitHooks = append(ov.commitHooks, fn)
+}
+
+// OnRollback registers fn to run if this overlay, or the nested
+// transaction in progress when it is registered, is rolled back.
+// Recorded in the same undo log as every other mutation, so it fires in
+// LIFO order interleaved with them, exactly like Txn.OnRollback.
+func (ov *stagedOverlay) OnRollback(fn func()) {
+	ov.undo = append(ov.undo, fn)
+}
+
+// runCommitHooks runs and clears every registered commit hook, in
+// registration order. Called only by stagedGraph.Transact, only once an
+// attempt has actually been published.
+func (ov *stagedOverlay) runCommitHooks() {
+	hooks := ov.commitHooks
+	ov.commitHooks = nil
+
+	for _, hook := range hooks {
+		hook()
+	}
+}
+
+// The following tests exercise stagedGraph/stagedOverlay (theorystate.md
+// sections 93-97): a second, structurally different GraphAPI
+// implementation used to prove that existing registries are portable
+// across backends, not merely documented as if they are.
+
+func TestStagedGraphBasicOperations(t *testing.T) {
+	g := newStagedGraph()
+
+	a, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for a: %v", err)
+	}
+
+	b, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for b: %v", err)
+	}
+
+	if !g.NodeExists(a) || !g.NodeExists(b) {
+		t.Fatal("created nodes do not both exist")
+	}
+
+	created, err := g.AddRelationship(a, b)
+	if err != nil {
+		t.Fatalf("AddRelationship(a,b): %v", err)
+	}
+	if !created {
+		t.Fatal("AddRelationship(a,b) reported that nothing was created")
+	}
+
+	if !g.HasRelationship(a, b) {
+		t.Fatal("HasRelationship(a,b) = false, want true")
+	}
+
+	relationship, exists, err := g.FindRelationship(a, b)
+	if err != nil {
+		t.Fatalf("FindRelationship(a,b): %v", err)
+	}
+	if !exists {
+		t.Fatal("FindRelationship(a,b) reported the relationship does not exist")
+	}
+	want := Relationship{From: a, To: b}
+	if !reflect.DeepEqual(relationship, want) {
+		t.Fatalf("FindRelationship(a,b) = %v, want %v", relationship, want)
+	}
+
+	outgoing, err := g.FindOutgoing(a)
+	if err != nil {
+		t.Fatalf("FindOutgoing(a): %v", err)
+	}
+	if !reflect.DeepEqual(outgoing, []Relationship{want}) {
+		t.Fatalf("FindOutgoing(a) = %v, want %v", outgoing, []Relationship{want})
+	}
+
+	incoming, err := g.FindIncoming(b)
+	if err != nil {
+		t.Fatalf("FindIncoming(b): %v", err)
+	}
+	if !reflect.DeepEqual(incoming, []Relationship{want}) {
+		t.Fatalf("FindIncoming(b) = %v, want %v", incoming, []Relationship{want})
+	}
+
+	all := g.FindRelationships()
+	if !reflect.DeepEqual(all, []Relationship{want}) {
+		t.Fatalf("FindRelationships() = %v, want %v", all, []Relationship{want})
+	}
+
+	removed, err := g.RemoveRelationship(a, b)
+	if err != nil {
+		t.Fatalf("RemoveRelationship(a,b): %v", err)
+	}
+	if !removed {
+		t.Fatal("RemoveRelationship(a,b) reported that nothing was removed")
+	}
+
+	if g.HasRelationship(a, b) {
+		t.Fatal("relationship still exists after removal")
+	}
+
+	if err2 := g.DeleteNode(a); err2 != nil {
+		t.Fatalf("DeleteNode(a): %v", err2)
+	}
+	if g.NodeExists(a) {
+		t.Fatal("node a still exists after DeleteNode()")
+	}
+}
+
+// TestStagedGraphFailedTransactLeavesNoTrace confirms a failed attempt's
+// writes never reach the backing store -- the baseline correctness
+// property this backend must have before ForceConflict-driven retries
+// (TestStagedGraphForceConflictRerunsFn) can mean anything.
+func TestStagedGraphFailedTransactLeavesNoTrace(t *testing.T) {
+	g := newStagedGraph()
+	errBoom := errors.New("boom")
+
+	var id NodeID
+
+	err := g.Transact(func(tx Tx) error {
+		var createErr error
+		id, createErr = createNodeTx(tx)
+		if createErr != nil {
+			return createErr
+		}
+
+		return errBoom
+	})
+	if !errors.Is(err, errBoom) {
+		t.Fatalf("Transact() error = %v, want %v", err, errBoom)
+	}
+
+	if g.NodeExists(id) {
+		t.Fatalf("node %d created by a failed attempt is visible in the backing store", id)
+	}
+}
+
+// TestStagedGraphForceConflictRerunsFn exercises the theorystate.md
+// section 91 "fn may be executed more than once" clause directly and
+// deterministically: forceConflict discards the first attempt's overlay
+// entirely, as a losing real CAS commit would, and Transact reruns fn
+// from scratch. Nothing from the discarded first attempt -- including
+// the NodeID it reserved -- may leak into the final, committed state.
+func TestStagedGraphForceConflictRerunsFn(t *testing.T) {
+	g := newStagedGraph()
+	g.forceConflict = func(attempt int) bool { return attempt == 1 }
+
+	var ids []NodeID
+
+	err := g.Transact(func(tx Tx) error {
+		id, err2 := createNodeTx(tx)
+		if err2 != nil {
+			return err2
+		}
+		ids = append(ids, id)
+
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Transact() error = %v", err)
+	}
+
+	if len(ids) != 2 {
+		t.Fatalf("fn ran %d time(s), want exactly 2 (one forced conflict, one real commit)", len(ids))
+	}
+
+	firstAttemptID, secondAttemptID := ids[0], ids[1]
+
+	if g.NodeExists(firstAttemptID) {
+		t.Fatalf("node %d from the discarded first attempt is visible in the backing store", firstAttemptID)
+	}
+	if !g.NodeExists(secondAttemptID) {
+		t.Fatalf("node %d from the committed second attempt does not exist", secondAttemptID)
+	}
+
+	if got := len(g.FindNodes()); got != 1 {
+		t.Fatalf("FindNodes() has %d node(s), want exactly 1 (the discarded attempt's node must not linger)", got)
+	}
+}
+
+// TestStagedGraphNestedTransactRollsBackOnlyInnerSteps is the
+// stagedOverlay counterpart of TestNestedTransactFailureRollsBackOnlyTheInnerSteps:
+// the overlay's own mark/rollbackTo mechanism must behave identically to
+// Txn's, even though it operates on a local buffer that has never
+// touched the real backing store, rather than on the store directly.
+func TestStagedGraphNestedTransactRollsBackOnlyInnerSteps(t *testing.T) {
+	g := newStagedGraph()
+	errInner := errors.New("inner failure")
+
+	var kept, dropped NodeID
+
+	err := g.Transact(func(tx Tx) error {
+		var txErr error
+		kept, txErr = createNodeTx(tx)
+		if txErr != nil {
+			return txErr
+		}
+
+		innerErr := tx.Transact(func(inner Tx) error {
+			var createErr error
+			dropped, createErr = createNodeTx(inner)
+			if createErr != nil {
+				return createErr
+			}
+
+			if linkErr := addRelationshipTx(inner, kept, dropped); linkErr != nil {
+				return linkErr
+			}
+
+			return errInner
+		})
+		if !errors.Is(innerErr, errInner) {
+			t.Errorf("nested Transact() error = %v, want %v", innerErr, errInner)
+		}
+
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Transact() error = %v", err)
+	}
+
+	if !g.NodeExists(kept) {
+		t.Fatal("the outer step was lost although only the nested transaction failed")
+	}
+	if g.NodeExists(dropped) {
+		t.Fatal("the nested step survived its own failed transaction")
+	}
+	if g.HasRelationship(kept, dropped) {
+		t.Fatal("a relationship added inside the failed nested transaction survived")
+	}
+}
+
+// TestStagedGraphCheckerDeclineLeavesNoTrace confirms a declined Checker
+// discards the whole attempt, exactly like TestCheckerPanicRollsBackAndPropagates
+// does for *Graph -- here there is nothing to actively roll back, since
+// nothing was ever applied to the backing store in the first place.
+func TestStagedGraphCheckerDeclineLeavesNoTrace(t *testing.T) {
+	g := newStagedGraph()
+
+	tag, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for tag: %v", err)
+	}
+
+	errVeto := errors.New("veto")
+	g.RegisterChecker(Checker{
+		Name: "veto",
+		Tags: []NodeID{tag},
+		Check: func(_ GraphReader, _ map[NodeID]struct{}) error {
+			return errVeto
+		},
+	})
+
+	var id NodeID
+
+	err = g.Transact(func(tx Tx) error {
+		var createErr error
+		id, createErr = createNodeTx(tx)
+		if createErr != nil {
+			return createErr
+		}
+
+		return addRelationshipTx(tx, tag, id)
+	})
+	if !errors.Is(err, errVeto) {
+		t.Fatalf("Transact() error = %v, want %v", err, errVeto)
+	}
+
+	if g.NodeExists(id) {
+		t.Fatalf("node %d created by a declined attempt is visible in the backing store", id)
+	}
+	if g.HasRelationship(tag, id) {
+		t.Fatal("relationship created by a declined attempt is visible in the backing store")
+	}
+}
+
+// T
 // a CSP/actor-style wrapper making it safe for multiple goroutines to
 // share one underlying *Graph, none of them ever touching it directly.
 

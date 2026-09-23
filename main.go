@@ -1139,7 +1139,7 @@ func (tx *Txn) FindNodes() []NodeID {
 var _ GraphReader = (*Txn)(nil)
 
 // Checker validates one domain-specific invariant against the graph
-// immediately after a Graph.Transact call's mutations have been fully
+// immediately after a Transact call's mutations have been fully
 // applied, before Transact reports success to its own caller. This is
 // the commit-time counterpart to the "always re-derive and re-check on
 // read, never cache" discipline every registry in this file otherwise
@@ -1149,20 +1149,25 @@ var _ GraphReader = (*Txn)(nil)
 // registry's own method happens to read the affected node
 // (theorystate.md sections 73/77).
 //
-// A Checker's Check function runs against the real Graph, already fully
-// mutated by the just-completed Transact call -- never a staged or
-// partial view. This is sound, not merely convenient, under the current
-// single-threaded execution model (theorystate.md section 19): nothing
-// else can observe the already-mutated-but-not-yet-checked intermediate
-// state, since nothing else runs between the mutation completing and
-// Check running, in the same synchronous call. Building a staged/overlay
-// view instead (theorystate.md section 77's original proposal) would
-// only actually be required once real concurrent access exists; until
-// then, "mutate for real, check for real, roll back exactly like any
-// other failure if declined" is strictly simpler, and rests entirely on
-// machinery that already exists and is already tested (Graph.Transact's
-// existing rollback, including Txn.DeleteNode's resurrection,
-// theorystate.md section 78).
+// Check's contract is stated backend-neutrally, since more than one
+// GraphAPI implementation exists in this file (theorystate.md section
+// 95): Check observes the state fn's mutations would produce, as of the
+// moment fn reports success -- never a state older than that, and never
+// one that depends on anything that happens after this call returns.
+// For *Graph specifically, this is the real, already-mutated Graph
+// itself, because nothing else can observe the intermediate state under
+// the current single-threaded execution model (theorystate.md section
+// 19); see Graph.Transact's own doc comment for that backend-specific
+// soundness argument, including why a staged/overlay view is not needed
+// for *Graph (theorystate.md section 77's resolution note). A backend
+// whose writes are not visible anywhere until a final commit step
+// (theorystate.md section 94, an etcd-backed GraphStore) instead hands
+// Check a view of its own not-yet-published changes merged over
+// last-committed state -- still exactly "the state fn's mutations would
+// produce," just realized by a different mechanism; theorystate.md
+// section 97 sketches a test-only GraphAPI implementation built around
+// exactly this second shape, specifically to catch registry code that
+// accidentally depends on the first shape's specifics.
 //
 // Checkers only run for mutations made through Graph.Transact, and there
 // is no public way to mutate a graph outside one (theorystate.md section
@@ -1183,7 +1188,7 @@ type Checker struct {
 
 	// Tags lists every tag NodeID this Checker's invariant is defined in
 	// terms of. Used only as a coarse, conservative relevance filter
-	// (see Graph.checkerRelevant) to decide whether this Checker is
+	// (see checkerRelevant) to decide whether this Checker is
 	// worth invoking at all for a given transaction's changeset -- never
 	// consulted by Check itself, which remains free to interpret its own
 	// tags however its own invariant actually requires.
@@ -1320,7 +1325,7 @@ func (g *Graph) runCheckers(touched map[NodeID]struct{}) error {
 	reader := graphCoreReader{graph: g}
 
 	for _, checker := range g.checkers {
-		if !g.checkerRelevant(checker, touched) {
+		if !checkerRelevant(reader, checker, touched) {
 			continue
 		}
 
@@ -1335,16 +1340,23 @@ func (g *Graph) runCheckers(touched map[NodeID]struct{}) error {
 // checkerRelevant reports whether checker's invariant could plausibly
 // have been affected by touched, using checker.Tags as a coarse,
 // conservative filter: checker is considered relevant the moment any
-// touched node currently carries any of checker's tags. This is
-// deliberately conservative (it can report true when Check would in fact
-// find nothing wrong) rather than precise -- precision is Check's own
-// responsibility, per the Checker doc comment; this filter exists only
-// to avoid invoking every registered Checker on every single commit
-// regardless of relevance.
-func (g *Graph) checkerRelevant(checker Checker, touched map[NodeID]struct{}) bool {
+// touched node currently carries any of checker's tags, as read through
+// view. This is deliberately conservative (it can report true when
+// Check would in fact find nothing wrong) rather than precise --
+// precision is Check's own responsibility, per the Checker doc comment;
+// this filter exists only to avoid invoking every registered Checker on
+// every single commit regardless of relevance.
+//
+// view is passed explicitly rather than this being a *Graph method
+// reading Graph's own fields directly, so the identical filtering logic
+// is shared by every GraphAPI implementation's own Checker-consulting
+// code -- not just *Graph's own runCheckers (theorystate.md section 95:
+// Checker's contract, and therefore this relevance filter alongside it,
+// is stated backend-neutrally).
+func checkerRelevant(view GraphReader, checker Checker, touched map[NodeID]struct{}) bool {
 	for _, tag := range checker.Tags {
 		for node := range touched {
-			if g.hasRelationshipCore(tag, node) {
+			if view.HasRelationship(tag, node) {
 				return true
 			}
 		}
