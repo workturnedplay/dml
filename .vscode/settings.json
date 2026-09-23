@@ -1,0 +1,53 @@
+{
+  "telemetry.telemetryLevel": "off",
+  "workbench.enableExperiments": false,
+  "workbench.settings.enableNaturalLanguageSearch": true,
+  "extensions.autoUpdate": false,
+  "extensions.autoCheckUpdates": false,
+  "update.mode": "none",
+  "editor.codeActionsOnSave": {
+    "source.organizeImports": "explicit"
+  },
+  "[go]": {
+    "editor.codeActionsOnSave": {
+      "source.organizeImports": "never"
+    }
+  },
+  "go.lintTool": "golangci-lint-v2",
+  //"go.lintTool": "custom", //doesn't work at all
+  "go.lintOnSave": "package",
+  "gopls": {
+    "diagnosticsDelay": "0s",
+    "analyses": {
+      "unsafeptr": true,
+      "printf": true,
+      "shadow": false, // DISABLE it in gopls, we count on golangci-lint (v2) to work! else this shows only as 3 dots aka hint not warning!
+      "ST1003": false
+    },
+    "analysisProgressReporting": true,
+    "diagnosticsTrigger": "Edit",
+    "ui.diagnostic.staticcheck": true
+  },
+  //"go.alternateTools": {
+  //      "customLint": "go" 
+  //},
+  //"go.customLintFlags": [
+  //      "vet",
+  //      "-vettool=C:\\Users\\user\\go\\bin\\shadow.exe"
+  //],
+  "go.lintFlags": [
+    
+  ],
+  "go.vetOnSave": "package",
+  "go.vetFlags": [
+        "-vettool=C:\\Users\\user\\go\\bin\\shadow.exe"
+  ],
+  "go.diagnostic.displayMessages": true,
+  "go.useLanguageServer": true,
+  "telemetry.editStats.enabled": false,
+  "telemetry.feedback.enabled": false,
+  "go.showWelcome": false,
+  "go.survey.prompt": false,
+  "go.toolsManagement.checkForUpdates": "off",
+  "go.trace.server": "verbose"
+}
