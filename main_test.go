@@ -2993,6 +2993,57 @@ func TestTransactRollsBackOnPanic(t *testing.T) {
 	}
 }
 
+// TestCheckerPanicRollsBackAndPropagates covers a path no existing test
+// does: Graph.Transact's defer/recover is registered once, before fn
+// runs, so it already covers a panic from inside the commit-time Checker
+// pass (runCheckers) exactly as it covers one from fn itself
+// (TestTransactRollsBackOnPanic above) -- but nothing previously
+// exercised that second path. A Checker whose Check function panics must
+// still roll back every mutation fn made and propagate the panic to
+// Transact's caller.
+func TestCheckerPanicRollsBackAndPropagates(t *testing.T) {
+	var g Graph
+
+	tag, tagErr := g.CreateNode()
+	if tagErr != nil {
+		t.Fatalf("CreateNode() for tag: %v", tagErr)
+	}
+
+	g.RegisterChecker(Checker{
+		Name: "panics",
+		Tags: []NodeID{tag},
+		Check: func(_ GraphReader, _ map[NodeID]struct{}) error {
+			panic("checker boom")
+		},
+	})
+
+	var id NodeID
+
+	func() {
+		defer func() {
+			if r := recover(); r == nil {
+				t.Fatal("expected the Checker's panic to propagate out of Transact()")
+			}
+		}()
+
+		if err := g.Transact(func(tx Tx) error {
+			var err error
+			id, err = createNodeTx(tx)
+			if err != nil {
+				t.Fatalf("CreateNode(): %v", err)
+			}
+
+			return addRelationshipTx(tx, tag, id)
+		}); err != nil {
+			t.Fatalf("Transact() returned error: %v", err)
+		}
+	}()
+
+	if g.NodeExists(id) {
+		t.Fatalf("node %d still exists after its transaction's Checker panicked", id)
+	}
+}
+
 func TestSubPointerReusesPointerRegistryUnderDifferentTag(t *testing.T) {
 	var g Graph
 	names := NewNameRegistry(&g)

@@ -3253,6 +3253,28 @@ outer:
 	return target, hasTarget, nil
 }
 
+// requireTagged checks that id exists and is tagged via (tag, id),
+// returning ErrNodeNotFound or notTaggedErr otherwise, without
+// inspecting id's other relationships. This is the shared "exists and
+// carries this registry's own tag" precondition check factored out of
+// what used to be six byte-for-byte identical three-line checks --
+// PointerRegistry.requirePointer, CapsuleRegistry.requireCapsule,
+// ListRegistry.requireList, SetRegistry.requireSet,
+// CompositeSetRegistry.requireCompositeSet, and
+// CompositeSetLogRegistry.requireLog -- each differing only in which tag
+// NodeID and which dedicated ErrNotX sentinel it returned.
+func requireTagged(graph GraphReader, id, tag NodeID, notTaggedErr error) error {
+	if !graph.NodeExists(id) {
+		return ErrNodeNotFound
+	}
+
+	if !graph.HasRelationship(tag, id) {
+		return notTaggedErr
+	}
+
+	return nil
+}
+
 // PointerRegistry enforces the Pointer invariant -- "at most one target"
 // -- for nodes tagged Pointer-kind via a caller-supplied tag relationship
 // (tag, P).
@@ -3428,18 +3450,15 @@ func (p *PointerRegistry) currentTarget(graph GraphReader, id NodeID) (target No
 
 // requirePointer checks that id exists and is tagged Pointer-kind,
 // returning ErrNodeNotFound or ErrNotPointer otherwise, without
-// inspecting id's relationships. Shared by currentTarget, setTargetTx and
-// removeTargetTx.
+// inspecting id's relationships. Shared by currentTarget, SetTarget and
+// RemoveTarget (corrected here from the stale "setTargetTx and
+// removeTargetTx" this comment used to say -- those tx-suffixed helpers
+// were inlined into the exported methods themselves back in item 33 and
+// no longer exist under those names). Delegates to the shared
+// requireTagged helper -- see its doc comment for why this used to be
+// its own three-line check.
 func (p *PointerRegistry) requirePointer(graph GraphReader, id NodeID) error {
-	if !graph.NodeExists(id) {
-		return ErrNodeNotFound
-	}
-
-	if !p.IsPointer(graph, id) {
-		return ErrNotPointer
-	}
-
-	return nil
+	return requireTagged(graph, id, p.allPointers, ErrNotPointer)
 }
 
 // Target returns P's current target.
@@ -4325,17 +4344,10 @@ func (c *CapsuleRegistry) IsCapsule(graph GraphReader, id NodeID) bool {
 
 // requireCapsule checks that id exists and is tagged
 // (AllElementCapsules, id), returning ErrNodeNotFound or ErrNotCapsule
-// otherwise.
+// otherwise. Delegates to the shared requireTagged helper (see its doc
+// comment on PointerRegistry.requirePointer).
 func (c *CapsuleRegistry) requireCapsule(graph GraphReader, id NodeID) error {
-	if !graph.NodeExists(id) {
-		return ErrNodeNotFound
-	}
-
-	if !c.IsCapsule(graph, id) {
-		return ErrNotCapsule
-	}
-
-	return nil
+	return requireTagged(graph, id, c.allElementCapsules, ErrNotCapsule)
 }
 
 // slotFor returns capsule's role-slot child tagged via (tag, slot) --
@@ -4954,17 +4966,10 @@ func (l *ListRegistry) IsList(graph GraphReader, id NodeID) bool {
 // requireList checks that list exists and is tagged (AllLists, list),
 // returning ErrNodeNotFound or ErrNotList otherwise. The mutating
 // methods call it with their tx, so the check and the write see the same
-// state.
+// state. Delegates to the shared requireTagged helper (see its doc
+// comment on PointerRegistry.requirePointer).
 func (l *ListRegistry) requireList(graph GraphReader, list NodeID) error {
-	if !graph.NodeExists(list) {
-		return ErrNodeNotFound
-	}
-
-	if !l.IsList(graph, list) {
-		return ErrNotList
-	}
-
-	return nil
+	return requireTagged(graph, list, l.allLists, ErrNotList)
 }
 
 // requireListValue is requireList plus a check that value exists.
@@ -5728,17 +5733,11 @@ func (s *SetRegistry) IsSet(graph GraphReader, id NodeID) bool {
 }
 
 // requireSet checks that set exists and is tagged (AllSets, set),
-// returning ErrNodeNotFound or ErrNotSet otherwise.
+// returning ErrNodeNotFound or ErrNotSet otherwise. Delegates to the
+// shared requireTagged helper (see its doc comment on
+// PointerRegistry.requirePointer).
 func (s *SetRegistry) requireSet(graph GraphReader, set NodeID) error {
-	if !graph.NodeExists(set) {
-		return ErrNodeNotFound
-	}
-
-	if !s.IsSet(graph, set) {
-		return ErrNotSet
-	}
-
-	return nil
+	return requireTagged(graph, set, s.allSets, ErrNotSet)
 }
 
 // requireSetMember is requireSet plus a check that member exists.
@@ -6421,17 +6420,10 @@ func (c *CompositeSetRegistry) IsCompositeSet(graph GraphReader, id NodeID) bool
 
 // requireCompositeSet checks that set exists and is tagged
 // (AllCompositeSets, set), returning ErrNodeNotFound or
-// ErrNotCompositeSet otherwise.
+// ErrNotCompositeSet otherwise. Delegates to the shared requireTagged
+// helper (see its doc comment on PointerRegistry.requirePointer).
 func (c *CompositeSetRegistry) requireCompositeSet(graph GraphReader, set NodeID) error {
-	if !graph.NodeExists(set) {
-		return ErrNodeNotFound
-	}
-
-	if !c.IsCompositeSet(graph, set) {
-		return ErrNotCompositeSet
-	}
-
-	return nil
+	return requireTagged(graph, set, c.allCompositeSets, ErrNotCompositeSet)
 }
 
 // NewCompositeSet creates a fresh NodeID and tags it (AllCompositeSets,
@@ -6882,17 +6874,10 @@ func (c *CompositeSetLogRegistry) IsCompositeSetLog(graph GraphReader, id NodeID
 
 // requireLog checks that log exists and is tagged
 // (AllCompositeSetLogs, log), returning ErrNodeNotFound or
-// ErrNotCompositeSetLog otherwise.
+// ErrNotCompositeSetLog otherwise. Delegates to the shared requireTagged
+// helper (see its doc comment on PointerRegistry.requirePointer).
 func (c *CompositeSetLogRegistry) requireLog(graph GraphReader, log NodeID) error {
-	if !graph.NodeExists(log) {
-		return ErrNodeNotFound
-	}
-
-	if !c.IsCompositeSetLog(graph, log) {
-		return ErrNotCompositeSetLog
-	}
-
-	return nil
+	return requireTagged(graph, log, c.allCompositeSetLogs, ErrNotCompositeSetLog)
 }
 
 // NewCompositeSetLog creates a fresh NodeID and tags it both

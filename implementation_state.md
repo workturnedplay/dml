@@ -1623,12 +1623,65 @@ NodeID-keyed structure outside the primitive graph.
  bypasses them is data that did not come through this process's Checkers
  (loaded, foreign, older build, pre-registration).
  main_test.go defines the four write methods on *Graph, *GraphActor and
- *RootGraph in test builds only: on *Graph they call the cores directly
- (raw, bypassing Checkers, as the out-of-band adversarial tests need); on
- *GraphActor and *RootGraph they run as one-operation transactions, so
- Checkers now run for those tests' setup writes. No test call site
- changed. Fixed a stale PointerRegistry doc claiming Graph.AddRelationship
- could be called directly.
+*RootGraph in test builds only: on *Graph they call the cores directly
+(raw, bypassing Checkers, as the out-of-band adversarial tests need); on
+*GraphActor and *RootGraph they run as one-operation transactions, so
+Checkers now run for those tests' setup writes. No test call site
+changed. Fixed a stale PointerRegistry doc claiming Graph.AddRelationship
+could be called directly.
+
+37. Two small, purely mechanical follow-ups found while checking the
+ codebase against an external review's suggested checklist (GPT-5.6
+ Luna: audit graph-passing/ownership, re-examine RootGraph/GraphActor
+ stacking, close DomainPointerRegistryD's cascade into stored-graph
+ fields). Nothing on that checklist needed fixing: items 24/26/87/90
+ already cover the graph-passing audit, items 27/87b already cover the
+ RootGraph/GraphActor stacking, and the DomainPointerRegistryD-cascade
+ concern no longer applies -- item 26 already closed subjectMetadataBase's
+ and domainConstraint's stored-graph-reference fields, and SetRegistry/
+ CompositeSetRegistry/CompositeSetLogRegistry never had one to begin
+ with. The same pass did turn up the two unrelated, purely mechanical
+ items below; neither closes a correctness gap, since everything they
+ touch was already correct.
+
+ (a) Factored out requireTagged(graph, id, tag, notTaggedErr), the
+ shared "exists and carries this registry's own tag" precondition check
+ that PointerRegistry.requirePointer, CapsuleRegistry.requireCapsule,
+ ListRegistry.requireList, SetRegistry.requireSet, CompositeSetRegistry.
+ requireCompositeSet, and CompositeSetLogRegistry.requireLog each
+ implemented as an identical three-line existence-then-tag check,
+ differing only in which tag NodeID and which dedicated ErrNotX
+ sentinel to return -- the same class of duplication subjectMetadataBase
+ (item 9) and singleChildTarget were factored out to close previously.
+ Each requireX is now a one-line delegation to requireTagged; no
+ behavior changed, since every IsX method these previously called
+ (IsPointer, IsCapsule, IsList, IsSet, IsCompositeSet, IsCompositeSetLog)
+ is itself already nothing but a single graph.HasRelationship(tag, id)
+ call, confirmed identical to requireTagged's own check before
+ extracting it. No test changed: every existing ErrNotX/ErrNodeNotFound
+ assertion continues to observe the same outcome. Along the way, fixed a
+ second stale doc comment of the same shape as item 28's: requirePointer
+ claimed to be "Shared by currentTarget, setTargetTx and removeTargetTx"
+ -- setTargetTx and removeTargetTx were inlined into SetTarget and
+ RemoveTarget themselves back in item 33 and no longer exist under those
+ names; the comment was never updated to say so.
+
+ (b) Added TestCheckerPanicRollsBackAndPropagates, closing a real gap in
+ test coverage (not a bug -- the behavior it covers was already
+ correct). Graph.Transact's defer/recover is registered once, before fn
+ runs, and therefore already covers a panic from inside the commit-time
+ Checker pass (runCheckers) exactly as it covers one from fn itself
+ (TestTransactRollsBackOnPanic) -- but nothing previously exercised that
+ second path. The new test registers a Checker whose Check function
+ panics, confirms the panic still propagates out of Transact(), and
+ confirms the node created and the relationship added by fn were both
+ rolled back first, exactly like a panic originating in fn would be.
+ GraphActor and RootGraph need no analogous test of their own: both
+ funnel every panic through this same Graph.Transact mechanism (see
+ GraphActor.do's existing recover-and-re-panic, which wraps the entire
+ g.Transact(fn) call regardless of where inside it a panic originates,
+ already proven by TestGraphActorTransactPanicPropagatesAndActorSurvives),
+ so one test at the source is sufficient.
 
 Currently unaddressed yet:
 - A "run every Checker over everything at load" pass belongs with any
