@@ -1732,9 +1732,24 @@ could be called directly.
  against both backends automatically, only hand-written portability
  tests against stagedGraph specifically (theorystate.md section 97).
 
+39. Design only, no code: persistent-backend direction (theorystate.md
+ sections 100-106). etcd is withdrawn as the graph-store candidate; the
+ production backend is a disk-backed GraphAPI (*Graph and stagedGraph stay
+ as reference/test backends), and bbolt is the first spike (pure Go,
+ go.etcd.io/bbolt; adding it needs `go mod vendor`). Reads and writes stay
+ serialized through GraphActor. On a KV backend, name bindings live in the
+ same store and transaction as their nodes with bound/retired records, an
+ Ensure of a retired name fails, startup fails if FoundationalNames lists a
+ retired name, and an explicit Purge removes a retired record. A startup
+ integrity sweep (Tx.Touch plus a paged, fail-closed VerifyAll) is wanted.
+ An earlier whole-image snapshot proposal was not adopted. Nothing in
+ main.go or main_test.go changed.
+
 Currently unaddressed yet:
-- A "run every Checker over everything at load" pass belongs with any
-  persistence work (item 36).
+- The startup integrity sweep (Tx.Touch plus a paged VerifyAll, theorystate.md
+  section 104) is designed but not built; it covers what item 36 records as
+  bypassing Checkers (data that did not come through this process's
+  Checkers). Paged reads (section 105) are OPEN.
 - Nested transactions as a production-backend feature are realized for
   the in-memory backend only (savepoints over the undo log); a
   structurally different, test-only realization also exists for

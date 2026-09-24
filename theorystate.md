@@ -2908,7 +2908,7 @@ prohibition is scoped to a *persistent, cross-attempt* mirror of the
 whole graph, never to a per-attempt buffer bounded by the size of one
 transaction.
 
-## 94. etcd-backed GraphStore — concrete design surface (OPEN, scoped this session)
+## 94. etcd-backed GraphStore — concrete design surface (OPEN; etcd withdrawn as the leading candidate, see §100)
 
 Five sub-questions, each answerable largely by reusing a decision already
 made elsewhere in this document for a different reason:
@@ -3190,6 +3190,221 @@ decided together with it rather than separately.
 
 ---
 
+## 100. Persistent backend: requirements, and etcd withdrawn as the leading candidate
+
+**DECIDED (etcd withdrawn); TENTATIVE where marked.** This supersedes §94's
+choice of candidate. §94a (key layout), §94b (durable ID counter) and §94c
+(buffering versus mutate-then-check) remain valid design material for any
+ordered-KV backend.
+
+**DECIDED — production storage is a disk-backed `GraphAPI`, not `*Graph`.**
+Every registry depends only on `GraphAPI`/`Tx` (§87, confirmed by §97), so
+`*Graph` and `stagedGraph` stay as reference and test backends and are not
+run in production. For the disk tier, persistence *is* the store: nothing is
+loaded into memory at startup, and durability comes from each commit. A
+whole-image snapshot/export is not part of the design (§106).
+
+**DECIDED — requirements for the persistent backend:**
+1. ordered prefix scans (for `FindOutgoing`/`FindIncoming`);
+2. atomic multi-key transactions with rollback;
+3. a dataset larger than RAM;
+4. embedded and single-node first, networked later only if needed;
+5. per-commit durability;
+6. able to hold the name records of §103 in the same transaction.
+
+**Why etcd is withdrawn.** etcd is a coordination store for small metadata,
+not a graph store. From memory, and to be verified before anything relies on
+it: it keeps an in-memory index of all keys; its backend has a size quota
+(default in the low GB); every edge costs two keys (§94a); multi-version
+history accumulates until compaction; and its default cap of 128 operations
+per transaction is within reach of several of our own `Transact` closures
+(`DeleteCapsule`, composite-set and log teardown). Its useful property, CAS,
+is available in embedded stores. etcd could still be considered later for a
+small coordination role (§98), never as the graph store.
+
+**Candidates (from memory; verify limits and maintenance status before
+choosing):**
+- *bbolt*: embedded copy-on-write B+tree, single file, mmap, one writer at a
+  time with snapshot readers, rollback by returning an error from the update
+  function, no practical transaction-size limit, one fsync per commit.
+- *Badger*: embedded pure-Go LSM, many optimistic writers with conflict
+  retry (the model of §89c(b)/§94e), a transaction must fit in a memtable
+  (`ErrTxnTooBig`), value-log GC to operate. Maintenance status unverified.
+- *FoundationDB*: distributed ordered KV, strictly serializable optimistic
+  transactions; roughly 10 MB and 5 seconds per transaction, small key/value
+  size caps, a cluster to run and a C client library. Only relevant if a
+  networked multi-writer store is ever required.
+- *SQLite/Postgres*: an edges table keyed `(from,to)` plus an index on
+  `(to,from)`. Viable, and unglamorous.
+
+**TENTATIVE — bbolt is the first spike.** It is pure Go (`go.etcd.io/bbolt`,
+no cgo). Its single-writer model matches `GraphActor` (§101); its
+update-then-abort model gives us mutate-then-check with free rollback, the
+same shape as `*Graph` (§96); and its cost of being wrong is small, because
+a swap behind `GraphAPI` is cheap and Badger is the natural next candidate.
+Adding a dependency means `go mod vendor` (prebuildcheck.bat uses
+`-mod=vendor`).
+
+## 101. Reads and writes are serialized through the GraphActor
+
+**DECIDED.** Every read and every `Transact` on a persistent backend goes
+through the one `GraphActor` goroutine, in FIFO order. There are no parallel
+snapshot readers. Reasons: one total order (`read1, read2, write1, read3` is
+exactly the order of arrival), no question of which snapshot point a reader
+sees relative to queued writes, and the safety argument of §89c stays
+literally true. Consequences for bbolt (from memory, to verify): there are
+never concurrent read transactions alongside the writer, so the
+remap-waits-for-readers and freed-page-reuse interactions do not arise; read
+transactions should still be kept short. The cost is that reads are not
+parallel. Reopening this needs an explicit answer to "which snapshot does a
+parallel reader see, relative to writes already queued".
+
+bbolt also takes an exclusive lock on its file (from memory), so one process
+owns a database at a time. This is consistent with §98's single-writer
+option for the KV tier.
+
+## 102. bbolt backend shape (TENTATIVE, spike)
+
+**Layout.** Buckets `nodes` (key: id), `out` (key: from‖to), `in` (key:
+to‖from), `meta` (nextID, exhausted flag) and `names` (§103). NodeIDs are
+8-byte big-endian, so byte order equals numeric order, which makes
+`FindOutgoing(x)` a prefix seek on `out`. `DeleteNode`'s emptiness check is
+one seek on `out` and one on `in`. `nextID` is written in the same
+transaction as the node, so the never-reuse guarantee of §40/§78 survives
+restarts.
+
+**Address space.** bbolt mmaps the file. That consumes virtual addresses,
+not RAM. On 64-bit builds this is not a practical limit; only 32-bit builds
+cap out (around 2 GB).
+
+**Transact.** `fn` runs inside `db.Update`; `tx.*` writes go to that
+transaction and reads see them. Checkers run inside the same update, before
+commit, against the state `fn` produced (§95). An error from `fn` or a
+Checker aborts the update and nothing persists. Nested `Transact` savepoints
+need a small undo log like `Txn`'s, since bbolt has none. `OnCommit` hooks
+must run only after the durable commit has succeeded, and `OnRollback` hooks
+on any abort. The exact timing relative to the commit is decided in the
+spike.
+
+**Questions the spike answers:** whether the registries pass unchanged on
+it (hand-written portability tests, as for `stagedGraph`, §97); file-growth
+behaviour on Windows, including whether a large initial mmap size matters;
+and commit latency (one fsync per write transaction).
+
+## 103. Names on a KV backend: same-transaction records, tombstones, Purge
+
+**DECIDED (design); implemented with the backend.** Bindings stay outside
+the graph (§6a). §98's alternative of representing bindings as graph
+structure is not adopted. On a KV backend the binding lives in a reserved
+`names` area of the same store, written in the same KV transaction as the
+node it names, so bindings and nodes cannot diverge across a crash, and
+arbitration between callers is the store's own (§98 is answered for this
+tier).
+
+**Records have two states:** `bound(id)` and `retired(lastID)`.
+
+**Semantics.**
+- `EnsureNamedNode`/`CreateNamedNode` look the name up inside the
+  transaction: `bound` returns the node (Ensure) or `ErrNameAlreadyBound`
+  (Create); absent creates node and binding together; `retired` fails with
+  `ErrNameRetired`. Failing loudly is deliberate: recreating a retired name
+  would hide a possible bug in whatever deleted it.
+- `NameRegistry.DeleteNode` retires the name instead of forgetting it.
+- The caller chooses atomicity by what it passes in. A `GraphAPI` makes the
+  call its own transaction (it survives a later abort of the caller's own
+  work). A `Tx` nests it (created node and binding roll back with the
+  caller, and the new ID is usable inside it). On bbolt, "own transaction"
+  must not be called from inside another `fn`, since a second writer would
+  wait for the first; startup ensure-all before any other work is the
+  natural shape.
+- **Startup:** `BootstrapNames` fails with `ErrNameRetired` if the Go code
+  still lists a name the store has retired. Warn-and-ignore was considered
+  and rejected: it would leave a foundational tag with no NodeID, and
+  something else would fail later, less clearly. If the code no longer lists
+  the name, startup never asks about it.
+- **`Purge(name)`** is a separate, deliberate operation that deletes a
+  *retired* record so the name can be created again (with a new NodeID;
+  IDs are never reused). It refuses a `bound` name: delete (retire) first.
+  It is never offered implicitly.
+- Raw deletion of a bound node stays detected as
+  `ErrNameBoundToDeletedNode`.
+
+**Consequence.** `NameRegistry` needs a storage seam so that the KV backend
+can supply the records through its `Tx`. The current map-based
+implementation (staging overlay, hooks, `RWMutex`) becomes the reference
+implementation for the memory and staged backends. The seam's shape is
+spike work.
+
+## 104. Startup integrity sweep: `Tx.Touch` and `VerifyAll`
+
+**DECIDED (wanted at startup); implementation ordered after the spike
+design.** Checkers only see nodes a transaction touches, so data that did not
+come through this process's Checkers is never checked until something reads
+it: written by an older build, restored from a backup, modified by another
+tool while the program was not running, or predating a newly added
+invariant (the gap §92 names). This is the semantic-level analogue of a
+disk-check utility.
+
+**Two layers.** Physical: the store's own consistency check (bbolt provides
+one, from memory). Semantic: `VerifyAll`.
+
+**Mechanism.** `Tx.Touch(ids ...NodeID)` marks nodes as touched without
+mutating anything; every `Tx` implementation provides it (`Txn`, `rootTx`,
+`stagedOverlay`, the bbolt tx). `VerifyAll(g Transactor, pageSize)` runs one
+`Transact` per page of node IDs, each calling `Touch` on its page, so the
+existing relevance filter and Checkers run unchanged, work under
+`GraphActor` and `RootGraph`, and never need the whole graph in memory.
+Chunking is sound because Checkers judge each touched node locally, and the
+non-local domain Checker (§86) finds its affected anchors by reverse lookup
+from each touched node. Until §105 provides paging, small databases may use
+`FindNodes()` directly.
+
+**Policy: fail-closed.** The first violation is returned as the existing
+attributable `"<CheckerName>: <err>"`, wrapped in `ErrLoadVerification`.
+There is no silent repair. `VerifyAll` covers only Checkers registered when
+it runs.
+
+**Startup order:** open the store; physical check; construct registries
+(this registers Checkers); `BootstrapNames` (fails on a retired name, §103);
+`VerifyAll`; ready.
+
+## 105. Paged and iterator reads (OPEN)
+
+`GraphReader` returns whole slices, so even with an ordered cursor inside the
+backend, the caller still receives a full slice. bbolt provides the cursor,
+not the feature. The calls that are unbounded at scale are:
+`FindNodes`, `FindRelationships`, `rootReader.FindOutgoing(ROOT)` (via
+`FindNodes`), `rootReader.FindRelationships`, `FindIncoming` on a very
+popular value node (`CapsulesWithValue`), the whole-set APIs (`Members`,
+`Elements`, `Evaluate`, `Operands`) and any unpaged `VerifyAll`. Correction
+to an earlier claim: hub tag nodes are not enumerated. The registries use
+only `HasRelationship(tag, x)` on them, and `addSlotOwners` explicitly
+avoids enumerating them.
+
+Two kinds of iteration need different tools. A bounded scan inside one
+transaction uses a cursor, consistent because the transaction is, with no
+writers blocked. A long sweep uses pages ("up to N IDs after key K"), each
+its own short transaction; the view can shift between pages, which is
+acceptable for verification (later changes are checked by commit-time
+Checkers) and not for an exact point-in-time result. The interface shape is
+not fixed (for example `FindNodesAfter(after NodeID, limit int)`); the slice
+forms would remain as thin wrappers. Next step: grep the real call sites
+before designing.
+
+## 106. Explored and not adopted
+
+- **Whole-image snapshot/export of `*Graph`** (JSON or binary, checksum,
+  atomic file replace): REJECTED FOR NOW. On a disk backend the store is the
+  persistence. If ever wanted as a backup tool it needs a streaming format
+  with a trailer hash, because a header hash forces full buffering.
+- **Journal/WAL:** not needed for the disk tier (each commit is durable).
+- **Parallel snapshot readers:** rejected by §101.
+- **etcd as graph store:** withdrawn (§100).
+- **Badger** stays as second candidate if write parallelism is ever needed;
+  **FoundationDB** only if a networked multi-writer store is required.
+
+---
+
 ## PART D — STATUS SUMMARY (consolidated)
 
 *(This part supersedes the early informal "explicitly not decided" list
@@ -3335,7 +3550,21 @@ kept current as sections above resolve or split further.)*
   portable across backend mechanism, not merely documented as if they
   are (§97).
 
+- Production storage is a disk-backed `GraphAPI`; `*Graph` and `stagedGraph`
+  are reference/test backends. etcd is withdrawn as the graph-store
+  candidate. Requirements for the persistent backend are recorded (§100).
+- Reads and writes on a persistent backend are serialized through the
+  `GraphActor`; no parallel snapshot readers (§101).
+- Names on a KV backend are stored in the same store and transaction as the
+  nodes they name, with `bound`/`retired` records; `Ensure` of a retired
+  name fails; startup fails if the code lists a retired name; an explicit
+  `Purge` removes a retired record. Bindings are not graph structure (§103).
+- A startup integrity sweep (`Tx.Touch` + paged `VerifyAll`, fail-closed) is
+  wanted (§104).
+
 ### TENTATIVE
+- bbolt as the first persistent-backend spike, with the layout and
+  transaction shape of §102.
 - Monotonically increasing NodeIDs; serialized first implementation.
 - Git-like push/pull cross-participant communication (§36).
 - Composite GraphID+counter real IDs (§59); real-ID mirroring without
@@ -3424,10 +3653,12 @@ kept current as sections above resolve or split further.)*
   arbitration, or a bounded-retry escape hatch to full serialization —
   for preventing livelock/starvation among repeatedly-conflicting
   optimistic retries (§89c).
-- Concrete etcd-backed GraphStore design: key encoding, NodeID allocation
-  via etcd's own CAS counter, write buffering and CAS-based commit at the
-  end of a transaction attempt, and how Checker timing relates to that
-  commit (§94, extending §87a/§89a).
+- Persistent backend (§100-§102): whether bbolt survives the spike
+  (registry portability, Windows file growth, commit latency), and if not,
+  Badger next; savepoints via an undo log; `OnCommit` hook timing relative
+  to the durable commit; the `NameRegistry` storage seam (§103); paged and
+  iterator reads (§105), including the call-site grep. §98 and §99 are
+  answered for a KV backend by §103 and §104.
 - Whether to build a harness that automatically re-runs the existing
   registry test suite against both *Graph and stagedGraph, versus
   writing portability tests by hand as needed; and whether stagedGraph
