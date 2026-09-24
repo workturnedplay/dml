@@ -3512,11 +3512,21 @@ hosts on different machines coordinate is Part C.
   `FindRelationships` and `FindNodes` have no error result, so on a disk
   backend a store failure can only panic. Fixing this belongs with §105.
 
-**Not built yet:** `VerifyAll` and the startup order (§104), the physical
-check, paged reads (§105). Names are persisted (§109). Windows behaviour,
-file growth and commit latency are measured by
-`TestBoltGraphReportCommitLatencyAndFileSize` and `BenchmarkBoltGraphCommit`
-(run without `-race`, with `-v`); the numbers are not recorded yet.
+**Measured** (`TestBoltGraphReportCommitLatencyAndFileSize` and
+`BenchmarkBoltGraphCommit`, run without `-race`; Windows, i7-8700K, disk
+type not recorded): the file starts at 32 KiB and was 1 MiB after one
+transaction of 2000 nodes and 3997 relationships (21 ms), unchanged after 200
+further commits, so it grows in steps and not in proportion to the data, and
+there is no large preallocation on Windows with the default
+`InitialMmapSize`. A single-node commit averaged about 3.3 ms (worst 8.5 ms;
+the benchmark gave 3.6 ms, 110 allocations). Commit cost dominates, so a
+`GraphActor` over BoltGraph does roughly 300 one-operation `Transact` calls
+per second, and grouping work into one `Transact` is much cheaper per
+operation. Not taken: disabling fsync, or bolt's `DB.Batch`. bbolt v1.5.0 was
+published on June 3, 2026 (pkg.go.dev).
+
+Names are persisted (§109); the startup sweep, paging and physical check are
+§110.
 
 ## 109. Names on BoltGraph: records, retirement, Purge, LoadNames (TENTATIVE, implemented)
 
@@ -3552,6 +3562,44 @@ file growth and commit latency are measured by
   (fails on a retired name). `VerifyAll` comes next (§104).
 - **Limitations.** A bolt key cannot be empty, so an empty name is rejected
   by the store on BoltGraph. Names are few, so `LoadNames` reads them all.
+
+## 110. Startup integrity sweep as built (TENTATIVE, implemented)
+
+§104 as built, with the startup order:
+
+1. `OpenBoltGraph`.
+2. `CheckStore()`: bolt's own page-level check (`Tx.Check`, whose channel
+   must be drained) followed by BoltGraph's layout checks: key lengths, the
+   ID counter ahead of every node (so no existing ID can be reissued), the
+   outgoing and incoming indexes mirroring each other (§4), and every edge
+   endpoint existing. It returns `ErrStoreCorrupt`, wrapping the first
+   problem and counting the rest. Run it before the graph is handed to a
+   `GraphActor`: bolt documents that its checker must not run alongside
+   other writers.
+3. Start the `GraphActor` (and `RootGraph` inside it, §87b).
+4. `NewNameRegistry`, `LoadNames`, `BootstrapNames(FoundationalNames)`
+   (fails on a retired name, §109).
+5. Construct registries (this registers their Checkers).
+6. `VerifyAll(graph, pageSize)`: one `Transact` per page of node IDs, each
+   calling `Tx.Touch` on its page, fail-closed with `ErrLoadVerification`
+   wrapping the Checker's own error. Nothing is repaired.
+7. `NameRegistry.VerifyBindings(graph)`: every bound name's node exists
+   (retired names are skipped). It copies the records before consulting the
+   graph, since under a `GraphActor` the actor's commit hooks take the
+   registry lock.
+
+**Paging.** The unexported optional interface `nodePager`
+(`findNodesAfter(after, hasAfter, limit)`) is implemented by BoltGraph's
+read view (cursor seek, only the page is read) and forwarded by the ROOT
+overlay; every other reader falls back to `FindNodes` and slices (`pageNodeIDs`).
+`hasAfter` is a separate flag because NodeID 0 is a valid cursor. This is not
+§105's exported shape, which stays open. What remains unbounded on BoltGraph:
+`FindNodes`, `FindRelationships` and `FindIncoming` on a very popular node.
+
+**Limits.** `VerifyAll` sees only Checkers registered when it runs, and the
+relevance filter looks at stored facts only (§87b). The view can shift
+between pages, which is acceptable because later changes go through
+commit-time Checkers. `CheckStore` is O(store).
 
 ---
 

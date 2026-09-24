@@ -1797,11 +1797,31 @@ could be called directly.
  TestBoltGraphReportCommitLatencyAndFileSize and BenchmarkBoltGraphCommit
  for measurement.
 
+42. Startup integrity sweep (theorystate.md sections 104, 110). Added
+ VerifyAll(graph, pageSize) (one Transact per page of node IDs, each
+ calling Tx.Touch; fail-closed, ErrLoadVerification), the unexported
+ nodePager interface with pageNodeIDs/nodesAfter (implemented by boltView
+ with a cursor, forwarded by rootReader, fallback to FindNodes elsewhere),
+ BoltGraph.CheckStore (bolt's Tx.Check plus boltView.checkLayout/checkEdges)
+ and NameRegistry.VerifyBindings. Test-only: testBackends() replaces an
+ inline backend list in TestTxTouchRunsRelevantCheckersWithoutMutation.
+ Covered by TestPageNodeIDs,
+ TestBoltGraphFindNodesAfterMatchesFindNodes,
+ TestVerifyAllTouchesEveryNodeInPagesOnEveryBackend,
+ TestVerifyAllDefaultsPageSizeAndHandlesAnEmptyGraph,
+ TestVerifyAllFindsViolationsThatBypassedCheckersOnBoltGraph,
+ TestVerifyAllThroughRootGraphInsideGraphActorOverBoltGraph,
+ TestBoltGraphCheckStore, TestNameRegistryVerifyBindings and
+ TestBoltGraphStartupSequence. The benchmark now uses b.Loop.
+ Measurements are recorded in theorystate.md section 108.
+
 Currently unaddressed yet:
-- Still to build for the persistent backend: VerifyAll with a paged sweep
-  and the startup order (theorystate.md section 104); a physical store
-  check; paged reads and error results for the GraphReader methods that
-  lack them (section 105).
+- Paged reads beyond node listing, and error results for the GraphReader
+  methods that lack them (theorystate.md section 105): FindNodes,
+  FindRelationships and FindIncoming on a popular node are still O(graph)
+  on BoltGraph.
+- The operation-level protocol between other processes and the graph host
+  (theorystate.md section 107).
 - Nested transactions as a production-backend feature are realized for
   the in-memory backend only (savepoints over the undo log); a
   structurally different, test-only realization also exists for

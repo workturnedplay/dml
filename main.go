@@ -1419,6 +1419,94 @@ func checkerRelevant(view GraphReader, checker Checker, touched map[NodeID]struc
 	return false
 }
 
+// nodePager is implemented by a GraphReader that can list a bounded page of
+// node IDs without materializing every node (BoltGraph's boltView and,
+// through forwarding, the ROOT overlay). Any other reader falls back to
+// FindNodes, which is fine for the memory-bound backends. This stays an
+// unexported optional interface until the paged-read rework of
+// theorystate.md section 105 decides the exported shape.
+type nodePager interface {
+	findNodesAfter(after NodeID, hasAfter bool, limit int) []NodeID
+}
+
+// pageNodeIDs returns up to limit IDs from sorted (ascending) that are
+// greater than after, or from the start if hasAfter is false. hasAfter is a
+// separate flag because NodeID 0 is a valid cursor. A non-positive limit
+// returns nothing.
+func pageNodeIDs(sorted []NodeID, after NodeID, hasAfter bool, limit int) []NodeID {
+	start := 0
+	if hasAfter {
+		start = sort.Search(len(sorted), func(i int) bool { return sorted[i] > after })
+	}
+
+	count := min(max(limit, 0), len(sorted)-start)
+
+	return sorted[start : start+count]
+}
+
+// nodesAfter returns a page of node IDs from reader, using its paging if it
+// has any (see nodePager) and FindNodes otherwise.
+func nodesAfter(reader GraphReader, after NodeID, hasAfter bool, limit int) []NodeID {
+	if pager, ok := reader.(nodePager); ok {
+		return pager.findNodesAfter(after, hasAfter, limit)
+	}
+
+	return pageNodeIDs(reader.FindNodes(), after, hasAfter, limit)
+}
+
+// defaultVerifyPageSize is the page size VerifyAll uses when given a
+// non-positive one.
+const defaultVerifyPageSize = 1000
+
+// VerifyAll runs every registered Checker over every node in the graph, the
+// semantic integrity sweep of theorystate.md section 104. Checkers only see
+// nodes a transaction touches, so data that did not come through this
+// process's Checkers (an older build, a restored backup, another tool, an
+// invariant added later) is otherwise unchecked until something reads it.
+//
+// The sweep runs one Transact per page of pageSize node IDs (a
+// non-positive pageSize means defaultVerifyPageSize), each calling Tx.Touch
+// on its page and changing nothing, so the existing relevance filter and
+// Checkers run unchanged, it works through a GraphActor and a RootGraph,
+// and it never needs the whole graph in memory on a backend that pages. The
+// view can shift between pages (a node added or removed in the gap), which
+// is acceptable here: later changes are checked by commit-time Checkers.
+//
+// It is fail-closed: the first Checker to decline is returned as an error
+// wrapping ErrLoadVerification and the Checker's own attributable error, and
+// nothing is repaired. It covers only the Checkers registered when it runs,
+// so call it after constructing the registries.
+func VerifyAll(graph Transactor, pageSize int) error {
+	if pageSize <= 0 {
+		pageSize = defaultVerifyPageSize
+	}
+
+	var after NodeID
+
+	hasAfter := false
+
+	for {
+		var page []NodeID
+
+		err := graph.Transact(func(tx Tx) error {
+			page = nodesAfter(tx, after, hasAfter, pageSize)
+			tx.Touch(page...)
+
+			return nil
+		})
+		if err != nil {
+			return fmt.Errorf("%w: %w", ErrLoadVerification, err)
+		}
+
+		if len(page) < pageSize {
+			return nil
+		}
+
+		after = page[len(page)-1]
+		hasAfter = true
+	}
+}
+
 // graphActorReentrancyDetectionEnabled gates the debug-only reentrancy
 // tripwire in GraphActor.do (theorystate.md section 90). Off by default:
 // determining the calling goroutine's ID has a real per-call cost
@@ -1789,6 +1877,14 @@ func (ga *GraphActor) RegisterChecker(c Checker) {
 // record. It indicates a damaged or foreign file, never a caller mistake.
 var ErrStoreCorrupt = errors.New("persistent graph store is corrupt")
 
+// ErrLoadVerification wraps the error VerifyAll returns when a Checker
+// declines a node at startup: data already in the store (written by an
+// older build, restored from a backup, or changed by another tool) violates
+// an invariant this process enforces. The wrapped error is the Checker's
+// own attributable "<Checker name>: <error>". Nothing is repaired
+// (theorystate.md section 104).
+var ErrLoadVerification = errors.New("stored data failed verification")
+
 // BoltGraph's on-disk layout (theorystate.md section 102). NodeIDs are
 // 8-byte big-endian, so byte order equals numeric order and a prefix scan
 // returns relationships sorted exactly as Graph does. nodes: id ->
@@ -1983,6 +2079,93 @@ func (v boltView) FindNodes() []NodeID {
 	}
 
 	return ids
+}
+
+// findNodesAfter returns up to limit node IDs greater than after (from the
+// first node if hasAfter is false), in ascending order, reading only that
+// range with a cursor (see nodePager).
+func (v boltView) findNodesAfter(after NodeID, hasAfter bool, limit int) []NodeID {
+	ids := []NodeID{}
+	cursor := v.nodes.Cursor()
+
+	var key []byte
+
+	if hasAfter {
+		key, _ = cursor.Seek(boltKey8(after))
+		if key != nil && boltID(key) == after {
+			key, _ = cursor.Next()
+		}
+	} else {
+		key, _ = cursor.First()
+	}
+
+	for ; key != nil && len(ids) < limit; key, _ = cursor.Next() {
+		ids = append(ids, boltID(key))
+	}
+
+	return ids
+}
+
+// Compile-time assertion that boltView pages.
+var _ nodePager = boltView{}
+
+// checkEdges verifies every key of the edge index primary against its
+// mirror index: the key has the right length, the mirrored key exists (the
+// two indexes describe the same relationships, theorystate.md section 4),
+// and both endpoints are existing nodes. primaryName and mirrorName are
+// only for the message.
+func (v boltView) checkEdges(primary, mirror *bolt.Bucket, primaryName, mirrorName string) error {
+	cursor := primary.Cursor()
+
+	for key, _ := cursor.First(); key != nil; key, _ = cursor.Next() {
+		if len(key) != 2*boltIDSize {
+			return fmt.Errorf("%w: %s index key of %d bytes, want %d", ErrStoreCorrupt, primaryName, len(key), 2*boltIDSize)
+		}
+
+		first, second := boltID(key), boltID(key[boltIDSize:])
+
+		if mirror.Get(boltKey16(second, first)) == nil {
+			return fmt.Errorf("%w: key (%d,%d) is in the %s index but its mirror is missing from the %s index", ErrStoreCorrupt, first, second, primaryName, mirrorName)
+		}
+
+		if !v.NodeExists(first) || !v.NodeExists(second) {
+			return fmt.Errorf("%w: key (%d,%d) in the %s index refers to a node that does not exist", ErrStoreCorrupt, first, second, primaryName)
+		}
+	}
+
+	return nil
+}
+
+// checkLayout verifies BoltGraph's own layout, which bolt's page-level check
+// knows nothing about: node keys have the right length, the persisted ID
+// counter is ahead of every node (so no existing ID can be issued again,
+// theorystate.md section 40) unless the ID space is exhausted, and the
+// outgoing and incoming indexes mirror each other. next and exhausted are
+// the persisted counter.
+func (v boltView) checkLayout(next NodeID, exhausted bool) error {
+	var highest NodeID
+
+	hasNodes := false
+	cursor := v.nodes.Cursor()
+
+	for key, _ := cursor.First(); key != nil; key, _ = cursor.Next() {
+		if len(key) != boltIDSize {
+			return fmt.Errorf("%w: node key of %d bytes, want %d", ErrStoreCorrupt, len(key), boltIDSize)
+		}
+
+		highest = boltID(key)
+		hasNodes = true
+	}
+
+	if hasNodes && !exhausted && highest >= next {
+		return fmt.Errorf("%w: node %d exists but the ID counter is only at %d, so it could be issued again", ErrStoreCorrupt, highest, next)
+	}
+
+	if err := v.checkEdges(v.out, v.in, "outgoing", "incoming"); err != nil {
+		return err
+	}
+
+	return v.checkEdges(v.in, v.out, "incoming", "outgoing")
 }
 
 // boltTxn is the Tx BoltGraph.Transact hands its closure: reads come from
@@ -2400,6 +2583,53 @@ func (g *BoltGraph) Close() error {
 	defer release()
 
 	return wrapBoltErr("close", g.db.Close())
+}
+
+// CheckStore is the physical half of the startup integrity check
+// (theorystate.md section 104): bolt's own page-level consistency check,
+// followed by BoltGraph's layout checks (see boltView.checkLayout). It
+// returns ErrStoreCorrupt, wrapping the first problem found and counting the
+// rest, and fixes nothing. It runs directly against the store, so call it
+// right after OpenBoltGraph, before the graph is handed to a GraphActor;
+// bolt documents that its checker must not run alongside other writers.
+func (g *BoltGraph) CheckStore() error {
+	release := g.guard.acquire()
+	defer release()
+
+	err := g.db.View(func(btx *bolt.Tx) error {
+		var first error
+
+		extra := 0
+
+		// The channel must be drained completely: bolt's checker runs in
+		// its own goroutine.
+		for checkErr := range btx.Check() {
+			if first == nil {
+				first = checkErr
+				continue
+			}
+
+			extra++
+		}
+
+		if first != nil {
+			return fmt.Errorf("%w: %w (and %d more problems)", ErrStoreCorrupt, first, extra)
+		}
+
+		txn, openErr := newBoltTxn(btx)
+		if openErr != nil {
+			return openErr
+		}
+
+		next, exhausted, counterErr := txn.counter()
+		if counterErr != nil {
+			return counterErr
+		}
+
+		return txn.checkLayout(next, exhausted)
+	})
+
+	return wrapBoltErr("check store", err)
 }
 
 // boltRead runs fn against a read-only view of g's store, in its own
@@ -3164,6 +3394,43 @@ func (r *NameRegistry) LoadNames(graph Transactor) error {
 	}))
 }
 
+// VerifyBindings checks that every bound name's node still exists, the
+// load-time counterpart of the ErrNameBoundToDeletedNode check a later use
+// would make (theorystate.md sections 6a, 104). It returns the first
+// problem, in name order, and repairs nothing. Retired names are not
+// checked: their node is meant to be gone. Call it after LoadNames.
+//
+// The records are copied first and the graph is only consulted after the
+// lock is released: under a GraphActor, that call runs on the actor
+// goroutine, whose commit hooks take this registry's lock for writing.
+func (r *NameRegistry) VerifyBindings(graph GraphReader) error {
+	r.mu.RLock()
+	bound := make(map[string]NodeID, len(r.records))
+
+	for name, rec := range r.records {
+		if rec.state == nameBound {
+			bound[name] = rec.id
+		}
+	}
+
+	r.mu.RUnlock()
+
+	names := make([]string, 0, len(bound))
+	for name := range bound {
+		names = append(names, name)
+	}
+
+	sort.Strings(names)
+
+	for _, name := range names {
+		if !graph.NodeExists(bound[name]) {
+			return fmt.Errorf("%w: %q is bound to node %d", ErrNameBoundToDeletedNode, name, bound[name])
+		}
+	}
+
+	return nil
+}
+
 // DeleteNode deletes id from the underlying graph and, only if that
 // succeeds, retires any name bound to id (its record becomes retired, so
 // the name cannot silently be recreated; see Purge).
@@ -3484,6 +3751,16 @@ func (v rootReader) NodeExists(id NodeID) bool {
 func (v rootReader) FindNodes() []NodeID {
 	return v.inner.FindNodes()
 }
+
+// findNodesAfter pages through the same set as FindNodes (ROOT included),
+// forwarding to the underlying reader's paging where it has any (see
+// nodePager).
+func (v rootReader) findNodesAfter(after NodeID, hasAfter bool, limit int) []NodeID {
+	return nodesAfter(v.inner, after, hasAfter, limit)
+}
+
+// Compile-time assertion that the ROOT overlay pages.
+var _ nodePager = rootReader{}
 
 // HasRelationship reports whether the relationship exists in the ROOT
 // view: ROOT has a virtual relationship to every existing node other than
