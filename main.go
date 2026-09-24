@@ -23,6 +23,7 @@ package dml
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"runtime"
@@ -30,6 +31,9 @@ import (
 	"strconv"
 	"sync"
 	"sync/atomic"
+	"time"
+
+	bolt "go.etcd.io/bbolt"
 )
 
 type NodeID uint64
@@ -670,6 +674,13 @@ type Tx interface {
 	// NameRegistry). A hook must not call back into the graph and must
 	// not panic.
 	OnRollback(fn func())
+
+	// Touch marks ids as touched by this transaction without changing
+	// anything, so commit-time Checkers whose relevance filter matches them
+	// run at the outermost commit exactly as if the transaction had modified
+	// them. It is what lets a startup sweep (VerifyAll, theorystate.md
+	// section 104) make Checkers re-validate nodes nothing has changed.
+	Touch(ids ...NodeID)
 }
 
 // Compile-time assertion that *Txn satisfies Tx.
@@ -749,33 +760,46 @@ var _ Tx = (*Txn)(nil)
 // returns nil.
 type Txn struct {
 	graph *Graph
-	undo  []func()
+
+	// txLog is this transaction's undo log and commit-hook list (see
+	// txLog). Graph.Transact runs the commit hooks only once the
+	// transaction has fully succeeded.
+	txLog
 
 	// touched records every NodeID this Txn's mutations have involved so
 	// far -- as an endpoint of an added or removed relationship, or as a
-	// created or deleted node -- so Graph.Transact can hand it to any
-	// relevant Checker once fn returns successfully. See the Checker
-	// type and the touch helper below. A relationship add/remove that
-	// turned out to be a no-op (already existed / never existed) is
-	// deliberately not recorded here, mirroring undo's own "only record
-	// what actually changed" discipline.
+	// created or deleted node, or explicitly via Touch -- so
+	// Graph.Transact can hand it to any relevant Checker once fn returns
+	// successfully. A relationship add/remove that turned out to be a
+	// no-op (already existed / never existed) is deliberately not recorded
+	// by the mutation itself, mirroring undo's own "only record what
+	// actually changed" discipline.
 	touched map[NodeID]struct{}
-
-	// commitHooks holds every function registered via OnCommit, run by
-	// Graph.Transact only once the transaction has fully succeeded.
-	commitHooks []func()
 }
 
-// touch records every one of ids as having been involved in this Txn's
-// mutations so far. See the touched field doc comment above.
-func (tx *Txn) touch(ids ...NodeID) {
-	if tx.touched == nil {
-		tx.touched = make(map[NodeID]struct{}, len(ids))
+// Touch marks every one of ids as involved in this transaction, exactly as
+// if a mutation had changed it, without changing anything. Every effective
+// mutation calls it for the nodes it changed; VerifyAll (theorystate.md
+// section 104) calls it to make Checkers re-validate untouched nodes. See
+// the touched field doc comment above.
+func (tx *Txn) Touch(ids ...NodeID) {
+	tx.touched = touchNodes(tx.touched, ids...)
+}
+
+// touchNodes adds ids to set and returns it, allocating the set on first
+// use. It is the one implementation of Tx.Touch's bookkeeping, shared by
+// every Tx implementation that records a touched set (Txn, the test-only
+// stagedOverlay, and BoltGraph's boltTxn).
+func touchNodes(set map[NodeID]struct{}, ids ...NodeID) map[NodeID]struct{} {
+	if set == nil {
+		set = make(map[NodeID]struct{}, len(ids))
 	}
 
 	for _, id := range ids {
-		tx.touched[id] = struct{}{}
+		set[id] = struct{}{}
 	}
+
+	return set
 }
 
 // Transact runs fn against a fresh Txn wrapping g. If fn returns a
@@ -843,50 +867,111 @@ func (g *Graph) Transact(fn func(tx Tx) error) (err error) {
 	return nil
 }
 
-// rollback undoes every mutation recorded on tx so far, in reverse
-// (LIFO) order. Reverse order matters: for example, if tx created a node
-// and then added a relationship from it, rolling back the relationship
-// first leaves the node empty, so rolling back the node's creation
-// (DeleteNode) afterward is guaranteed to satisfy DeleteNode's
-// no-relationships precondition (see the Graph.DeleteNode doc comment).
-// Undoing in the opposite order would risk DeleteNode failing with
-// ErrNodeNotEmpty.
-func (tx *Txn) rollback() {
-	tx.rollbackTo(txMark{})
-}
-
-// txMark records how long tx's undo log and commit-hook list were at some
-// point, so a nested transaction can later be rolled back to exactly
-// that point.
+// txMark records how long a transaction's undo log and commit-hook list
+// were at some point, so a nested transaction can later be rolled back to
+// exactly that point.
 type txMark struct {
 	undo  int
 	hooks int
 }
 
-// mark returns tx's current position, for rollbackTo.
-func (tx *Txn) mark() txMark {
-	return txMark{undo: len(tx.undo), hooks: len(tx.commitHooks)}
+// txLog is the undo log and commit-hook list shared by every Tx
+// implementation that applies its mutations as it goes and undoes them on
+// failure: Txn, the test-only stagedOverlay, and BoltGraph's boltTxn. The
+// embedding type appends one closure to undo per effective mutation, and
+// gets OnCommit, OnRollback, nested savepoints (runNested) and rollback
+// from here, so those exist once (theorystate.md sections 45, 91).
+type txLog struct {
+	undo        []func()
+	commitHooks []func()
 }
 
-// rollbackTo undoes, in reverse (LIFO) order, every mutation recorded on
-// tx since m was taken, and discards every commit hook registered since
-// then. The zero txMark rolls back the whole transaction.
+// mark returns the log's current position, for rollbackTo.
+func (l *txLog) mark() txMark {
+	return txMark{undo: len(l.undo), hooks: len(l.commitHooks)}
+}
+
+// rollback undoes everything recorded so far. See rollbackTo.
+func (l *txLog) rollback() {
+	l.rollbackTo(txMark{})
+}
+
+// rollbackTo undoes, in reverse (LIFO) order, every step recorded since m
+// was taken, and discards every commit hook registered since then. The
+// zero txMark rolls back the whole transaction. Reverse order matters: if a
+// transaction created a node and then added a relationship from it,
+// undoing the relationship first leaves the node empty, so undoing the
+// node's creation afterward satisfies DeleteNode's no-relationships
+// precondition (see the Graph.DeleteNode doc comment).
 //
-// tx.touched is deliberately not rewound: it stays a conservative
-// superset of what the transaction changed. A Checker given a node whose
-// change was rolled back simply re-validates a node that is already
-// valid, and every Checker in this file ignores nodes that no longer
-// exist.
-func (tx *Txn) rollbackTo(m txMark) {
-	for i := len(tx.undo) - 1; i >= m.undo; i-- {
-		tx.undo[i]()
+// The embedding type's touched set is deliberately not rewound: it stays a
+// conservative superset of what the transaction changed. A Checker given a
+// node whose change was rolled back simply re-validates a node that is
+// already valid, and every Checker in this file ignores nodes that no
+// longer exist.
+func (l *txLog) rollbackTo(m txMark) {
+	for i := len(l.undo) - 1; i >= m.undo; i-- {
+		l.undo[i]()
 	}
 
-	clear(tx.undo[m.undo:])
-	tx.undo = tx.undo[:m.undo]
+	clear(l.undo[m.undo:])
+	l.undo = l.undo[:m.undo]
 
-	clear(tx.commitHooks[m.hooks:])
-	tx.commitHooks = tx.commitHooks[:m.hooks]
+	clear(l.commitHooks[m.hooks:])
+	l.commitHooks = l.commitHooks[:m.hooks]
+}
+
+// OnCommit implements Tx.OnCommit: fn runs once, after every Checker has
+// approved (and, for a durable backend, after the commit), and is
+// discarded if the transaction rolls back.
+func (l *txLog) OnCommit(fn func()) {
+	l.commitHooks = append(l.commitHooks, fn)
+}
+
+// OnRollback implements Tx.OnRollback. The hook is recorded in the undo
+// log, so it runs in LIFO order with the graph mutations around it when
+// the transaction -- or the nested transaction it was registered in -- is
+// rolled back, and is simply dropped when the outermost transaction
+// commits.
+func (l *txLog) OnRollback(fn func()) {
+	l.undo = append(l.undo, fn)
+}
+
+// runCommitHooks runs and clears every registered commit hook, in
+// registration order. The backend calls it only after fn, every relevant
+// Checker and (where there is one) the durable commit have succeeded.
+func (l *txLog) runCommitHooks() {
+	hooks := l.commitHooks
+	l.commitHooks = nil
+
+	for _, hook := range hooks {
+		hook()
+	}
+}
+
+// runNested runs fn as a nested transaction, a savepoint inside the
+// enclosing one, handing it tx (the embedding type, which shares this
+// log). If fn returns an error or panics, everything done since the call
+// and every commit hook registered since then is undone; the enclosing
+// closure may handle the error and carry on. If fn succeeds nothing more
+// happens: Checkers run once, at the outermost commit, and the effects are
+// provisional until then (theorystate.md section 45).
+func (l *txLog) runNested(tx Tx, fn func(nested Tx) error) error {
+	mark := l.mark()
+
+	defer func() {
+		if r := recover(); r != nil {
+			l.rollbackTo(mark)
+			panic(r)
+		}
+	}()
+
+	if err := fn(tx); err != nil {
+		l.rollbackTo(mark)
+		return err
+	}
+
+	return nil
 }
 
 // Transact implements Transactor for a transaction already in progress:
@@ -901,48 +986,7 @@ func (tx *Txn) rollbackTo(m txMark) {
 // fn succeeds, nothing more happens: no Checker runs here (they run once,
 // at the outermost commit) and the effects are provisional until then.
 func (tx *Txn) Transact(fn func(nested Tx) error) error {
-	mark := tx.mark()
-
-	defer func() {
-		if r := recover(); r != nil {
-			tx.rollbackTo(mark)
-			panic(r)
-		}
-	}()
-
-	if err := fn(tx); err != nil {
-		tx.rollbackTo(mark)
-		return err
-	}
-
-	return nil
-}
-
-// OnCommit implements Tx.OnCommit: fn runs once, after every Checker has
-// approved, and is discarded if the transaction rolls back.
-func (tx *Txn) OnCommit(fn func()) {
-	tx.commitHooks = append(tx.commitHooks, fn)
-}
-
-// OnRollback implements Tx.OnRollback. The hook is recorded in the undo
-// log, so it runs in LIFO order with the graph mutations around it when
-// the transaction -- or the nested transaction it was registered in -- is
-// rolled back, and is simply dropped when the outermost transaction
-// commits.
-func (tx *Txn) OnRollback(fn func()) {
-	tx.undo = append(tx.undo, fn)
-}
-
-// runCommitHooks runs and clears every registered commit hook, in
-// registration order. Graph.Transact calls it only after fn and every
-// relevant Checker have succeeded.
-func (tx *Txn) runCommitHooks() {
-	hooks := tx.commitHooks
-	tx.commitHooks = nil
-
-	for _, hook := range hooks {
-		hook()
-	}
+	return tx.runNested(tx, fn)
 }
 
 // CreateNode behaves exactly like Graph.CreateNode, additionally
@@ -954,7 +998,7 @@ func (tx *Txn) CreateNode() (NodeID, error) {
 		return 0, err
 	}
 
-	tx.touch(id)
+	tx.Touch(id)
 
 	tx.undo = append(tx.undo, func() {
 		// By the time this runs (see rollback's LIFO ordering), any
@@ -994,7 +1038,7 @@ func (tx *Txn) AddRelationship(a, b NodeID) (created bool, err error) {
 	}
 
 	if created {
-		tx.touch(a, b)
+		tx.Touch(a, b)
 
 		tx.undo = append(tx.undo, func() {
 			// Best-effort: deliberately swallowed, mirroring
@@ -1020,7 +1064,7 @@ func (tx *Txn) RemoveRelationship(a, b NodeID) (removed bool, err error) {
 	}
 
 	if removed {
-		tx.touch(a, b)
+		tx.Touch(a, b)
 
 		tx.undo = append(tx.undo, func() {
 			// Best-effort: deliberately swallowed, mirroring
@@ -1059,7 +1103,7 @@ func (tx *Txn) DeleteNode(id NodeID) error {
 		return err
 	}
 
-	tx.touch(id)
+	tx.Touch(id)
 
 	tx.undo = append(tx.undo, func() {
 		tx.graph.resurrectNode(id)
@@ -1318,18 +1362,28 @@ var _ GraphReader = graphCoreReader{}
 // that is already holding g's concurrentAccessGuard -- see the
 // graphCoreReader doc comment.
 func (g *Graph) runCheckers(touched map[NodeID]struct{}) error {
-	if len(touched) == 0 || len(g.checkers) == 0 {
+	return runCheckersOver(g.checkers, graphCoreReader{graph: g}, touched)
+}
+
+// runCheckersOver consults every Checker in checkers whose Tags make it
+// plausibly relevant to touched (see checkerRelevant), in order, returning
+// the first error any relevant Checker reports, wrapped with that
+// Checker's Name for attribution. An empty touched set or an empty
+// checkers list trivially passes. view is the state the transaction's
+// mutations produce, in whatever form the backend provides it (Graph's
+// graphCoreReader, stagedGraph's overlay, BoltGraph's update-transaction
+// view). It is shared by every GraphAPI implementation's Transact.
+func runCheckersOver(checkers []Checker, view GraphReader, touched map[NodeID]struct{}) error {
+	if len(touched) == 0 || len(checkers) == 0 {
 		return nil
 	}
 
-	reader := graphCoreReader{graph: g}
-
-	for _, checker := range g.checkers {
-		if !checkerRelevant(reader, checker, touched) {
+	for _, checker := range checkers {
+		if !checkerRelevant(view, checker, touched) {
 			continue
 		}
 
-		if err := checker.Check(reader, touched); err != nil {
+		if err := checker.Check(view, touched); err != nil {
 			return fmt.Errorf("%s: %w", checker.Name, err)
 		}
 	}
@@ -1728,6 +1782,685 @@ func (ga *GraphActor) RegisterChecker(c Checker) {
 	ga.do(func(g GraphAPI) {
 		g.RegisterChecker(c)
 	})
+}
+
+// ErrStoreCorrupt is returned when the persistent store does not have the
+// structure BoltGraph writes: a missing bucket or a malformed counter
+// record. It indicates a damaged or foreign file, never a caller mistake.
+var ErrStoreCorrupt = errors.New("persistent graph store is corrupt")
+
+// BoltGraph's on-disk layout (theorystate.md section 102). NodeIDs are
+// 8-byte big-endian, so byte order equals numeric order and a prefix scan
+// returns relationships sorted exactly as Graph does. nodes: id ->
+// present. out: from||to -> present. in: to||from -> present (the reverse
+// index). meta: one counter record, next ID (8 bytes) plus an exhausted
+// flag (1 byte). Values are the one-byte boltPresent, never empty, so
+// "key exists" is always Get(key) != nil.
+var (
+	boltBucketNodes = []byte("nodes")
+	boltBucketOut   = []byte("out")
+	boltBucketIn    = []byte("in")
+	boltBucketMeta  = []byte("meta")
+	boltCounterKey  = []byte("counter")
+	boltPresent     = []byte{1}
+)
+
+const boltIDSize = 8
+
+// boltKey8 encodes id as an 8-byte big-endian key.
+func boltKey8(id NodeID) []byte {
+	key := make([]byte, boltIDSize)
+	binary.BigEndian.PutUint64(key, uint64(id))
+
+	return key
+}
+
+// boltKey16 encodes the ordered pair (first, second) as a 16-byte key.
+func boltKey16(first, second NodeID) []byte {
+	key := make([]byte, 2*boltIDSize)
+	binary.BigEndian.PutUint64(key[:boltIDSize], uint64(first))
+	binary.BigEndian.PutUint64(key[boltIDSize:], uint64(second))
+
+	return key
+}
+
+// boltID decodes the NodeID held in the first eight bytes of key.
+func boltID(key []byte) NodeID {
+	return NodeID(binary.BigEndian.Uint64(key))
+}
+
+// wrapBoltErr wraps an error returned by the bolt package with the
+// operation that failed, preserving errors.Is/As. A nil err stays nil.
+func wrapBoltErr(op string, err error) error {
+	if err == nil {
+		return nil
+	}
+
+	return fmt.Errorf("bolt %s: %w", op, err)
+}
+
+// boltScanPrefix calls visit for every key in bucket that starts with
+// prefix, in key order, until visit returns false. The key slice is valid
+// only during the call.
+func boltScanPrefix(bucket *bolt.Bucket, prefix []byte, visit func(key []byte) bool) {
+	cursor := bucket.Cursor()
+
+	for key, _ := cursor.Seek(prefix); key != nil && bytes.HasPrefix(key, prefix); key, _ = cursor.Next() {
+		if !visit(key) {
+			return
+		}
+	}
+}
+
+// boltHasPrefix reports whether bucket holds any key starting with prefix.
+func boltHasPrefix(bucket *bolt.Bucket, prefix []byte) bool {
+	found := false
+
+	boltScanPrefix(bucket, prefix, func(_ []byte) bool {
+		found = true
+		return false
+	})
+
+	return found
+}
+
+// boltView is the read side of BoltGraph over one bolt transaction: a
+// read-only one for reads made outside a Transact, or the update
+// transaction itself for reads made inside one, where it sees that
+// transaction's own uncommitted writes (theorystate.md section 101). It is
+// also what a Checker's Check function receives.
+type boltView struct {
+	nodes *bolt.Bucket
+	out   *bolt.Bucket
+	in    *bolt.Bucket
+}
+
+// Compile-time assertion that boltView satisfies GraphReader.
+var _ GraphReader = boltView{}
+
+// newBoltView returns the view over btx, or ErrStoreCorrupt if a bucket is
+// missing.
+func newBoltView(btx *bolt.Tx) (boltView, error) {
+	view := boltView{
+		nodes: btx.Bucket(boltBucketNodes),
+		out:   btx.Bucket(boltBucketOut),
+		in:    btx.Bucket(boltBucketIn),
+	}
+
+	if view.nodes == nil || view.out == nil || view.in == nil {
+		return boltView{}, ErrStoreCorrupt
+	}
+
+	return view, nil
+}
+
+// NodeExists reports whether id exists.
+func (v boltView) NodeExists(id NodeID) bool {
+	return v.nodes.Get(boltKey8(id)) != nil
+}
+
+// HasRelationship reports whether the relationship (a, b) exists.
+func (v boltView) HasRelationship(a, b NodeID) bool {
+	if !v.NodeExists(a) || !v.NodeExists(b) {
+		return false
+	}
+
+	return v.out.Get(boltKey16(a, b)) != nil
+}
+
+// FindRelationship reports whether the exact relationship (from, to)
+// exists.
+func (v boltView) FindRelationship(from, to NodeID) (Relationship, bool, error) {
+	if !v.NodeExists(from) || !v.NodeExists(to) {
+		return Relationship{}, false, ErrNodeNotFound
+	}
+
+	if v.out.Get(boltKey16(from, to)) == nil {
+		return Relationship{}, false, nil
+	}
+
+	return Relationship{From: from, To: to}, true, nil
+}
+
+// FindOutgoing returns every relationship whose source is from, sorted by
+// To.
+func (v boltView) FindOutgoing(from NodeID) ([]Relationship, error) {
+	if !v.NodeExists(from) {
+		return nil, ErrNodeNotFound
+	}
+
+	relationships := []Relationship{}
+
+	boltScanPrefix(v.out, boltKey8(from), func(key []byte) bool {
+		relationships = append(relationships, Relationship{From: from, To: boltID(key[boltIDSize:])})
+		return true
+	})
+
+	return relationships, nil
+}
+
+// FindIncoming returns every relationship whose target is to, sorted by
+// From.
+func (v boltView) FindIncoming(to NodeID) ([]Relationship, error) {
+	if !v.NodeExists(to) {
+		return nil, ErrNodeNotFound
+	}
+
+	relationships := []Relationship{}
+
+	boltScanPrefix(v.in, boltKey8(to), func(key []byte) bool {
+		relationships = append(relationships, Relationship{From: boltID(key[boltIDSize:]), To: to})
+		return true
+	})
+
+	return relationships, nil
+}
+
+// FindRelationships returns every relationship, sorted by From then To.
+// This is O(graph); see theorystate.md section 105.
+func (v boltView) FindRelationships() []Relationship {
+	relationships := []Relationship{}
+	cursor := v.out.Cursor()
+
+	for key, _ := cursor.First(); key != nil; key, _ = cursor.Next() {
+		relationships = append(relationships, Relationship{From: boltID(key), To: boltID(key[boltIDSize:])})
+	}
+
+	return relationships
+}
+
+// FindNodes returns every existing NodeID, sorted ascending. This is
+// O(graph); see theorystate.md section 105.
+func (v boltView) FindNodes() []NodeID {
+	ids := []NodeID{}
+	cursor := v.nodes.Cursor()
+
+	for key, _ := cursor.First(); key != nil; key, _ = cursor.Next() {
+		ids = append(ids, boltID(key))
+	}
+
+	return ids
+}
+
+// boltTxn is the Tx BoltGraph.Transact hands its closure: reads come from
+// the embedded boltView (over the update transaction, so they see this
+// transaction's own writes), writes go to the same bolt transaction, and
+// the embedded txLog records how to undo each write so a nested
+// transaction can be rolled back to a savepoint. The outermost rollback
+// needs no data undo at all: bolt discards the whole update transaction,
+// and only the rollback hooks must run (see abort).
+type boltTxn struct {
+	boltView
+	txLog
+
+	meta    *bolt.Bucket
+	touched map[NodeID]struct{}
+
+	// broken is the first failure of a data undo step. A transaction whose
+	// savepoint could not be restored is no longer trustworthy, so
+	// Transact aborts it instead of committing.
+	broken error
+
+	// dead is set once the outermost transaction is being abandoned or has
+	// ended: data undo steps must no longer touch the (discarded or
+	// closed) bolt transaction, only rollback hooks still run.
+	dead bool
+}
+
+// Compile-time assertion that *boltTxn satisfies Tx.
+var _ Tx = (*boltTxn)(nil)
+
+// newBoltTxn returns the Tx over the update transaction btx, or
+// ErrStoreCorrupt if a bucket is missing.
+func newBoltTxn(btx *bolt.Tx) (*boltTxn, error) {
+	view, err := newBoltView(btx)
+	if err != nil {
+		return nil, err
+	}
+
+	meta := btx.Bucket(boltBucketMeta)
+	if meta == nil {
+		return nil, ErrStoreCorrupt
+	}
+
+	return &boltTxn{boltView: view, meta: meta}, nil
+}
+
+// pushUndo records step as the undo of a data mutation. A failing step
+// poisons the transaction (see broken) rather than being ignored, and a
+// step is skipped once the transaction is dead (see dead).
+func (t *boltTxn) pushUndo(step func() error) {
+	t.undo = append(t.undo, func() {
+		if t.dead {
+			return
+		}
+
+		if err := step(); err != nil && t.broken == nil {
+			t.broken = err
+		}
+	})
+}
+
+// abort abandons the outermost transaction: bolt itself discards every
+// write, so only the OnRollback hooks run (in LIFO order), and no data
+// undo step touches the store. Calling it again does nothing.
+func (t *boltTxn) abort() {
+	t.dead = true
+	t.rollback()
+}
+
+// Touch marks ids as touched without changing anything (see Tx.Touch).
+func (t *boltTxn) Touch(ids ...NodeID) {
+	t.touched = touchNodes(t.touched, ids...)
+}
+
+// Transact opens a nested transaction, a savepoint (see txLog.runNested).
+func (t *boltTxn) Transact(fn func(nested Tx) error) error {
+	return t.runNested(t, fn)
+}
+
+// counter reads the persisted ID counter: the next NodeID CreateNode will
+// hand out and whether the ID space is exhausted. A store that has never
+// created a node has no counter record, which reads as (0, false).
+func (t *boltTxn) counter() (next NodeID, exhausted bool, err error) {
+	raw := t.meta.Get(boltCounterKey)
+	if raw == nil {
+		return 0, false, nil
+	}
+
+	if len(raw) != boltIDSize+1 {
+		return 0, false, ErrStoreCorrupt
+	}
+
+	return boltID(raw), raw[boltIDSize] == 1, nil
+}
+
+// setCounter persists the ID counter, in the same bolt transaction as the
+// node creation it belongs to, so a committed node and the counter that
+// covers it are never separated by a crash -- the never-reuse guarantee
+// (theorystate.md sections 40, 78) survives restarts.
+func (t *boltTxn) setCounter(next NodeID, exhausted bool) error {
+	raw := make([]byte, boltIDSize+1)
+	binary.BigEndian.PutUint64(raw, uint64(next))
+
+	if exhausted {
+		raw[boltIDSize] = 1
+	}
+
+	return wrapBoltErr("write counter", t.meta.Put(boltCounterKey, raw))
+}
+
+// CreateNode creates a node, exactly like Graph's node creation. Undoing
+// it (nested rollback) deletes the node but, like Graph, does not give the
+// ID back: the counter only increases within a process.
+func (t *boltTxn) CreateNode() (NodeID, error) {
+	next, exhausted, err := t.counter()
+	if err != nil {
+		return 0, err
+	}
+
+	if exhausted {
+		return 0, ErrNodeIDExhausted
+	}
+
+	id := next
+	key := boltKey8(id)
+
+	t.pushUndo(func() error {
+		return wrapBoltErr("undo create node", t.nodes.Delete(key))
+	})
+
+	if putErr := t.nodes.Put(key, boltPresent); putErr != nil {
+		return 0, wrapBoltErr("create node", putErr)
+	}
+
+	if id == ^NodeID(0) {
+		exhausted = true
+	} else {
+		next++
+	}
+
+	if counterErr := t.setCounter(next, exhausted); counterErr != nil {
+		return 0, counterErr
+	}
+
+	t.Touch(id)
+
+	return id, nil
+}
+
+// putEdgeKeys writes both index entries of one relationship.
+func (t *boltTxn) putEdgeKeys(outKey, inKey []byte) error {
+	if err := t.out.Put(outKey, boltPresent); err != nil {
+		return wrapBoltErr("put outgoing edge", err)
+	}
+
+	return wrapBoltErr("put incoming edge", t.in.Put(inKey, boltPresent))
+}
+
+// deleteEdgeKeys removes both index entries of one relationship.
+func (t *boltTxn) deleteEdgeKeys(outKey, inKey []byte) error {
+	if err := t.out.Delete(outKey); err != nil {
+		return wrapBoltErr("delete outgoing edge", err)
+	}
+
+	return wrapBoltErr("delete incoming edge", t.in.Delete(inKey))
+}
+
+// AddRelationship adds (a, b); both nodes must exist. Adding an existing
+// relationship reports created == false and records nothing to undo.
+func (t *boltTxn) AddRelationship(a, b NodeID) (created bool, err error) {
+	if !t.NodeExists(a) || !t.NodeExists(b) {
+		return false, ErrNodeNotFound
+	}
+
+	outKey, inKey := boltKey16(a, b), boltKey16(b, a)
+	if t.out.Get(outKey) != nil {
+		return false, nil
+	}
+
+	// The undo is recorded first: deleting keys that were never written is
+	// a no-op, so a failure halfway through the two writes is still undone.
+	t.pushUndo(func() error { return t.deleteEdgeKeys(outKey, inKey) })
+
+	if putErr := t.putEdgeKeys(outKey, inKey); putErr != nil {
+		return false, putErr
+	}
+
+	t.Touch(a, b)
+
+	return true, nil
+}
+
+// RemoveRelationship removes (a, b); both nodes must exist. Removing a
+// relationship that is not there reports removed == false.
+func (t *boltTxn) RemoveRelationship(a, b NodeID) (removed bool, err error) {
+	if !t.NodeExists(a) || !t.NodeExists(b) {
+		return false, ErrNodeNotFound
+	}
+
+	outKey, inKey := boltKey16(a, b), boltKey16(b, a)
+	if t.out.Get(outKey) == nil {
+		return false, nil
+	}
+
+	t.pushUndo(func() error { return t.putEdgeKeys(outKey, inKey) })
+
+	if deleteErr := t.deleteEdgeKeys(outKey, inKey); deleteErr != nil {
+		return false, deleteErr
+	}
+
+	t.Touch(a, b)
+
+	return true, nil
+}
+
+// DeleteNode deletes id only if it has no relationships in either
+// direction (theorystate.md section 18). The undo restores the bare node,
+// which is a complete restoration for the same reason as Txn.DeleteNode
+// (theorystate.md section 78).
+func (t *boltTxn) DeleteNode(id NodeID) error {
+	if !t.NodeExists(id) {
+		return ErrNodeNotFound
+	}
+
+	key := boltKey8(id)
+	if boltHasPrefix(t.out, key) || boltHasPrefix(t.in, key) {
+		return ErrNodeNotEmpty
+	}
+
+	t.pushUndo(func() error {
+		return wrapBoltErr("undo delete node", t.nodes.Put(key, boltPresent))
+	})
+
+	if err := t.nodes.Delete(key); err != nil {
+		return wrapBoltErr("delete node", err)
+	}
+
+	t.Touch(id)
+
+	return nil
+}
+
+// BoltGraph is the disk-backed GraphAPI (theorystate.md sections 100-108):
+// nodes, relationships and the ID counter live in one bbolt file, laid out
+// as described at boltBucketNodes. Only one process may open the file
+// (bbolt takes a file lock), which is the graph-host model of section 107.
+//
+// A bare BoltGraph supports one goroutine at a time (concurrentAccessGuard
+// panics on overlap, exactly like *Graph); wrap it in a GraphActor for
+// concurrent callers, which is also what serializes reads and writes so a
+// read transaction is never opened while a write transaction is open on
+// the same goroutine (bbolt's documented deadlock). Reads outside a
+// Transact each run in their own short read transaction; inside a Transact
+// every read goes through the update transaction.
+//
+// Durability: Transact is one bbolt update transaction, so each committed
+// Transact is durable and an aborted or crashed one leaves no trace.
+// OnCommit hooks run only after that commit has succeeded, and OnRollback
+// hooks run on any abort, including a failed commit.
+//
+// The GraphReader methods with no error result (NodeExists, HasRelationship,
+// FindRelationships, FindNodes) panic if the store itself fails (for
+// example after Close); giving them error results belongs to the paged-read
+// rework of theorystate.md section 105.
+type BoltGraph struct {
+	guard    concurrentAccessGuard
+	db       *bolt.DB
+	checkers []Checker
+}
+
+// Compile-time assertion that *BoltGraph satisfies GraphAPI.
+var _ GraphAPI = (*BoltGraph)(nil)
+
+// OpenBoltGraph opens, creating if necessary, the store at path. The open
+// waits at most one second for the file lock (bbolt documents that option
+// for Darwin and Linux only, so on Windows a second open of a locked file
+// may block; the graph host must not be started twice, theorystate.md
+// section 107).
+func OpenBoltGraph(path string) (*BoltGraph, error) {
+	db, err := bolt.Open(path, 0o600, &bolt.Options{Timeout: time.Second})
+	if err != nil {
+		return nil, fmt.Errorf("bolt: opening %s: %w", path, err)
+	}
+
+	initErr := db.Update(func(btx *bolt.Tx) error {
+		for _, name := range [][]byte{boltBucketNodes, boltBucketOut, boltBucketIn, boltBucketMeta} {
+			if _, bucketErr := btx.CreateBucketIfNotExists(name); bucketErr != nil {
+				return wrapBoltErr("create bucket "+string(name), bucketErr)
+			}
+		}
+
+		return nil
+	})
+	if initErr != nil {
+		if closeErr := db.Close(); closeErr != nil {
+			return nil, fmt.Errorf("bolt: initializing %s: %w (closing also failed: %v)", path, initErr, closeErr)
+		}
+
+		return nil, fmt.Errorf("bolt: initializing %s: %w", path, initErr)
+	}
+
+	return &BoltGraph{db: db}, nil
+}
+
+// Close closes the store. It is idempotent.
+func (g *BoltGraph) Close() error {
+	release := g.guard.acquire()
+	defer release()
+
+	return wrapBoltErr("close", g.db.Close())
+}
+
+// boltRead runs fn against a read-only view of g's store, in its own
+// short bolt read transaction, and returns its result. The caller must
+// hold g's guard.
+func boltRead[T any](g *BoltGraph, fn func(v boltView) (T, error)) (T, error) {
+	var result T
+
+	err := g.db.View(func(btx *bolt.Tx) error {
+		view, viewErr := newBoltView(btx)
+		if viewErr != nil {
+			return viewErr
+		}
+
+		var fnErr error
+		result, fnErr = fn(view)
+
+		return fnErr
+	})
+	if err != nil {
+		var zero T
+		return zero, wrapInterfaceErr(err)
+	}
+
+	return result, nil
+}
+
+// boltMust is boltRead for reads whose GraphReader method has no error
+// result: a store failure panics (see the BoltGraph doc comment).
+func boltMust[T any](g *BoltGraph, fn func(v boltView) T) T {
+	result, err := boltRead(g, func(v boltView) (T, error) { return fn(v), nil })
+	if err != nil {
+		panic(fmt.Sprintf("dml: reading the persistent store failed: %v", err))
+	}
+
+	return result
+}
+
+// NodeExists reports whether id exists.
+func (g *BoltGraph) NodeExists(id NodeID) bool {
+	release := g.guard.acquire()
+	defer release()
+
+	return boltMust(g, func(v boltView) bool { return v.NodeExists(id) })
+}
+
+// HasRelationship reports whether (a, b) exists.
+func (g *BoltGraph) HasRelationship(a, b NodeID) bool {
+	release := g.guard.acquire()
+	defer release()
+
+	return boltMust(g, func(v boltView) bool { return v.HasRelationship(a, b) })
+}
+
+// FindRelationship reports whether the exact relationship exists.
+func (g *BoltGraph) FindRelationship(from, to NodeID) (Relationship, bool, error) {
+	release := g.guard.acquire()
+	defer release()
+
+	type found struct {
+		relationship Relationship
+		exists       bool
+	}
+
+	result, err := boltRead(g, func(v boltView) (found, error) {
+		relationship, exists, findErr := v.FindRelationship(from, to)
+		return found{relationship: relationship, exists: exists}, findErr
+	})
+
+	return result.relationship, result.exists, err
+}
+
+// FindOutgoing returns every relationship whose source is from.
+func (g *BoltGraph) FindOutgoing(from NodeID) ([]Relationship, error) {
+	release := g.guard.acquire()
+	defer release()
+
+	return boltRead(g, func(v boltView) ([]Relationship, error) { return v.FindOutgoing(from) })
+}
+
+// FindIncoming returns every relationship whose target is to.
+func (g *BoltGraph) FindIncoming(to NodeID) ([]Relationship, error) {
+	release := g.guard.acquire()
+	defer release()
+
+	return boltRead(g, func(v boltView) ([]Relationship, error) { return v.FindIncoming(to) })
+}
+
+// FindRelationships returns every relationship. O(graph).
+func (g *BoltGraph) FindRelationships() []Relationship {
+	release := g.guard.acquire()
+	defer release()
+
+	return boltMust(g, func(v boltView) []Relationship { return v.FindRelationships() })
+}
+
+// FindNodes returns every existing NodeID. O(graph).
+func (g *BoltGraph) FindNodes() []NodeID {
+	release := g.guard.acquire()
+	defer release()
+
+	return boltMust(g, func(v boltView) []NodeID { return v.FindNodes() })
+}
+
+// RegisterChecker registers c, exactly like Graph.RegisterChecker.
+func (g *BoltGraph) RegisterChecker(c Checker) {
+	release := g.guard.acquire()
+	defer release()
+
+	g.checkers = append(g.checkers, c)
+}
+
+// Transact runs fn as one bbolt update transaction. Every read fn makes
+// goes through tx, which sees fn's own writes. If fn returns an error or
+// panics, or a relevant Checker declines the resulting state, or a nested
+// rollback could not be restored, the update is abandoned: bolt discards
+// every write and only the OnRollback hooks run. Otherwise the update
+// commits durably and only then do the OnCommit hooks run, still inside
+// this call and under the guard, so they are serialized with every other
+// closure. If the commit itself fails, the OnRollback hooks run instead.
+func (g *BoltGraph) Transact(fn func(tx Tx) error) error {
+	release := g.guard.acquire()
+	defer release()
+
+	var txn *boltTxn
+
+	err := g.db.Update(func(btx *bolt.Tx) error {
+		var openErr error
+
+		txn, openErr = newBoltTxn(btx)
+		if openErr != nil {
+			return openErr
+		}
+
+		defer func() {
+			if r := recover(); r != nil {
+				txn.abort()
+				panic(r)
+			}
+		}()
+
+		if fnErr := fn(txn); fnErr != nil {
+			txn.abort()
+			return fnErr
+		}
+
+		if checkErr := runCheckersOver(g.checkers, txn.boltView, txn.touched); checkErr != nil {
+			txn.abort()
+			return checkErr
+		}
+
+		if txn.broken != nil {
+			txn.abort()
+			return txn.broken
+		}
+
+		return nil
+	})
+	if err != nil {
+		if txn != nil {
+			// Only reached with work still to do when the commit itself
+			// failed; abort is idempotent otherwise.
+			txn.abort()
+		}
+
+		return wrapInterfaceErr(err)
+	}
+
+	txn.runCommitHooks()
+
+	return nil
 }
 
 var (
@@ -2681,6 +3414,12 @@ func (t rootTx) OnCommit(fn func()) {
 // registered through the overlay run when that transaction rolls back.
 func (t rootTx) OnRollback(fn func()) {
 	t.tx.OnRollback(fn)
+}
+
+// Touch forwards to the underlying transaction: touched sets hold NodeIDs
+// only, which the ROOT overlay does not change.
+func (t rootTx) Touch(ids ...NodeID) {
+	t.tx.Touch(ids...)
 }
 
 // Transact forwards to the underlying transaction's nested Transact and

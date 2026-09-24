@@ -1748,11 +1748,37 @@ could be called directly.
  server store with client-side registry code (FoundationDB, Postgres,
  SpacetimeDB) is not adopted. Nothing in main.go or main_test.go changed.
 
+40. BoltGraph spike, graph half (theorystate.md sections 100-108). Added
+ BoltGraph/OpenBoltGraph (a disk-backed GraphAPI over one bbolt file;
+ go.etcd.io/bbolt is now a vendored dependency), boltView/boltTxn, and
+ Tx.Touch on every Tx (Txn, rootTx, stagedOverlay, boltTxn). DRY: the undo
+ log, hooks and nested savepoints moved into a shared txLog (Txn,
+ stagedOverlay and boltTxn embed it; stagedMark and the per-type copies are
+ gone), Txn.touch/stagedOverlay.touch became Touch over a shared touchNodes,
+ and Graph/stagedGraph/BoltGraph share runCheckersOver. Committed IDs are
+ never reused across restarts (counter persisted with the nodes); an
+ outermost abort reverts the counter. Covered by TestBoltGraphBasicOperations,
+ TestBoltGraphPersistsGraphAndNeverReusesIDsAcrossReopen,
+ TestBoltGraphExhaustedCounterPersists,
+ TestBoltGraphFailedTransactLeavesNoTrace,
+ TestBoltGraphPanicRollsBackRunsRollbackHookAndStaysUsable,
+ TestBoltGraphReadsInsideTransactSeeUncommittedWrites,
+ TestBoltGraphNestedTransactRollsBackOnlyInnerSteps,
+ TestBoltGraphCheckerSeesWritesAndDeclineLeavesNoTrace,
+ TestBoltGraphCommitAndRollbackHooks,
+ TestBoltGraphPointerRegistryPortability,
+ TestBoltGraphPointerStateSurvivesReopen,
+ TestGraphActorOverBoltGraphConcurrentCreateNodeProducesUniqueIDs,
+ TestRootGraphOverBoltGraphBasicOperations and
+ TestTxTouchRunsRelevantCheckersWithoutMutation.
+
 Currently unaddressed yet:
-- The startup integrity sweep (Tx.Touch plus a paged VerifyAll, theorystate.md
-  section 104) is designed but not built; it covers what item 36 records as
-  bypassing Checkers (data that did not come through this process's
-  Checkers). Paged reads (section 105) are OPEN.
+- Still to build for the persistent backend: name records in the same store
+  with bound/retired states, ensure/purge and startup failure on a retired
+  name (theorystate.md section 103); VerifyAll with a paged sweep and the
+  startup order (section 104); a physical store check; paged reads and
+  error results for the GraphReader methods that lack them (section 105).
+  Until names persist, only tests reopen a store.
 - Nested transactions as a production-backend feature are realized for
   the in-memory backend only (savepoints over the undo log); a
   structurally different, test-only realization also exists for

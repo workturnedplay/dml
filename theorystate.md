@@ -3480,6 +3480,44 @@ transport, authentication, the set of operations, and how results and errors
 cross the boundary (related to §89c's transaction-descriptor vocabulary). How
 hosts on different machines coordinate is Part C.
 
+## 108. BoltGraph spike: graph half (TENTATIVE, implemented)
+
+`BoltGraph` (main.go) is the §102 layout as a `GraphAPI`. What it settled:
+
+- **Transact is one bbolt update transaction.** Every read inside goes
+  through it (§101), so a read transaction is never opened while the update
+  is open. Checkers run inside the update, before commit, over a view of the
+  same transaction, so they see the state `fn` produced (§95). An error,
+  panic, declined Checker, or a nested rollback that could not be restored
+  abandons the update: bolt discards every write and only `OnRollback` hooks
+  run (no data undo is needed at the outermost level). `OnCommit` hooks run
+  only after the durable commit, still under the guard; if the commit itself
+  fails, the rollback hooks run instead. Nested `Transact` is a savepoint via
+  an undo log.
+- **Shared machinery.** `txLog` (undo log, commit and rollback hooks,
+  nested savepoints) is now shared by `Txn`, the test-only `stagedOverlay`
+  and `boltTxn`; `touchNodes` and `runCheckersOver` replace duplicated
+  bookkeeping and the duplicated checker loop.
+- **`Tx.Touch(ids...)`** exists on every `Tx`. It marks nodes as touched
+  without mutating, so Checkers run for them at commit (§104's mechanism).
+  `VerifyAll` itself is not built yet.
+- **ID counter.** `nextID` and the exhausted flag are stored in the same
+  bolt transaction as the nodes, so committed IDs are never reused, even
+  across restarts (§40, §78). One difference from `*Graph`: an outermost
+  abort also reverts the counter, so an ID that was handed out inside a
+  transaction that never committed can be issued again. That ID was never
+  observable outside the transaction; a nested rollback does not restore the
+  counter, as with `*Graph`.
+- **Interface limit found.** `NodeExists`, `HasRelationship`,
+  `FindRelationships` and `FindNodes` have no error result, so on a disk
+  backend a store failure can only panic. Fixing this belongs with §105.
+
+**Not built yet:** name records in the same store (§103), `VerifyAll` and the
+startup order (§104), the physical check, paged reads (§105). Until names are
+persisted, a reopened store's `NameRegistry` is empty and `BootstrapNames`
+would mint second tag nodes, so only tests reopen a file. Windows behaviour,
+file growth and commit latency are not measured yet.
+
 ---
 
 ## PART D — STATUS SUMMARY (consolidated)

@@ -18,13 +18,15 @@ package dml
 
 import (
 	"errors"
-	"fmt"
 	"os"
+	"path/filepath"
 	"reflect"
 	"sort"
 	"strings"
 	"sync"
 	"testing"
+
+	bolt "go.etcd.io/bbolt"
 )
 
 // TestMain enables GraphActor's debug-only reentrancy tripwire
@@ -11144,21 +11146,7 @@ func (g *stagedGraph) reserveID() NodeID {
 // directly, which has not been touched yet for this backend. Unguarded:
 // only ever called from Transact while g.guard is already held.
 func (g *stagedGraph) runCheckers(ov *stagedOverlay) error {
-	if len(ov.touched) == 0 || len(g.checkers) == 0 {
-		return nil
-	}
-
-	for _, checker := range g.checkers {
-		if !checkerRelevant(ov, checker, ov.touched) {
-			continue
-		}
-
-		if err := checker.Check(ov, ov.touched); err != nil {
-			return fmt.Errorf("%s: %w", checker.Name, err)
-		}
-	}
-
-	return nil
+	return runCheckersOver(g.checkers, ov, ov.touched)
 }
 
 // publish applies every change recorded in ov to g's backing store, in
@@ -11303,19 +11291,15 @@ type stagedOverlay struct {
 	// have involved, for Checker relevance filtering (checkerRelevant).
 	touched map[NodeID]struct{}
 
-	// undo mirrors Txn.undo: one closure per mutation, undoing that
-	// mutation's effect on this overlay's own maps (never on base, which
-	// this attempt has not touched). OnRollback hooks are appended here
-	// too, so they run in LIFO order interleaved with the overlay
-	// mutations around them, exactly like Txn.OnRollback.
-	undo []func()
-
-	// commitHooks holds every function registered via OnCommit, run by
-	// stagedGraph.Transact only once this attempt has actually been
-	// published -- never merely once fn itself returns nil, since a
-	// later forceConflict-triggered retry would otherwise already have
-	// run a hook for an attempt that was in fact discarded.
-	commitHooks []func()
+	// txLog is this attempt's undo log -- one closure per mutation,
+	// undoing that mutation's effect on this overlay's own maps (never on
+	// base, which this attempt has not touched), with OnRollback hooks
+	// interleaved -- and its commit-hook list, run by stagedGraph.Transact
+	// only once this attempt has actually been published, never merely
+	// once fn itself returns nil, since a later forceConflict-triggered
+	// retry would otherwise already have run a hook for an attempt that
+	// was in fact discarded.
+	txLog
 }
 
 // newStagedOverlay returns an empty overlay over base, ready for one
@@ -11335,14 +11319,8 @@ func newStagedOverlay(base *stagedGraph) *stagedOverlay {
 var _ Tx = (*stagedOverlay)(nil)
 var _ GraphReader = (*stagedOverlay)(nil)
 
-func (ov *stagedOverlay) touch(ids ...NodeID) {
-	if ov.touched == nil {
-		ov.touched = make(map[NodeID]struct{}, len(ids))
-	}
-
-	for _, id := range ids {
-		ov.touched[id] = struct{}{}
-	}
+func (ov *stagedOverlay) Touch(ids ...NodeID) {
+	ov.touched = touchNodes(ov.touched, ids...)
 }
 
 // nodeExists reports whether id exists in the state this attempt has
@@ -11566,7 +11544,7 @@ func (ov *stagedOverlay) CreateNode() (NodeID, error) {
 	id := ov.base.reserveID()
 
 	ov.createdNodes[id] = struct{}{}
-	ov.touch(id)
+	ov.Touch(id)
 
 	ov.undo = append(ov.undo, func() {
 		delete(ov.createdNodes, id)
@@ -11599,7 +11577,7 @@ func (ov *stagedOverlay) AddRelationship(a, b NodeID) (created bool, err error) 
 		wasRemoved = true
 	}
 
-	ov.touch(a, b)
+	ov.Touch(a, b)
 
 	ov.undo = append(ov.undo, func() {
 		delete(ov.addedEdges[a], b)
@@ -11638,7 +11616,7 @@ func (ov *stagedOverlay) RemoveRelationship(a, b NodeID) (removed bool, err erro
 	}
 	ov.removedEdges[a][b] = struct{}{}
 
-	ov.touch(a, b)
+	ov.Touch(a, b)
 
 	ov.undo = append(ov.undo, func() {
 		delete(ov.removedEdges[a], b)
@@ -11680,7 +11658,7 @@ func (ov *stagedOverlay) DeleteNode(id NodeID) error {
 		return ErrNodeNotEmpty
 	}
 
-	ov.touch(id)
+	ov.Touch(id)
 
 	if _, created := ov.createdNodes[id]; created {
 		delete(ov.createdNodes, id)
@@ -11701,35 +11679,6 @@ func (ov *stagedOverlay) DeleteNode(id NodeID) error {
 	return nil
 }
 
-// stagedMark records how long ov's undo log and commit-hook list were at
-// some point, so a nested transaction can later be rolled back to
-// exactly that point -- the overlay-level counterpart of Txn's txMark.
-type stagedMark struct {
-	undo  int
-	hooks int
-}
-
-func (ov *stagedOverlay) mark() stagedMark {
-	return stagedMark{undo: len(ov.undo), hooks: len(ov.commitHooks)}
-}
-
-// rollbackTo undoes, in reverse (LIFO) order, every mutation recorded on
-// ov's own buffer since m was taken, and discards every commit hook
-// registered since then -- the overlay-level counterpart of
-// Txn.rollbackTo, operating on this attempt's local maps rather than on
-// a real graph.
-func (ov *stagedOverlay) rollbackTo(m stagedMark) {
-	for i := len(ov.undo) - 1; i >= m.undo; i-- {
-		ov.undo[i]()
-	}
-
-	clear(ov.undo[m.undo:])
-	ov.undo = ov.undo[:m.undo]
-
-	clear(ov.commitHooks[m.hooks:])
-	ov.commitHooks = ov.commitHooks[:m.hooks]
-}
-
 // Transact implements Transactor for a staged attempt already in
 // progress: fn runs as a nested transaction, a savepoint over this same
 // overlay, mirroring Txn.Transact exactly (theorystate.md section 45) --
@@ -11737,50 +11686,7 @@ func (ov *stagedOverlay) rollbackTo(m stagedMark) {
 // Checkers never run here (only once, at the outermost
 // stagedGraph.Transact commit).
 func (ov *stagedOverlay) Transact(fn func(nested Tx) error) error {
-	mark := ov.mark()
-
-	defer func() {
-		if r := recover(); r != nil {
-			ov.rollbackTo(mark)
-			panic(r)
-		}
-	}()
-
-	if err := fn(ov); err != nil {
-		ov.rollbackTo(mark)
-		return err
-	}
-
-	return nil
-}
-
-// OnCommit registers fn to run once this attempt is actually published
-// to the backing store (see stagedGraph.publish) -- never merely once fn
-// itself returns nil, since a later forceConflict-triggered retry would
-// otherwise already have run a hook for an attempt that was in fact
-// discarded.
-func (ov *stagedOverlay) OnCommit(fn func()) {
-	ov.commitHooks = append(ov.commitHooks, fn)
-}
-
-// OnRollback registers fn to run if this overlay, or the nested
-// transaction in progress when it is registered, is rolled back.
-// Recorded in the same undo log as every other mutation, so it fires in
-// LIFO order interleaved with them, exactly like Txn.OnRollback.
-func (ov *stagedOverlay) OnRollback(fn func()) {
-	ov.undo = append(ov.undo, fn)
-}
-
-// runCommitHooks runs and clears every registered commit hook, in
-// registration order. Called only by stagedGraph.Transact, only once an
-// attempt has actually been published.
-func (ov *stagedOverlay) runCommitHooks() {
-	hooks := ov.commitHooks
-	ov.commitHooks = nil
-
-	for _, hook := range hooks {
-		hook()
-	}
+	return ov.runNested(ov, fn)
 }
 
 // The following tests exercise stagedGraph/stagedOverlay (theorystate.md
@@ -12197,6 +12103,793 @@ func TestRootGraphOverStagedGraphBasicOperations(t *testing.T) {
 
 	if r.HasRelationship(root, root) {
 		t.Fatal("ROOT incorrectly has a relationship to itself")
+	}
+}
+
+// ---------------------------------------------------------------------
+// BoltGraph tests (theorystate.md sections 100-108). Names are not
+// persisted yet, so a reopened store's NameRegistry starts empty: tests
+// that reopen a file reuse the NodeIDs they already know instead of
+// calling BootstrapNames again.
+
+// The methods below exist ONLY in test builds, exactly like the ones for
+// stagedGraph: GraphAPI has no raw writes, so these run as one-operation
+// transactions and Checkers run for them.
+
+func (g *BoltGraph) CreateNode() (NodeID, error) {
+	return createNodeVia(g)
+}
+
+func (g *BoltGraph) AddRelationship(a, b NodeID) (bool, error) {
+	return addRelationshipVia(g, a, b)
+}
+
+func (g *BoltGraph) RemoveRelationship(a, b NodeID) (bool, error) {
+	return removeRelationshipVia(g, a, b)
+}
+
+func (g *BoltGraph) DeleteNode(id NodeID) error {
+	return deleteNodeVia(g, id)
+}
+
+func boltTestPath(t *testing.T) string {
+	t.Helper()
+
+	return filepath.Join(t.TempDir(), "dml.db")
+}
+
+// openBoltTestGraph opens the store at path and closes it when the test
+// ends (Close is idempotent, so tests may also close it themselves).
+func openBoltTestGraph(t *testing.T, path string) *BoltGraph {
+	t.Helper()
+
+	g, err := OpenBoltGraph(path)
+	if err != nil {
+		t.Fatalf("OpenBoltGraph(%q): %v", path, err)
+	}
+
+	t.Cleanup(func() {
+		if closeErr := g.Close(); closeErr != nil {
+			t.Errorf("Close(): %v", closeErr)
+		}
+	})
+
+	return g
+}
+
+func newBoltTestGraph(t *testing.T) *BoltGraph {
+	t.Helper()
+
+	return openBoltTestGraph(t, boltTestPath(t))
+}
+
+// mustCreateNode creates a node through any Transactor, failing t on error.
+func mustCreateNode(t *testing.T, api Transactor) NodeID {
+	t.Helper()
+
+	id, err := createNodeVia(api)
+	if err != nil {
+		t.Fatalf("CreateNode(): %v", err)
+	}
+
+	return id
+}
+
+func TestBoltGraphBasicOperations(t *testing.T) {
+	g := newBoltTestGraph(t)
+
+	a := mustCreateNode(t, g)
+	b := mustCreateNode(t, g)
+	if a != 0 || b != 1 {
+		t.Fatalf("first two NodeIDs = %d, %d, want 0, 1", a, b)
+	}
+
+	if !g.NodeExists(a) || !g.NodeExists(b) {
+		t.Fatal("created nodes do not both exist")
+	}
+
+	created, err := g.AddRelationship(a, b)
+	if err != nil {
+		t.Fatalf("AddRelationship(a,b): %v", err)
+	}
+	if !created {
+		t.Fatal("AddRelationship(a,b) reported that nothing was created")
+	}
+
+	again, err := g.AddRelationship(a, b)
+	if err != nil {
+		t.Fatalf("second AddRelationship(a,b): %v", err)
+	}
+	if again {
+		t.Fatal("second AddRelationship(a,b) reported creating a duplicate")
+	}
+
+	if !g.HasRelationship(a, b) || g.HasRelationship(b, a) {
+		t.Fatal("relationship direction is wrong")
+	}
+
+	want := Relationship{From: a, To: b}
+
+	relationship, exists, err := g.FindRelationship(a, b)
+	if err != nil || !exists || relationship != want {
+		t.Fatalf("FindRelationship(a,b) = (%v,%v,%v), want (%v,true,nil)", relationship, exists, err, want)
+	}
+
+	if _, missing, findErr := g.FindRelationship(b, a); findErr != nil || missing {
+		t.Fatalf("FindRelationship(b,a) = (%v,%v), want (false,nil)", missing, findErr)
+	}
+
+	outgoing, err := g.FindOutgoing(a)
+	if err != nil || !reflect.DeepEqual(outgoing, []Relationship{want}) {
+		t.Fatalf("FindOutgoing(a) = (%v,%v), want (%v,nil)", outgoing, err, []Relationship{want})
+	}
+
+	incoming, err := g.FindIncoming(b)
+	if err != nil || !reflect.DeepEqual(incoming, []Relationship{want}) {
+		t.Fatalf("FindIncoming(b) = (%v,%v), want (%v,nil)", incoming, err, []Relationship{want})
+	}
+
+	if all := g.FindRelationships(); !reflect.DeepEqual(all, []Relationship{want}) {
+		t.Fatalf("FindRelationships() = %v, want %v", all, []Relationship{want})
+	}
+
+	const nonexistent NodeID = 999999
+
+	if _, findErr := g.FindOutgoing(nonexistent); !errors.Is(findErr, ErrNodeNotFound) {
+		t.Fatalf("FindOutgoing(nonexistent) error = %v, want %v", findErr, ErrNodeNotFound)
+	}
+	if _, addErr := g.AddRelationship(a, nonexistent); !errors.Is(addErr, ErrNodeNotFound) {
+		t.Fatalf("AddRelationship(a, nonexistent) error = %v, want %v", addErr, ErrNodeNotFound)
+	}
+
+	if deleteErr := g.DeleteNode(a); !errors.Is(deleteErr, ErrNodeNotEmpty) {
+		t.Fatalf("DeleteNode(a) error = %v, want %v", deleteErr, ErrNodeNotEmpty)
+	}
+	if deleteErr := g.DeleteNode(b); !errors.Is(deleteErr, ErrNodeNotEmpty) {
+		t.Fatalf("DeleteNode(b) error = %v, want %v (incoming relationship)", deleteErr, ErrNodeNotEmpty)
+	}
+
+	removed, err := g.RemoveRelationship(a, b)
+	if err != nil || !removed {
+		t.Fatalf("RemoveRelationship(a,b) = (%v,%v), want (true,nil)", removed, err)
+	}
+
+	// A self-relationship counts as both outgoing and incoming.
+	c := mustCreateNode(t, g)
+	if _, selfErr := g.AddRelationship(c, c); selfErr != nil {
+		t.Fatalf("AddRelationship(c,c): %v", selfErr)
+	}
+	if deleteErr := g.DeleteNode(c); !errors.Is(deleteErr, ErrNodeNotEmpty) {
+		t.Fatalf("DeleteNode(c) error = %v, want %v", deleteErr, ErrNodeNotEmpty)
+	}
+	if _, selfErr := g.RemoveRelationship(c, c); selfErr != nil {
+		t.Fatalf("RemoveRelationship(c,c): %v", selfErr)
+	}
+	if deleteErr := g.DeleteNode(c); deleteErr != nil {
+		t.Fatalf("DeleteNode(c) after removing its relationship: %v", deleteErr)
+	}
+
+	if nodes := g.FindNodes(); !reflect.DeepEqual(nodes, []NodeID{a, b}) {
+		t.Fatalf("FindNodes() = %v, want %v", nodes, []NodeID{a, b})
+	}
+}
+
+// TestBoltGraphPersistsGraphAndNeverReusesIDsAcrossReopen is the
+// persistence guarantee this backend exists for: committed nodes and
+// relationships survive a close and reopen, and the ID counter is
+// persisted with them, so even the highest deleted ID is never reissued.
+func TestBoltGraphPersistsGraphAndNeverReusesIDsAcrossReopen(t *testing.T) {
+	path := boltTestPath(t)
+	first := openBoltTestGraph(t, path)
+
+	a := mustCreateNode(t, first)
+	b := mustCreateNode(t, first)
+	c := mustCreateNode(t, first)
+
+	if _, err := first.AddRelationship(a, b); err != nil {
+		t.Fatalf("AddRelationship(a,b): %v", err)
+	}
+	if err := first.DeleteNode(c); err != nil {
+		t.Fatalf("DeleteNode(c): %v", err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatalf("Close(): %v", err)
+	}
+
+	second := openBoltTestGraph(t, path)
+
+	if nodes := second.FindNodes(); !reflect.DeepEqual(nodes, []NodeID{a, b}) {
+		t.Fatalf("FindNodes() after reopen = %v, want %v", nodes, []NodeID{a, b})
+	}
+	if !second.HasRelationship(a, b) {
+		t.Fatal("relationship (a,b) did not survive the reopen")
+	}
+	if incoming, err := second.FindIncoming(b); err != nil || len(incoming) != 1 {
+		t.Fatalf("FindIncoming(b) after reopen = (%v,%v), want the one persisted relationship", incoming, err)
+	}
+
+	d := mustCreateNode(t, second)
+	if d == c || d != c+1 {
+		t.Fatalf("first NodeID after reopen = %d, want %d (deleted ID %d must never be reissued)", d, c+1, c)
+	}
+}
+
+// TestBoltGraphExhaustedCounterPersists covers the edge of the ID space:
+// the last ID is handed out once, the exhausted flag is persisted with it,
+// and a reopened store still refuses to create another node.
+func TestBoltGraphExhaustedCounterPersists(t *testing.T) {
+	path := boltTestPath(t)
+	first := openBoltTestGraph(t, path)
+
+	err := first.db.Update(func(btx *bolt.Tx) error {
+		txn, openErr := newBoltTxn(btx)
+		if openErr != nil {
+			return openErr
+		}
+
+		return txn.setCounter(^NodeID(0), false)
+	})
+	if err != nil {
+		t.Fatalf("setting the counter: %v", err)
+	}
+
+	last := mustCreateNode(t, first)
+	if last != ^NodeID(0) {
+		t.Fatalf("CreateNode() = %d, want the last ID %d", last, ^NodeID(0))
+	}
+
+	if _, createErr := first.CreateNode(); !errors.Is(createErr, ErrNodeIDExhausted) {
+		t.Fatalf("CreateNode() past the last ID error = %v, want %v", createErr, ErrNodeIDExhausted)
+	}
+
+	if closeErr := first.Close(); closeErr != nil {
+		t.Fatalf("Close(): %v", closeErr)
+	}
+
+	second := openBoltTestGraph(t, path)
+
+	if _, createErr := second.CreateNode(); !errors.Is(createErr, ErrNodeIDExhausted) {
+		t.Fatalf("CreateNode() after reopen error = %v, want %v (exhausted flag must persist)", createErr, ErrNodeIDExhausted)
+	}
+	if !second.NodeExists(last) {
+		t.Fatal("the last node did not survive the reopen")
+	}
+}
+
+func TestBoltGraphFailedTransactLeavesNoTrace(t *testing.T) {
+	g := newBoltTestGraph(t)
+	errBoom := errors.New("boom")
+
+	var id NodeID
+
+	err := g.Transact(func(tx Tx) error {
+		var createErr error
+		id, createErr = createNodeTx(tx)
+		if createErr != nil {
+			return createErr
+		}
+
+		return errBoom
+	})
+	if !errors.Is(err, errBoom) {
+		t.Fatalf("Transact() error = %v, want %v", err, errBoom)
+	}
+
+	if g.NodeExists(id) {
+		t.Fatalf("node %d created by a failed transaction is visible", id)
+	}
+	if nodes := g.FindNodes(); len(nodes) != 0 {
+		t.Fatalf("FindNodes() = %v, want none", nodes)
+	}
+}
+
+func TestBoltGraphPanicRollsBackRunsRollbackHookAndStaysUsable(t *testing.T) {
+	g := newBoltTestGraph(t)
+
+	var id NodeID
+
+	rolledBack := false
+
+	func() {
+		defer func() {
+			if r := recover(); r == nil {
+				t.Fatal("expected the panic to propagate out of Transact()")
+			}
+		}()
+
+		//nolint:errcheck // the closure panics before Transact can return
+		_ = g.Transact(func(tx Tx) error {
+			var createErr error
+			id, createErr = createNodeTx(tx)
+			if createErr != nil {
+				t.Errorf("CreateNode(): %v", createErr)
+			}
+
+			tx.OnRollback(func() { rolledBack = true })
+
+			panic("boom")
+		})
+	}()
+
+	if g.NodeExists(id) {
+		t.Fatalf("node %d survived a panicking transaction", id)
+	}
+	if !rolledBack {
+		t.Fatal("the OnRollback hook did not run for a panicking transaction")
+	}
+
+	// The guard and the store are both usable again.
+	mustCreateNode(t, g)
+}
+
+func TestBoltGraphReadsInsideTransactSeeUncommittedWrites(t *testing.T) {
+	g := newBoltTestGraph(t)
+	existing := mustCreateNode(t, g)
+
+	err := g.Transact(func(tx Tx) error {
+		created, createErr := createNodeTx(tx)
+		if createErr != nil {
+			return createErr
+		}
+		if linkErr := addRelationshipTx(tx, existing, created); linkErr != nil {
+			return linkErr
+		}
+
+		if !tx.NodeExists(created) || !tx.HasRelationship(existing, created) {
+			t.Error("the transaction does not see its own uncommitted writes")
+		}
+
+		outgoing, outErr := tx.FindOutgoing(existing)
+		if outErr != nil {
+			return wrapInterfaceErr(outErr)
+		}
+		if want := []Relationship{{From: existing, To: created}}; !reflect.DeepEqual(outgoing, want) {
+			t.Errorf("tx.FindOutgoing() = %v, want %v", outgoing, want)
+		}
+
+		incoming, inErr := tx.FindIncoming(created)
+		if inErr != nil {
+			return wrapInterfaceErr(inErr)
+		}
+		if want := []Relationship{{From: existing, To: created}}; !reflect.DeepEqual(incoming, want) {
+			t.Errorf("tx.FindIncoming() = %v, want %v", incoming, want)
+		}
+
+		if nodes := tx.FindNodes(); !reflect.DeepEqual(nodes, []NodeID{existing, created}) {
+			t.Errorf("tx.FindNodes() = %v, want %v", nodes, []NodeID{existing, created})
+		}
+
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Transact(): %v", err)
+	}
+}
+
+// TestBoltGraphNestedTransactRollsBackOnlyInnerSteps is the BoltGraph
+// counterpart of TestNestedTransactFailureRollsBackOnlyTheInnerSteps,
+// covering every kind of mutation the savepoint undo log must reverse:
+// node creation, relationship add and remove, and node deletion.
+func TestBoltGraphNestedTransactRollsBackOnlyInnerSteps(t *testing.T) {
+	g := newBoltTestGraph(t)
+	errInner := errors.New("inner failure")
+
+	kept := mustCreateNode(t, g)
+	victim := mustCreateNode(t, g)
+	other := mustCreateNode(t, g)
+
+	if _, err := g.AddRelationship(kept, other); err != nil {
+		t.Fatalf("AddRelationship(kept, other): %v", err)
+	}
+
+	var dropped NodeID
+
+	err := g.Transact(func(tx Tx) error {
+		innerErr := tx.Transact(func(inner Tx) error {
+			var createErr error
+			dropped, createErr = createNodeTx(inner)
+			if createErr != nil {
+				return createErr
+			}
+
+			if linkErr := addRelationshipTx(inner, kept, dropped); linkErr != nil {
+				return linkErr
+			}
+			if removeErr := removeRelationshipTx(inner, kept, other); removeErr != nil {
+				return removeErr
+			}
+			if deleteErr := deleteNodeTx(inner, victim); deleteErr != nil {
+				return deleteErr
+			}
+
+			return errInner
+		})
+		if !errors.Is(innerErr, errInner) {
+			t.Errorf("nested Transact() error = %v, want %v", innerErr, errInner)
+		}
+
+		if tx.NodeExists(dropped) {
+			t.Error("the nested node survived its own failed transaction")
+		}
+		if !tx.NodeExists(victim) {
+			t.Error("the node deleted inside the failed nested transaction was not restored")
+		}
+		if !tx.HasRelationship(kept, other) {
+			t.Error("the relationship removed inside the failed nested transaction was not restored")
+		}
+
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Transact() error = %v", err)
+	}
+
+	if g.NodeExists(dropped) || g.HasRelationship(kept, dropped) {
+		t.Fatal("the nested transaction's steps were committed")
+	}
+	if !g.NodeExists(victim) || !g.HasRelationship(kept, other) {
+		t.Fatal("the restored state was not committed")
+	}
+}
+
+func TestBoltGraphCheckerSeesWritesAndDeclineLeavesNoTrace(t *testing.T) {
+	g := newBoltTestGraph(t)
+	tag := mustCreateNode(t, g)
+
+	errVeto := errors.New("veto")
+	veto := false
+	sawTagged := false
+
+	g.RegisterChecker(Checker{
+		Name: "veto",
+		Tags: []NodeID{tag},
+		Check: func(view GraphReader, touched map[NodeID]struct{}) error {
+			for node := range touched {
+				if view.HasRelationship(tag, node) {
+					sawTagged = true
+				}
+			}
+
+			if veto {
+				return errVeto
+			}
+
+			return nil
+		},
+	})
+
+	// The Checker sees the state the transaction produced, before commit.
+	first := mustCreateNode(t, g)
+	if _, err := g.AddRelationship(tag, first); err != nil {
+		t.Fatalf("AddRelationship(tag, first): %v", err)
+	}
+	if !sawTagged {
+		t.Fatal("the Checker did not see the uncommitted tag relationship")
+	}
+
+	// A declined commit leaves nothing behind.
+	veto = true
+
+	var second NodeID
+
+	err := g.Transact(func(tx Tx) error {
+		var createErr error
+		second, createErr = createNodeTx(tx)
+		if createErr != nil {
+			return createErr
+		}
+
+		return addRelationshipTx(tx, tag, second)
+	})
+	if !errors.Is(err, errVeto) {
+		t.Fatalf("Transact() error = %v, want %v", err, errVeto)
+	}
+	if g.NodeExists(second) || g.HasRelationship(tag, second) {
+		t.Fatal("a declined transaction left a node or relationship behind")
+	}
+
+	// A transaction that touches nothing tagged does not consult it.
+	untagged := mustCreateNode(t, g)
+	if !g.NodeExists(untagged) {
+		t.Fatal("an irrelevant transaction was declined by a Checker it does not concern")
+	}
+}
+
+func TestBoltGraphCommitAndRollbackHooks(t *testing.T) {
+	g := newBoltTestGraph(t)
+	tag := mustCreateNode(t, g)
+	node := mustCreateNode(t, g)
+
+	errBoom := errors.New("boom")
+	errVeto := errors.New("veto")
+	veto := false
+
+	g.RegisterChecker(Checker{
+		Name: "veto",
+		Tags: []NodeID{tag},
+		Check: func(_ GraphReader, _ map[NodeID]struct{}) error {
+			if veto {
+				return errVeto
+			}
+
+			return nil
+		},
+	})
+
+	var events []string
+
+	hooks := func(tx Tx) {
+		tx.OnCommit(func() { events = append(events, "commit") })
+		tx.OnRollback(func() { events = append(events, "rollback") })
+	}
+
+	if err := g.Transact(func(tx Tx) error {
+		hooks(tx)
+		return nil
+	}); err != nil {
+		t.Fatalf("Transact(commit): %v", err)
+	}
+
+	if err := g.Transact(func(tx Tx) error {
+		hooks(tx)
+		return errBoom
+	}); !errors.Is(err, errBoom) {
+		t.Fatalf("Transact(fail) error = %v, want %v", err, errBoom)
+	}
+
+	veto = true
+
+	if err := g.Transact(func(tx Tx) error {
+		hooks(tx)
+		return addRelationshipTx(tx, tag, node)
+	}); !errors.Is(err, errVeto) {
+		t.Fatalf("Transact(veto) error = %v, want %v", err, errVeto)
+	}
+
+	if want := []string{"commit", "rollback", "rollback"}; !reflect.DeepEqual(events, want) {
+		t.Fatalf("hooks ran %v, want %v", events, want)
+	}
+}
+
+// TestBoltGraphPointerRegistryPortability is the payoff of theorystate.md
+// section 97 once more: PointerRegistry and NameRegistry run unchanged on
+// a structurally different, disk-backed backend.
+func TestBoltGraphPointerRegistryPortability(t *testing.T) {
+	g := newBoltTestGraph(t)
+	names := NewNameRegistry(g)
+
+	ids, err := names.BootstrapNames(g, FoundationalNames)
+	if err != nil {
+		t.Fatalf("BootstrapNames(): %v", err)
+	}
+
+	pointers, err := NewPointerRegistry(g, ids[NameAllPointers])
+	if err != nil {
+		t.Fatalf("NewPointerRegistry(): %v", err)
+	}
+
+	p, err := pointers.NewPointer(g)
+	if err != nil {
+		t.Fatalf("NewPointer(): %v", err)
+	}
+
+	x := mustCreateNode(t, g)
+	y := mustCreateNode(t, g)
+
+	if setErr := pointers.SetTarget(g, p, x); setErr != nil {
+		t.Fatalf("SetTarget(p, x): %v", setErr)
+	}
+	if setErr := pointers.SetTarget(g, p, y); setErr != nil {
+		t.Fatalf("SetTarget(p, y): %v", setErr)
+	}
+
+	if g.HasRelationship(p, x) {
+		t.Fatal("old target relationship survived a replacement SetTarget()")
+	}
+
+	target, hasTarget, err := pointers.Target(g, p)
+	if err != nil || !hasTarget || target != y {
+		t.Fatalf("Target(p) = (%d,%v,%v), want (%d,true,nil)", target, hasTarget, err, y)
+	}
+
+	// The registry's commit-time Checker guards this backend too: a
+	// second target added inside a transaction is declined.
+	badErr := g.Transact(func(tx Tx) error {
+		return addRelationshipTx(tx, p, x)
+	})
+	if !errors.Is(badErr, ErrTooManyPointerTargets) {
+		t.Fatalf("adding a second target error = %v, want %v", badErr, ErrTooManyPointerTargets)
+	}
+}
+
+// TestBoltGraphPointerStateSurvivesReopen checks that graph structure
+// written through a registry is still there, and still guarded by a freshly
+// constructed registry's Checker, after a reopen. NameRegistry bindings are
+// not persisted yet, so the tag's NodeID is carried across by the test.
+func TestBoltGraphPointerStateSurvivesReopen(t *testing.T) {
+	path := boltTestPath(t)
+	first := openBoltTestGraph(t, path)
+
+	allPointers := mustCreateNode(t, first)
+
+	pointers, err := NewPointerRegistry(first, allPointers)
+	if err != nil {
+		t.Fatalf("NewPointerRegistry(): %v", err)
+	}
+
+	p, err := pointers.NewPointer(first)
+	if err != nil {
+		t.Fatalf("NewPointer(): %v", err)
+	}
+
+	x := mustCreateNode(t, first)
+	if setErr := pointers.SetTarget(first, p, x); setErr != nil {
+		t.Fatalf("SetTarget(p, x): %v", setErr)
+	}
+
+	if closeErr := first.Close(); closeErr != nil {
+		t.Fatalf("Close(): %v", closeErr)
+	}
+
+	second := openBoltTestGraph(t, path)
+
+	reopened, err := NewPointerRegistry(second, allPointers)
+	if err != nil {
+		t.Fatalf("NewPointerRegistry() after reopen: %v", err)
+	}
+
+	target, hasTarget, err := reopened.Target(second, p)
+	if err != nil || !hasTarget || target != x {
+		t.Fatalf("Target(p) after reopen = (%d,%v,%v), want (%d,true,nil)", target, hasTarget, err, x)
+	}
+
+	y := mustCreateNode(t, second)
+	if setErr := reopened.SetTarget(second, p, y); setErr != nil {
+		t.Fatalf("SetTarget(p, y) after reopen: %v", setErr)
+	}
+}
+
+func TestGraphActorOverBoltGraphConcurrentCreateNodeProducesUniqueIDs(t *testing.T) {
+	actor := NewGraphActor(newBoltTestGraph(t))
+	defer actor.Close()
+
+	const goroutines = 20
+
+	var wg sync.WaitGroup
+	ids := make([]NodeID, goroutines)
+	errs := make([]error, goroutines)
+
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ids[i], errs[i] = actor.CreateNode()
+		}()
+	}
+
+	wg.Wait()
+
+	seen := make(map[NodeID]struct{}, goroutines)
+	for i, id := range ids {
+		if errs[i] != nil {
+			t.Fatalf("goroutine %d: %v", i, errs[i])
+		}
+		if _, dup := seen[id]; dup {
+			t.Fatalf("CreateNode() returned duplicate NodeID %d", id)
+		}
+		seen[id] = struct{}{}
+	}
+
+	if nodes := actor.FindNodes(); len(nodes) != goroutines {
+		t.Fatalf("FindNodes() has %d nodes, want %d", len(nodes), goroutines)
+	}
+}
+
+func TestRootGraphOverBoltGraphBasicOperations(t *testing.T) {
+	g := newBoltTestGraph(t)
+
+	root := mustCreateNode(t, g)
+	a := mustCreateNode(t, g)
+
+	r, err := NewRootGraph(g, root)
+	if err != nil {
+		t.Fatalf("NewRootGraph(): %v", err)
+	}
+
+	if !r.HasRelationship(root, a) {
+		t.Fatal("a is not visible as a virtual ROOT child")
+	}
+	if r.HasRelationship(root, root) {
+		t.Fatal("ROOT incorrectly has a relationship to itself")
+	}
+	if g.HasRelationship(root, a) {
+		t.Fatal("the virtual ROOT relationship was physically stored")
+	}
+}
+
+// TestTxTouchRunsRelevantCheckersWithoutMutation covers Tx.Touch on every
+// backend that records touched sets: a touched node whose tag a Checker is
+// keyed on makes that Checker run at commit, a touched node it is not keyed
+// on does not, nothing is mutated, and a declining Checker fails the
+// transaction (theorystate.md section 104).
+func TestTxTouchRunsRelevantCheckersWithoutMutation(t *testing.T) {
+	backends := []struct {
+		name string
+		open func(tb *testing.T) GraphAPI
+	}{
+		{name: "Graph", open: func(_ *testing.T) GraphAPI { return &Graph{} }},
+		{name: "stagedGraph", open: func(_ *testing.T) GraphAPI { return newStagedGraph() }},
+		{name: "BoltGraph", open: func(tb *testing.T) GraphAPI { return newBoltTestGraph(tb) }},
+	}
+
+	for _, backend := range backends {
+		t.Run(backend.name, func(t *testing.T) {
+			api := backend.open(t)
+
+			tag := mustCreateNode(t, api)
+			tagged := mustCreateNode(t, api)
+			untagged := mustCreateNode(t, api)
+
+			if _, err := addRelationshipVia(api, tag, tagged); err != nil {
+				t.Fatalf("AddRelationship(tag, tagged): %v", err)
+			}
+
+			errVeto := errors.New("veto")
+			veto := false
+			runs := 0
+			sawTagged := false
+
+			api.RegisterChecker(Checker{
+				Name: "probe",
+				Tags: []NodeID{tag},
+				Check: func(_ GraphReader, touched map[NodeID]struct{}) error {
+					runs++
+					_, sawTagged = touched[tagged]
+
+					if veto {
+						return errVeto
+					}
+
+					return nil
+				},
+			})
+
+			relationshipsBefore := api.FindRelationships()
+			nodesBefore := api.FindNodes()
+
+			if err := api.Transact(func(tx Tx) error {
+				tx.Touch(untagged)
+				return nil
+			}); err != nil {
+				t.Fatalf("Transact(touch untagged): %v", err)
+			}
+			if runs != 0 {
+				t.Fatalf("the Checker ran %d times for a node it is not keyed on, want 0", runs)
+			}
+
+			if err := api.Transact(func(tx Tx) error {
+				tx.Touch(tagged)
+				return nil
+			}); err != nil {
+				t.Fatalf("Transact(touch tagged): %v", err)
+			}
+			if runs != 1 || !sawTagged {
+				t.Fatalf("runs=%d sawTagged=%v, want 1,true after touching a tagged node", runs, sawTagged)
+			}
+
+			if !reflect.DeepEqual(api.FindRelationships(), relationshipsBefore) || !reflect.DeepEqual(api.FindNodes(), nodesBefore) {
+				t.Fatal("Touch changed the graph")
+			}
+
+			veto = true
+
+			if err := api.Transact(func(tx Tx) error {
+				tx.Touch(tagged)
+				return nil
+			}); !errors.Is(err, errVeto) {
+				t.Fatalf("Transact(touch with veto) error = %v, want %v", err, errVeto)
+			}
+		})
 	}
 }
 
