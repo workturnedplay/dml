@@ -1742,8 +1742,11 @@ could be called directly.
  Ensure of a retired name fails, startup fails if FoundationalNames lists a
  retired name, and an explicit Purge removes a retired record. A startup
  integrity sweep (Tx.Touch plus a paged, fail-closed VerifyAll) is wanted.
- An earlier whole-image snapshot proposal was not adopted. Nothing in
- main.go or main_test.go changed.
+ An earlier whole-image snapshot proposal was not adopted. Decided
+ (section 107): one owner process per graph runs GraphActor, registries
+ and Checkers; other processes ask it for named operations, and a shared
+ server store with client-side registry code (FoundationDB, Postgres,
+ SpacetimeDB) is not adopted. Nothing in main.go or main_test.go changed.
 
 Currently unaddressed yet:
 - The startup integrity sweep (Tx.Touch plus a paged VerifyAll, theorystate.md

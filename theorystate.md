@@ -3127,7 +3127,7 @@ a real (rather than externally forced) conflict-detection mechanism, are
 both left for whenever an actual networked backend makes either worth
 the cost.
 
-## 98. NameRegistry under a shared, multi-process backend (OPEN, newly named)
+## 98. NameRegistry under a shared, multi-process backend (moot under §107's single-owner decision)
 
 A gap surfaced by §94's premise (multiple processes genuinely sharing one
 persistent backend) that no existing section addresses: `NameRegistry`'s
@@ -3419,6 +3419,67 @@ before designing.
 - **Badger** stays as second candidate if write parallelism is ever needed;
   **FoundationDB** only if a networked multi-writer store is required.
 
+## 107. One owner process per graph; other processes ask the owner
+
+**DECIDED.** The persistent store is opened by exactly one process, the
+graph host. That process runs the `GraphActor` (§101), every registry and
+every Checker. Other processes (on the same machine or elsewhere) do not
+open the store: they ask the host to perform operations. Option B, a shared
+server store with many client processes each running registry code
+(FoundationDB, Postgres), is not adopted.
+
+**Reasons.**
+- It is the theory's own model: every node has one owning participant
+  (§37), nobody writes directly into another participant's graph (§36),
+  and processors communicate rather than share mutable state (§20, §28).
+  §94 and §98 assumed multi-process sharing only because etcd was the
+  candidate; that was never a theory requirement.
+- One enforcement point for invariants. Under B every client process
+  registers its own Checkers, so a client running an older or different
+  build could write data that the others reject. Under A there is one set
+  of Checkers.
+- §98 (name arbitration across processes) is moot: there is a single
+  writer, so §103's same-transaction name records need no cross-process
+  arbitration.
+- No network round trip per read, no server or cluster to operate, no
+  transaction time limits (FoundationDB fails transactions after 5
+  seconds), and the store remains a local detail behind `GraphAPI`, so it
+  can be swapped without touching any registry.
+
+**What other processes get.** Named, registry-level operations (for example
+`SetTarget`, `Append`), each executed by the host as one `Transact`. A Go
+closure cannot cross a process boundary, so a remote caller never submits a
+`Transact(fn)`. This is the same limitation as §89c's in-graph transaction
+descriptors, and it is exactly §36's "a request to the node's owner".
+
+**bbolt consequences (checked against its documentation).** Its file lock
+means a second process cannot open the same file, which is now a feature.
+Its `Timeout` option is documented only for Darwin and Linux, so on Windows
+a second open may block indefinitely; the host must guard against being
+started twice (for example its own lock or a fast-fail check) rather than
+rely on that option.
+
+**Considered and not adopted.**
+- SpacetimeDB: its modules are written in Rust, C#, TypeScript or C++ (no
+  Go), and clients call reducers as remote procedure calls, each reducer
+  being one server-side transaction. A client cannot run an interactive
+  `Transact(fn)`, so using it would mean rewriting the engine as a module.
+- FoundationDB and Postgres: option B only.
+- Writing our own storage engine: not now. Crash-safe page and fsync
+  management is a project of its own, and the seam makes it replaceable
+  later.
+
+**Other computers.** Each computer runs its own graph hosts, and connecting
+graphs is Part C (mirrors, identifiers, permissions), which is independent
+of the store choice. A git-like commit log (§17, §36, §66) remains a
+possible later layer, for example as another bucket in the store; nothing is
+decided about it here.
+
+**OPEN.** The operation-level protocol between other processes and the host:
+transport, authentication, the set of operations, and how results and errors
+cross the boundary (related to §89c's transaction-descriptor vocabulary). How
+hosts on different machines coordinate is Part C.
+
 ---
 
 ## PART D — STATUS SUMMARY (consolidated)
@@ -3577,6 +3638,10 @@ kept current as sections above resolve or split further.)*
   `Purge` removes a retired record. Bindings are not graph structure (§103).
 - A startup integrity sweep (`Tx.Touch` + paged `VerifyAll`, fail-closed) is
   wanted (§104).
+- One owner process per graph: only the host opens the store and runs the
+  `GraphActor`, registries and Checkers; other processes ask the host for
+  named operations. A shared server store with client-side registry code is
+  not adopted (§107).
 
 ### TENTATIVE
 - bbolt as the first persistent-backend spike, with the layout and
@@ -3673,8 +3738,11 @@ kept current as sections above resolve or split further.)*
   (registry portability, Windows file growth, commit latency), and if not,
   Badger next; savepoints via an undo log; `OnCommit` hook timing relative
   to the durable commit; the `NameRegistry` storage seam (§103); paged and
-  iterator reads (§105), including the call-site grep. §98 and §99 are
-  answered for a KV backend by §103 and §104.
+  iterator reads (§105), including the call-site grep. §98 is moot under
+  §107, and §99 is answered by §104.
+- The operation-level protocol between other processes and the graph host
+  (transport, authentication, operation set, error transport), and how hosts
+  on different machines coordinate (§107, Part C).
 - Whether to build a harness that automatically re-runs the existing
   registry test suite against both *Graph and stagedGraph, versus
   writing portability tests by hand as needed; and whether stagedGraph
