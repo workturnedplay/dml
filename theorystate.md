@@ -3227,13 +3227,18 @@ choosing):**
 - *bbolt*: embedded copy-on-write B+tree, single file, mmap, one writer at a
   time with snapshot readers, rollback by returning an error from the update
   function, no practical transaction-size limit, one fsync per commit.
-- *Badger*: embedded pure-Go LSM, many optimistic writers with conflict
-  retry (the model of §89c(b)/§94e), a transaction must fit in a memtable
-  (`ErrTxnTooBig`), value-log GC to operate. Maintenance status unverified.
+- *Badger*: embedded pure-Go LSM with serializable snapshot isolation, many
+  optimistic writers with conflict retry (the model of §89c(b)/§94e), a
+  transaction must fit in a memtable (`ErrTxnTooBig`), value-log GC to
+  operate. Checked: a v4 module was published in August 2026, so it is
+  maintained; the issue tracker shows many stale open issues (low but
+  non-zero activity).
 - *FoundationDB*: distributed ordered KV, strictly serializable optimistic
-  transactions; roughly 10 MB and 5 seconds per transaction, small key/value
-  size caps, a cluster to run and a C client library. Only relevant if a
-  networked multi-writer store is ever required.
+  transactions. Checked against its documentation: at most 10,000,000 bytes
+  of affected data per transaction (keys and ranges read count, values read
+  do not), transactions fail after 5 seconds, keys at most 10,000 bytes,
+  values at most 100,000 bytes; a cluster to run and a C client library.
+  Only relevant if a networked multi-writer store is ever required.
 - *SQLite/Postgres*: an edges table keyed `(from,to)` plus an index on
   `(to,from)`. Viable, and unglamorous.
 
@@ -3252,10 +3257,15 @@ through the one `GraphActor` goroutine, in FIFO order. There are no parallel
 snapshot readers. Reasons: one total order (`read1, read2, write1, read3` is
 exactly the order of arrival), no question of which snapshot point a reader
 sees relative to queued writes, and the safety argument of §89c stays
-literally true. Consequences for bbolt (from memory, to verify): there are
-never concurrent read transactions alongside the writer, so the
+literally true. Consequences for bbolt (checked against its documentation):
+there are never concurrent read transactions alongside the writer, so the
 remap-waits-for-readers and freed-page-reuse interactions do not arise; read
-transactions should still be kept short. The cost is that reads are not
+transactions should still be kept short. bbolt documents that opening a read
+and a write transaction in the same goroutine can deadlock the writer (it
+must re-mmap as the file grows). Therefore every read made inside a
+`Transact` must go through that transaction's own update handle, and a
+separate read transaction is opened only for reads made outside any
+`Transact`, where the actor guarantees no write transaction is open. The cost is that reads are not
 parallel. Reopening this needs an explicit answer to "which snapshot does a
 parallel reader see, relative to writes already queued".
 
@@ -3288,8 +3298,14 @@ spike.
 
 **Questions the spike answers:** whether the registries pass unchanged on
 it (hand-written portability tests, as for `stagedGraph`, §97); file-growth
-behaviour on Windows, including whether a large initial mmap size matters;
-and commit latency (one fsync per write transaction).
+behaviour on Windows; and commit latency (one fsync per write transaction).
+Known from bbolt's documentation: on Windows, mmapping can grow the file, and
+`InitialMmapSize` apparently sets the on-disk size there (on other platforms
+the file grows only with data), so it is left at its default; its `Timeout`
+open option is documented only for Darwin and Linux, so on Windows opening an
+already-locked database may block indefinitely. The spike lives in main.go and
+main_test.go, per the consolidation convention, which means every build of the
+package links bbolt.
 
 ## 103. Names on a KV backend: same-transaction records, tombstones, Purge
 
