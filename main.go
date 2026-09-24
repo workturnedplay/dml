@@ -2275,7 +2275,7 @@ func OpenBoltGraph(path string) (*BoltGraph, error) {
 	})
 	if initErr != nil {
 		if closeErr := db.Close(); closeErr != nil {
-			return nil, fmt.Errorf("bolt: initializing %s: %w (closing also failed: %v)", path, initErr, closeErr)
+			return nil, fmt.Errorf("bolt: initializing %s: %w (closing also failed: %w)", path, initErr, closeErr)
 		}
 
 		return nil, fmt.Errorf("bolt: initializing %s: %w", path, initErr)
