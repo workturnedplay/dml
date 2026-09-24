@@ -3512,11 +3512,46 @@ hosts on different machines coordinate is Part C.
   `FindRelationships` and `FindNodes` have no error result, so on a disk
   backend a store failure can only panic. Fixing this belongs with §105.
 
-**Not built yet:** name records in the same store (§103), `VerifyAll` and the
-startup order (§104), the physical check, paged reads (§105). Until names are
-persisted, a reopened store's `NameRegistry` is empty and `BootstrapNames`
-would mint second tag nodes, so only tests reopen a file. Windows behaviour,
-file growth and commit latency are not measured yet.
+**Not built yet:** `VerifyAll` and the startup order (§104), the physical
+check, paged reads (§105). Names are persisted (§109). Windows behaviour,
+file growth and commit latency are measured by
+`TestBoltGraphReportCommitLatencyAndFileSize` and `BenchmarkBoltGraphCommit`
+(run without `-race`, with `-v`); the numbers are not recorded yet.
+
+## 109. Names on BoltGraph: records, retirement, Purge, LoadNames (TENTATIVE, implemented)
+
+§103 as built.
+
+- **Records.** A `names` bucket holds one record per name: a state byte
+  (`bound` or `retired`) and a NodeID. It is written inside the same bolt
+  transaction as the node it concerns, and the write is undone by a nested
+  rollback like every other mutation. The capability is an optional
+  interface on the transaction (`nameRecordProvider`), which `rootTx`
+  forwards, so names created through the ROOT layer are persisted too.
+- **One overlay for all backends.** The registry keeps a committed
+  `records` map (a cache of the store where there is one) and a `pending`
+  overlay of the records the transaction in flight has written. This
+  replaced the earlier pending-binding/pending-gone bookkeeping. Commit
+  hooks publish records in order and rollback hooks restore the previous
+  staged state, so a name staged twice in one transaction ends at its last
+  state.
+- **Retirement applies to every backend.** `DeleteNode` of a named node and
+  `Unbind` (now transactional) retire the name; `Bind`, `CreateNamedNode`,
+  `EnsureNamedNode` and `BootstrapNames` on a retired name fail with
+  `ErrNameRetired`. A name created and deleted inside one transaction is
+  retired too, since the delete was deliberate. Renaming a node's name means
+  `Purge`, then ensure.
+- **`Purge(name)`** deletes a retired record (`ErrNameNotRetired` for a
+  bound name, `ErrNameNotFound` for none). It is never done implicitly.
+- **`LoadNames`** replaces the committed records with the store's, and is a
+  no-op on a backend with no durable store. Skipping it after opening a
+  store is detected: the path that would create a new record first checks
+  the store, and an existing record is `ErrNamesNotLoaded`, so a forgotten
+  load can never mint a second `AllPointers`.
+- **Startup so far:** open the store, `LoadNames`, `BootstrapNames`
+  (fails on a retired name). `VerifyAll` comes next (§104).
+- **Limitations.** A bolt key cannot be empty, so an empty name is rejected
+  by the store on BoltGraph. Names are few, so `LoadNames` reads them all.
 
 ---
 

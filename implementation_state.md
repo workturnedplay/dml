@@ -1772,13 +1772,36 @@ could be called directly.
  TestRootGraphOverBoltGraphBasicOperations and
  TestTxTouchRunsRelevantCheckersWithoutMutation.
 
+41. Names on BoltGraph (theorystate.md sections 103, 109). NameRegistry now
+ keeps bound/retired records: a committed records map plus one generic
+ pending overlay replaced the pending-binding/pending-gone bookkeeping
+ (stageBinding, stageForget, forgetNode and friends are gone). Records are
+ written to a names bucket in the same bolt transaction as the node
+ (nameRecordStore/nameRecordProvider, implemented by boltTxn and forwarded
+ by rootTx). DeleteNode and Unbind retire names, Purge deletes a retired
+ record, LoadNames reloads the committed records after a restart, and a
+ forgotten LoadNames is detected (ErrNamesNotLoaded). Behaviour changes for
+ the in-memory backends too: Unbind takes a graph; a deleted node's name
+ can no longer be rebound without Purge, including inside the same
+ transaction. Tests changed accordingly
+ (TestNameRegistryDeleteRetiresNameAndRebindNeedsPurge, formerly
+ ...DeleteThenRebindSameNameInOneTransaction; the create-then-delete and
+ Unbind tests). Added TestNameRegistryRetiredNameFailsEveryWayOfAskingForIt,
+ TestNameRegistryPurge, TestNameRegistryUnbindRetiresNameButKeepsNode,
+ TestNameRegistryLoadNamesIsANoOpWithoutADurableStore,
+ TestBoltGraphNamesPersistAcrossReopen,
+ TestBoltGraphForgettingLoadNamesIsDetected,
+ TestBoltGraphRetiredNamePersistsAndPurgeAllowsRecreation,
+ TestBoltGraphNameRecordsFollowTransactionAndSavepointOutcomes,
+ TestBoltGraphNamesThroughRootGraphPersist, plus
+ TestBoltGraphReportCommitLatencyAndFileSize and BenchmarkBoltGraphCommit
+ for measurement.
+
 Currently unaddressed yet:
-- Still to build for the persistent backend: name records in the same store
-  with bound/retired states, ensure/purge and startup failure on a retired
-  name (theorystate.md section 103); VerifyAll with a paged sweep and the
-  startup order (section 104); a physical store check; paged reads and
-  error results for the GraphReader methods that lack them (section 105).
-  Until names persist, only tests reopen a store.
+- Still to build for the persistent backend: VerifyAll with a paged sweep
+  and the startup order (theorystate.md section 104); a physical store
+  check; paged reads and error results for the GraphReader methods that
+  lack them (section 105).
 - Nested transactions as a production-backend feature are realized for
   the in-memory backend only (savepoints over the undo log); a
   structurally different, test-only realization also exists for

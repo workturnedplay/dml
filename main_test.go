@@ -25,6 +25,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	bolt "go.etcd.io/bbolt"
 )
@@ -935,7 +936,7 @@ func TestNameRegistryUnbindDoesNotDeleteNode(t *testing.T) {
 		t.Fatalf("CreateNamedNode() returned error: %v", err)
 	}
 
-	removed, err := names.Unbind("A")
+	removed, err := names.Unbind(&g, "A")
 	if err != nil {
 		t.Fatalf("Unbind() returned error: %v", err)
 	}
@@ -961,7 +962,7 @@ func TestNameRegistryUnbindMissing(t *testing.T) {
 	var g Graph
 	names := NewNameRegistry(&g)
 
-	removed, err := names.Unbind("missing")
+	removed, err := names.Unbind(&g, "missing")
 	if !errors.Is(err, ErrNameNotFound) {
 		t.Fatalf("Unbind() error = %v, want %v", err, ErrNameNotFound)
 	}
@@ -12893,6 +12894,476 @@ func TestTxTouchRunsRelevantCheckersWithoutMutation(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------
+// Name retirement, Purge and LoadNames (theorystate.md section 103).
+
+func TestNameRegistryRetiredNameFailsEveryWayOfAskingForIt(t *testing.T) {
+	var g Graph
+	names := NewNameRegistry(&g)
+
+	id, err := names.CreateNamedNode(&g, "A")
+	if err != nil {
+		t.Fatalf("CreateNamedNode(): %v", err)
+	}
+
+	if delErr := names.DeleteNode(&g, id); delErr != nil {
+		t.Fatalf("DeleteNode(): %v", delErr)
+	}
+
+	if _, ok := names.Lookup("A"); ok {
+		t.Fatal("a retired name still resolves")
+	}
+
+	other := mustCreateNode(t, &g)
+
+	if _, ensureErr := names.EnsureNamedNode(&g, "A"); !errors.Is(ensureErr, ErrNameRetired) {
+		t.Fatalf("EnsureNamedNode() error = %v, want %v", ensureErr, ErrNameRetired)
+	}
+	if _, createErr := names.CreateNamedNode(&g, "A"); !errors.Is(createErr, ErrNameRetired) {
+		t.Fatalf("CreateNamedNode() error = %v, want %v", createErr, ErrNameRetired)
+	}
+	if bindErr := names.Bind(&g, "A", other); !errors.Is(bindErr, ErrNameRetired) {
+		t.Fatalf("Bind() error = %v, want %v", bindErr, ErrNameRetired)
+	}
+	if _, bootErr := names.BootstrapNames(&g, []string{"A"}); !errors.Is(bootErr, ErrNameRetired) {
+		t.Fatalf("BootstrapNames() error = %v, want %v", bootErr, ErrNameRetired)
+	}
+}
+
+func TestNameRegistryPurge(t *testing.T) {
+	var g Graph
+	names := NewNameRegistry(&g)
+
+	if purgeErr := names.Purge(&g, "missing"); !errors.Is(purgeErr, ErrNameNotFound) {
+		t.Fatalf("Purge(missing) error = %v, want %v", purgeErr, ErrNameNotFound)
+	}
+
+	id, err := names.CreateNamedNode(&g, "A")
+	if err != nil {
+		t.Fatalf("CreateNamedNode(): %v", err)
+	}
+
+	if purgeErr := names.Purge(&g, "A"); !errors.Is(purgeErr, ErrNameNotRetired) {
+		t.Fatalf("Purge(bound name) error = %v, want %v", purgeErr, ErrNameNotRetired)
+	}
+
+	if delErr := names.DeleteNode(&g, id); delErr != nil {
+		t.Fatalf("DeleteNode(): %v", delErr)
+	}
+	if purgeErr := names.Purge(&g, "A"); purgeErr != nil {
+		t.Fatalf("Purge(retired name): %v", purgeErr)
+	}
+
+	fresh, err := names.EnsureNamedNode(&g, "A")
+	if err != nil {
+		t.Fatalf("EnsureNamedNode() after Purge(): %v", err)
+	}
+	if fresh == id {
+		t.Fatalf("the recreated name got the old NodeID %d", id)
+	}
+	if found, ok := names.Lookup("A"); !ok || found != fresh {
+		t.Fatalf("Lookup(\"A\") = (%d,%v), want (%d,true)", found, ok, fresh)
+	}
+}
+
+func TestNameRegistryUnbindRetiresNameButKeepsNode(t *testing.T) {
+	var g Graph
+	names := NewNameRegistry(&g)
+
+	id, err := names.CreateNamedNode(&g, "B")
+	if err != nil {
+		t.Fatalf("CreateNamedNode(): %v", err)
+	}
+
+	if removed, unbindErr := names.Unbind(&g, "B"); unbindErr != nil || !removed {
+		t.Fatalf("Unbind() = (%v,%v), want (true,nil)", removed, unbindErr)
+	}
+	if !g.NodeExists(id) {
+		t.Fatal("Unbind() deleted the node")
+	}
+
+	if _, ensureErr := names.EnsureNamedNode(&g, "B"); !errors.Is(ensureErr, ErrNameRetired) {
+		t.Fatalf("EnsureNamedNode() after Unbind() error = %v, want %v", ensureErr, ErrNameRetired)
+	}
+	if _, unbindErr := names.Unbind(&g, "B"); !errors.Is(unbindErr, ErrNameNotFound) {
+		t.Fatalf("second Unbind() error = %v, want %v", unbindErr, ErrNameNotFound)
+	}
+}
+
+func TestNameRegistryLoadNamesIsANoOpWithoutADurableStore(t *testing.T) {
+	var g Graph
+	names := NewNameRegistry(&g)
+
+	id, err := names.CreateNamedNode(&g, "A")
+	if err != nil {
+		t.Fatalf("CreateNamedNode(): %v", err)
+	}
+
+	if loadErr := names.LoadNames(&g); loadErr != nil {
+		t.Fatalf("LoadNames(): %v", loadErr)
+	}
+	if found, ok := names.Lookup("A"); !ok || found != id {
+		t.Fatalf("Lookup(\"A\") = (%d,%v) after LoadNames(), want (%d,true)", found, ok, id)
+	}
+}
+
+// ---------------------------------------------------------------------
+// Names on BoltGraph.
+
+func TestBoltGraphNamesPersistAcrossReopen(t *testing.T) {
+	path := boltTestPath(t)
+	first := openBoltTestGraph(t, path)
+	firstNames := NewNameRegistry(first)
+
+	ids, err := firstNames.BootstrapNames(first, FoundationalNames)
+	if err != nil {
+		t.Fatalf("BootstrapNames(): %v", err)
+	}
+
+	nodeCount := len(first.FindNodes())
+
+	if closeErr := first.Close(); closeErr != nil {
+		t.Fatalf("Close(): %v", closeErr)
+	}
+
+	second := openBoltTestGraph(t, path)
+	secondNames := NewNameRegistry(second)
+
+	if _, ok := secondNames.Lookup(NameAllPointers); ok {
+		t.Fatal("a fresh registry knows a name before LoadNames()")
+	}
+
+	if loadErr := secondNames.LoadNames(second); loadErr != nil {
+		t.Fatalf("LoadNames(): %v", loadErr)
+	}
+
+	for name, id := range ids {
+		if found, ok := secondNames.Lookup(name); !ok || found != id {
+			t.Fatalf("Lookup(%q) = (%d,%v), want (%d,true)", name, found, ok, id)
+		}
+		if got, ok := secondNames.NameForNode(id); !ok || got != name {
+			t.Fatalf("NameForNode(%d) = (%q,%v), want (%q,true)", id, got, ok, name)
+		}
+	}
+
+	again, err := secondNames.BootstrapNames(second, FoundationalNames)
+	if err != nil {
+		t.Fatalf("BootstrapNames() after reopen: %v", err)
+	}
+	if !reflect.DeepEqual(again, ids) {
+		t.Fatalf("BootstrapNames() after reopen = %v, want the original %v", again, ids)
+	}
+	if got := len(second.FindNodes()); got != nodeCount {
+		t.Fatalf("BootstrapNames() after reopen changed the node count from %d to %d", nodeCount, got)
+	}
+}
+
+func TestBoltGraphForgettingLoadNamesIsDetected(t *testing.T) {
+	path := boltTestPath(t)
+	first := openBoltTestGraph(t, path)
+
+	if _, err := NewNameRegistry(first).EnsureNamedNode(first, "A"); err != nil {
+		t.Fatalf("EnsureNamedNode(): %v", err)
+	}
+
+	if closeErr := first.Close(); closeErr != nil {
+		t.Fatalf("Close(): %v", closeErr)
+	}
+
+	second := openBoltTestGraph(t, path)
+
+	_, err := NewNameRegistry(second).EnsureNamedNode(second, "A")
+	if !errors.Is(err, ErrNamesNotLoaded) {
+		t.Fatalf("EnsureNamedNode() without LoadNames() error = %v, want %v", err, ErrNamesNotLoaded)
+	}
+
+	if nodes := second.FindNodes(); len(nodes) != 1 {
+		t.Fatalf("FindNodes() = %v, want only the original node (the failed Ensure must roll back)", nodes)
+	}
+}
+
+func TestBoltGraphRetiredNamePersistsAndPurgeAllowsRecreation(t *testing.T) {
+	path := boltTestPath(t)
+	first := openBoltTestGraph(t, path)
+	firstNames := NewNameRegistry(first)
+
+	old, err := firstNames.CreateNamedNode(first, "A")
+	if err != nil {
+		t.Fatalf("CreateNamedNode(): %v", err)
+	}
+	if delErr := firstNames.DeleteNode(first, old); delErr != nil {
+		t.Fatalf("DeleteNode(): %v", delErr)
+	}
+
+	if closeErr := first.Close(); closeErr != nil {
+		t.Fatalf("Close(): %v", closeErr)
+	}
+
+	second := openBoltTestGraph(t, path)
+	secondNames := NewNameRegistry(second)
+
+	if loadErr := secondNames.LoadNames(second); loadErr != nil {
+		t.Fatalf("LoadNames(): %v", loadErr)
+	}
+	if _, ok := secondNames.Lookup("A"); ok {
+		t.Fatal("a retired name resolves after a restart")
+	}
+
+	// This is the startup failure of theorystate.md section 103: the code
+	// still asks for a name the store has retired.
+	if _, bootErr := secondNames.BootstrapNames(second, []string{"A"}); !errors.Is(bootErr, ErrNameRetired) {
+		t.Fatalf("BootstrapNames() error = %v, want %v", bootErr, ErrNameRetired)
+	}
+
+	if purgeErr := secondNames.Purge(second, "A"); purgeErr != nil {
+		t.Fatalf("Purge(): %v", purgeErr)
+	}
+
+	fresh, err := secondNames.EnsureNamedNode(second, "A")
+	if err != nil {
+		t.Fatalf("EnsureNamedNode() after Purge(): %v", err)
+	}
+	if fresh <= old {
+		t.Fatalf("recreated NodeID = %d, want greater than the old %d", fresh, old)
+	}
+
+	if closeErr := second.Close(); closeErr != nil {
+		t.Fatalf("Close(): %v", closeErr)
+	}
+
+	third := openBoltTestGraph(t, path)
+	thirdNames := NewNameRegistry(third)
+
+	if loadErr := thirdNames.LoadNames(third); loadErr != nil {
+		t.Fatalf("LoadNames() after the purge: %v", loadErr)
+	}
+	if found, ok := thirdNames.Lookup("A"); !ok || found != fresh {
+		t.Fatalf("Lookup(\"A\") = (%d,%v), want (%d,true)", found, ok, fresh)
+	}
+}
+
+// TestBoltGraphNameRecordsFollowTransactionAndSavepointOutcomes checks
+// that a name record commits, or is undone, exactly with the node it names:
+// an aborted transaction leaves none, and a failed nested transaction
+// undoes its own record (the savepoint undo log) but not its parent's.
+func TestBoltGraphNameRecordsFollowTransactionAndSavepointOutcomes(t *testing.T) {
+	path := boltTestPath(t)
+	first := openBoltTestGraph(t, path)
+	names := NewNameRegistry(first)
+
+	errOuter := errors.New("outer failure")
+	errInner := errors.New("inner failure")
+
+	err := first.Transact(func(tx Tx) error {
+		if _, createErr := names.CreateNamedNode(tx, "aborted"); createErr != nil {
+			return createErr
+		}
+
+		return errOuter
+	})
+	if !errors.Is(err, errOuter) {
+		t.Fatalf("Transact(abort) error = %v, want %v", err, errOuter)
+	}
+
+	var kept NodeID
+
+	err = first.Transact(func(tx Tx) error {
+		var createErr error
+		kept, createErr = names.CreateNamedNode(tx, "kept")
+		if createErr != nil {
+			return createErr
+		}
+
+		innerErr := tx.Transact(func(inner Tx) error {
+			if _, nestedErr := names.CreateNamedNode(inner, "dropped"); nestedErr != nil {
+				return nestedErr
+			}
+
+			return errInner
+		})
+		if !errors.Is(innerErr, errInner) {
+			t.Errorf("nested Transact() error = %v, want %v", innerErr, errInner)
+		}
+
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Transact() error = %v", err)
+	}
+
+	if closeErr := first.Close(); closeErr != nil {
+		t.Fatalf("Close(): %v", closeErr)
+	}
+
+	second := openBoltTestGraph(t, path)
+	secondNames := NewNameRegistry(second)
+
+	if loadErr := secondNames.LoadNames(second); loadErr != nil {
+		t.Fatalf("LoadNames(): %v", loadErr)
+	}
+
+	if found, ok := secondNames.Lookup("kept"); !ok || found != kept {
+		t.Fatalf("Lookup(\"kept\") = (%d,%v), want (%d,true)", found, ok, kept)
+	}
+	for _, name := range []string{"aborted", "dropped"} {
+		if _, ok := secondNames.Lookup(name); ok {
+			t.Fatalf("the store holds a record for %q, which was rolled back", name)
+		}
+	}
+}
+
+// TestBoltGraphNamesThroughRootGraphPersist checks that the ROOT layer
+// forwards the name store: without rootTx.nameRecords, names created
+// through a RootGraph would silently not be persisted.
+func TestBoltGraphNamesThroughRootGraphPersist(t *testing.T) {
+	path := boltTestPath(t)
+	first := openBoltTestGraph(t, path)
+
+	root := mustCreateNode(t, first)
+
+	rootGraph, err := NewRootGraph(first, root)
+	if err != nil {
+		t.Fatalf("NewRootGraph(): %v", err)
+	}
+
+	id, err := NewNameRegistry(rootGraph).CreateNamedNode(rootGraph, "X")
+	if err != nil {
+		t.Fatalf("CreateNamedNode() through the ROOT layer: %v", err)
+	}
+
+	if closeErr := first.Close(); closeErr != nil {
+		t.Fatalf("Close(): %v", closeErr)
+	}
+
+	second := openBoltTestGraph(t, path)
+	secondNames := NewNameRegistry(second)
+
+	if loadErr := secondNames.LoadNames(second); loadErr != nil {
+		t.Fatalf("LoadNames(): %v", loadErr)
+	}
+	if found, ok := secondNames.Lookup("X"); !ok || found != id {
+		t.Fatalf("Lookup(\"X\") = (%d,%v), want (%d,true)", found, ok, id)
+	}
+}
+
+// ---------------------------------------------------------------------
+// Measurement: commit latency and file size (theorystate.md section 108).
+// Run without -race, which distorts timing, and with -v to see the log:
+//
+//	go test -run TestBoltGraphReportCommitLatencyAndFileSize -v
+//	go test -run "^$" -bench BoltGraphCommit -benchtime 300x
+
+func TestBoltGraphReportCommitLatencyAndFileSize(t *testing.T) {
+	if testing.Short() {
+		t.Skip("measurement only; run without -short")
+	}
+
+	path := boltTestPath(t)
+	g := openBoltTestGraph(t, path)
+
+	logSize := func(label string) {
+		info, statErr := os.Stat(path)
+		if statErr != nil {
+			t.Fatalf("Stat(): %v", statErr)
+		}
+
+		t.Logf("file size %-40s %10d bytes", label, info.Size())
+	}
+
+	logSize("empty store")
+
+	const bulkNodes = 2000
+
+	var ids []NodeID
+
+	start := time.Now()
+
+	err := g.Transact(func(tx Tx) error {
+		ids = ids[:0] // fn may be re-run
+
+		for i := 0; i < bulkNodes; i++ {
+			id, createErr := createNodeTx(tx)
+			if createErr != nil {
+				return createErr
+			}
+
+			ids = append(ids, id)
+		}
+
+		for i := 1; i < len(ids); i++ {
+			if linkErr := addRelationshipTx(tx, ids[i-1], ids[i]); linkErr != nil {
+				return linkErr
+			}
+
+			if i >= 2 {
+				if linkErr := addRelationshipTx(tx, ids[i-2], ids[i]); linkErr != nil {
+					return linkErr
+				}
+			}
+		}
+
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("bulk Transact(): %v", err)
+	}
+
+	t.Logf("one transaction: %d nodes and %d relationships in %v", len(ids), len(g.FindRelationships()), time.Since(start))
+	logSize("after the bulk transaction")
+
+	const commits = 200
+
+	var total, worst time.Duration
+
+	for i := 0; i < commits; i++ {
+		begin := time.Now()
+
+		if _, createErr := createNodeVia(g); createErr != nil {
+			t.Fatalf("CreateNode(): %v", createErr)
+		}
+
+		elapsed := time.Since(begin)
+
+		total += elapsed
+		if elapsed > worst {
+			worst = elapsed
+		}
+	}
+
+	t.Logf("%d single-node commits: average %v, worst %v", commits, total/commits, worst)
+	logSize("after the single-node commits")
+}
+
+func BenchmarkBoltGraphCommit(b *testing.B) {
+	path := filepath.Join(b.TempDir(), "bench.db")
+
+	g, openErr := OpenBoltGraph(path)
+	if openErr != nil {
+		b.Fatalf("OpenBoltGraph(): %v", openErr)
+	}
+
+	b.Cleanup(func() {
+		if closeErr := g.Close(); closeErr != nil {
+			b.Errorf("Close(): %v", closeErr)
+		}
+	})
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		if _, createErr := createNodeVia(g); createErr != nil {
+			b.Fatalf("CreateNode(): %v", createErr)
+		}
+	}
+
+	b.StopTimer()
+
+	if info, statErr := os.Stat(path); statErr == nil {
+		b.ReportMetric(float64(info.Size()), "file-bytes")
+	}
+}
+
 // a CSP/actor-style wrapper making it safe for multiple goroutines to
 // share one underlying *Graph, none of them ever touching it directly.
 
@@ -14227,7 +14698,7 @@ func TestNameRegistryLookupIsSafeWhileGraphActorBindsAndUnbinds(t *testing.T) {
 				return
 			}
 
-			if _, unbindErr := names.Unbind(name); unbindErr != nil {
+			if _, unbindErr := names.Unbind(actor, name); unbindErr != nil {
 				t.Errorf("Unbind(%q): %v", name, unbindErr)
 			}
 		}()
@@ -14626,8 +15097,8 @@ func TestRootGraphTransactForwardsOnRollback(t *testing.T) {
 func requireNoStagedNames(t *testing.T, names *NameRegistry) {
 	t.Helper()
 
-	if len(names.pendingByName) != 0 || len(names.pendingByID) != 0 || len(names.pendingGone) != 0 {
-		t.Fatalf("staged name overlay not empty: byName=%v byID=%v gone=%v", names.pendingByName, names.pendingByID, names.pendingGone)
+	if len(names.pending) != 0 {
+		t.Fatalf("staged name overlay not empty: %v", names.pending)
 	}
 }
 
@@ -14722,7 +15193,7 @@ func TestNameRegistryNestedFailureUnstagesItsBinding(t *testing.T) {
 	requireNoStagedNames(t, names)
 }
 
-func TestNameRegistryDeleteThenRebindSameNameInOneTransaction(t *testing.T) {
+func TestNameRegistryDeleteRetiresNameAndRebindNeedsPurge(t *testing.T) {
 	var g Graph
 	names := NewNameRegistry(&g)
 
@@ -14731,7 +15202,7 @@ func TestNameRegistryDeleteThenRebindSameNameInOneTransaction(t *testing.T) {
 		t.Fatalf("CreateNamedNode(): %v", err)
 	}
 
-	var replacement NodeID
+	var rebindErr error
 
 	err = g.Transact(func(tx Tx) error {
 		if deleteErr := names.DeleteNode(tx, old); deleteErr != nil {
@@ -14743,20 +15214,44 @@ func TestNameRegistryDeleteThenRebindSameNameInOneTransaction(t *testing.T) {
 			t.Errorf("Lookup(\"A\") = (%d,%v) inside the transaction, want the committed (%d,true)", found, ok, old)
 		}
 
-		var createErr error
-		replacement, createErr = names.CreateNamedNode(tx, "A")
+		// Inside the transaction the name is already retired: rebinding it
+		// is refused instead of silently succeeding.
+		_, rebindErr = names.CreateNamedNode(tx, "A")
 
-		return createErr
+		return nil
 	})
 	if err != nil {
 		t.Fatalf("Transact() error = %v", err)
 	}
+	if !errors.Is(rebindErr, ErrNameRetired) {
+		t.Fatalf("CreateNamedNode() of a name retired in the same transaction error = %v, want %v", rebindErr, ErrNameRetired)
+	}
 
-	if found, ok := names.Lookup("A"); !ok || found != replacement {
-		t.Fatalf("Lookup(\"A\") = (%d,%v), want (%d,true)", found, ok, replacement)
+	if _, ok := names.Lookup("A"); ok {
+		t.Fatal("a retired name still resolves")
 	}
 	if _, ok := names.NameForNode(old); ok {
 		t.Fatalf("deleted node %d still has a name", old)
+	}
+	requireNoStagedNames(t, names)
+
+	if _, ensureErr := names.EnsureNamedNode(&g, "A"); !errors.Is(ensureErr, ErrNameRetired) {
+		t.Fatalf("EnsureNamedNode() of a retired name error = %v, want %v", ensureErr, ErrNameRetired)
+	}
+
+	if purgeErr := names.Purge(&g, "A"); purgeErr != nil {
+		t.Fatalf("Purge(): %v", purgeErr)
+	}
+
+	replacement, err := names.EnsureNamedNode(&g, "A")
+	if err != nil {
+		t.Fatalf("EnsureNamedNode() after Purge(): %v", err)
+	}
+	if replacement == old {
+		t.Fatalf("the recreated name got the old NodeID %d; IDs are never reused", old)
+	}
+	if found, ok := names.Lookup("A"); !ok || found != replacement {
+		t.Fatalf("Lookup(\"A\") = (%d,%v), want (%d,true)", found, ok, replacement)
 	}
 	requireNoStagedNames(t, names)
 
@@ -14810,6 +15305,10 @@ func TestNameRegistryCreateThenDeleteInOneTransactionLeavesNoBinding(t *testing.
 		t.Fatalf("node %d survived its own deletion", id)
 	}
 	requireNoStagedNames(t, names)
+
+	if _, ensureErr := names.EnsureNamedNode(&g, "T"); !errors.Is(ensureErr, ErrNameRetired) {
+		t.Fatalf("EnsureNamedNode() of a name created and deleted in one transaction error = %v, want %v", ensureErr, ErrNameRetired)
+	}
 }
 
 func TestSetMutatorsComposeInsideOneTransactionAndRollBackTogether(t *testing.T) {
