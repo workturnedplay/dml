@@ -1465,7 +1465,7 @@ func checkerRelevant(view GraphReader, checker Checker, touched map[NodeID]struc
 // unexported optional interface until the paged-read rework of
 // theorystate.md section 105 decides the exported shape.
 type nodePager interface {
-	findNodesAfter(after NodeID, hasAfter bool, limit int) []NodeID
+	findNodesAfter(after NodeID, hasAfter bool, limit int) ([]NodeID, error)
 }
 
 // pageNodeIDs returns up to limit IDs from sorted (ascending) that are
@@ -1484,13 +1484,23 @@ func pageNodeIDs(sorted []NodeID, after NodeID, hasAfter bool, limit int) []Node
 }
 
 // nodesAfter returns a page of node IDs from reader, using its paging if it
-// has any (see nodePager) and FindNodes otherwise.
-func nodesAfter(reader GraphReader, after NodeID, hasAfter bool, limit int) []NodeID {
+// has any (see nodePager) and FindNodes otherwise. The fallback path can
+// genuinely fail on a backend whose FindNodes can fail (BoltGraph, e.g.
+// reached via a RootGraph wrapping one directly, which does not itself
+// implement nodePager), so the error is propagated rather than assumed
+// away.
+func nodesAfter(reader GraphReader, after NodeID, hasAfter bool, limit int) ([]NodeID, error) {
 	if pager, ok := reader.(nodePager); ok {
-		return pager.findNodesAfter(after, hasAfter, limit)
+		ids, err := pager.findNodesAfter(after, hasAfter, limit)
+		return ids, wrapInterfaceErr(err)
 	}
 
-	return pageNodeIDs(reader.FindNodes(), after, hasAfter, limit)
+	ids, err := reader.FindNodes()
+	if err != nil {
+		return nil, wrapInterfaceErr(err)
+	}
+
+	return pageNodeIDs(ids, after, hasAfter, limit), nil
 }
 
 // defaultVerifyPageSize is the page size VerifyAll uses when given a
@@ -1528,7 +1538,13 @@ func VerifyAll(graph Transactor, pageSize int) error {
 		var page []NodeID
 
 		err := graph.Transact(func(tx Tx) error {
-			page = nodesAfter(tx, after, hasAfter, pageSize)
+			var pageErr error
+
+			page, pageErr = nodesAfter(tx, after, hasAfter, pageSize)
+			if pageErr != nil {
+				return pageErr
+			}
+
 			tx.Touch(page...)
 
 			return nil
@@ -2036,24 +2052,48 @@ func newBoltView(btx *bolt.Tx) (boltView, error) {
 	return view, nil
 }
 
-// NodeExists reports whether id exists.
-func (v boltView) NodeExists(id NodeID) bool {
-	return v.nodes.Get(boltKey8(id)) != nil
+// NodeExists reports whether id exists. bolt reads from an already-open
+// transaction cannot themselves fail, so this always returns a nil
+// error; the return exists to satisfy GraphReader (see its doc comment).
+func (v boltView) NodeExists(id NodeID) (bool, error) {
+	return v.nodes.Get(boltKey8(id)) != nil, nil
 }
 
 // HasRelationship reports whether the relationship (a, b) exists.
-func (v boltView) HasRelationship(a, b NodeID) bool {
-	if !v.NodeExists(a) || !v.NodeExists(b) {
-		return false
+func (v boltView) HasRelationship(a, b NodeID) (bool, error) {
+	existsA, err := v.NodeExists(a)
+	if err != nil {
+		return false, err
+	}
+	if !existsA {
+		return false, nil
 	}
 
-	return v.out.Get(boltKey16(a, b)) != nil
+	existsB, err := v.NodeExists(b)
+	if err != nil {
+		return false, err
+	}
+	if !existsB {
+		return false, nil
+	}
+
+	return v.out.Get(boltKey16(a, b)) != nil, nil
 }
 
 // FindRelationship reports whether the exact relationship (from, to)
 // exists.
 func (v boltView) FindRelationship(from, to NodeID) (Relationship, bool, error) {
-	if !v.NodeExists(from) || !v.NodeExists(to) {
+	existsFrom, err := v.NodeExists(from)
+	if err != nil {
+		return Relationship{}, false, err
+	}
+
+	existsTo, err := v.NodeExists(to)
+	if err != nil {
+		return Relationship{}, false, err
+	}
+
+	if !existsFrom || !existsTo {
 		return Relationship{}, false, ErrNodeNotFound
 	}
 
@@ -2067,7 +2107,11 @@ func (v boltView) FindRelationship(from, to NodeID) (Relationship, bool, error) 
 // FindOutgoing returns every relationship whose source is from, sorted by
 // To.
 func (v boltView) FindOutgoing(from NodeID) ([]Relationship, error) {
-	if !v.NodeExists(from) {
+	exists, err := v.NodeExists(from)
+	if err != nil {
+		return nil, err
+	}
+	if !exists {
 		return nil, ErrNodeNotFound
 	}
 
@@ -2084,7 +2128,11 @@ func (v boltView) FindOutgoing(from NodeID) ([]Relationship, error) {
 // FindIncoming returns every relationship whose target is to, sorted by
 // From.
 func (v boltView) FindIncoming(to NodeID) ([]Relationship, error) {
-	if !v.NodeExists(to) {
+	exists, err := v.NodeExists(to)
+	if err != nil {
+		return nil, err
+	}
+	if !exists {
 		return nil, ErrNodeNotFound
 	}
 
@@ -2099,8 +2147,10 @@ func (v boltView) FindIncoming(to NodeID) ([]Relationship, error) {
 }
 
 // FindRelationships returns every relationship, sorted by From then To.
-// This is O(graph); see theorystate.md section 105.
-func (v boltView) FindRelationships() []Relationship {
+// This is O(graph); see theorystate.md section 105. bolt cursor reads
+// from an already-open transaction cannot themselves fail, so this
+// always returns a nil error.
+func (v boltView) FindRelationships() ([]Relationship, error) {
 	relationships := []Relationship{}
 	cursor := v.out.Cursor()
 
@@ -2108,12 +2158,14 @@ func (v boltView) FindRelationships() []Relationship {
 		relationships = append(relationships, Relationship{From: boltID(key), To: boltID(key[boltIDSize:])})
 	}
 
-	return relationships
+	return relationships, nil
 }
 
 // FindNodes returns every existing NodeID, sorted ascending. This is
-// O(graph); see theorystate.md section 105.
-func (v boltView) FindNodes() []NodeID {
+// O(graph); see theorystate.md section 105. bolt cursor reads from an
+// already-open transaction cannot themselves fail, so this always
+// returns a nil error.
+func (v boltView) FindNodes() ([]NodeID, error) {
 	ids := []NodeID{}
 	cursor := v.nodes.Cursor()
 
@@ -2121,13 +2173,18 @@ func (v boltView) FindNodes() []NodeID {
 		ids = append(ids, boltID(key))
 	}
 
-	return ids
+	return ids, nil
 }
 
 // findNodesAfter returns up to limit node IDs greater than after (from the
 // first node if hasAfter is false), in ascending order, reading only that
-// range with a cursor (see nodePager).
-func (v boltView) findNodesAfter(after NodeID, hasAfter bool, limit int) []NodeID {
+// range with a cursor (see nodePager). bolt cursor reads from an
+// already-open transaction cannot themselves fail, so this always
+// returns a nil error; the return exists to satisfy nodePager, whose
+// signature must accommodate a backend-generic caller (nodesAfter) that
+// can genuinely fail elsewhere (e.g. its own fallback path calling
+// GraphReader.FindNodes on a backend that has no paging of its own).
+func (v boltView) findNodesAfter(after NodeID, hasAfter bool, limit int) ([]NodeID, error) {
 	ids := []NodeID{}
 	cursor := v.nodes.Cursor()
 
@@ -2146,7 +2203,7 @@ func (v boltView) findNodesAfter(after NodeID, hasAfter bool, limit int) []NodeI
 		ids = append(ids, boltID(key))
 	}
 
-	return ids
+	return ids, nil
 }
 
 // Compile-time assertion that boltView pages.
@@ -2171,7 +2228,17 @@ func (v boltView) checkEdges(primary, mirror *bolt.Bucket, primaryName, mirrorNa
 			return fmt.Errorf("%w: key (%d,%d) is in the %s index but its mirror is missing from the %s index", ErrStoreCorrupt, first, second, primaryName, mirrorName)
 		}
 
-		if !v.NodeExists(first) || !v.NodeExists(second) {
+		existsFirst, err := v.NodeExists(first)
+		if err != nil {
+			return err
+		}
+
+		existsSecond, err := v.NodeExists(second)
+		if err != nil {
+			return err
+		}
+
+		if !existsFirst || !existsSecond {
 			return fmt.Errorf("%w: key (%d,%d) in the %s index refers to a node that does not exist", ErrStoreCorrupt, first, second, primaryName)
 		}
 	}
@@ -2712,19 +2779,19 @@ func boltMust[T any](g *BoltGraph, fn func(v boltView) T) T {
 }
 
 // NodeExists reports whether id exists.
-func (g *BoltGraph) NodeExists(id NodeID) bool {
+func (g *BoltGraph) NodeExists(id NodeID) (bool, error) {
 	release := g.guard.acquire()
 	defer release()
 
-	return boltMust(g, func(v boltView) bool { return v.NodeExists(id) })
+	return boltRead(g, func(v boltView) (bool, error) { return v.NodeExists(id) })
 }
 
 // HasRelationship reports whether (a, b) exists.
-func (g *BoltGraph) HasRelationship(a, b NodeID) bool {
+func (g *BoltGraph) HasRelationship(a, b NodeID) (bool, error) {
 	release := g.guard.acquire()
 	defer release()
 
-	return boltMust(g, func(v boltView) bool { return v.HasRelationship(a, b) })
+	return boltRead(g, func(v boltView) (bool, error) { return v.HasRelationship(a, b) })
 }
 
 // FindRelationship reports whether the exact relationship exists.
@@ -2762,19 +2829,19 @@ func (g *BoltGraph) FindIncoming(to NodeID) ([]Relationship, error) {
 }
 
 // FindRelationships returns every relationship. O(graph).
-func (g *BoltGraph) FindRelationships() []Relationship {
+func (g *BoltGraph) FindRelationships() ([]Relationship, error) {
 	release := g.guard.acquire()
 	defer release()
 
-	return boltMust(g, func(v boltView) []Relationship { return v.FindRelationships() })
+	return boltRead(g, func(v boltView) ([]Relationship, error) { return v.FindRelationships() })
 }
 
 // FindNodes returns every existing NodeID. O(graph).
-func (g *BoltGraph) FindNodes() []NodeID {
+func (g *BoltGraph) FindNodes() ([]NodeID, error) {
 	release := g.guard.acquire()
 	defer release()
 
-	return boltMust(g, func(v boltView) []NodeID { return v.FindNodes() })
+	return boltRead(g, func(v boltView) ([]NodeID, error) { return v.FindNodes() })
 }
 
 // RegisterChecker registers c, exactly like Graph.RegisterChecker.
