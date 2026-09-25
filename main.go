@@ -3819,7 +3819,11 @@ var _ GraphReader = rootReader{}
 // exist.
 func (v rootReader) requireExist(ids ...NodeID) error {
 	for _, id := range ids {
-		if !v.inner.NodeExists(id) {
+		exists, err := v.inner.NodeExists(id)
+		if err != nil {
+			return wrapInterfaceErr(err)
+		}
+		if !exists {
 			return ErrNodeNotFound
 		}
 	}
@@ -3830,12 +3834,20 @@ func (v rootReader) requireExist(ids ...NodeID) error {
 // virtualRootRelationships returns the virtual (ROOT, X) relationship for
 // every existing X != ROOT, sorted by To (FindNodes is already sorted
 // ascending). It returns nothing if ROOT does not exist.
-func (v rootReader) virtualRootRelationships() []Relationship {
-	if !v.inner.NodeExists(v.root) {
-		return nil
+func (v rootReader) virtualRootRelationships() ([]Relationship, error) {
+	exists, err := v.inner.NodeExists(v.root)
+	if err != nil {
+		return nil, wrapInterfaceErr(err)
+	}
+	if !exists {
+		return nil, nil
 	}
 
-	ids := v.inner.FindNodes()
+	ids, err := v.inner.FindNodes()
+	if err != nil {
+		return nil, wrapInterfaceErr(err)
+	}
+
 	relationships := make([]Relationship, 0, len(ids))
 
 	for _, id := range ids {
@@ -3849,23 +3861,25 @@ func (v rootReader) virtualRootRelationships() []Relationship {
 		})
 	}
 
-	return relationships
+	return relationships, nil
 }
 
 // NodeExists reports whether id exists in the underlying graph.
-func (v rootReader) NodeExists(id NodeID) bool {
-	return v.inner.NodeExists(id)
+func (v rootReader) NodeExists(id NodeID) (bool, error) {
+	exists, err := v.inner.NodeExists(id)
+	return exists, wrapInterfaceErr(err)
 }
 
 // FindNodes returns every existing node, ROOT included.
-func (v rootReader) FindNodes() []NodeID {
-	return v.inner.FindNodes()
+func (v rootReader) FindNodes() ([]NodeID, error) {
+	ids, err := v.inner.FindNodes()
+	return ids, wrapInterfaceErr(err)
 }
 
 // findNodesAfter pages through the same set as FindNodes (ROOT included),
 // forwarding to the underlying reader's paging where it has any (see
 // nodePager).
-func (v rootReader) findNodesAfter(after NodeID, hasAfter bool, limit int) []NodeID {
+func (v rootReader) findNodesAfter(after NodeID, hasAfter bool, limit int) ([]NodeID, error) {
 	return nodesAfter(v.inner, after, hasAfter, limit)
 }
 
@@ -3875,16 +3889,29 @@ var _ nodePager = rootReader{}
 // HasRelationship reports whether the relationship exists in the ROOT
 // view: ROOT has a virtual relationship to every existing node other than
 // itself; every other relationship comes from the underlying graph.
-func (v rootReader) HasRelationship(from, to NodeID) bool {
-	if !v.inner.NodeExists(from) || !v.inner.NodeExists(to) {
-		return false
+func (v rootReader) HasRelationship(from, to NodeID) (bool, error) {
+	existsFrom, err := v.inner.NodeExists(from)
+	if err != nil {
+		return false, wrapInterfaceErr(err)
+	}
+	if !existsFrom {
+		return false, nil
+	}
+
+	existsTo, err := v.inner.NodeExists(to)
+	if err != nil {
+		return false, wrapInterfaceErr(err)
+	}
+	if !existsTo {
+		return false, nil
 	}
 
 	if from == v.root {
-		return to != v.root
+		return to != v.root, nil
 	}
 
-	return v.inner.HasRelationship(from, to)
+	has, err := v.inner.HasRelationship(from, to)
+	return has, wrapInterfaceErr(err)
 }
 
 // FindRelationship reports whether the exact relationship exists in the
@@ -3894,7 +3921,11 @@ func (v rootReader) FindRelationship(from, to NodeID) (Relationship, bool, error
 		return Relationship{}, false, err
 	}
 
-	if !v.HasRelationship(from, to) {
+	has, err := v.HasRelationship(from, to)
+	if err != nil {
+		return Relationship{}, false, err
+	}
+	if !has {
 		return Relationship{}, false, nil
 	}
 
@@ -3908,16 +3939,20 @@ func (v rootReader) FindRelationship(from, to NodeID) (Relationship, bool, error
 // ROOT view: for ROOT, every existing node other than ROOT; for every
 // other node, its ordinary stored relationships.
 func (v rootReader) FindOutgoing(from NodeID) ([]Relationship, error) {
-	if !v.inner.NodeExists(from) {
+	exists, err := v.inner.NodeExists(from)
+	if err != nil {
+		return nil, wrapInterfaceErr(err)
+	}
+	if !exists {
 		return nil, ErrNodeNotFound
 	}
 
 	if from != v.root {
-		relationships, err := v.inner.FindOutgoing(from)
-		return relationships, wrapInterfaceErr(err)
+		relationships, findErr := v.inner.FindOutgoing(from)
+		return relationships, wrapInterfaceErr(findErr)
 	}
 
-	return v.virtualRootRelationships(), nil
+	return v.virtualRootRelationships()
 }
 
 // FindIncoming returns every relationship whose target is to in the ROOT
@@ -3927,7 +3962,11 @@ func (v rootReader) FindOutgoing(from NodeID) ([]Relationship, error) {
 // stored (ROOT, X) is never reported twice and a stored (ROOT, ROOT) is
 // hidden.
 func (v rootReader) FindIncoming(to NodeID) ([]Relationship, error) {
-	if !v.inner.NodeExists(to) {
+	exists, err := v.inner.NodeExists(to)
+	if err != nil {
+		return nil, wrapInterfaceErr(err)
+	}
+	if !exists {
 		return nil, ErrNodeNotFound
 	}
 
@@ -3946,11 +3985,17 @@ func (v rootReader) FindIncoming(to NodeID) ([]Relationship, error) {
 		relationships = append(relationships, relationship)
 	}
 
-	if to != v.root && v.inner.NodeExists(v.root) {
-		relationships = append(relationships, Relationship{
-			From: v.root,
-			To:   to,
-		})
+	if to != v.root {
+		rootExists, rootErr := v.inner.NodeExists(v.root)
+		if rootErr != nil {
+			return nil, wrapInterfaceErr(rootErr)
+		}
+		if rootExists {
+			relationships = append(relationships, Relationship{
+				From: v.root,
+				To:   to,
+			})
+		}
 	}
 
 	sort.Slice(relationships, func(i, j int) bool {
@@ -3964,9 +4009,17 @@ func (v rootReader) FindIncoming(to NodeID) ([]Relationship, error) {
 // all stored relationships except those whose source is ROOT, plus the
 // virtual ROOT -> X relationship for every existing X != ROOT. A stored
 // ROOT -> X is ignored because the overlay represents it virtually anyway.
-func (v rootReader) FindRelationships() []Relationship {
-	stored := v.inner.FindRelationships()
-	virtual := v.virtualRootRelationships()
+func (v rootReader) FindRelationships() ([]Relationship, error) {
+	stored, err := v.inner.FindRelationships()
+	if err != nil {
+		return nil, wrapInterfaceErr(err)
+	}
+
+	virtual, err := v.virtualRootRelationships()
+	if err != nil {
+		return nil, err
+	}
+
 	relationships := make([]Relationship, 0, len(stored)+len(virtual))
 
 	for _, relationship := range stored {
@@ -3987,7 +4040,7 @@ func (v rootReader) FindRelationships() []Relationship {
 		return relationships[i].To < relationships[j].To
 	})
 
-	return relationships
+	return relationships, nil
 }
 
 // rootStore is the full read/write ROOT overlay over any GraphStore. It
@@ -4121,7 +4174,11 @@ func (s rootStore) RemoveRelationship(from, to NodeID) (removed bool, err error)
 // its relationship count, so this failure cannot be resolved by clearing
 // relationships and retrying (theorystate.md section 18a).
 func (s rootStore) DeleteNode(id NodeID) error {
-	if !s.NodeExists(id) {
+	exists, err := s.NodeExists(id)
+	if err != nil {
+		return err
+	}
+	if !exists {
 		return ErrNodeNotFound
 	}
 
@@ -4175,7 +4232,11 @@ func NewRootGraph(graph GraphAPI, root NodeID) (*RootGraph, error) {
 		return nil, ErrRootGraphOverActor
 	}
 
-	if !graph.NodeExists(root) {
+	exists, err := graph.NodeExists(root)
+	if err != nil {
+		return nil, wrapInterfaceErr(err)
+	}
+	if !exists {
 		return nil, ErrNodeNotFound
 	}
 
