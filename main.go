@@ -47,6 +47,20 @@ var (
 	ErrNodeNotFound    = errors.New("node not found")
 	ErrNodeNotEmpty    = errors.New("node has relationships")
 	ErrNodeIDExhausted = errors.New("node ID space exhausted")
+
+	// ErrGraphStoreUnavailable is returned by a GraphReader method when
+	// the backend's own read channel failed -- an I/O error, a closed
+	// database handle, or similar -- as opposed to the request itself
+	// being invalid (ErrNodeNotFound) or the store answering with content
+	// that is present but violates this package's own on-disk layout
+	// (ErrStoreCorrupt). Every in-memory-backed GraphReader in this file
+	// (*Graph, *Txn, graphCoreReader, *GraphActor, and the test-only
+	// stagedGraph/stagedOverlay) has no failure mode of this kind and
+	// never returns it; BoltGraph is, at present, the only backend that
+	// can. Callers should treat it the way any other backend-availability
+	// failure is treated: as a reason not to trust this specific read,
+	// not as a claim about whether the underlying data is well-formed.
+	ErrGraphStoreUnavailable = errors.New("graph store did not answer a read")
 )
 
 // concurrentAccessGuard is a fail-fast (not blocking) protection against
@@ -198,12 +212,14 @@ func (g *Graph) createNodeCore() (NodeID, error) {
 // This acquires g's concurrentAccessGuard for the duration of the call;
 // see that type's doc comment. The unexported nodeExists already serves
 // as this method's unguarded core, called directly by every other
-// *Graph method and by graphCoreReader/Txn.
-func (g *Graph) NodeExists(id NodeID) bool {
+// *Graph method and by graphCoreReader/Txn. The error return exists to
+// satisfy GraphReader; a bare *Graph has no failure mode here and always
+// returns nil (see the GraphReader doc comment).
+func (g *Graph) NodeExists(id NodeID) (bool, error) {
 	release := g.guard.acquire()
 	defer release()
 
-	return g.nodeExists(id)
+	return g.nodeExists(id), nil
 }
 
 // addRelationshipCore creates the primitive relationship (a, b). Both
@@ -256,12 +272,15 @@ func (g *Graph) removeRelationshipCore(a, b NodeID) (removed bool, err error) {
 // HasRelationship reports whether the primitive relationship (a, b) exists.
 //
 // This acquires g's concurrentAccessGuard for the duration of the call;
-// see hasRelationshipCore for the actual, unguarded implementation.
-func (g *Graph) HasRelationship(a, b NodeID) bool {
+// see hasRelationshipCore for the actual, unguarded implementation. The
+// error return exists to satisfy GraphReader; a bare *Graph has no
+// failure mode here and always returns nil (see the GraphReader doc
+// comment).
+func (g *Graph) HasRelationship(a, b NodeID) (bool, error) {
 	release := g.guard.acquire()
 	defer release()
 
-	return g.hasRelationshipCore(a, b)
+	return g.hasRelationshipCore(a, b), nil
 }
 
 // hasRelationshipCore is HasRelationship's unguarded implementation; see
@@ -390,12 +409,15 @@ func (g *Graph) findIncomingCore(to NodeID) ([]Relationship, error) {
 // has no semantic meaning.
 //
 // This acquires g's concurrentAccessGuard for the duration of the call;
-// see findRelationshipsCore for the actual, unguarded implementation.
-func (g *Graph) FindRelationships() []Relationship {
+// see findRelationshipsCore for the actual, unguarded implementation. The
+// error return exists to satisfy GraphReader; a bare *Graph has no
+// failure mode here and always returns nil (see the GraphReader doc
+// comment).
+func (g *Graph) FindRelationships() ([]Relationship, error) {
 	release := g.guard.acquire()
 	defer release()
 
-	return g.findRelationshipsCore()
+	return g.findRelationshipsCore(), nil
 }
 
 // findRelationshipsCore is FindRelationships's unguarded implementation;
@@ -432,12 +454,14 @@ func (g *Graph) findRelationshipsCore() []Relationship {
 // The ordering has no semantic meaning.
 //
 // This acquires g's concurrentAccessGuard for the duration of the call;
-// see findNodesCore for the actual, unguarded implementation.
-func (g *Graph) FindNodes() []NodeID {
+// see findNodesCore for the actual, unguarded implementation. The error
+// return exists to satisfy GraphReader; a bare *Graph has no failure mode
+// here and always returns nil (see the GraphReader doc comment).
+func (g *Graph) FindNodes() ([]NodeID, error) {
 	release := g.guard.acquire()
 	defer release()
 
-	return g.findNodesCore()
+	return g.findNodesCore(), nil
 }
 
 // findNodesCore is FindNodes's unguarded implementation; see
@@ -522,13 +546,28 @@ func (g *Graph) nodeExists(id NodeID) bool {
 // anything -- can depend on exactly that capability rather than a
 // concrete storage type, or the wider GraphStore/GraphAPI surfaces below
 // that also grant write access (theorystate.md section 87).
+//
+// NodeExists, HasRelationship, FindRelationships, and FindNodes each
+// return an error alongside their result. An earlier version of this
+// interface gave them no way to fail at all, which was modeled on the
+// in-memory *Graph -- for which none of these four queries can genuinely
+// fail -- and broke the moment BoltGraph (a disk-backed backend,
+// theorystate.md section 108) needed to report a real read failure
+// instead of panicking. Every backend's own implementation of these four
+// still returns a nil error in the overwhelming majority of cases -- in
+// particular, always, for every purely in-memory-backed reader in this
+// file (*Graph, *Txn, graphCoreReader, *GraphActor). ErrGraphStoreUnavailable
+// is reserved for a backend whose read channel itself failed, as opposed
+// to a request that is merely invalid (ErrNodeNotFound) or content that
+// is present but violates this package's own layout (ErrStoreCorrupt) --
+// see ErrGraphStoreUnavailable's own doc comment for that distinction.
 type GraphReader interface {
-	NodeExists(id NodeID) bool
-	HasRelationship(a, b NodeID) bool
+	NodeExists(id NodeID) (bool, error)
+	HasRelationship(a, b NodeID) (bool, error)
 	FindRelationship(from, to NodeID) (Relationship, bool, error)
 	FindOutgoing(from NodeID) ([]Relationship, error)
 	FindIncoming(to NodeID) ([]Relationship, error)
-	FindRelationships() []Relationship
+	FindRelationships() ([]Relationship, error)
 
 	// FindNodes returns the NodeID of every node that currently exists,
 	// sorted ascending. The order has no semantic meaning (theorystate.md
@@ -536,7 +575,7 @@ type GraphReader interface {
 	// This is the node-enumeration counterpart of FindRelationships, and
 	// is what lets RootGraph's ROOT overlay run over any GraphStore
 	// rather than only the concrete *Graph (theorystate.md section 87b).
-	FindNodes() []NodeID
+	FindNodes() ([]NodeID, error)
 }
 
 // GraphStore is the complete primitive storage surface -- GraphReader's
@@ -1137,14 +1176,14 @@ func (tx *Txn) DeleteNode(id NodeID) error {
 // running on the actor's one dedicated goroutine deadlocks. tx.NodeExists
 // and friends give every helper a value that is always correct for both
 // cases: the real *Graph, directly, with no channel involved at all.
-func (tx *Txn) NodeExists(id NodeID) bool {
-	return tx.graph.nodeExists(id)
+func (tx *Txn) NodeExists(id NodeID) (bool, error) {
+	return tx.graph.nodeExists(id), nil
 }
 
 // HasRelationship delegates to the real, concrete *Graph's unguarded
 // core. See the NodeExists doc comment above.
-func (tx *Txn) HasRelationship(a, b NodeID) bool {
-	return tx.graph.hasRelationshipCore(a, b)
+func (tx *Txn) HasRelationship(a, b NodeID) (bool, error) {
+	return tx.graph.hasRelationshipCore(a, b), nil
 }
 
 // FindRelationship delegates to the real, concrete *Graph's unguarded
@@ -1167,14 +1206,14 @@ func (tx *Txn) FindIncoming(to NodeID) ([]Relationship, error) {
 
 // FindRelationships delegates to the real, concrete *Graph's unguarded
 // core. See the NodeExists doc comment above.
-func (tx *Txn) FindRelationships() []Relationship {
-	return tx.graph.findRelationshipsCore()
+func (tx *Txn) FindRelationships() ([]Relationship, error) {
+	return tx.graph.findRelationshipsCore(), nil
 }
 
 // FindNodes delegates to the real, concrete *Graph's unguarded core.
 // See the NodeExists doc comment above.
-func (tx *Txn) FindNodes() []NodeID {
-	return tx.graph.findNodesCore()
+func (tx *Txn) FindNodes() ([]NodeID, error) {
+	return tx.graph.findNodesCore(), nil
 }
 
 // Compile-time assertion that *Txn satisfies GraphReader, exactly
@@ -1305,14 +1344,14 @@ type graphCoreReader struct {
 
 // NodeExists delegates to graph's unguarded core. See the
 // graphCoreReader doc comment.
-func (r graphCoreReader) NodeExists(id NodeID) bool {
-	return r.graph.nodeExists(id)
+func (r graphCoreReader) NodeExists(id NodeID) (bool, error) {
+	return r.graph.nodeExists(id), nil
 }
 
 // HasRelationship delegates to graph's unguarded core. See the
 // graphCoreReader doc comment.
-func (r graphCoreReader) HasRelationship(a, b NodeID) bool {
-	return r.graph.hasRelationshipCore(a, b)
+func (r graphCoreReader) HasRelationship(a, b NodeID) (bool, error) {
+	return r.graph.hasRelationshipCore(a, b), nil
 }
 
 // FindRelationship delegates to graph's unguarded core. See the
@@ -1335,14 +1374,14 @@ func (r graphCoreReader) FindIncoming(to NodeID) ([]Relationship, error) {
 
 // FindRelationships delegates to graph's unguarded core. See the
 // graphCoreReader doc comment.
-func (r graphCoreReader) FindRelationships() []Relationship {
-	return r.graph.findRelationshipsCore()
+func (r graphCoreReader) FindRelationships() ([]Relationship, error) {
+	return r.graph.findRelationshipsCore(), nil
 }
 
 // FindNodes delegates to graph's unguarded core. See the
 // graphCoreReader doc comment.
-func (r graphCoreReader) FindNodes() []NodeID {
-	return r.graph.findNodesCore()
+func (r graphCoreReader) FindNodes() ([]NodeID, error) {
+	return r.graph.findNodesCore(), nil
 }
 
 // Compile-time assertion that graphCoreReader satisfies GraphReader,
@@ -1772,26 +1811,28 @@ func (ga *GraphActor) Close() {
 
 // NodeExists behaves exactly like the backend's NodeExists, routed
 // through ga's dedicated goroutine.
-func (ga *GraphActor) NodeExists(id NodeID) bool {
+func (ga *GraphActor) NodeExists(id NodeID) (bool, error) {
 	var exists bool
+	var err error
 
 	ga.do(func(g GraphAPI) {
-		exists = g.NodeExists(id)
+		exists, err = g.NodeExists(id)
 	})
 
-	return exists
+	return exists, wrapInterfaceErr(err)
 }
 
 // HasRelationship behaves exactly like the backend's HasRelationship,
 // routed through ga's dedicated goroutine.
-func (ga *GraphActor) HasRelationship(a, b NodeID) bool {
+func (ga *GraphActor) HasRelationship(a, b NodeID) (bool, error) {
 	var has bool
+	var err error
 
 	ga.do(func(g GraphAPI) {
-		has = g.HasRelationship(a, b)
+		has, err = g.HasRelationship(a, b)
 	})
 
-	return has
+	return has, wrapInterfaceErr(err)
 }
 
 // FindRelationship behaves exactly like the backend's FindRelationship,
@@ -1828,26 +1869,28 @@ func (ga *GraphActor) FindIncoming(to NodeID) (relationships []Relationship, err
 // FindRelationships, routed through ga's dedicated goroutine. If the
 // backend is a RootGraph, its whole overlay computation runs as this one
 // job, so the result is a single consistent snapshot.
-func (ga *GraphActor) FindRelationships() []Relationship {
+func (ga *GraphActor) FindRelationships() ([]Relationship, error) {
 	var relationships []Relationship
+	var err error
 
 	ga.do(func(g GraphAPI) {
-		relationships = g.FindRelationships()
+		relationships, err = g.FindRelationships()
 	})
 
-	return relationships
+	return relationships, wrapInterfaceErr(err)
 }
 
 // FindNodes behaves exactly like the backend's FindNodes, routed through
 // ga's dedicated goroutine.
-func (ga *GraphActor) FindNodes() []NodeID {
+func (ga *GraphActor) FindNodes() ([]NodeID, error) {
 	var ids []NodeID
+	var err error
 
 	ga.do(func(g GraphAPI) {
-		ids = g.FindNodes()
+		ids, err = g.FindNodes()
 	})
 
-	return ids
+	return ids, wrapInterfaceErr(err)
 }
 
 // Transact behaves exactly like the backend's Transact, with fn's entire
