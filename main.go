@@ -2457,7 +2457,15 @@ func (t *boltTxn) deleteEdgeKeys(outKey, inKey []byte) error {
 // AddRelationship adds (a, b); both nodes must exist. Adding an existing
 // relationship reports created == false and records nothing to undo.
 func (t *boltTxn) AddRelationship(a, b NodeID) (created bool, err error) {
-	if !t.NodeExists(a) || !t.NodeExists(b) {
+	existsA, err := t.NodeExists(a)
+	if err != nil {
+		return false, err
+	}
+	existsB, err := t.NodeExists(b)
+	if err != nil {
+		return false, err
+	}
+	if !existsA || !existsB {
 		return false, ErrNodeNotFound
 	}
 
@@ -2482,7 +2490,15 @@ func (t *boltTxn) AddRelationship(a, b NodeID) (created bool, err error) {
 // RemoveRelationship removes (a, b); both nodes must exist. Removing a
 // relationship that is not there reports removed == false.
 func (t *boltTxn) RemoveRelationship(a, b NodeID) (removed bool, err error) {
-	if !t.NodeExists(a) || !t.NodeExists(b) {
+	existsA, err := t.NodeExists(a)
+	if err != nil {
+		return false, err
+	}
+	existsB, err := t.NodeExists(b)
+	if err != nil {
+		return false, err
+	}
+	if !existsA || !existsB {
 		return false, ErrNodeNotFound
 	}
 
@@ -2507,7 +2523,11 @@ func (t *boltTxn) RemoveRelationship(a, b NodeID) (removed bool, err error) {
 // which is a complete restoration for the same reason as Txn.DeleteNode
 // (theorystate.md section 78).
 func (t *boltTxn) DeleteNode(id NodeID) error {
-	if !t.NodeExists(id) {
+	exists, err := t.NodeExists(id)
+	if err != nil {
+		return err
+	}
+	if !exists {
 		return ErrNodeNotFound
 	}
 
@@ -3139,7 +3159,11 @@ func (r *NameRegistry) lookupLive(graph GraphReader, name string) (id NodeID, bo
 	case nameRetired:
 		return 0, false, fmt.Errorf("%w: %q", ErrNameRetired, name)
 	case nameBound:
-		if !graph.NodeExists(rec.id) {
+		exists, existsErr := graph.NodeExists(rec.id)
+		if existsErr != nil {
+			return 0, false, wrapInterfaceErr(existsErr)
+		}
+		if !exists {
 			return 0, false, ErrNameBoundToDeletedNode
 		}
 
@@ -3186,7 +3210,11 @@ func (r *NameRegistry) Bind(graph Transactor, name string, id NodeID) error {
 // registry's maps. alreadyBound reports that name is already bound to
 // exactly id, so binding it again is an idempotent no-op.
 func (r *NameRegistry) checkBind(tx Tx, name string, id NodeID) (alreadyBound bool, err error) {
-	if !tx.NodeExists(id) {
+	exists, err := tx.NodeExists(id)
+	if err != nil {
+		return false, wrapInterfaceErr(err)
+	}
+	if !exists {
 		return false, ErrNodeNotFound
 	}
 
@@ -3541,7 +3569,11 @@ func (r *NameRegistry) VerifyBindings(graph GraphReader) error {
 	sort.Strings(names)
 
 	for _, name := range names {
-		if !graph.NodeExists(bound[name]) {
+		exists, err := graph.NodeExists(bound[name])
+		if err != nil {
+			return wrapInterfaceErr(err)
+		}
+		if !exists {
 			return fmt.Errorf("%w: %q is bound to node %d", ErrNameBoundToDeletedNode, name, bound[name])
 		}
 	}
@@ -4844,7 +4876,11 @@ type PointerRegistry struct {
 // instance -- under any tag -- wires up commit-time enforcement for
 // that specific tag, with no additional per-representation code.
 func NewPointerRegistry(graph GraphAPI, allPointers NodeID) (*PointerRegistry, error) {
-	if !graph.NodeExists(allPointers) {
+	exists, err := graph.NodeExists(allPointers)
+	if err != nil {
+		return nil, wrapInterfaceErr(err)
+	}
+	if !exists {
 		return nil, ErrNodeNotFound
 	}
 
@@ -4972,7 +5008,11 @@ func (p *PointerRegistry) SetTarget(graph Transactor, id, target NodeID) error {
 			return requireErr
 		}
 
-		if !tx.NodeExists(target) {
+		exists, err := tx.NodeExists(target)
+		if err != nil {
+			return wrapInterfaceErr(err)
+		}
+		if !exists {
 			return ErrNodeNotFound
 		}
 
@@ -5250,7 +5290,11 @@ func (b *subjectMetadataBase) locate(graph GraphReader, subject NodeID) (metadat
 // this so that creating the metadata and setting the target are one
 // atomic step: a later failure rolls the metadata creation back too.
 func (b *subjectMetadataBase) ensureMetadataTx(tx txReader, subject NodeID) (metadata, subjectSlot NodeID, err error) {
-	if !tx.NodeExists(subject) {
+	exists, err := tx.NodeExists(subject)
+	if err != nil {
+		return 0, 0, wrapInterfaceErr(err)
+	}
+	if !exists {
 		return 0, 0, ErrNodeNotFound
 	}
 
@@ -5269,7 +5313,11 @@ func (b *subjectMetadataBase) EnsureMetadata(graph Transactor, subject NodeID) (
 // HasMetadata reports whether subject currently has an associated
 // metadata node, regardless of whether a target has been set.
 func (b *subjectMetadataBase) HasMetadata(graph GraphReader, subject NodeID) (bool, error) {
-	if !graph.NodeExists(subject) {
+	exists, err := graph.NodeExists(subject)
+	if err != nil {
+		return false, wrapInterfaceErr(err)
+	}
+	if !exists {
 		return false, ErrNodeNotFound
 	}
 
@@ -5351,11 +5399,19 @@ type PointerMetadataRegistry struct {
 // PointerMetadataRegistryD -- see subjectMetadataBase's doc comment for
 // why this subject-side logic is factored out rather than duplicated.
 func NewPointerMetadataRegistry(graph GraphAPI, allPointerMetadata, allSubjectSlots NodeID) (*PointerMetadataRegistry, error) {
-	if !graph.NodeExists(allPointerMetadata) {
+	existsMetadata, err := graph.NodeExists(allPointerMetadata)
+	if err != nil {
+		return nil, wrapInterfaceErr(err)
+	}
+	if !existsMetadata {
 		return nil, ErrNodeNotFound
 	}
 
-	if !graph.NodeExists(allSubjectSlots) {
+	existsSlots, err := graph.NodeExists(allSubjectSlots)
+	if err != nil {
+		return nil, wrapInterfaceErr(err)
+	}
+	if !existsSlots {
 		return nil, ErrNodeNotFound
 	}
 
@@ -5416,7 +5472,11 @@ func NewPointerMetadataRegistry(graph GraphAPI, allPointerMetadata, allSubjectSl
 // when it has one with no target set yet -- callers that need to
 // distinguish those two cases should use HasMetadata first.
 func (m *PointerMetadataRegistry) Target(graph GraphReader, subject NodeID) (target NodeID, hasTarget bool, err error) {
-	if !graph.NodeExists(subject) {
+	exists, err := graph.NodeExists(subject)
+	if err != nil {
+		return 0, false, wrapInterfaceErr(err)
+	}
+	if !exists {
 		return 0, false, ErrNodeNotFound
 	}
 
@@ -5442,7 +5502,11 @@ func (m *PointerMetadataRegistry) SetTarget(graph Transactor, subject, target No
 	// Creating the metadata (if needed), reading the current target and
 	// replacing it are one atomic step.
 	return wrapInterfaceErr(graph.Transact(func(tx Tx) error {
-		if !tx.NodeExists(target) {
+		exists, err := tx.NodeExists(target)
+		if err != nil {
+			return wrapInterfaceErr(err)
+		}
+		if !exists {
 			return ErrNodeNotFound
 		}
 
@@ -5462,7 +5526,11 @@ func (m *PointerMetadataRegistry) SetTarget(graph Transactor, subject, target No
 // meaningful state, exactly like an empty Pointer in Representation A.
 func (m *PointerMetadataRegistry) RemoveTarget(graph Transactor, subject NodeID) (removed bool, err error) {
 	return transactBool(graph, func(tx Tx) (bool, error) {
-		if !tx.NodeExists(subject) {
+		exists, existsErr := tx.NodeExists(subject)
+		if existsErr != nil {
+			return false, wrapInterfaceErr(existsErr)
+		}
+		if !exists {
 			return false, ErrNodeNotFound
 		}
 
@@ -5545,15 +5613,27 @@ type PointerMetadataRegistryD struct {
 // PointerMetadataRegistry -- see subjectMetadataBase's doc comment for
 // why this subject-side logic is factored out rather than duplicated.
 func NewPointerMetadataRegistryD(graph GraphAPI, allPointerMetadata, allSubjectSlots, allTargetSlots NodeID) (*PointerMetadataRegistryD, error) {
-	if !graph.NodeExists(allPointerMetadata) {
+	existsMetadata, err := graph.NodeExists(allPointerMetadata)
+	if err != nil {
+		return nil, wrapInterfaceErr(err)
+	}
+	if !existsMetadata {
 		return nil, ErrNodeNotFound
 	}
 
-	if !graph.NodeExists(allSubjectSlots) {
+	existsSubjectSlots, err := graph.NodeExists(allSubjectSlots)
+	if err != nil {
+		return nil, wrapInterfaceErr(err)
+	}
+	if !existsSubjectSlots {
 		return nil, ErrNodeNotFound
 	}
 
-	if !graph.NodeExists(allTargetSlots) {
+	existsTargetSlots, err := graph.NodeExists(allTargetSlots)
+	if err != nil {
+		return nil, wrapInterfaceErr(err)
+	}
+	if !existsTargetSlots {
 		return nil, ErrNodeNotFound
 	}
 
@@ -5629,7 +5709,11 @@ func (m *PointerMetadataRegistryD) targetOfMetadata(graph GraphReader, metadata 
 // target set yet -- callers that need to distinguish those cases should
 // use HasMetadata and EnsureMetadata directly.
 func (m *PointerMetadataRegistryD) Target(graph GraphReader, subject NodeID) (target NodeID, hasTarget bool, err error) {
-	if !graph.NodeExists(subject) {
+	exists, err := graph.NodeExists(subject)
+	if err != nil {
+		return 0, false, wrapInterfaceErr(err)
+	}
+	if !exists {
 		return 0, false, ErrNodeNotFound
 	}
 
@@ -5655,7 +5739,11 @@ func (m *PointerMetadataRegistryD) SetTarget(graph Transactor, subject, target N
 	// Creating the metadata and/or target-slot (if needed), reading the
 	// current target and replacing it are one atomic step.
 	return wrapInterfaceErr(graph.Transact(func(tx Tx) error {
-		if !tx.NodeExists(target) {
+		exists, err := tx.NodeExists(target)
+		if err != nil {
+			return wrapInterfaceErr(err)
+		}
+		if !exists {
 			return ErrNodeNotFound
 		}
 
@@ -5692,7 +5780,11 @@ func (m *PointerMetadataRegistryD) SetTarget(graph Transactor, subject, target N
 // at all -- is a valid, meaningful state.
 func (m *PointerMetadataRegistryD) RemoveTarget(graph Transactor, subject NodeID) (removed bool, err error) {
 	return transactBool(graph, func(tx Tx) (bool, error) {
-		if !tx.NodeExists(subject) {
+		exists, existsErr := tx.NodeExists(subject)
+		if existsErr != nil {
+			return false, wrapInterfaceErr(existsErr)
+		}
+		if !exists {
 			return false, ErrNodeNotFound
 		}
 
@@ -5773,7 +5865,11 @@ type CapsuleRegistry struct {
 // allValueSlot, and allNextSlot's existence is checked by the embedded
 // NewPointerRegistry calls; allElementCapsules is checked here.
 func NewCapsuleRegistry(graph GraphAPI, allElementCapsules, allPrevSlot, allValueSlot, allNextSlot NodeID) (*CapsuleRegistry, error) {
-	if !graph.NodeExists(allElementCapsules) {
+	exists, err := graph.NodeExists(allElementCapsules)
+	if err != nil {
+		return nil, wrapInterfaceErr(err)
+	}
+	if !exists {
 		return nil, ErrNodeNotFound
 	}
 
@@ -6028,7 +6124,11 @@ func (c *CapsuleRegistry) removeSlotTarget(graph Transactor, capsule NodeID, slo
 // value must already exist.
 func (c *CapsuleRegistry) NewCapsule(graph Transactor, value NodeID) (NodeID, error) {
 	return transactValue(graph, func(tx Tx) (NodeID, error) {
-		if !tx.NodeExists(value) {
+		exists, err := tx.NodeExists(value)
+		if err != nil {
+			return 0, wrapInterfaceErr(err)
+		}
+		if !exists {
 			return 0, ErrNodeNotFound
 		}
 
@@ -6402,15 +6502,27 @@ type ListRegistry struct {
 // NameRegistry.BootstrapNames(FoundationalNames). capsules must already
 // be constructed over the same graph.
 func NewListRegistry(graph GraphAPI, capsules *CapsuleRegistry, allLists, allHeads, allTails NodeID) (*ListRegistry, error) {
-	if !graph.NodeExists(allLists) {
+	existsLists, err := graph.NodeExists(allLists)
+	if err != nil {
+		return nil, wrapInterfaceErr(err)
+	}
+	if !existsLists {
 		return nil, ErrNodeNotFound
 	}
 
-	if !graph.NodeExists(allHeads) {
+	existsHeads, err := graph.NodeExists(allHeads)
+	if err != nil {
+		return nil, wrapInterfaceErr(err)
+	}
+	if !existsHeads {
 		return nil, ErrNodeNotFound
 	}
 
-	if !graph.NodeExists(allTails) {
+	existsTails, err := graph.NodeExists(allTails)
+	if err != nil {
+		return nil, wrapInterfaceErr(err)
+	}
+	if !existsTails {
 		return nil, ErrNodeNotFound
 	}
 
@@ -6489,7 +6601,11 @@ func (l *ListRegistry) requireListValue(graph GraphReader, list, value NodeID) e
 		return requireErr
 	}
 
-	if !graph.NodeExists(value) {
+	exists, err := graph.NodeExists(value)
+	if err != nil {
+		return wrapInterfaceErr(err)
+	}
+	if !exists {
 		return ErrNodeNotFound
 	}
 
@@ -6705,7 +6821,11 @@ func (l *ListRegistry) InsertAfter(graph Transactor, list, afterCapsule, value N
 			return 0, requireErr
 		}
 
-		if !tx.HasRelationship(list, afterCapsule) {
+		inList, err := tx.HasRelationship(list, afterCapsule)
+		if err != nil {
+			return 0, wrapInterfaceErr(err)
+		}
+		if !inList {
 			return 0, ErrCapsuleNotInList
 		}
 
@@ -7074,7 +7194,11 @@ func (l *ListRegistry) RemoveWithoutDeletingCapsule(graph Transactor, list, caps
 			return requireErr
 		}
 
-		if !tx.HasRelationship(list, capsule) {
+		inList, err := tx.HasRelationship(list, capsule)
+		if err != nil {
+			return wrapInterfaceErr(err)
+		}
+		if !inList {
 			return ErrCapsuleNotInList
 		}
 
@@ -7312,12 +7436,20 @@ type SetRegistry struct {
 // which is only appropriate if no other Set representation exists in the
 // calling program yet.
 func NewSetRegistry(graph GraphAPI, allSets NodeID, otherSetTags ...NodeID) (*SetRegistry, error) {
-	if !graph.NodeExists(allSets) {
+	existsSets, err := graph.NodeExists(allSets)
+	if err != nil {
+		return nil, wrapInterfaceErr(err)
+	}
+	if !existsSets {
 		return nil, ErrNodeNotFound
 	}
 
 	for _, tag := range otherSetTags {
-		if !graph.NodeExists(tag) {
+		exists, tagErr := graph.NodeExists(tag)
+		if tagErr != nil {
+			return nil, wrapInterfaceErr(tagErr)
+		}
+		if !exists {
 			return nil, ErrNodeNotFound
 		}
 	}
@@ -7348,7 +7480,11 @@ func (s *SetRegistry) requireSetMember(graph GraphReader, set, member NodeID) er
 		return requireErr
 	}
 
-	if !graph.NodeExists(member) {
+	exists, err := graph.NodeExists(member)
+	if err != nil {
+		return wrapInterfaceErr(err)
+	}
+	if !exists {
 		return ErrNodeNotFound
 	}
 
@@ -7379,12 +7515,20 @@ func (s *SetRegistry) NewSet(graph Transactor) (NodeID, error) {
 // them.
 func (s *SetRegistry) TagAsSet(graph Transactor, id NodeID) error {
 	return wrapInterfaceErr(graph.Transact(func(tx Tx) error {
-		if !tx.NodeExists(id) {
+		exists, err := tx.NodeExists(id)
+		if err != nil {
+			return wrapInterfaceErr(err)
+		}
+		if !exists {
 			return ErrNodeNotFound
 		}
 
 		for _, tag := range s.otherSetTags {
-			if tx.HasRelationship(tag, id) {
+			conflict, conflictErr := tx.HasRelationship(tag, id)
+			if conflictErr != nil {
+				return wrapInterfaceErr(conflictErr)
+			}
+			if conflict {
 				return ErrSetRepresentationConflict
 			}
 		}
@@ -7960,7 +8104,11 @@ type CompositeSetRegistry struct {
 // constructor parameter.
 func NewCompositeSetRegistry(graph GraphAPI, sets *SetRegistry, allCompositeSets, allAdditiveOp, allSubtractiveOp, allScalarOperand, allSetOperand NodeID) (*CompositeSetRegistry, error) {
 	for _, tag := range []NodeID{allCompositeSets, allAdditiveOp, allSubtractiveOp, allScalarOperand, allSetOperand} {
-		if !graph.NodeExists(tag) {
+		exists, err := graph.NodeExists(tag)
+		if err != nil {
+			return nil, wrapInterfaceErr(err)
+		}
+		if !exists {
 			return nil, ErrNodeNotFound
 		}
 	}
@@ -8204,7 +8352,11 @@ func (c *CompositeSetRegistry) RemoveOperand(graph Transactor, set, u NodeID) er
 			return requireErr
 		}
 
-		if !tx.HasRelationship(set, u) {
+		inSet, err := tx.HasRelationship(set, u)
+		if err != nil {
+			return wrapInterfaceErr(err)
+		}
+		if !inSet {
 			return ErrOperandNotInCompositeSet
 		}
 
@@ -8577,7 +8729,11 @@ type CompositeSetLogRegistry struct {
 // for why this second wiring step is required.
 func NewCompositeSetLogRegistry(graph GraphAPI, lists *ListRegistry, composites *CompositeSetRegistry, allCompositeSetLogs, allAdditiveOp, allSubtractiveOp, allScalarOperand, allSetOperand NodeID) (*CompositeSetLogRegistry, error) {
 	for _, tag := range []NodeID{allCompositeSetLogs, allAdditiveOp, allSubtractiveOp, allScalarOperand, allSetOperand} {
-		if !graph.NodeExists(tag) {
+		exists, err := graph.NodeExists(tag)
+		if err != nil {
+			return nil, wrapInterfaceErr(err)
+		}
+		if !exists {
 			return nil, ErrNodeNotFound
 		}
 	}
@@ -8701,7 +8857,11 @@ func (c *CompositeSetLogRegistry) RemoveOperation(graph Transactor, log, capsule
 			return requireErr
 		}
 
-		if !tx.HasRelationship(log, capsule) {
+		inLog, err := tx.HasRelationship(log, capsule)
+		if err != nil {
+			return wrapInterfaceErr(err)
+		}
+		if !inLog {
 			return ErrCapsuleNotInList
 		}
 
@@ -9150,7 +9310,11 @@ func (d *domainConstraint) attachDomain(graph Transactor, anchor, domain NodeID)
 // Pointer elsewhere in this file.
 func (d *domainConstraint) RemoveDomain(graph Transactor, anchor NodeID) (removed bool, err error) {
 	return transactBool(graph, func(tx Tx) (bool, error) {
-		if !tx.NodeExists(anchor) {
+		exists, existsErr := tx.NodeExists(anchor)
+		if existsErr != nil {
+			return false, wrapInterfaceErr(existsErr)
+		}
+		if !exists {
 			return false, ErrNodeNotFound
 		}
 
@@ -9629,7 +9793,11 @@ func (b *DomainPointerRegistryB) subPointer(graph GraphReader, anchor NodeID) (u
 // sub-pointer yet" and each mint one.
 func (b *DomainPointerRegistryB) NewDomainPointer(graph Transactor, anchor NodeID) error {
 	return wrapInterfaceErr(graph.Transact(func(tx Tx) error {
-		if !tx.NodeExists(anchor) {
+		exists, err := tx.NodeExists(anchor)
+		if err != nil {
+			return wrapInterfaceErr(err)
+		}
+		if !exists {
 			return ErrNodeNotFound
 		}
 
@@ -9672,7 +9840,11 @@ func (b *DomainPointerRegistryB) SetTarget(graph Transactor, anchor, target Node
 	// The domain check and the write see the same state, so a domain
 	// change cannot slip in between.
 	return wrapInterfaceErr(graph.Transact(func(tx Tx) error {
-		if !tx.NodeExists(target) {
+		exists, err := tx.NodeExists(target)
+		if err != nil {
+			return wrapInterfaceErr(err)
+		}
+		if !exists {
 			return ErrNodeNotFound
 		}
 
@@ -9810,7 +9982,11 @@ func (d *DomainPointerRegistryD) Target(graph GraphReader, subject NodeID) (targ
 func (d *DomainPointerRegistryD) SetTarget(graph Transactor, subject, target NodeID) error {
 	// The domain check and the write see the same state.
 	return wrapInterfaceErr(graph.Transact(func(tx Tx) error {
-		if !tx.NodeExists(target) {
+		exists, err := tx.NodeExists(target)
+		if err != nil {
+			return wrapInterfaceErr(err)
+		}
+		if !exists {
 			return ErrNodeNotFound
 		}
 
