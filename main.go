@@ -1418,12 +1418,16 @@ func runCheckersOver(checkers []Checker, view GraphReader, touched map[NodeID]st
 	}
 
 	for _, checker := range checkers {
-		if !checkerRelevant(view, checker, touched) {
+		relevant, err := checkerRelevant(view, checker, touched)
+		if err != nil {
+			return err
+		}
+		if !relevant {
 			continue
 		}
 
-		if err := checker.Check(view, touched); err != nil {
-			return fmt.Errorf("%s: %w", checker.Name, err)
+		if checkErr := checker.Check(view, touched); checkErr != nil {
+			return fmt.Errorf("%s: %w", checker.Name, checkErr)
 		}
 	}
 
@@ -1446,16 +1450,20 @@ func runCheckersOver(checkers []Checker, view GraphReader, touched map[NodeID]st
 // code -- not just *Graph's own runCheckers (theorystate.md section 95:
 // Checker's contract, and therefore this relevance filter alongside it,
 // is stated backend-neutrally).
-func checkerRelevant(view GraphReader, checker Checker, touched map[NodeID]struct{}) bool {
+func checkerRelevant(view GraphReader, checker Checker, touched map[NodeID]struct{}) (bool, error) {
 	for _, tag := range checker.Tags {
 		for node := range touched {
-			if view.HasRelationship(tag, node) {
-				return true
+			has, err := view.HasRelationship(tag, node)
+			if err != nil {
+				return false, wrapInterfaceErr(err)
+			}
+			if has {
+				return true, nil
 			}
 		}
 	}
 
-	return false
+	return false, nil
 }
 
 // nodePager is implemented by a GraphReader that can list a bounded page of
@@ -4709,11 +4717,19 @@ outer:
 // CompositeSetLogRegistry.requireLog -- each differing only in which tag
 // NodeID and which dedicated ErrNotX sentinel it returned.
 func requireTagged(graph GraphReader, id, tag NodeID, notTaggedErr error) error {
-	if !graph.NodeExists(id) {
+	exists, err := graph.NodeExists(id)
+	if err != nil {
+		return wrapInterfaceErr(err)
+	}
+	if !exists {
 		return ErrNodeNotFound
 	}
 
-	if !graph.HasRelationship(tag, id) {
+	has, err := graph.HasRelationship(tag, id)
+	if err != nil {
+		return wrapInterfaceErr(err)
+	}
+	if !has {
 		return notTaggedErr
 	}
 
@@ -5041,14 +5057,20 @@ func findUniqueTaggedParent(g GraphReader, node, tag NodeID) (parent NodeID, fou
 	}
 
 	for _, rel := range incoming {
-		if g.HasRelationship(tag, rel.From) {
-			if found {
-				return 0, false, ErrAmbiguousPointerMetadata
-			}
-
-			parent = rel.From
-			found = true
+		has, hasErr := g.HasRelationship(tag, rel.From)
+		if hasErr != nil {
+			return 0, false, wrapInterfaceErr(hasErr)
 		}
+		if !has {
+			continue
+		}
+
+		if found {
+			return 0, false, ErrAmbiguousPointerMetadata
+		}
+
+		parent = rel.From
+		found = true
 	}
 
 	return parent, found, nil
@@ -5076,14 +5098,20 @@ func findUniqueTaggedChild(g GraphReader, node, tag NodeID) (child NodeID, found
 	}
 
 	for _, rel := range outgoing {
-		if g.HasRelationship(tag, rel.To) {
-			if found {
-				return 0, false, ErrAmbiguousPointerMetadata
-			}
-
-			child = rel.To
-			found = true
+		has, hasErr := g.HasRelationship(tag, rel.To)
+		if hasErr != nil {
+			return 0, false, wrapInterfaceErr(hasErr)
 		}
+		if !has {
+			continue
+		}
+
+		if found {
+			return 0, false, ErrAmbiguousPointerMetadata
+		}
+
+		child = rel.To
+		found = true
 	}
 
 	return child, found, nil
@@ -5102,8 +5130,15 @@ func findUniqueTaggedChild(g GraphReader, node, tag NodeID) (child NodeID, found
 // with exactly one tag per axis -- ErrInvalidOperandDescriptor is
 // returned instead of guessing.
 func exactlyOneTag(g GraphReader, node, tagA, tagB NodeID) (isA bool, err error) {
-	hasA := g.HasRelationship(tagA, node)
-	hasB := g.HasRelationship(tagB, node)
+	hasA, err := g.HasRelationship(tagA, node)
+	if err != nil {
+		return false, wrapInterfaceErr(err)
+	}
+
+	hasB, err := g.HasRelationship(tagB, node)
+	if err != nil {
+		return false, wrapInterfaceErr(err)
+	}
 
 	switch {
 	case hasA && !hasB:
