@@ -4863,7 +4863,11 @@ func NewPointerRegistry(graph GraphAPI, allPointers NodeID) (*PointerRegistry, e
 		Tags: []NodeID{allPointers},
 		Check: func(g GraphReader, touched map[NodeID]struct{}) error {
 			for node := range touched {
-				if !g.HasRelationship(allPointers, node) {
+				tagged, taggedErr := g.HasRelationship(allPointers, node)
+				if taggedErr != nil {
+					return wrapInterfaceErr(taggedErr)
+				}
+				if !tagged {
 					continue
 				}
 
@@ -4886,8 +4890,9 @@ func NewPointerRegistry(graph GraphAPI, allPointers NodeID) (*PointerRegistry, e
 // PointerRegistry doc comment) -- passing the wrong graph value here is
 // a caller error at the call site, not a hidden footgun inside this
 // type.
-func (p *PointerRegistry) IsPointer(graph GraphReader, id NodeID) bool {
-	return graph.HasRelationship(p.allPointers, id)
+func (p *PointerRegistry) IsPointer(graph GraphReader, id NodeID) (bool, error) {
+	has, err := graph.HasRelationship(p.allPointers, id)
+	return has, wrapInterfaceErr(err)
 }
 
 // currentTarget returns P's current single target, re-derived fresh from
@@ -5372,7 +5377,11 @@ func NewPointerMetadataRegistry(graph GraphAPI, allPointerMetadata, allSubjectSl
 		Tags: []NodeID{allPointerMetadata},
 		Check: func(g GraphReader, touched map[NodeID]struct{}) error {
 			for node := range touched {
-				if !g.HasRelationship(allPointerMetadata, node) {
+				tagged, taggedErr := g.HasRelationship(allPointerMetadata, node)
+				if taggedErr != nil {
+					return wrapInterfaceErr(taggedErr)
+				}
+				if !tagged {
 					continue
 				}
 
@@ -5384,8 +5393,8 @@ func NewPointerMetadataRegistry(graph GraphAPI, allPointerMetadata, allSubjectSl
 					continue
 				}
 
-				if _, _, err = singleChildTarget(g, node, slot); err != nil {
-					return err
+				if _, _, targetErr := singleChildTarget(g, node, slot); targetErr != nil {
+					return targetErr
 				}
 			}
 
@@ -5561,7 +5570,11 @@ func NewPointerMetadataRegistryD(graph GraphAPI, allPointerMetadata, allSubjectS
 		Tags: []NodeID{allTargetSlots},
 		Check: func(g GraphReader, touched map[NodeID]struct{}) error {
 			for node := range touched {
-				if !g.HasRelationship(allTargetSlots, node) {
+				tagged, taggedErr := g.HasRelationship(allTargetSlots, node)
+				if taggedErr != nil {
+					return wrapInterfaceErr(taggedErr)
+				}
+				if !tagged {
 					continue
 				}
 
@@ -5800,7 +5813,11 @@ func NewCapsuleRegistry(graph GraphAPI, allElementCapsules, allPrevSlot, allValu
 		Tags: []NodeID{allElementCapsules},
 		Check: func(g GraphReader, touched map[NodeID]struct{}) error {
 			for node := range touched {
-				if !g.HasRelationship(allElementCapsules, node) {
+				tagged, taggedErr := g.HasRelationship(allElementCapsules, node)
+				if taggedErr != nil {
+					return wrapInterfaceErr(taggedErr)
+				}
+				if !tagged {
 					continue
 				}
 
@@ -5818,8 +5835,9 @@ func NewCapsuleRegistry(graph GraphAPI, allElementCapsules, allPrevSlot, allValu
 
 // IsCapsule reports whether id is currently tagged
 // (AllElementCapsules, id).
-func (c *CapsuleRegistry) IsCapsule(graph GraphReader, id NodeID) bool {
-	return graph.HasRelationship(c.allElementCapsules, id)
+func (c *CapsuleRegistry) IsCapsule(graph GraphReader, id NodeID) (bool, error) {
+	has, err := graph.HasRelationship(c.allElementCapsules, id)
+	return has, wrapInterfaceErr(err)
 }
 
 // requireCapsule checks that id exists and is tagged
@@ -5883,21 +5901,25 @@ func (c *CapsuleRegistry) slotFor(graph GraphReader, capsule, tag NodeID) (slot 
 // own doc comment) -- a pre-check here would only be redundant work for
 // that specific caller, not a missed reuse opportunity.
 func (c *CapsuleRegistry) wellFormed(graph GraphReader, capsule NodeID) error {
-	if !c.IsCapsule(graph, capsule) {
+	isCapsule, err := c.IsCapsule(graph, capsule)
+	if err != nil {
+		return err
+	}
+	if !isCapsule {
 		return ErrNotCapsule
 	}
 
 	for _, slots := range []*PointerRegistry{c.prevSlots, c.valueSlots, c.nextSlots} {
-		slot, found, err := c.slotFor(graph, capsule, slots.allPointers)
-		if err != nil {
-			return err
+		slot, found, slotErr := c.slotFor(graph, capsule, slots.allPointers)
+		if slotErr != nil {
+			return slotErr
 		}
 		if !found {
 			return ErrNotCapsule
 		}
 
-		if _, _, err = slots.Target(graph, slot); err != nil {
-			return err
+		if _, _, targetErr := slots.Target(graph, slot); targetErr != nil {
+			return targetErr
 		}
 	}
 
@@ -6130,13 +6152,17 @@ func (c *CapsuleRegistry) CapsulesWithValue(graph GraphReader, value NodeID) ([]
 	for _, rel := range incoming {
 		slot := rel.From
 
-		if !c.valueSlots.IsPointer(graph, slot) {
+		isValueSlot, isSlotErr := c.valueSlots.IsPointer(graph, slot)
+		if isSlotErr != nil {
+			return nil, isSlotErr
+		}
+		if !isValueSlot {
 			continue
 		}
 
-		capsule, found, err := findUniqueTaggedParent(graph, slot, c.allElementCapsules)
-		if err != nil {
-			return nil, err
+		capsule, found, findErr := findUniqueTaggedParent(graph, slot, c.allElementCapsules)
+		if findErr != nil {
+			return nil, findErr
 		}
 		if !found {
 			continue
@@ -6422,7 +6448,11 @@ func NewListRegistry(graph GraphAPI, capsules *CapsuleRegistry, allLists, allHea
 		Tags: []NodeID{allLists},
 		Check: func(g GraphReader, touched map[NodeID]struct{}) error {
 			for node := range touched {
-				if !g.HasRelationship(allLists, node) {
+				tagged, taggedErr := g.HasRelationship(allLists, node)
+				if taggedErr != nil {
+					return wrapInterfaceErr(taggedErr)
+				}
+				if !tagged {
 					continue
 				}
 
@@ -6439,8 +6469,9 @@ func NewListRegistry(graph GraphAPI, capsules *CapsuleRegistry, allLists, allHea
 }
 
 // IsList reports whether id is currently tagged (AllLists, id).
-func (l *ListRegistry) IsList(graph GraphReader, id NodeID) bool {
-	return graph.HasRelationship(l.allLists, id)
+func (l *ListRegistry) IsList(graph GraphReader, id NodeID) (bool, error) {
+	has, err := graph.HasRelationship(l.allLists, id)
+	return has, wrapInterfaceErr(err)
 }
 
 // requireList checks that list exists and is tagged (AllLists, list),
@@ -6476,11 +6507,19 @@ func (l *ListRegistry) NewList(graph Transactor) (NodeID, error) {
 // Head returns list's current head capsule, if any. hasHead is false for
 // an empty list.
 func (l *ListRegistry) Head(graph GraphReader, list NodeID) (head NodeID, hasHead bool, err error) {
-	if !graph.NodeExists(list) {
+	exists, err := graph.NodeExists(list)
+	if err != nil {
+		return 0, false, wrapInterfaceErr(err)
+	}
+	if !exists {
 		return 0, false, ErrNodeNotFound
 	}
 
-	if !l.IsList(graph, list) {
+	isList, err := l.IsList(graph, list)
+	if err != nil {
+		return 0, false, err
+	}
+	if !isList {
 		return 0, false, ErrNotList
 	}
 
@@ -6488,7 +6527,16 @@ func (l *ListRegistry) Head(graph GraphReader, list NodeID) (head NodeID, hasHea
 	if err != nil || !found {
 		return head, found, err
 	}
-	if !l.capsules.IsCapsule(graph, head) || !graph.HasRelationship(list, head) {
+
+	isCapsule, err := l.capsules.IsCapsule(graph, head)
+	if err != nil {
+		return 0, false, err
+	}
+	hasEdge, err := graph.HasRelationship(list, head)
+	if err != nil {
+		return 0, false, wrapInterfaceErr(err)
+	}
+	if !isCapsule || !hasEdge {
 		return 0, false, ErrInvalidListStructure
 	}
 	return head, true, nil
@@ -6497,11 +6545,19 @@ func (l *ListRegistry) Head(graph GraphReader, list NodeID) (head NodeID, hasHea
 // Tail returns list's current tail capsule, if any. hasTail is false for
 // an empty list.
 func (l *ListRegistry) Tail(graph GraphReader, list NodeID) (tail NodeID, hasTail bool, err error) {
-	if !graph.NodeExists(list) {
+	exists, err := graph.NodeExists(list)
+	if err != nil {
+		return 0, false, wrapInterfaceErr(err)
+	}
+	if !exists {
 		return 0, false, ErrNodeNotFound
 	}
 
-	if !l.IsList(graph, list) {
+	isList, err := l.IsList(graph, list)
+	if err != nil {
+		return 0, false, err
+	}
+	if !isList {
 		return 0, false, ErrNotList
 	}
 
@@ -6509,7 +6565,16 @@ func (l *ListRegistry) Tail(graph GraphReader, list NodeID) (tail NodeID, hasTai
 	if err != nil || !found {
 		return tail, found, err
 	}
-	if !l.capsules.IsCapsule(graph, tail) || !graph.HasRelationship(list, tail) {
+
+	isCapsule, err := l.capsules.IsCapsule(graph, tail)
+	if err != nil {
+		return 0, false, err
+	}
+	hasEdge, err := graph.HasRelationship(list, tail)
+	if err != nil {
+		return 0, false, wrapInterfaceErr(err)
+	}
+	if !isCapsule || !hasEdge {
 		return 0, false, ErrInvalidListStructure
 	}
 	return tail, true, nil
@@ -6716,7 +6781,11 @@ func (l *ListRegistry) validateStructure(graph GraphReader, list NodeID) error {
 
 	members := make(map[NodeID]struct{})
 	for _, rel := range outgoing {
-		if l.capsules.IsCapsule(graph, rel.To) {
+		isMember, memberErr := l.capsules.IsCapsule(graph, rel.To)
+		if memberErr != nil {
+			return memberErr
+		}
+		if isMember {
 			members[rel.To] = struct{}{}
 		}
 	}
@@ -6728,7 +6797,15 @@ func (l *ListRegistry) validateStructure(graph GraphReader, list NodeID) error {
 		return nil
 	}
 
-	if !l.capsules.IsCapsule(graph, head) || !l.capsules.IsCapsule(graph, tail) {
+	headIsCapsule, err := l.capsules.IsCapsule(graph, head)
+	if err != nil {
+		return err
+	}
+	tailIsCapsule, err := l.capsules.IsCapsule(graph, tail)
+	if err != nil {
+		return err
+	}
+	if !headIsCapsule || !tailIsCapsule {
 		return ErrInvalidListStructure
 	}
 	if _, ok := members[head]; !ok {
@@ -6746,21 +6823,33 @@ func (l *ListRegistry) validateStructure(graph GraphReader, list NodeID) error {
 		}
 		visited[current] = struct{}{}
 
-		if !l.capsules.IsCapsule(graph, current) {
-			return ErrInvalidListStructure
+		currentIsCapsule, currentIsCapsuleErr := l.capsules.IsCapsule(graph, current)
+		if currentIsCapsuleErr != nil {
+			return currentIsCapsuleErr
 		}
-		if !graph.HasRelationship(list, current) {
-			return ErrInvalidListStructure
-		}
-		if _, hasValue, err := l.capsules.Value(graph, current); err != nil {
-			return err
-		} else if !hasValue {
+		if !currentIsCapsule {
 			return ErrInvalidListStructure
 		}
 
-		next, hasNext, err := l.capsules.Next(graph, current)
-		if err != nil {
-			return err
+		currentInList, currentInListErr := graph.HasRelationship(list, current)
+		if currentInListErr != nil {
+			return wrapInterfaceErr(currentInListErr)
+		}
+		if !currentInList {
+			return ErrInvalidListStructure
+		}
+
+		_, hasValue, valueErr := l.capsules.Value(graph, current)
+		if valueErr != nil {
+			return valueErr
+		}
+		if !hasValue {
+			return ErrInvalidListStructure
+		}
+
+		next, hasNext, nextErr := l.capsules.Next(graph, current)
+		if nextErr != nil {
+			return nextErr
 		}
 		if !hasNext {
 			if current != tail {
@@ -6769,12 +6858,21 @@ func (l *ListRegistry) validateStructure(graph GraphReader, list NodeID) error {
 			break
 		}
 
-		if !l.capsules.IsCapsule(graph, next) || !graph.HasRelationship(list, next) {
+		nextIsCapsule, nextIsCapsuleErr := l.capsules.IsCapsule(graph, next)
+		if nextIsCapsuleErr != nil {
+			return nextIsCapsuleErr
+		}
+		nextInList, nextInListErr := graph.HasRelationship(list, next)
+		if nextInListErr != nil {
+			return wrapInterfaceErr(nextInListErr)
+		}
+		if !nextIsCapsule || !nextInList {
 			return ErrInvalidListStructure
 		}
-		prev, hasPrev, err := l.capsules.Prev(graph, next)
-		if err != nil {
-			return err
+
+		prev, hasPrev, prevErr := l.capsules.Prev(graph, next)
+		if prevErr != nil {
+			return prevErr
 		}
 		if !hasPrev || prev != current {
 			return ErrInvalidListStructure
@@ -6783,9 +6881,11 @@ func (l *ListRegistry) validateStructure(graph GraphReader, list NodeID) error {
 		current = next
 	}
 
-	if _, hasPrev, err := l.capsules.Prev(graph, head); err != nil {
+	_, headHasPrev, err := l.capsules.Prev(graph, head)
+	if err != nil {
 		return err
-	} else if hasPrev {
+	}
+	if headHasPrev {
 		return ErrInvalidListStructure
 	}
 
@@ -6800,15 +6900,24 @@ func (l *ListRegistry) validateStructure(graph GraphReader, list NodeID) error {
 // the list structure so out-of-band mutations cannot turn a corrupted
 // chain into a silently accepted partial or cross-list traversal.
 func (l *ListRegistry) Elements(graph GraphReader, list NodeID) ([]NodeID, error) {
-	if !graph.NodeExists(list) {
+	exists, err := graph.NodeExists(list)
+	if err != nil {
+		return nil, wrapInterfaceErr(err)
+	}
+	if !exists {
 		return nil, ErrNodeNotFound
 	}
 
-	if !l.IsList(graph, list) {
+	isList, err := l.IsList(graph, list)
+	if err != nil {
+		return nil, err
+	}
+	if !isList {
 		return nil, ErrNotList
 	}
 
-	if err := l.validateStructure(graph, list); err != nil {
+	err = l.validateStructure(graph, list)
+	if err != nil {
 		return nil, err
 	}
 
@@ -6865,11 +6974,19 @@ func (l *ListRegistry) Elements(graph GraphReader, list NodeID) ([]NodeID, error
 // exist, this fails with ErrNodeNotFound, via
 // CapsuleRegistry.CapsulesWithValue.
 func (l *ListRegistry) OccurrencesOf(graph GraphReader, list, value NodeID) ([]NodeID, error) {
-	if !graph.NodeExists(list) {
+	exists, err := graph.NodeExists(list)
+	if err != nil {
+		return nil, wrapInterfaceErr(err)
+	}
+	if !exists {
 		return nil, ErrNodeNotFound
 	}
 
-	if !l.IsList(graph, list) {
+	isList, err := l.IsList(graph, list)
+	if err != nil {
+		return nil, err
+	}
+	if !isList {
 		return nil, ErrNotList
 	}
 
@@ -6881,7 +6998,11 @@ func (l *ListRegistry) OccurrencesOf(graph GraphReader, list, value NodeID) ([]N
 	var occurrences []NodeID
 
 	for _, capsule := range candidates {
-		if graph.HasRelationship(list, capsule) {
+		inList, inListErr := graph.HasRelationship(list, capsule)
+		if inListErr != nil {
+			return nil, wrapInterfaceErr(inListErr)
+		}
+		if inList {
 			occurrences = append(occurrences, capsule)
 		}
 	}
@@ -7208,8 +7329,9 @@ func NewSetRegistry(graph GraphAPI, allSets NodeID, otherSetTags ...NodeID) (*Se
 }
 
 // IsSet reports whether id is currently tagged (AllSets, id).
-func (s *SetRegistry) IsSet(graph GraphReader, id NodeID) bool {
-	return graph.HasRelationship(s.allSets, id)
+func (s *SetRegistry) IsSet(graph GraphReader, id NodeID) (bool, error) {
+	has, err := graph.HasRelationship(s.allSets, id)
+	return has, wrapInterfaceErr(err)
 }
 
 // requireSet checks that set exists and is tagged (AllSets, set),
@@ -7317,19 +7439,32 @@ func (s *SetRegistry) Remove(graph Transactor, set, member NodeID) (removed bool
 
 // Contains reports whether member currently belongs to set.
 func (s *SetRegistry) Contains(graph GraphReader, set, member NodeID) (bool, error) {
-	if !graph.NodeExists(set) {
+	existsSet, err := graph.NodeExists(set)
+	if err != nil {
+		return false, wrapInterfaceErr(err)
+	}
+	if !existsSet {
 		return false, ErrNodeNotFound
 	}
 
-	if !s.IsSet(graph, set) {
+	isSet, err := s.IsSet(graph, set)
+	if err != nil {
+		return false, err
+	}
+	if !isSet {
 		return false, ErrNotSet
 	}
 
-	if !graph.NodeExists(member) {
+	existsMember, err := graph.NodeExists(member)
+	if err != nil {
+		return false, wrapInterfaceErr(err)
+	}
+	if !existsMember {
 		return false, ErrNodeNotFound
 	}
 
-	return graph.HasRelationship(set, member), nil
+	has, err := graph.HasRelationship(set, member)
+	return has, wrapInterfaceErr(err)
 }
 
 // Members returns every current member of set, i.e. every direct child of
@@ -7338,11 +7473,19 @@ func (s *SetRegistry) Contains(graph GraphReader, set, member NodeID) (bool, err
 // This does NOT recurse into any member that happens to itself be tagged
 // Set-kind -- see the SetRegistry doc comment.
 func (s *SetRegistry) Members(graph GraphReader, set NodeID) ([]NodeID, error) {
-	if !graph.NodeExists(set) {
+	exists, err := graph.NodeExists(set)
+	if err != nil {
+		return nil, wrapInterfaceErr(err)
+	}
+	if !exists {
 		return nil, ErrNodeNotFound
 	}
 
-	if !s.IsSet(graph, set) {
+	isSet, err := s.IsSet(graph, set)
+	if err != nil {
+		return nil, err
+	}
+	if !isSet {
 		return nil, ErrNotSet
 	}
 
@@ -7537,17 +7680,34 @@ func operandTargetGeneric(graph GraphReader, u NodeID) (operand NodeID, err erro
 // (via logs). Shared by CompositeSetRegistry.AddOperand and
 // CompositeSetLogRegistry.AppendOperation's identical expand-time
 // validation.
-func operandCarriesKnownSetTag(graph GraphReader, sets *SetRegistry, composites *CompositeSetRegistry, logs *CompositeSetLogRegistry, operand NodeID) bool {
-	if sets.IsSet(graph, operand) {
-		return true
+func operandCarriesKnownSetTag(graph GraphReader, sets *SetRegistry, composites *CompositeSetRegistry, logs *CompositeSetLogRegistry, operand NodeID) (bool, error) {
+	isSet, err := sets.IsSet(graph, operand)
+	if err != nil {
+		return false, err
 	}
-	if composites.IsCompositeSet(graph, operand) {
-		return true
+	if isSet {
+		return true, nil
 	}
-	if logs != nil && logs.IsCompositeSetLog(graph, operand) {
-		return true
+
+	isComposite, err := composites.IsCompositeSet(graph, operand)
+	if err != nil {
+		return false, err
 	}
-	return false
+	if isComposite {
+		return true, nil
+	}
+
+	if logs != nil {
+		isLog, logErr := logs.IsCompositeSetLog(graph, operand)
+		if logErr != nil {
+			return false, logErr
+		}
+		if isLog {
+			return true, nil
+		}
+	}
+
+	return false, nil
 }
 
 // requireOperand checks, against graph, that operand exists and -- when
@@ -7557,12 +7717,22 @@ func operandCarriesKnownSetTag(graph GraphReader, sets *SetRegistry, composites 
 // CompositeSetLogRegistry.AppendOperation, which validate an operand
 // identically (theorystate.md section 80).
 func requireOperand(graph GraphReader, sets *SetRegistry, composites *CompositeSetRegistry, logs *CompositeSetLogRegistry, operand NodeID, expand bool) error {
-	if !graph.NodeExists(operand) {
+	exists, err := graph.NodeExists(operand)
+	if err != nil {
+		return wrapInterfaceErr(err)
+	}
+	if !exists {
 		return ErrNodeNotFound
 	}
 
-	if expand && !operandCarriesKnownSetTag(graph, sets, composites, logs, operand) {
-		return ErrInvalidSetOperand
+	if expand {
+		known, knownErr := operandCarriesKnownSetTag(graph, sets, composites, logs, operand)
+		if knownErr != nil {
+			return knownErr
+		}
+		if !known {
+			return ErrInvalidSetOperand
+		}
 	}
 
 	return nil
@@ -7580,19 +7750,33 @@ func requireOperand(graph GraphReader, sets *SetRegistry, composites *CompositeS
 // resolveSetOperandGeneric, no visited-set threading is needed here --
 // there is nothing for this function itself to recurse into.
 func domainContainsGeneric(graph GraphReader, sets *SetRegistry, composites *CompositeSetRegistry, logs *CompositeSetLogRegistry, domain, value NodeID) (bool, error) {
-	switch {
-	case sets.IsSet(graph, domain):
-		return sets.Contains(graph, domain, value)
-
-	case composites.IsCompositeSet(graph, domain):
-		return composites.Contains(graph, domain, value)
-
-	case logs != nil && logs.IsCompositeSetLog(graph, domain):
-		return logs.Contains(graph, domain, value)
-
-	default:
-		return false, ErrInvalidSetOperand
+	isSet, err := sets.IsSet(graph, domain)
+	if err != nil {
+		return false, err
 	}
+	if isSet {
+		return sets.Contains(graph, domain, value)
+	}
+
+	isComposite, err := composites.IsCompositeSet(graph, domain)
+	if err != nil {
+		return false, err
+	}
+	if isComposite {
+		return composites.Contains(graph, domain, value)
+	}
+
+	if logs != nil {
+		isLog, logErr := logs.IsCompositeSetLog(graph, domain)
+		if logErr != nil {
+			return false, logErr
+		}
+		if isLog {
+			return logs.Contains(graph, domain, value)
+		}
+	}
+
+	return false, ErrInvalidSetOperand
 }
 
 // resolveSetOperandGeneric resolves operand's own current membership,
@@ -7613,11 +7797,19 @@ func domainContainsGeneric(graph GraphReader, sets *SetRegistry, composites *Com
 // representations, so a cycle crossing between them is still detected
 // (theorystate.md section 83).
 func resolveSetOperandGeneric(graph GraphReader, sets *SetRegistry, composites *CompositeSetRegistry, logs *CompositeSetLogRegistry, operand NodeID, visited map[NodeID]struct{}) ([]NodeID, error) {
-	switch {
-	case sets.IsSet(graph, operand):
+	isSet, err := sets.IsSet(graph, operand)
+	if err != nil {
+		return nil, err
+	}
+	if isSet {
 		return sets.Members(graph, operand)
+	}
 
-	case composites.IsCompositeSet(graph, operand):
+	isComposite, err := composites.IsCompositeSet(graph, operand)
+	if err != nil {
+		return nil, err
+	}
+	if isComposite {
 		if _, seen := visited[operand]; seen {
 			return nil, ErrCompositeSetCycle
 		}
@@ -7625,19 +7817,25 @@ func resolveSetOperandGeneric(graph GraphReader, sets *SetRegistry, composites *
 		defer delete(visited, operand)
 
 		return composites.evaluate(graph, operand, visited)
-
-	case logs != nil && logs.IsCompositeSetLog(graph, operand):
-		if _, seen := visited[operand]; seen {
-			return nil, ErrCompositeSetCycle
-		}
-		visited[operand] = struct{}{}
-		defer delete(visited, operand)
-
-		return logs.evaluate(graph, operand, visited)
-
-	default:
-		return nil, ErrInvalidSetOperand
 	}
+
+	if logs != nil {
+		isLog, logErr := logs.IsCompositeSetLog(graph, operand)
+		if logErr != nil {
+			return nil, logErr
+		}
+		if isLog {
+			if _, seen := visited[operand]; seen {
+				return nil, ErrCompositeSetCycle
+			}
+			visited[operand] = struct{}{}
+			defer delete(visited, operand)
+
+			return logs.evaluate(graph, operand, visited)
+		}
+	}
+
+	return nil, ErrInvalidSetOperand
 }
 
 // resolveOperandGeneric returns the set of NodeIDs descriptor u currently
@@ -7800,7 +7998,11 @@ func NewCompositeSetRegistry(graph GraphAPI, sets *SetRegistry, allCompositeSets
 		Tags: []NodeID{allCompositeSets},
 		Check: func(g GraphReader, touched map[NodeID]struct{}) error {
 			for node := range touched {
-				if !g.HasRelationship(allCompositeSets, node) {
+				tagged, taggedErr := g.HasRelationship(allCompositeSets, node)
+				if taggedErr != nil {
+					return wrapInterfaceErr(taggedErr)
+				}
+				if !tagged {
 					continue
 				}
 
@@ -7812,14 +8014,14 @@ func NewCompositeSetRegistry(graph GraphAPI, sets *SetRegistry, allCompositeSets
 				for _, rel := range outgoing {
 					u := rel.To
 
-					if _, err = exactlyOneTag(g, u, allAdditiveOp, allSubtractiveOp); err != nil {
-						return err
+					if _, additiveErr := exactlyOneTag(g, u, allAdditiveOp, allSubtractiveOp); additiveErr != nil {
+						return additiveErr
 					}
-					if _, err = exactlyOneTag(g, u, allScalarOperand, allSetOperand); err != nil {
-						return err
+					if _, operandErr := exactlyOneTag(g, u, allScalarOperand, allSetOperand); operandErr != nil {
+						return operandErr
 					}
-					if _, err = operandTargetGeneric(g, u); err != nil {
-						return err
+					if _, targetErr := operandTargetGeneric(g, u); targetErr != nil {
+						return targetErr
 					}
 				}
 			}
@@ -7833,22 +8035,35 @@ func NewCompositeSetRegistry(graph GraphAPI, sets *SetRegistry, allCompositeSets
 		Tags: []NodeID{allAdditiveOp, allSubtractiveOp, allScalarOperand, allSetOperand},
 		Check: func(g GraphReader, touched map[NodeID]struct{}) error {
 			for node := range touched {
-				isDescriptor := g.HasRelationship(allAdditiveOp, node) ||
-					g.HasRelationship(allSubtractiveOp, node) ||
-					g.HasRelationship(allScalarOperand, node) ||
-					g.HasRelationship(allSetOperand, node)
-				if !isDescriptor {
+				hasAdditive, err := g.HasRelationship(allAdditiveOp, node)
+				if err != nil {
+					return wrapInterfaceErr(err)
+				}
+				hasSubtractive, err := g.HasRelationship(allSubtractiveOp, node)
+				if err != nil {
+					return wrapInterfaceErr(err)
+				}
+				hasScalar, err := g.HasRelationship(allScalarOperand, node)
+				if err != nil {
+					return wrapInterfaceErr(err)
+				}
+				hasSet, err := g.HasRelationship(allSetOperand, node)
+				if err != nil {
+					return wrapInterfaceErr(err)
+				}
+
+				if !hasAdditive && !hasSubtractive && !hasScalar && !hasSet {
 					continue
 				}
 
-				if _, err := exactlyOneTag(g, node, allAdditiveOp, allSubtractiveOp); err != nil {
-					return err
+				if _, tagErr := exactlyOneTag(g, node, allAdditiveOp, allSubtractiveOp); tagErr != nil {
+					return tagErr
 				}
-				if _, err := exactlyOneTag(g, node, allScalarOperand, allSetOperand); err != nil {
-					return err
+				if _, tagErr := exactlyOneTag(g, node, allScalarOperand, allSetOperand); tagErr != nil {
+					return tagErr
 				}
-				if _, err := operandTargetGeneric(g, node); err != nil {
-					return err
+				if _, targetErr := operandTargetGeneric(g, node); targetErr != nil {
+					return targetErr
 				}
 			}
 
@@ -7894,8 +8109,9 @@ func (c *CompositeSetRegistry) SetLogs(logs *CompositeSetLogRegistry) {
 
 // IsCompositeSet reports whether id is currently tagged
 // (AllCompositeSets, id).
-func (c *CompositeSetRegistry) IsCompositeSet(graph GraphReader, id NodeID) bool {
-	return graph.HasRelationship(c.allCompositeSets, id)
+func (c *CompositeSetRegistry) IsCompositeSet(graph GraphReader, id NodeID) (bool, error) {
+	has, err := graph.HasRelationship(c.allCompositeSets, id)
+	return has, wrapInterfaceErr(err)
 }
 
 // requireCompositeSet checks that set exists and is tagged
@@ -8011,10 +8227,19 @@ func (c *CompositeSetRegistry) RemoveOperand(graph Transactor, set, u NodeID) er
 // OperandTarget/OperandIsAdditive/OperandIsSetOperand to inspect each
 // one.
 func (c *CompositeSetRegistry) Operands(graph GraphReader, set NodeID) ([]NodeID, error) {
-	if !graph.NodeExists(set) {
+	exists, err := graph.NodeExists(set)
+	if err != nil {
+		return nil, wrapInterfaceErr(err)
+	}
+	if !exists {
 		return nil, ErrNodeNotFound
 	}
-	if !c.IsCompositeSet(graph, set) {
+
+	isComposite, err := c.IsCompositeSet(graph, set)
+	if err != nil {
+		return nil, err
+	}
+	if !isComposite {
 		return nil, ErrNotCompositeSet
 	}
 
@@ -8061,10 +8286,19 @@ func (c *CompositeSetRegistry) OperandIsSetOperand(graph GraphReader, u NodeID) 
 // would revisit a composite-kind node already on the current resolution
 // path, ErrCompositeSetCycle is returned (theorystate.md section 83).
 func (c *CompositeSetRegistry) Evaluate(graph GraphReader, set NodeID) ([]NodeID, error) {
-	if !graph.NodeExists(set) {
+	exists, err := graph.NodeExists(set)
+	if err != nil {
+		return nil, wrapInterfaceErr(err)
+	}
+	if !exists {
 		return nil, ErrNodeNotFound
 	}
-	if !c.IsCompositeSet(graph, set) {
+
+	isComposite, err := c.IsCompositeSet(graph, set)
+	if err != nil {
+		return nil, err
+	}
+	if !isComposite {
 		return nil, ErrNotCompositeSet
 	}
 
@@ -8083,13 +8317,27 @@ func (c *CompositeSetRegistry) Evaluate(graph GraphReader, set NodeID) ([]NodeID
 // set must already be tagged (AllCompositeSets, set); value must already
 // exist. Like Evaluate, this is never cached.
 func (c *CompositeSetRegistry) Contains(graph GraphReader, set, value NodeID) (bool, error) {
-	if !graph.NodeExists(set) {
+	existsSet, err := graph.NodeExists(set)
+	if err != nil {
+		return false, wrapInterfaceErr(err)
+	}
+	if !existsSet {
 		return false, ErrNodeNotFound
 	}
-	if !c.IsCompositeSet(graph, set) {
+
+	isComposite, err := c.IsCompositeSet(graph, set)
+	if err != nil {
+		return false, err
+	}
+	if !isComposite {
 		return false, ErrNotCompositeSet
 	}
-	if !graph.NodeExists(value) {
+
+	existsValue, err := graph.NodeExists(value)
+	if err != nil {
+		return false, wrapInterfaceErr(err)
+	}
+	if !existsValue {
 		return false, ErrNodeNotFound
 	}
 
@@ -8348,8 +8596,9 @@ func NewCompositeSetLogRegistry(graph GraphAPI, lists *ListRegistry, composites 
 
 // IsCompositeSetLog reports whether id is currently tagged
 // (AllCompositeSetLogs, id).
-func (c *CompositeSetLogRegistry) IsCompositeSetLog(graph GraphReader, id NodeID) bool {
-	return graph.HasRelationship(c.allCompositeSetLogs, id)
+func (c *CompositeSetLogRegistry) IsCompositeSetLog(graph GraphReader, id NodeID) (bool, error) {
+	has, err := graph.HasRelationship(c.allCompositeSetLogs, id)
+	return has, wrapInterfaceErr(err)
 }
 
 // requireLog checks that log exists and is tagged
@@ -8488,10 +8737,19 @@ func (c *CompositeSetLogRegistry) RemoveOperation(graph Transactor, log, capsule
 // 82's fold is order-sensitive). Use OperandTarget/OperandIsAdditive/
 // OperandIsSetOperand to inspect each one.
 func (c *CompositeSetLogRegistry) Operations(graph GraphReader, log NodeID) ([]NodeID, error) {
-	if !graph.NodeExists(log) {
+	exists, err := graph.NodeExists(log)
+	if err != nil {
+		return nil, wrapInterfaceErr(err)
+	}
+	if !exists {
 		return nil, ErrNodeNotFound
 	}
-	if !c.IsCompositeSetLog(graph, log) {
+
+	isLog, err := c.IsCompositeSetLog(graph, log)
+	if err != nil {
+		return nil, err
+	}
+	if !isLog {
 		return nil, ErrNotCompositeSetLog
 	}
 
@@ -8530,10 +8788,19 @@ func (c *CompositeSetLogRegistry) OperandIsSetOperand(graph GraphReader, u NodeI
 // already on the current resolution path, ErrCompositeSetCycle is
 // returned (theorystate.md section 83).
 func (c *CompositeSetLogRegistry) Evaluate(graph GraphReader, log NodeID) ([]NodeID, error) {
-	if !graph.NodeExists(log) {
+	exists, err := graph.NodeExists(log)
+	if err != nil {
+		return nil, wrapInterfaceErr(err)
+	}
+	if !exists {
 		return nil, ErrNodeNotFound
 	}
-	if !c.IsCompositeSetLog(graph, log) {
+
+	isLog, err := c.IsCompositeSetLog(graph, log)
+	if err != nil {
+		return nil, err
+	}
+	if !isLog {
 		return nil, ErrNotCompositeSetLog
 	}
 
@@ -8613,13 +8880,27 @@ func (c *CompositeSetLogRegistry) resolveOperand(graph GraphReader, u NodeID, vi
 // avoid this cost, consistent with every other Evaluate/Contains in this
 // file.
 func (c *CompositeSetLogRegistry) Contains(graph GraphReader, log, value NodeID) (bool, error) {
-	if !graph.NodeExists(log) {
+	existsLog, err := graph.NodeExists(log)
+	if err != nil {
+		return false, wrapInterfaceErr(err)
+	}
+	if !existsLog {
 		return false, ErrNodeNotFound
 	}
-	if !c.IsCompositeSetLog(graph, log) {
+
+	isLog, err := c.IsCompositeSetLog(graph, log)
+	if err != nil {
+		return false, err
+	}
+	if !isLog {
 		return false, ErrNotCompositeSetLog
 	}
-	if !graph.NodeExists(value) {
+
+	existsValue, err := graph.NodeExists(value)
+	if err != nil {
+		return false, wrapInterfaceErr(err)
+	}
+	if !existsValue {
 		return false, ErrNodeNotFound
 	}
 
@@ -8676,20 +8957,28 @@ func (c *CompositeSetLogRegistry) operandMentions(graph GraphReader, operand Nod
 		return operand == value, nil
 	}
 
-	switch {
-	case c.sets.IsSet(graph, operand):
+	isSet, err := c.sets.IsSet(graph, operand)
+	if err != nil {
+		return false, err
+	}
+	if isSet {
 		return c.sets.Contains(graph, operand, value)
+	}
 
-	case c.composites.IsCompositeSet(graph, operand):
+	isComposite, err := c.composites.IsCompositeSet(graph, operand)
+	if err != nil {
+		return false, err
+	}
+	if isComposite {
 		if _, seen := visited[operand]; seen {
 			return false, ErrCompositeSetCycle
 		}
 		visited[operand] = struct{}{}
 		defer delete(visited, operand)
 
-		resolved, err := c.composites.evaluate(graph, operand, visited)
-		if err != nil {
-			return false, err
+		resolved, evalErr := c.composites.evaluate(graph, operand, visited)
+		if evalErr != nil {
+			return false, evalErr
 		}
 		for _, id := range resolved {
 			if id == value {
@@ -8697,8 +8986,13 @@ func (c *CompositeSetLogRegistry) operandMentions(graph GraphReader, operand Nod
 			}
 		}
 		return false, nil
+	}
 
-	case c.IsCompositeSetLog(graph, operand):
+	isLog, err := c.IsCompositeSetLog(graph, operand)
+	if err != nil {
+		return false, err
+	}
+	if isLog {
 		if _, seen := visited[operand]; seen {
 			return false, ErrCompositeSetCycle
 		}
@@ -8706,10 +9000,9 @@ func (c *CompositeSetLogRegistry) operandMentions(graph GraphReader, operand Nod
 		defer delete(visited, operand)
 
 		return c.contains(graph, operand, value, visited)
-
-	default:
-		return false, ErrInvalidSetOperand
 	}
+
+	return false, ErrInvalidSetOperand
 }
 
 // DeleteCompositeSetLog deletes log from the underlying graph,
@@ -8805,13 +9098,27 @@ func (d *domainConstraint) Domain(graph GraphReader, anchor NodeID) (domain Node
 // SetDomain / DomainPointerRegistryD.SetDomain.
 func (d *domainConstraint) attachDomain(graph Transactor, anchor, domain NodeID) error {
 	return wrapInterfaceErr(graph.Transact(func(tx Tx) error {
-		if !tx.NodeExists(anchor) {
+		existsAnchor, err := tx.NodeExists(anchor)
+		if err != nil {
+			return wrapInterfaceErr(err)
+		}
+		if !existsAnchor {
 			return ErrNodeNotFound
 		}
-		if !tx.NodeExists(domain) {
+
+		existsDomain, err := tx.NodeExists(domain)
+		if err != nil {
+			return wrapInterfaceErr(err)
+		}
+		if !existsDomain {
 			return ErrNodeNotFound
 		}
-		if !operandCarriesKnownSetTag(tx, d.sets, d.composites, d.logs, domain) {
+
+		known, err := operandCarriesKnownSetTag(tx, d.sets, d.composites, d.logs, domain)
+		if err != nil {
+			return err
+		}
+		if !known {
 			return ErrInvalidSetOperand
 		}
 
@@ -8974,17 +9281,35 @@ func (d *domainConstraint) affectedAnchors(g GraphReader, targetTag NodeID, touc
 	anchors := make(map[NodeID]struct{})
 
 	for node := range touched {
-		if !g.NodeExists(node) {
+		exists, err := g.NodeExists(node)
+		if err != nil {
+			return nil, wrapInterfaceErr(err)
+		}
+		if !exists {
 			continue
 		}
 
-		if d.domainSlots.IsPointer(g, node) || g.HasRelationship(targetTag, node) {
+		isDomainSlot, err := d.domainSlots.IsPointer(g, node)
+		if err != nil {
+			return nil, err
+		}
+
+		isTargetHolder, err := g.HasRelationship(targetTag, node)
+		if err != nil {
+			return nil, wrapInterfaceErr(err)
+		}
+
+		if isDomainSlot || isTargetHolder {
 			if slotErr := d.addSlotOwners(g, node, targetTag, anchors); slotErr != nil {
 				return nil, slotErr
 			}
 		}
 
-		if !operandCarriesKnownSetTag(g, d.sets, d.composites, d.logs, node) {
+		known, err := operandCarriesKnownSetTag(g, d.sets, d.composites, d.logs, node)
+		if err != nil {
+			return nil, err
+		}
+		if !known {
 			continue
 		}
 
@@ -9028,7 +9353,15 @@ func (d *domainConstraint) addSlotOwners(g GraphReader, slot, targetTag NodeID, 
 
 	for _, rel := range incoming {
 		owner := rel.From
-		if owner == d.domainSlots.allPointers || owner == targetTag || g.HasRelationship(owner, d.domainSlots.allPointers) {
+		if owner == d.domainSlots.allPointers || owner == targetTag {
+			continue
+		}
+
+		isUniversalParent, hasErr := g.HasRelationship(owner, d.domainSlots.allPointers)
+		if hasErr != nil {
+			return wrapInterfaceErr(hasErr)
+		}
+		if isUniversalParent {
 			continue
 		}
 
@@ -9049,7 +9382,11 @@ func (d *domainConstraint) domainSlotsOf(g GraphReader, domain NodeID) ([]NodeID
 
 	slots := make([]NodeID, 0, len(incoming))
 	for _, rel := range incoming {
-		if d.domainSlots.IsPointer(g, rel.From) {
+		isSlot, isSlotErr := d.domainSlots.IsPointer(g, rel.From)
+		if isSlotErr != nil {
+			return nil, isSlotErr
+		}
+		if isSlot {
 			slots = append(slots, rel.From)
 		}
 	}
@@ -9104,7 +9441,11 @@ func (d *domainConstraint) setOperandContainers(g GraphReader, node NodeID) ([]N
 
 	containers := make([]NodeID, 0, len(incoming))
 	for _, rel := range incoming {
-		if !g.HasRelationship(d.composites.allSetOperand, rel.From) {
+		isSetOperand, hasErr := g.HasRelationship(d.composites.allSetOperand, rel.From)
+		if hasErr != nil {
+			return nil, wrapInterfaceErr(hasErr)
+		}
+		if !isSetOperand {
 			continue
 		}
 
@@ -9133,7 +9474,11 @@ func (d *domainConstraint) descriptorOwners(g GraphReader, u NodeID) ([]NodeID, 
 
 	owners := make([]NodeID, 0, len(incoming))
 	for _, rel := range incoming {
-		if d.composites.IsCompositeSet(g, rel.From) {
+		isComposite, isCompositeErr := d.composites.IsCompositeSet(g, rel.From)
+		if isCompositeErr != nil {
+			return nil, isCompositeErr
+		}
+		if isComposite {
 			owners = append(owners, rel.From)
 		}
 	}
@@ -9154,7 +9499,11 @@ func (d *domainConstraint) descriptorOwners(g GraphReader, u NodeID) ([]NodeID, 
 		}
 
 		for _, rel := range capsuleIncoming {
-			if d.logs.IsCompositeSetLog(g, rel.From) {
+			isLog, isLogErr := d.logs.IsCompositeSetLog(g, rel.From)
+			if isLogErr != nil {
+				return nil, isLogErr
+			}
+			if isLog {
 				owners = append(owners, rel.From)
 			}
 		}
