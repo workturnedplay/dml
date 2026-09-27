@@ -4607,6 +4607,48 @@ func TestCapsulesWithValueDetectsAmbiguousCapsuleOwnership(t *testing.T) {
 	}
 }
 
+// TestCapsulesWithValuePagesAcrossMultipleFetches shrinks
+// capsulesWithValuePageSize temporarily so this can exercise
+// CapsulesWithValue's own multi-page loop (theorystate.md section 105)
+// without needing thousands of capsules. This runs against a plain
+// in-memory *Graph, which has no native incomingPager of its own -- what
+// is under test here is CapsulesWithValue's own looping and cursor
+// bookkeeping, not any particular backend's paging mechanism (that is
+// covered separately by TestBoltGraphFindIncomingAfterMatchesFindIncoming).
+func TestCapsulesWithValuePagesAcrossMultipleFetches(t *testing.T) {
+	original := capsulesWithValuePageSize
+	capsulesWithValuePageSize = 3
+	t.Cleanup(func() { capsulesWithValuePageSize = original })
+
+	g, capsules := newCapsuleTestFixture(t)
+
+	value, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for value: %v", err)
+	}
+
+	const occurrences = 7
+
+	want := make([]NodeID, 0, occurrences)
+
+	for range occurrences {
+		capsule, err2 := capsules.NewCapsule(g, value)
+		if err2 != nil {
+			t.Fatalf("NewCapsule(): %v", err2)
+		}
+		want = append(want, capsule)
+	}
+
+	got, err := capsules.CapsulesWithValue(g, value)
+	if err != nil {
+		t.Fatalf("CapsulesWithValue(): %v", err)
+	}
+
+	if !reflect.DeepEqual(sortedNodeIDs(got), sortedNodeIDs(want)) {
+		t.Fatalf("CapsulesWithValue() = %v, want %v (in some order)", got, want)
+	}
+}
+
 func newListTestFixture(t *testing.T) (*Graph, *CapsuleRegistry, *ListRegistry) {
 	t.Helper()
 
@@ -13608,6 +13650,157 @@ func TestBoltGraphFindNodesAfterMatchesFindNodes(t *testing.T) {
 			}
 
 			after = page[len(page)-1]
+			hasAfter = true
+		}
+
+		if !reflect.DeepEqual(paged, all) {
+			t.Fatalf("paging with limit %d gave %v, want %v", limit, paged, all)
+		}
+	}
+}
+
+func TestBoltGraphFindOutgoingAfterMatchesFindOutgoing(t *testing.T) {
+	g := newBoltTestGraph(t)
+
+	from := mustCreateNode(t, g)
+
+	for range 7 {
+		to := mustCreateNode(t, g)
+		if _, err := g.AddRelationship(from, to); err != nil {
+			t.Fatalf("AddRelationship(from, to): %v", err)
+		}
+	}
+
+	all, err := g.FindOutgoing(from)
+	if err != nil {
+		t.Fatalf("FindOutgoing(from): %v", err)
+	}
+
+	for limit := 1; limit <= len(all)+1; limit++ {
+		var paged []Relationship
+
+		var after NodeID
+
+		hasAfter := false
+
+		for {
+			page, pageErr := boltRead(g, func(v boltView) ([]Relationship, error) {
+				return v.findOutgoingAfter(from, after, hasAfter, limit)
+			})
+			if pageErr != nil {
+				t.Fatalf("findOutgoingAfter() with limit %d: %v", limit, pageErr)
+			}
+			paged = append(paged, page...)
+
+			if len(page) < limit {
+				break
+			}
+
+			after = page[len(page)-1].To
+			hasAfter = true
+		}
+
+		if !reflect.DeepEqual(paged, all) {
+			t.Fatalf("paging with limit %d gave %v, want %v", limit, paged, all)
+		}
+	}
+}
+
+func TestBoltGraphFindIncomingAfterMatchesFindIncoming(t *testing.T) {
+	g := newBoltTestGraph(t)
+
+	to := mustCreateNode(t, g)
+
+	for range 7 {
+		from := mustCreateNode(t, g)
+		if _, err := g.AddRelationship(from, to); err != nil {
+			t.Fatalf("AddRelationship(from, to): %v", err)
+		}
+	}
+
+	all, err := g.FindIncoming(to)
+	if err != nil {
+		t.Fatalf("FindIncoming(to): %v", err)
+	}
+
+	for limit := 1; limit <= len(all)+1; limit++ {
+		var paged []Relationship
+
+		var after NodeID
+
+		hasAfter := false
+
+		for {
+			page, pageErr := boltRead(g, func(v boltView) ([]Relationship, error) {
+				return v.findIncomingAfter(to, after, hasAfter, limit)
+			})
+			if pageErr != nil {
+				t.Fatalf("findIncomingAfter() with limit %d: %v", limit, pageErr)
+			}
+			paged = append(paged, page...)
+
+			if len(page) < limit {
+				break
+			}
+
+			after = page[len(page)-1].From
+			hasAfter = true
+		}
+
+		if !reflect.DeepEqual(paged, all) {
+			t.Fatalf("paging with limit %d gave %v, want %v", limit, paged, all)
+		}
+	}
+}
+
+// TestRootReaderFindOutgoingAfterMatchesFindOutgoing exercises
+// rootReader.findOutgoingAfter (theorystate.md section 105): ROOT's own
+// virtual outgoing set pages over existing node IDs rather than over any
+// stored relationship, so this deliberately creates ROOT after a couple of
+// other nodes and creates a few more afterwards, putting ROOT's own NodeID
+// in the middle of the ID space paged over -- exactly the case that would
+// silently shorten a page if filtering ROOT back out (the overlay's own
+// irreflexivity) were not compensated for.
+func TestRootReaderFindOutgoingAfterMatchesFindOutgoing(t *testing.T) {
+	var g Graph
+
+	newTestNode(t, &g)
+	newTestNode(t, &g)
+	root := newTestNode(t, &g)
+
+	for range 4 {
+		newTestNode(t, &g)
+	}
+
+	r, err := NewRootGraph(&g, root)
+	if err != nil {
+		t.Fatalf("NewRootGraph(): %v", err)
+	}
+
+	all, err := r.FindOutgoing(root)
+	if err != nil {
+		t.Fatalf("FindOutgoing(root): %v", err)
+	}
+
+	for limit := 1; limit <= len(all)+1; limit++ {
+		var paged []Relationship
+
+		var after NodeID
+
+		hasAfter := false
+
+		for {
+			page, pageErr := r.findOutgoingAfter(root, after, hasAfter, limit)
+			if pageErr != nil {
+				t.Fatalf("findOutgoingAfter() with limit %d: %v", limit, pageErr)
+			}
+			paged = append(paged, page...)
+
+			if len(page) < limit {
+				break
+			}
+
+			after = page[len(page)-1].To
 			hasAfter = true
 		}
 

@@ -3384,28 +3384,81 @@ it runs.
 (this registers Checkers); `BootstrapNames` (fails on a retired name, §103);
 `VerifyAll`; ready.
 
-## 105. Paged and iterator reads (OPEN)
+## 105. Paged and iterator reads (partially implemented; largely still OPEN)
 
 `GraphReader` returns whole slices, so even with an ordered cursor inside the
 backend, the caller still receives a full slice. bbolt provides the cursor,
-not the feature. The calls that are unbounded at scale are:
-`FindNodes`, `FindRelationships`, `rootReader.FindOutgoing(ROOT)` (via
-`FindNodes`), `rootReader.FindRelationships`, `FindIncoming` on a very
-popular value node (`CapsulesWithValue`), the whole-set APIs (`Members`,
-`Elements`, `Evaluate`, `Operands`) and any unpaged `VerifyAll`. Correction
-to an earlier claim: hub tag nodes are not enumerated. The registries use
-only `HasRelationship(tag, x)` on them, and `addSlotOwners` explicitly
-avoids enumerating them.
+not the feature by itself.
+
+**Node paging (done, section 110).** `FindNodes` pages via the unexported
+`nodePager` interface (`findNodesAfter`), implemented by `boltView` with a
+cursor and forwarded by the ROOT overlay; `VerifyAll` is built on it.
+
+**Relationship paging for one node's own edges (done this session).** The
+same shape, mirrored for a single node's own outgoing or incoming
+relationships: `outgoingPager`/`incomingPager` (`findOutgoingAfter`/
+`findIncomingAfter`), implemented by `boltView` with a cursor over the
+`out`/`in` buckets, dispatched through `outgoingAfter`/`incomingAfter`
+(falling back to `FindOutgoing`/`FindIncoming` sliced client-side via
+`pageRelationships` for a reader with no native paging). This closes two
+of the specific unbounded call sites named below:
+
+- `rootReader.FindOutgoing(ROOT)`: ROOT's entire outgoing set is virtual
+  (section 12a), so `rootReader.findOutgoingAfter` pages over existing node
+  IDs instead (reusing `nodesAfter`) and translates each into a virtual
+  relationship, fetching one extra candidate so filtering ROOT itself back
+  out (irreflexivity) never silently shortens an otherwise-full page.
+  `rootReader` deliberately implements only `outgoingPager`, not
+  `incomingPager`: `FindIncoming` always potentially adds one virtual
+  `(ROOT, to)` relationship and hides any physically-stored ROOT-sourced
+  one, and splicing that correctly into a bounded page is real remaining
+  work (see below), not a trivial extension of the outgoing case, which has
+  nothing virtual on the non-ROOT side to reconcile.
+- `FindIncoming` on a very popular value node (`CapsulesWithValue`):
+  `CapsuleRegistry.CapsulesWithValue` now walks `value`'s incoming
+  relationships in bounded pages (`capsulesWithValuePageSize`, a `var` so
+  tests can shrink it) rather than materializing the whole list at once.
+
+**Accepted trade-off, not a new one.** For a reader with no native pager
+(the in-memory `*Graph`, `stagedGraph`), looping `outgoingAfter`/
+`incomingAfter` (or `nodesAfter`) over successive pages re-fetches and
+re-slices the full unpaged result on every call -- quadratic in the total
+edge/node count for that loop, not linear. This is not a regression
+introduced here: `VerifyAll`'s own `nodesAfter` loop already has the
+identical shape for `FindNodes` and was accepted without comment, because a
+backend where "everything already fits in memory" was never the paging
+problem this exists to solve; it is recorded explicitly here rather than
+left to be independently rediscovered as a surprise. A caller that would
+call one of these paged helpers in a loop against an *arbitrary* reader
+(the way `CapsulesWithValue` does) must accept the same trade-off, not
+assume the fallback path is cheap.
+
+**Still unbounded, per the grep this section already called for:**
+`FindRelationships`, `rootReader.FindRelationships`, `rootReader.FindIncoming`
+on any node (no virtual-aware paged incoming yet, see above), the whole-set
+APIs (`Members`, `Elements`, `Evaluate`, `Operands`), and two internal
+full-child-set reads not previously named here:
+`ListRegistry.validateStructure`'s `FindOutgoing(list)` (every list's
+elements are the list node's own direct children, read in full on every
+`Elements` call and on every commit touching the list, via its Checker) and
+`CompositeSetRegistry.Operands`/`evaluate`'s `FindOutgoing(set)` (every
+operand descriptor, similarly). Paging either would not reduce total work --
+both need the complete child set for their own correctness checks (stray
+non-capsule children, `len(visited) != len(members)`, or the additive/
+subtractive fold) -- only bound peak memory and per-call transaction size,
+and reworking `validateStructure` specifically to consume a page stream
+instead of one materialized membership map is real design work, not a
+mechanical wrapper. Correction to an earlier claim: hub tag nodes are not
+enumerated. The registries use only `HasRelationship(tag, x)` on them, and
+`addSlotOwners` explicitly avoids enumerating them.
 
 Two kinds of iteration need different tools. A bounded scan inside one
 transaction uses a cursor, consistent because the transaction is, with no
 writers blocked. A long sweep uses pages ("up to N IDs after key K"), each
 its own short transaction; the view can shift between pages, which is
 acceptable for verification (later changes are checked by commit-time
-Checkers) and not for an exact point-in-time result. The interface shape is
-not fixed (for example `FindNodesAfter(after NodeID, limit int)`); the slice
-forms would remain as thin wrappers. Next step: grep the real call sites
-before designing.
+Checkers) and not for an exact point-in-time result. The exported interface
+shape, if any of this is ever promoted to one, is still not fixed.
 
 ## 106. Explored and not adopted
 

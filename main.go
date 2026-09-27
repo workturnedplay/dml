@@ -1511,6 +1511,83 @@ func nodesAfter(reader GraphReader, after NodeID, hasAfter bool, limit int) ([]N
 	return pageNodeIDs(ids, after, hasAfter, limit), nil
 }
 
+// outgoingPager is implemented by a GraphReader that can list a bounded
+// page of one node's own outgoing relationships without materializing
+// every one of them (BoltGraph's boltView, and the ROOT overlay for any
+// anchor -- ROOT's own virtual outgoing set pages over node IDs; see
+// rootReader.findOutgoingAfter). Any other reader falls back to
+// FindOutgoing, sliced client-side (see outgoingAfter), which is fine for
+// the memory-bound backends. Like nodePager, this stays an unexported
+// optional interface until the paged-read rework of theorystate.md
+// section 105 decides the exported shape.
+type outgoingPager interface {
+	findOutgoingAfter(from, after NodeID, hasAfter bool, limit int) ([]Relationship, error)
+}
+
+// incomingPager is outgoingPager's mirror for incoming relationships.
+// Implemented by BoltGraph's boltView only for now: the ROOT overlay's
+// FindIncoming always potentially adds one virtual (ROOT, to) relationship
+// and hides any physically-stored ROOT-sourced one (theorystate.md section
+// 12a), and splicing that correctly into a bounded page is not yet built --
+// see the rootReader doc comment and theorystate.md section 105.
+type incomingPager interface {
+	findIncomingAfter(to, after NodeID, hasAfter bool, limit int) ([]Relationship, error)
+}
+
+// pageRelationships returns up to limit relationships from sorted (already
+// ascending by whatever key extracts) whose key is greater than after, or
+// from the start if hasAfter is false. This is the relationship-level
+// counterpart of pageNodeIDs, parameterized over which endpoint the caller
+// is paging by (To for an outgoing page, From for an incoming page).
+func pageRelationships(sorted []Relationship, after NodeID, hasAfter bool, limit int, key func(Relationship) NodeID) []Relationship {
+	start := 0
+	if hasAfter {
+		start = sort.Search(len(sorted), func(i int) bool { return key(sorted[i]) > after })
+	}
+
+	count := min(max(limit, 0), len(sorted)-start)
+
+	return sorted[start : start+count]
+}
+
+// outgoingAfter returns a page of from's own outgoing relationships from
+// reader, using its paging if it has any (see outgoingPager) and
+// FindOutgoing otherwise. As with nodesAfter, a caller looping this over
+// successive pages against a reader with no native paging re-fetches and
+// re-slices FindOutgoing's full result on every call -- harmless for the
+// memory-bound backends, where nothing is gained by pretending otherwise,
+// and exactly the shape VerifyAll's own nodesAfter loop already accepts
+// for FindNodes.
+func outgoingAfter(reader GraphReader, from, after NodeID, hasAfter bool, limit int) ([]Relationship, error) {
+	if pager, ok := reader.(outgoingPager); ok {
+		relationships, err := pager.findOutgoingAfter(from, after, hasAfter, limit)
+		return relationships, wrapInterfaceErr(err)
+	}
+
+	all, err := reader.FindOutgoing(from)
+	if err != nil {
+		return nil, wrapInterfaceErr(err)
+	}
+
+	return pageRelationships(all, after, hasAfter, limit, func(r Relationship) NodeID { return r.To }), nil
+}
+
+// incomingAfter is outgoingAfter's mirror for to's own incoming
+// relationships (see incomingPager).
+func incomingAfter(reader GraphReader, to, after NodeID, hasAfter bool, limit int) ([]Relationship, error) {
+	if pager, ok := reader.(incomingPager); ok {
+		relationships, err := pager.findIncomingAfter(to, after, hasAfter, limit)
+		return relationships, wrapInterfaceErr(err)
+	}
+
+	all, err := reader.FindIncoming(to)
+	if err != nil {
+		return nil, wrapInterfaceErr(err)
+	}
+
+	return pageRelationships(all, after, hasAfter, limit, func(r Relationship) NodeID { return r.From }), nil
+}
+
 // defaultVerifyPageSize is the page size VerifyAll uses when given a
 // non-positive one.
 const defaultVerifyPageSize = 1000
@@ -2214,8 +2291,83 @@ func (v boltView) findNodesAfter(after NodeID, hasAfter bool, limit int) ([]Node
 	return ids, nil
 }
 
-// Compile-time assertion that boltView pages.
-var _ nodePager = boltView{}
+// findOutgoingAfter returns up to limit relationships whose source is from
+// and whose target is greater than after (from the first if hasAfter is
+// false), in ascending target order, reading only that range with a cursor
+// (see outgoingPager). bolt cursor reads from an already-open transaction
+// cannot themselves fail, so this always returns a nil error once from's
+// existence is confirmed.
+func (v boltView) findOutgoingAfter(from, after NodeID, hasAfter bool, limit int) ([]Relationship, error) {
+	exists, err := v.NodeExists(from)
+	if err != nil {
+		return nil, err
+	}
+	if !exists {
+		return nil, ErrNodeNotFound
+	}
+
+	relationships := []Relationship{}
+	prefix := boltKey8(from)
+	cursor := v.out.Cursor()
+
+	var key []byte
+
+	if hasAfter {
+		key, _ = cursor.Seek(boltKey16(from, after))
+		if key != nil && boltID(key[boltIDSize:]) == after {
+			key, _ = cursor.Next()
+		}
+	} else {
+		key, _ = cursor.Seek(prefix)
+	}
+
+	for ; key != nil && bytes.HasPrefix(key, prefix) && len(relationships) < limit; key, _ = cursor.Next() {
+		relationships = append(relationships, Relationship{From: from, To: boltID(key[boltIDSize:])})
+	}
+
+	return relationships, nil
+}
+
+// findIncomingAfter is findOutgoingAfter's mirror over the incoming index
+// (see incomingPager).
+func (v boltView) findIncomingAfter(to, after NodeID, hasAfter bool, limit int) ([]Relationship, error) {
+	exists, err := v.NodeExists(to)
+	if err != nil {
+		return nil, err
+	}
+	if !exists {
+		return nil, ErrNodeNotFound
+	}
+
+	relationships := []Relationship{}
+	prefix := boltKey8(to)
+	cursor := v.in.Cursor()
+
+	var key []byte
+
+	if hasAfter {
+		key, _ = cursor.Seek(boltKey16(to, after))
+		if key != nil && boltID(key[boltIDSize:]) == after {
+			key, _ = cursor.Next()
+		}
+	} else {
+		key, _ = cursor.Seek(prefix)
+	}
+
+	for ; key != nil && bytes.HasPrefix(key, prefix) && len(relationships) < limit; key, _ = cursor.Next() {
+		relationships = append(relationships, Relationship{From: boltID(key[boltIDSize:]), To: to})
+	}
+
+	return relationships, nil
+}
+
+// Compile-time assertions that boltView pages nodes and relationships.
+// boltTxn picks these up for free through embedding boltView.
+var (
+	_ nodePager     = boltView{}
+	_ outgoingPager = boltView{}
+	_ incomingPager = boltView{}
+)
 
 // checkEdges verifies every key of the edge index primary against its
 // mirror index: the key has the right length, the mirrored key exists (the
@@ -3915,6 +4067,75 @@ func (v rootReader) findNodesAfter(after NodeID, hasAfter bool, limit int) ([]No
 
 // Compile-time assertion that the ROOT overlay pages.
 var _ nodePager = rootReader{}
+
+// findOutgoingAfter pages through from's own outgoing relationships in the
+// ROOT view. For any node other than ROOT this is a pure, complete
+// delegation to the underlying reader's own paging (see outgoingPager):
+// nothing about a non-ROOT node's outgoing relationships is virtual, so
+// there is nothing here for the overlay to add or hide. For ROOT itself,
+// whose entire outgoing set is virtual (theorystate.md section 12a), this
+// pages over existing node IDs instead (see nodesAfter) and translates
+// each into a virtual (ROOT, X) relationship, fetching one extra candidate
+// so that filtering ROOT itself back out -- excluded by the overlay's own
+// irreflexivity -- still leaves a full page whenever one is available,
+// rather than under-reporting a page that only looks short because ROOT
+// happened to fall inside it.
+//
+// This does not cover FindIncoming: the ROOT overlay always potentially
+// adds one virtual (ROOT, to) relationship and hides any physically-stored
+// ROOT-sourced one, and correctly splicing that into a bounded page is not
+// yet built (theorystate.md section 105) -- rootReader deliberately does
+// not implement incomingPager, so a paged caller falls back to the
+// existing, complete, unpaged FindIncoming.
+func (v rootReader) findOutgoingAfter(from, after NodeID, hasAfter bool, limit int) ([]Relationship, error) {
+	if from != v.root {
+		return outgoingAfter(v.inner, from, after, hasAfter, limit)
+	}
+
+	rootExists, err := v.inner.NodeExists(v.root)
+	if err != nil {
+		return nil, wrapInterfaceErr(err)
+	}
+	if !rootExists {
+		return nil, nil
+	}
+
+	want := max(limit, 0)
+
+	// Fetch one extra candidate so that filtering ROOT itself back out
+	// still leaves a full page whenever one is available. Guarded against
+	// overflow for a limit already at the edge of int's range, which no
+	// realistic caller passes.
+	fetchWant := want + 1
+	if fetchWant <= want {
+		fetchWant = want
+	}
+
+	ids, err := nodesAfter(v.inner, after, hasAfter, fetchWant)
+	if err != nil {
+		return nil, err
+	}
+
+	relationships := make([]Relationship, 0, want)
+
+	for _, id := range ids {
+		if id == v.root {
+			continue
+		}
+		if len(relationships) == want {
+			break
+		}
+
+		relationships = append(relationships, Relationship{From: v.root, To: id})
+	}
+
+	return relationships, nil
+}
+
+// Compile-time assertion that the ROOT overlay pages outgoing
+// relationships. It deliberately does not implement incomingPager -- see
+// findOutgoingAfter's doc comment.
+var _ outgoingPager = rootReader{}
 
 // HasRelationship reports whether the relationship exists in the ROOT
 // view: ROOT has a virtual relationship to every existing node other than
@@ -6231,37 +6452,69 @@ func (c *CapsuleRegistry) SetValue(graph Transactor, capsule, value NodeID) erro
 // The returned capsules are in no particular semantic order (they follow
 // Graph.FindIncoming's own deterministic sort by slot NodeID, which does
 // not necessarily correspond to capsule creation order).
-func (c *CapsuleRegistry) CapsulesWithValue(graph GraphReader, value NodeID) ([]NodeID, error) {
-	incoming, err := graph.FindIncoming(value)
-	if err != nil {
-		return nil, wrapInterfaceErr(err)
-	}
+//
+// Reading value's incoming relationships is now paged internally
+// (theorystate.md section 105), capsulesWithValuePageSize at a time, so a
+// value referenced from a very large number of places -- the "very popular
+// value node" case that section names directly -- does not require
+// materializing its entire incoming edge list in memory just to filter it
+// down to genuine value-slot owners. This only changes anything for a
+// backend that implements incomingPager (BoltGraph's boltView, and
+// anything built on it, including through a GraphActor): such a backend
+// reads one bounded page at a time via a cursor. A backend without native
+// paging (the in-memory *Graph, stagedGraph) still ends up re-fetching and
+// re-slicing FindIncoming's full result on every page, exactly like
+// VerifyAll's own nodesAfter loop already accepts for FindNodes -- harmless
+// for a backend where the whole graph already fits in memory regardless.
 
+// capsulesWithValuePageSize bounds each internal page CapsulesWithValue
+// reads while walking a value's incoming relationships (theorystate.md
+// section 105). A var, not a const, specifically so tests can shrink it to
+// exercise the multi-page loop without needing thousands of capsules.
+var capsulesWithValuePageSize = 1000
+
+func (c *CapsuleRegistry) CapsulesWithValue(graph GraphReader, value NodeID) ([]NodeID, error) {
 	var capsules []NodeID
 
-	for _, rel := range incoming {
-		slot := rel.From
+	var after NodeID
 
-		isValueSlot, isSlotErr := c.valueSlots.IsPointer(graph, slot)
-		if isSlotErr != nil {
-			return nil, isSlotErr
-		}
-		if !isValueSlot {
-			continue
-		}
+	hasAfter := false
 
-		capsule, found, findErr := findUniqueTaggedParent(graph, slot, c.allElementCapsules)
-		if findErr != nil {
-			return nil, findErr
-		}
-		if !found {
-			continue
+	for {
+		page, err := incomingAfter(graph, value, after, hasAfter, capsulesWithValuePageSize)
+		if err != nil {
+			return nil, err
 		}
 
-		capsules = append(capsules, capsule)
+		for _, rel := range page {
+			slot := rel.From
+
+			isValueSlot, isSlotErr := c.valueSlots.IsPointer(graph, slot)
+			if isSlotErr != nil {
+				return nil, isSlotErr
+			}
+			if !isValueSlot {
+				continue
+			}
+
+			capsule, found, findErr := findUniqueTaggedParent(graph, slot, c.allElementCapsules)
+			if findErr != nil {
+				return nil, findErr
+			}
+			if !found {
+				continue
+			}
+
+			capsules = append(capsules, capsule)
+		}
+
+		if len(page) < capsulesWithValuePageSize {
+			return capsules, nil
+		}
+
+		after = page[len(page)-1].From
+		hasAfter = true
 	}
-
-	return capsules, nil
 }
 
 // Prev returns capsule's previous-capsule link, if any. hasPrev is false

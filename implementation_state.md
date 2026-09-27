@@ -1797,7 +1797,62 @@ could be called directly.
  TestBoltGraphReportCommitLatencyAndFileSize and BenchmarkBoltGraphCommit
  for measurement.
 
-42. Startup integrity sweep (theorystate.md sections 104, 110). Added
+43. Paged reads for one node's own outgoing/incoming relationships
+ (theorystate.md section 105), mirroring item 42's node paging. Added
+ outgoingPager/incomingPager (findOutgoingAfter/findIncomingAfter),
+ implemented on BoltGraph's boltView with a cursor over the out/in
+ buckets (and, through embedding, on boltTxn for free), dispatched
+ through the new outgoingAfter/incomingAfter functions (falling back to
+ FindOutgoing/FindIncoming sliced client-side via the new
+ pageRelationships helper for a reader with no native paging -- the same
+ shape nodesAfter/pageNodeIDs already have for nodes).
+
+ rootReader.findOutgoingAfter closes the specific
+ "rootReader.FindOutgoing(ROOT) via FindNodes" unbounded call theorystate.md
+ section 105 named: since ROOT's entire outgoing set is virtual, it pages
+ over existing node IDs (reusing nodesAfter) and translates each into a
+ virtual relationship, fetching one extra candidate per page so filtering
+ ROOT itself back out (the overlay's own irreflexivity, section 12a) can
+ never silently shorten an otherwise-full page. rootReader deliberately
+ implements only outgoingPager, not incomingPager: FindIncoming always
+ potentially adds one virtual (ROOT, to) relationship and hides any
+ physically-stored ROOT-sourced one, and correctly splicing that into a
+ bounded page is left OPEN rather than rushed, since it is not a small
+ extension of the outgoing case (which has nothing virtual to reconcile
+ on the non-ROOT side).
+
+ CapsuleRegistry.CapsulesWithValue now walks a value's incoming
+ relationships in bounded pages (capsulesWithValuePageSize, kept as a var
+ rather than a const specifically so tests can shrink it) instead of
+ materializing theorystate.md section 105's named "very popular value
+ node" case all at once. This is the first real consumer of the new
+ paging primitives, matching the precedent that item 42's own node
+ paging was introduced alongside VerifyAll rather than built
+ speculatively with no caller (theorystate.md section 7's
+ construct-only-what-is-needed discipline).
+
+ Explicitly not addressed: a reader with no native pager (a bare *Graph,
+ stagedGraph) re-fetches and re-slices the full unpaged result on every
+ page when one of these is looped, exactly like VerifyAll's own
+ nodesAfter loop already does for FindNodes -- an accepted, now
+ explicitly named trade-off, not a new one. Also still unbounded:
+ FindRelationships, rootReader.FindRelationships, rootReader.FindIncoming
+ (no virtual-aware paged incoming yet), the whole-set APIs (Members,
+ Elements, Evaluate, Operands), and two internal full-child-set reads
+ identified by the grep theorystate.md section 105 itself called for:
+ ListRegistry.validateStructure's FindOutgoing(list) and
+ CompositeSetRegistry.Operands/evaluate's FindOutgoing(set) -- paging
+ either would not reduce total work, since both need the complete child
+ set for their own correctness checks, and reworking validateStructure to
+ consume a page stream instead of one materialized membership map is
+ real design work, not a mechanical wrapper.
+
+ Covered by TestBoltGraphFindOutgoingAfterMatchesFindOutgoing,
+ TestBoltGraphFindIncomingAfterMatchesFindIncoming,
+ TestRootReaderFindOutgoingAfterMatchesFindOutgoing, and
+ TestCapsulesWithValuePagesAcrossMultipleFetches.
+
+44. Startup integrity sweep (theorystate.md sections 104, 110). Added
  VerifyAll(graph, pageSize) (one Transact per page of node IDs, each
  calling Tx.Touch; fail-closed, ErrLoadVerification), the unexported
  nodePager interface with pageNodeIDs/nodesAfter (implemented by boltView
@@ -1816,10 +1871,13 @@ could be called directly.
  Measurements are recorded in theorystate.md section 108.
 
 Currently unaddressed yet:
-- Paged reads beyond node listing, and error results for the GraphReader
-  methods that lack them (theorystate.md section 105): FindNodes,
-  FindRelationships and FindIncoming on a popular node are still O(graph)
-  on BoltGraph.
+- Paged reads beyond a single node's own outgoing/incoming edges, and
+  error results for the GraphReader methods that lack them
+  (theorystate.md section 105, item 43): FindRelationships,
+  rootReader.FindRelationships, and rootReader.FindIncoming (no
+  virtual-aware paged incoming yet) are still O(graph) on BoltGraph, as
+  are ListRegistry.validateStructure's and CompositeSetRegistry's own
+  full-child-set reads.
 - The operation-level protocol between other processes and the graph host
   (theorystate.md section 107).
 - Nested transactions as a production-backend feature are also realized
