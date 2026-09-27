@@ -153,6 +153,131 @@ func sortedNodeIDs(ids []NodeID) []NodeID {
 	return sorted
 }
 
+// The must* helpers below wrap the GraphReader/registry methods that
+// gained an error return (NodeExists, HasRelationship, FindRelationships,
+// FindNodes, and the IsX family), failing the test immediately if the
+// call itself errors, and otherwise returning exactly what the wrapped
+// method reported. Every purely in-memory backend in this file never
+// actually returns a non-nil error here; these exist so the hundreds of
+// top-level test assertions calling these methods don't each need their
+// own "if err != nil { t.Fatalf(...) }" line. They must NEVER be called
+// from inside a Transact or Checker.Check closure: such a closure may run
+// on a GraphActor's own dedicated worker goroutine rather than the test's
+// own, and calling t.Fatalf from any goroutine other than the one running
+// the test is unsupported by the testing package. Call sites inside such
+// a closure instead propagate the error by returning it, exactly like
+// every other error already flowing out of that closure.
+
+func mustNodeExists(t *testing.T, g GraphReader, id NodeID) bool {
+	t.Helper()
+
+	exists, err := g.NodeExists(id)
+	if err != nil {
+		t.Fatalf("NodeExists(%d): %v", id, err)
+	}
+
+	return exists
+}
+
+func mustHasRelationship(t *testing.T, g GraphReader, a, b NodeID) bool {
+	t.Helper()
+
+	has, err := g.HasRelationship(a, b)
+	if err != nil {
+		t.Fatalf("HasRelationship(%d,%d): %v", a, b, err)
+	}
+
+	return has
+}
+
+func mustFindRelationships(t *testing.T, g GraphReader) []Relationship {
+	t.Helper()
+
+	relationships, err := g.FindRelationships()
+	if err != nil {
+		t.Fatalf("FindRelationships(): %v", err)
+	}
+
+	return relationships
+}
+
+func mustFindNodes(t *testing.T, g GraphReader) []NodeID {
+	t.Helper()
+
+	ids, err := g.FindNodes()
+	if err != nil {
+		t.Fatalf("FindNodes(): %v", err)
+	}
+
+	return ids
+}
+
+func mustIsPointer(t *testing.T, p *PointerRegistry, g GraphReader, id NodeID) bool {
+	t.Helper()
+
+	is, err := p.IsPointer(g, id)
+	if err != nil {
+		t.Fatalf("IsPointer(%d): %v", id, err)
+	}
+
+	return is
+}
+
+func mustIsCapsule(t *testing.T, c *CapsuleRegistry, g GraphReader, id NodeID) bool {
+	t.Helper()
+
+	is, err := c.IsCapsule(g, id)
+	if err != nil {
+		t.Fatalf("IsCapsule(%d): %v", id, err)
+	}
+
+	return is
+}
+
+func mustIsList(t *testing.T, l *ListRegistry, g GraphReader, id NodeID) bool {
+	t.Helper()
+
+	is, err := l.IsList(g, id)
+	if err != nil {
+		t.Fatalf("IsList(%d): %v", id, err)
+	}
+
+	return is
+}
+
+func mustIsSet(t *testing.T, s *SetRegistry, g GraphReader, id NodeID) bool {
+	t.Helper()
+
+	is, err := s.IsSet(g, id)
+	if err != nil {
+		t.Fatalf("IsSet(%d): %v", id, err)
+	}
+
+	return is
+}
+
+func mustIsCompositeSet(t *testing.T, c *CompositeSetRegistry, g GraphReader, id NodeID) bool {
+	t.Helper()
+
+	is, err := c.IsCompositeSet(g, id)
+	if err != nil {
+		t.Fatalf("IsCompositeSet(%d): %v", id, err)
+	}
+
+	return is
+}
+
+func mustIsCompositeSetLog(t *testing.T, c *CompositeSetLogRegistry, g GraphReader, id NodeID) bool {
+	t.Helper()
+
+	is, err := c.IsCompositeSetLog(g, id)
+	if err != nil {
+		t.Fatalf("IsCompositeSetLog(%d): %v", id, err)
+	}
+
+	return is
+}
+
 func TestCreateNode(t *testing.T) {
 	var g Graph
 
@@ -178,11 +303,11 @@ func TestCreateNode(t *testing.T) {
 		t.Fatalf("CreateNode() returned duplicate NodeID %d", a)
 	}
 
-	if !g.NodeExists(a) {
+	if !mustNodeExists(t, &g, a) {
 		t.Fatalf("created node %d does not exist", a)
 	}
 
-	if !g.NodeExists(b) {
+	if !mustNodeExists(t, &g, b) {
 		t.Fatalf("created node %d does not exist", b)
 	}
 }
@@ -236,11 +361,11 @@ func TestRelationshipIsDirected(t *testing.T) {
 		t.Fatalf("AddRelationship(%d, %d) reported that nothing was created", a, b)
 	}
 
-	if !g.HasRelationship(a, b) {
+	if !mustHasRelationship(t, &g, a, b) {
 		t.Fatalf("expected (%d,%d) to exist", a, b)
 	}
 
-	if g.HasRelationship(b, a) {
+	if mustHasRelationship(t, &g, b, a) {
 		t.Fatalf(
 			"(%d,%d) incorrectly exists merely because (%d,%d) exists",
 			b, a, a, b,
@@ -318,7 +443,7 @@ func TestSelfRelationshipIsAllowed(t *testing.T) {
 		t.Fatal("self relationship was not created")
 	}
 
-	if !g.HasRelationship(a, a) {
+	if !mustHasRelationship(t, &g, a, a) {
 		t.Fatalf("expected (%d,%d) to exist", a, a)
 	}
 
@@ -510,7 +635,7 @@ func TestFindRelationships(t *testing.T) {
 		t.Fatalf("AddRelationship(%d,%d): %v", c, b, err)
 	}
 
-	relationships := g.FindRelationships()
+	relationships := mustFindRelationships(t, &g)
 
 	expected := []Relationship{
 		{From: a, To: b},
@@ -552,7 +677,7 @@ func TestRemoveRelationship(t *testing.T) {
 		t.Fatal("RemoveRelationship() reported that nothing was removed")
 	}
 
-	if g.HasRelationship(a, b) {
+	if mustHasRelationship(t, &g, a, b) {
 		t.Fatalf("relationship (%d,%d) still exists", a, b)
 	}
 
@@ -600,7 +725,7 @@ func TestDeleteNodeRequiresNoRelationships(t *testing.T) {
 		)
 	}
 
-	if !g.NodeExists(a) {
+	if !mustNodeExists(t, &g, a) {
 		t.Fatalf(
 			"node %d disappeared even though deletion should have failed",
 			a,
@@ -619,7 +744,7 @@ func TestDeleteNodeRequiresNoRelationships(t *testing.T) {
 		)
 	}
 
-	if g.NodeExists(a) {
+	if mustNodeExists(t, &g, a) {
 		t.Fatalf("node %d still exists after successful deletion", a)
 	}
 }
@@ -649,7 +774,7 @@ func TestDeleteNodeWithIncomingRelationshipAlsoFails(t *testing.T) {
 		)
 	}
 
-	if !g.NodeExists(b) {
+	if !mustNodeExists(t, &g, b) {
 		t.Fatalf(
 			"node %d disappeared even though deletion should have failed",
 			b,
@@ -675,7 +800,7 @@ func TestRelationshipRequiresExistingNodes(t *testing.T) {
 		)
 	}
 
-	if g.HasRelationship(a, nonexistent) {
+	if mustHasRelationship(t, &g, a, nonexistent) {
 		t.Fatalf("relationship to nonexistent node unexpectedly exists")
 	}
 }
@@ -731,7 +856,7 @@ func TestZeroValueGraphWorks(t *testing.T) {
 		t.Fatalf("first node in zero-value Graph = %d, want 0", a)
 	}
 
-	if !g.NodeExists(a) {
+	if !mustNodeExists(t, &g, a) {
 		t.Fatalf("created node %d does not exist", a)
 	}
 }
@@ -795,7 +920,7 @@ func TestNameRegistryCreateNamedNode(t *testing.T) {
 		t.Fatalf("CreateNamedNode() returned error: %v", err)
 	}
 
-	if !g.NodeExists(id) {
+	if !mustNodeExists(t, &g, id) {
 		t.Fatalf("created node %d does not exist", id)
 	}
 
@@ -922,7 +1047,7 @@ func TestNameRegistryCreateNamedNodeDoesNotDuplicateName(t *testing.T) {
 		)
 	}
 
-	if !g.NodeExists(first) {
+	if !mustNodeExists(t, &g, first) {
 		t.Fatalf("original named node %d disappeared", first)
 	}
 }
@@ -953,7 +1078,7 @@ func TestNameRegistryUnbindDoesNotDeleteNode(t *testing.T) {
 		t.Fatal("NodeID still has a name after Unbind()")
 	}
 
-	if !g.NodeExists(id) {
+	if !mustNodeExists(t, &g, id) {
 		t.Fatalf("Unbind() incorrectly deleted NodeID %d", id)
 	}
 }
@@ -985,7 +1110,7 @@ func TestNameRegistryDeleteNodeRemovesNameAssociation(t *testing.T) {
 		t.Fatalf("DeleteNode(%d): %v", id, err)
 	}
 
-	if g.NodeExists(id) {
+	if mustNodeExists(t, &g, id) {
 		t.Fatalf("node %d still exists after DeleteNode()", id)
 	}
 
@@ -1021,7 +1146,7 @@ func TestNameRegistryDeleteNodeFailsIfNotEmpty(t *testing.T) {
 		t.Fatalf("DeleteNode(%d) error = %v, want %v", a, err, ErrNodeNotEmpty)
 	}
 
-	if !g.NodeExists(a) {
+	if !mustNodeExists(t, &g, a) {
 		t.Fatalf("node %d disappeared even though deletion should have failed", a)
 	}
 
@@ -1044,7 +1169,7 @@ func TestNameRegistryDeleteNodeWithoutNameWorks(t *testing.T) {
 		t.Fatalf("DeleteNode(%d): %v", id, err)
 	}
 
-	if g.NodeExists(id) {
+	if mustNodeExists(t, &g, id) {
 		t.Fatalf("node %d still exists after DeleteNode()", id)
 	}
 }
@@ -1063,11 +1188,11 @@ func TestNameRegistryDoesNotCreateRelationships(t *testing.T) {
 		t.Fatalf("CreateNamedNode(\"B\") returned error: %v", err)
 	}
 
-	if g.HasRelationship(a, b) {
+	if mustHasRelationship(t, &g, a, b) {
 		t.Fatalf("name registry created unexpected relationship (%d,%d)", a, b)
 	}
 
-	if g.HasRelationship(b, a) {
+	if mustHasRelationship(t, &g, b, a) {
 		t.Fatalf("name registry created unexpected relationship (%d,%d)", b, a)
 	}
 }
@@ -1081,7 +1206,7 @@ func TestNameRegistryEnsureNamedNodeCreatesWhenMissing(t *testing.T) {
 		t.Fatalf("EnsureNamedNode() returned error: %v", err)
 	}
 
-	if !g.NodeExists(id) {
+	if !mustNodeExists(t, &g, id) {
 		t.Fatalf("EnsureNamedNode() returned NodeID %d that does not exist", id)
 	}
 
@@ -1257,7 +1382,7 @@ func TestBootstrapNamesCreatesAllNames(t *testing.T) {
 			t.Fatalf("BootstrapNames() result missing entry for %q", name)
 		}
 
-		if !g.NodeExists(id) {
+		if !mustNodeExists(t, &g, id) {
 			t.Fatalf("BootstrapNames() returned nonexistent NodeID %d for %q", id, name)
 		}
 
@@ -1369,7 +1494,7 @@ func TestAllPointersTagsPointerViaRelationship(t *testing.T) {
 		t.Fatal("tagging relationship (AllPointers, p) was not created")
 	}
 
-	if !g.HasRelationship(allPointers, p) {
+	if !mustHasRelationship(t, &g, allPointers, p) {
 		t.Fatal("p is not tagged as Pointer-kind via (AllPointers, p)")
 	}
 }
@@ -1436,7 +1561,7 @@ func TestRootDoesNotPointToItself(t *testing.T) {
 		t.Fatalf("NewRootGraph(): %v", err)
 	}
 
-	if r.HasRelationship(root, root) {
+	if mustHasRelationship(t, r, root, root) {
 		t.Fatal("ROOT incorrectly has a relationship to itself")
 	}
 
@@ -1513,7 +1638,7 @@ func TestRootCanBeTargetOfNormalRelationship(t *testing.T) {
 		t.Fatal("AddRelationship(a, ROOT) reported that nothing was created")
 	}
 
-	if !r.HasRelationship(a, root) {
+	if !mustHasRelationship(t, r, a, root) {
 		t.Fatal("relationship (a, ROOT) is not visible")
 	}
 
@@ -1526,7 +1651,7 @@ func TestRootCanBeTargetOfNormalRelationship(t *testing.T) {
 		t.Fatal("RemoveRelationship(a, ROOT) reported that nothing was removed")
 	}
 
-	if r.HasRelationship(a, root) {
+	if mustHasRelationship(t, r, a, root) {
 		t.Fatal("relationship (a, ROOT) still exists after removal")
 	}
 }
@@ -1549,11 +1674,11 @@ func TestRootCreateNodeGoesThroughRootLayer(t *testing.T) {
 		t.Fatalf("RootView.CreateNode(): %v", err)
 	}
 
-	if !g.NodeExists(a) {
+	if !mustNodeExists(t, &g, a) {
 		t.Fatalf("new node %d does not exist in primitive graph", a)
 	}
 
-	if !r.HasRelationship(root, a) {
+	if !mustHasRelationship(t, r, root, a) {
 		t.Fatalf("new node %d is not visible as a ROOT child", a)
 	}
 }
@@ -1576,11 +1701,11 @@ func TestRootRelationshipIsVirtual(t *testing.T) {
 		t.Fatalf("NewRootGraph(): %v", err)
 	}
 
-	if g.HasRelationship(root, a) {
+	if mustHasRelationship(t, &g, root, a) {
 		t.Fatal("ROOT relationship was physically stored in Graph")
 	}
 
-	if !r.HasRelationship(root, a) {
+	if !mustHasRelationship(t, r, root, a) {
 		t.Fatal("ROOT relationship is not visible through RootView")
 	}
 }
@@ -1612,11 +1737,11 @@ func TestRootAddRelationshipDoesNotPhysicallyStoreVirtualRelationship(t *testing
 		t.Fatal("AddRelationship(ROOT, a) reported a physical relationship was created")
 	}
 
-	if g.HasRelationship(root, a) {
+	if mustHasRelationship(t, &g, root, a) {
 		t.Fatal("AddRelationship(ROOT, a) physically stored the virtual relationship")
 	}
 
-	if !r.HasRelationship(root, a) {
+	if !mustHasRelationship(t, r, root, a) {
 		t.Fatal("virtual ROOT relationship is missing")
 	}
 }
@@ -1648,7 +1773,7 @@ func TestRootRemoveRelationshipCannotRemoveVirtualRelationship(t *testing.T) {
 		t.Fatal("RemoveRelationship(ROOT, a) reported removal of a virtual relationship")
 	}
 
-	if !r.HasRelationship(root, a) {
+	if !mustHasRelationship(t, r, root, a) {
 		t.Fatal("removing virtual ROOT relationship incorrectly removed it")
 	}
 }
@@ -1721,7 +1846,7 @@ func TestRootFindRelationshipsIncludesVirtualRelationships(t *testing.T) {
 		t.Fatalf("NewRootGraph(): %v", err)
 	}
 
-	got := r.FindRelationships()
+	got := mustFindRelationships(t, r)
 
 	want := []Relationship{
 		{From: root, To: a},
@@ -1756,11 +1881,11 @@ func TestRootDeleteNodeRemovesOrdinaryNode(t *testing.T) {
 		t.Fatalf("DeleteNode(a): %v", err)
 	}
 
-	if r.NodeExists(a) {
+	if mustNodeExists(t, r, a) {
 		t.Fatal("deleted node still exists")
 	}
 
-	if r.HasRelationship(root, a) {
+	if mustHasRelationship(t, r, root, a) {
 		t.Fatal("deleted node is still visible as a ROOT child")
 	}
 }
@@ -1783,7 +1908,7 @@ func TestRootCannotDeleteRoot(t *testing.T) {
 		t.Fatalf("DeleteNode(ROOT) error = %v, want %v", err, ErrCannotDeleteRoot)
 	}
 
-	if !r.NodeExists(root) {
+	if !mustNodeExists(t, r, root) {
 		t.Fatal("ROOT disappeared after failed deletion")
 	}
 }
@@ -1823,7 +1948,7 @@ func TestRootPhysicalRelationshipDoesNotDuplicateVirtualRelationship(t *testing.
 		t.Fatalf("FindOutgoing(ROOT) = %v, want %v", got, want)
 	}
 
-	got = r.FindRelationships()
+	got = mustFindRelationships(t, r)
 
 	want = []Relationship{
 		{From: root, To: a},
@@ -1845,7 +1970,7 @@ func TestRootPhysicalSelfRelationshipIsHidden(t *testing.T) {
 		t.Fatalf("AddRelationship(ROOT, ROOT) in primitive graph: %v", err2)
 	}
 
-	if !g.HasRelationship(root, root) {
+	if !mustHasRelationship(t, &g, root, root) {
 		t.Fatal("primitive graph does not contain (ROOT, ROOT)")
 	}
 
@@ -1854,7 +1979,7 @@ func TestRootPhysicalSelfRelationshipIsHidden(t *testing.T) {
 		t.Fatalf("NewRootGraph(): %v", err)
 	}
 
-	if r.HasRelationship(root, root) {
+	if mustHasRelationship(t, r, root, root) {
 		t.Fatal("ROOT self-relationship is visible through RootGraph")
 	}
 
@@ -1876,7 +2001,7 @@ func TestRootPhysicalSelfRelationshipIsHidden(t *testing.T) {
 		t.Fatalf("FindIncoming(ROOT) = %v, want no relationships", got)
 	}
 
-	got = r.FindRelationships()
+	got = mustFindRelationships(t, r)
 
 	if len(got) != 0 {
 		t.Fatalf("FindRelationships() = %v, want no relationships", got)
@@ -1886,7 +2011,7 @@ func TestRootPhysicalSelfRelationshipIsHidden(t *testing.T) {
 func TestFindNodesReturnsSortedExistingNodes(t *testing.T) {
 	var g Graph
 
-	if got := g.FindNodes(); len(got) != 0 {
+	if got := mustFindNodes(t, &g); len(got) != 0 {
 		t.Fatalf("FindNodes() on an empty graph = %v, want empty", got)
 	}
 
@@ -1909,7 +2034,7 @@ func TestFindNodesReturnsSortedExistingNodes(t *testing.T) {
 		t.Fatalf("DeleteNode(b): %v", err2)
 	}
 
-	got := g.FindNodes()
+	got := mustFindNodes(t, &g)
 	want := []NodeID{a, c}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("FindNodes() = %v, want %v (sorted, deleted node excluded)", got, want)
@@ -1936,7 +2061,11 @@ func TestTxnFindNodesReflectsUncommittedCreatesAndRollback(t *testing.T) {
 			return txErr
 		}
 
-		inside = tx.FindNodes()
+		var findErr error
+		inside, findErr = tx.FindNodes()
+		if findErr != nil {
+			return wrapInterfaceErr(findErr)
+		}
 
 		return errForcedRollback
 	})
@@ -1950,7 +2079,7 @@ func TestTxnFindNodesReflectsUncommittedCreatesAndRollback(t *testing.T) {
 	}
 
 	wantAfter := []NodeID{existing}
-	if got := g.FindNodes(); !reflect.DeepEqual(got, wantAfter) {
+	if got := mustFindNodes(t, &g); !reflect.DeepEqual(got, wantAfter) {
 		t.Fatalf("FindNodes() after rollback = %v, want %v", got, wantAfter)
 	}
 }
@@ -1999,7 +2128,7 @@ func TestRootGraphInsideGraphActor(t *testing.T) {
 	}
 
 	wantAll := []Relationship{{From: root, To: a}, {From: root, To: b}, {From: a, To: b}}
-	if all := actor.FindRelationships(); !reflect.DeepEqual(all, wantAll) {
+	if all := mustFindRelationships(t, actor); !reflect.DeepEqual(all, wantAll) {
 		t.Fatalf("FindRelationships() = %v, want %v", all, wantAll)
 	}
 
@@ -2007,7 +2136,7 @@ func TestRootGraphInsideGraphActor(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateNode() for c: %v", err)
 	}
-	if !actor.HasRelationship(root, c) {
+	if !mustHasRelationship(t, actor, root, c) {
 		t.Fatalf("new node %d is not visible as a ROOT child", c)
 	}
 
@@ -2020,7 +2149,11 @@ func TestRootGraphInsideGraphActor(t *testing.T) {
 	var deleteRootErr error
 
 	err = actor.Transact(func(tx Tx) error {
-		sawVirtualInTx = tx.HasRelationship(root, a)
+		var hasErr error
+		sawVirtualInTx, hasErr = tx.HasRelationship(root, a)
+		if hasErr != nil {
+			return wrapInterfaceErr(hasErr)
+		}
 
 		var txErr error
 		createdVirtualInTx, txErr = tx.AddRelationship(root, a)
@@ -2143,7 +2276,7 @@ func TestGraphActorRootGraphFindRelationshipsIsAtomic(t *testing.T) {
 	}()
 
 	for running := true; running; {
-		snapshot := actor.FindRelationships()
+		snapshot := mustFindRelationships(t, actor)
 
 		if bad, found := findDanglingRelationship(root, snapshot); found {
 			t.Errorf("FindRelationships() returned %v, whose endpoints are not all ROOT children of the same snapshot", bad)
@@ -2254,7 +2387,11 @@ func TestRootGraphTransactAndCheckerSeeOverlay(t *testing.T) {
 		Name: "overlay-probe",
 		Tags: []NodeID{tag},
 		Check: func(view GraphReader, _ map[NodeID]struct{}) error {
-			checkerSawVirtual = view.HasRelationship(root, x)
+			has, hasErr := view.HasRelationship(root, x)
+			if hasErr != nil {
+				return hasErr
+			}
+			checkerSawVirtual = has
 			return nil
 		},
 	})
@@ -2262,7 +2399,11 @@ func TestRootGraphTransactAndCheckerSeeOverlay(t *testing.T) {
 	var sawVirtualInTx, createdVirtualInTx bool
 
 	err = r.Transact(func(tx Tx) error {
-		sawVirtualInTx = tx.HasRelationship(root, x)
+		var hasErr error
+		sawVirtualInTx, hasErr = tx.HasRelationship(root, x)
+		if hasErr != nil {
+			return wrapInterfaceErr(hasErr)
+		}
 
 		var txErr error
 		createdVirtualInTx, txErr = tx.AddRelationship(root, x)
@@ -2285,7 +2426,7 @@ func TestRootGraphTransactAndCheckerSeeOverlay(t *testing.T) {
 	if !checkerSawVirtual {
 		t.Fatal("the Checker's reader did not present the virtual (ROOT, x) relationship")
 	}
-	if g.HasRelationship(root, x) {
+	if mustHasRelationship(t, &g, root, x) {
 		t.Fatal("the virtual (ROOT, x) relationship was physically stored")
 	}
 }
@@ -2339,7 +2480,7 @@ func TestRootFindRelationshipsWithoutRootNodeEmitsNoVirtualRelationships(t *test
 		t.Fatalf("raw DeleteNode(ROOT): %v", err3)
 	}
 
-	got := r.FindRelationships()
+	got := mustFindRelationships(t, r)
 	want := []Relationship{{From: a, To: b}}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("FindRelationships() = %v, want %v", got, want)
@@ -2390,11 +2531,11 @@ func TestPointerRegistryNewPointerStartsEmpty(t *testing.T) {
 		t.Fatalf("NewPointer(): %v", err)
 	}
 
-	if !g.NodeExists(p) {
+	if !mustNodeExists(t, g, p) {
 		t.Fatalf("NewPointer() returned NodeID %d that does not exist", p)
 	}
 
-	if !pointers.IsPointer(g, p) {
+	if !mustIsPointer(t, pointers, g, p) {
 		t.Fatalf("NewPointer() did not tag %d as Pointer-kind", p)
 	}
 
@@ -2501,7 +2642,7 @@ func TestPointerRegistrySetTargetReplacesExistingTarget(t *testing.T) {
 		t.Fatalf("Target(%d) = (%d,%v), want (%d,true)", p, target, hasTarget, y)
 	}
 
-	if g.HasRelationship(p, x) {
+	if mustHasRelationship(t, g, p, x) {
 		t.Fatalf("old target relationship (%d,%d) was not removed", p, x)
 	}
 
@@ -2634,7 +2775,7 @@ func TestPointerRegistryTagAsPointerTagsFreshNode(t *testing.T) {
 		t.Fatalf("CreateNode(): %v", err)
 	}
 
-	if pointers.IsPointer(g, id) {
+	if mustIsPointer(t, pointers, g, id) {
 		t.Fatalf("node %d is unexpectedly already tagged Pointer-kind", id)
 	}
 
@@ -2642,7 +2783,7 @@ func TestPointerRegistryTagAsPointerTagsFreshNode(t *testing.T) {
 		t.Fatalf("TagAsPointer(%d): %v", id, err)
 	}
 
-	if !pointers.IsPointer(g, id) {
+	if !mustIsPointer(t, pointers, g, id) {
 		t.Fatalf("TagAsPointer(%d) did not tag the node", id)
 	}
 }
@@ -2709,7 +2850,7 @@ func TestPointerRegistryTagAsPointerRejectsMultipleExistingChildren(t *testing.T
 		t.Fatalf("TagAsPointer() error = %v, want %v", err, ErrTooManyPointerTargets)
 	}
 
-	if pointers.IsPointer(g, id) {
+	if mustIsPointer(t, pointers, g, id) {
 		t.Fatalf("node %d was tagged despite violating the Pointer invariant", id)
 	}
 }
@@ -2809,11 +2950,11 @@ func TestTransactCommitsMutationsOnSuccess(t *testing.T) {
 		t.Fatalf("Transact() returned error: %v", err)
 	}
 
-	if !g.NodeExists(a) || !g.NodeExists(b) {
+	if !mustNodeExists(t, &g, a) || !mustNodeExists(t, &g, b) {
 		t.Fatalf("nodes %d, %d do not both exist after successful Transact()", a, b)
 	}
 
-	if !g.HasRelationship(a, b) {
+	if !mustHasRelationship(t, &g, a, b) {
 		t.Fatalf("relationship (%d,%d) missing after successful Transact()", a, b)
 	}
 }
@@ -2839,7 +2980,7 @@ func TestTransactRollsBackCreateNodeOnLaterFailure(t *testing.T) {
 		t.Fatalf("Transact() error = %v, want %v", err, ErrNodeNotFound)
 	}
 
-	if g.NodeExists(id) {
+	if mustNodeExists(t, &g, id) {
 		t.Fatalf("node %d still exists after its creating transaction rolled back", id)
 	}
 }
@@ -2880,11 +3021,11 @@ func TestTransactRollsBackRelationshipsInLIFOOrder(t *testing.T) {
 		t.Fatalf("Transact() error = %v, want %v", err, ErrNodeNotFound)
 	}
 
-	if g.HasRelationship(a, b) {
+	if mustHasRelationship(t, &g, a, b) {
 		t.Fatalf("relationship (%d,%d) survived a rolled-back transaction", a, b)
 	}
 
-	if g.HasRelationship(a, c) {
+	if mustHasRelationship(t, &g, a, c) {
 		t.Fatalf("relationship (%d,%d) survived a rolled-back transaction", a, c)
 	}
 }
@@ -2920,7 +3061,7 @@ func TestTransactRollsBackRemoveRelationshipOnLaterFailure(t *testing.T) {
 		t.Fatalf("Transact() error = %v, want %v", err, ErrNodeNotFound)
 	}
 
-	if !g.HasRelationship(a, b) {
+	if !mustHasRelationship(t, &g, a, b) {
 		t.Fatalf("relationship (%d,%d) was not restored after rollback", a, b)
 	}
 }
@@ -2963,7 +3104,7 @@ func TestTransactDoesNotUndoPreexistingRelationship(t *testing.T) {
 		t.Fatalf("Transact() error = %v, want %v", err, ErrNodeNotFound)
 	}
 
-	if !g.HasRelationship(a, b) {
+	if !mustHasRelationship(t, &g, a, b) {
 		t.Fatalf("preexisting relationship (%d,%d) was incorrectly removed by rollback", a, b)
 	}
 }
@@ -2992,7 +3133,7 @@ func TestTransactRollsBackOnPanic(t *testing.T) {
 		}
 	}()
 
-	if g.NodeExists(id) {
+	if mustNodeExists(t, &g, id) {
 		t.Fatalf("node %d still exists after a panicking transaction", id)
 	}
 }
@@ -3043,7 +3184,7 @@ func TestCheckerPanicRollsBackAndPropagates(t *testing.T) {
 		}
 	}()
 
-	if g.NodeExists(id) {
+	if mustNodeExists(t, &g, id) {
 		t.Fatalf("node %d still exists after its transaction's Checker panicked", id)
 	}
 }
@@ -3853,11 +3994,11 @@ func TestNewCapsuleTagsAndSetsValue(t *testing.T) {
 		t.Fatalf("NewCapsule(): %v", err)
 	}
 
-	if !g.NodeExists(capsule) {
+	if !mustNodeExists(t, g, capsule) {
 		t.Fatalf("NewCapsule() returned NodeID %d that does not exist", capsule)
 	}
 
-	if !capsules.IsCapsule(g, capsule) {
+	if !mustIsCapsule(t, capsules, g, capsule) {
 		t.Fatalf("NewCapsule() did not tag %d as an ElementCapsule", capsule)
 	}
 
@@ -4046,20 +4187,20 @@ func TestCapsuleRegistryDeleteCapsuleDeletesCleanCapsule(t *testing.T) {
 		t.Fatalf("DeleteCapsule(): %v", err)
 	}
 
-	if g.NodeExists(capsule) {
+	if mustNodeExists(t, g, capsule) {
 		t.Fatalf("capsule %d still exists after DeleteCapsule()", capsule)
 	}
-	if g.NodeExists(prevSlot) {
+	if mustNodeExists(t, g, prevSlot) {
 		t.Fatalf("prevSlot %d still exists after DeleteCapsule()", prevSlot)
 	}
-	if g.NodeExists(valueSlot) {
+	if mustNodeExists(t, g, valueSlot) {
 		t.Fatalf("valueSlot %d still exists after DeleteCapsule()", valueSlot)
 	}
-	if g.NodeExists(nextSlot) {
+	if mustNodeExists(t, g, nextSlot) {
 		t.Fatalf("nextSlot %d still exists after DeleteCapsule()", nextSlot)
 	}
 
-	if !g.NodeExists(value) {
+	if !mustNodeExists(t, g, value) {
 		t.Fatal("DeleteCapsule() incorrectly deleted the capsule's value")
 	}
 }
@@ -4087,13 +4228,13 @@ func TestCapsuleRegistryDeleteCapsuleFailsIfStillListed(t *testing.T) {
 		t.Fatalf("DeleteCapsule() error = %v, want %v", err, ErrCapsuleNotEmpty)
 	}
 
-	if !g.NodeExists(capsule) {
+	if !mustNodeExists(t, g, capsule) {
 		t.Fatal("capsule disappeared despite a failed DeleteCapsule()")
 	}
-	if !capsules.IsCapsule(g, capsule) {
+	if !mustIsCapsule(t, capsules, g, capsule) {
 		t.Fatal("capsule lost its AllElementCapsules tag despite a failed DeleteCapsule()")
 	}
-	if !g.HasRelationship(list, capsule) {
+	if !mustHasRelationship(t, g, list, capsule) {
 		t.Fatal("capsule lost its list membership despite a failed DeleteCapsule()")
 	}
 
@@ -4136,7 +4277,7 @@ func TestCapsuleRegistryDeleteCapsuleFailsIfPrevOrNextSet(t *testing.T) {
 		t.Fatalf("DeleteCapsule(c1) error = %v, want %v", err, ErrCapsuleNotEmpty)
 	}
 
-	if !g.NodeExists(c1) {
+	if !mustNodeExists(t, g, c1) {
 		t.Fatal("c1 disappeared despite a failed DeleteCapsule()")
 	}
 
@@ -4185,10 +4326,10 @@ func TestCapsuleRegistryDeleteCapsuleFailsIfSlotHasExtraParent(t *testing.T) {
 		t.Fatalf("DeleteCapsule() error = %v, want %v", err, ErrCapsuleNotEmpty)
 	}
 
-	if !g.NodeExists(capsule) || !g.NodeExists(valueSlot) {
+	if !mustNodeExists(t, g, capsule) || !mustNodeExists(t, g, valueSlot) {
 		t.Fatal("capsule or valueSlot disappeared despite a failed DeleteCapsule()")
 	}
-	if !g.HasRelationship(metadata, valueSlot) {
+	if !mustHasRelationship(t, g, metadata, valueSlot) {
 		t.Fatal("unrelated metadata relationship was disturbed by a failed DeleteCapsule()")
 	}
 }
@@ -4275,7 +4416,7 @@ func TestCapsuleRoleSlotsAreNotTaggedWithGenericAllPointers(t *testing.T) {
 			t.Fatalf("slotFor(%s): found=%v err=%v", tc.name, found, err)
 		}
 
-		if g.HasRelationship(allPointers, slot) {
+		if mustHasRelationship(t, &g, allPointers, slot) {
 			t.Fatalf("%s slot %d is tagged with the generic AllPointers tag; it should only carry its own role tag", tc.name, slot)
 		}
 
@@ -4557,11 +4698,11 @@ func TestNewListTagsListAndStartsEmpty(t *testing.T) {
 		t.Fatalf("NewList(): %v", err)
 	}
 
-	if !g.NodeExists(list) {
+	if !mustNodeExists(t, g, list) {
 		t.Fatalf("NewList() returned NodeID %d that does not exist", list)
 	}
 
-	if !lists.IsList(g, list) {
+	if !mustIsList(t, lists, g, list) {
 		t.Fatalf("NewList() did not tag %d as a list", list)
 	}
 
@@ -4803,7 +4944,7 @@ func TestListInsertAfterTailUpdatesTail(t *testing.T) {
 	}
 
 	// The old tail (capsuleA) must have lost its AllTails tag.
-	if g.HasRelationship(lists.allTails, capsuleA) {
+	if mustHasRelationship(t, g, lists.allTails, capsuleA) {
 		t.Fatalf("old tail capsule %d is still tagged AllTails after InsertAfter extended the list", capsuleA)
 	}
 
@@ -4879,10 +5020,10 @@ func TestListRegistryCheckerCatchesInvalidStructureAtCommitTime(t *testing.T) {
 
 	// Confirm the whole changeset was rolled back: bogus must not be
 	// linked into list nor tagged as head.
-	if g.HasRelationship(list, bogus) {
+	if mustHasRelationship(t, g, list, bogus) {
 		t.Fatal("list still contains bogus after the Checker declined the commit")
 	}
-	if g.HasRelationship(lists.allHeads, bogus) {
+	if mustHasRelationship(t, g, lists.allHeads, bogus) {
 		t.Fatal("bogus is still tagged AllHeads after the Checker declined the commit")
 	}
 
@@ -5365,7 +5506,7 @@ func TestListRemoveWithoutDeletingCapsuleClearsCapsuleOwnLinks(t *testing.T) {
 
 	// The capsule itself remains a valid, addressable ElementCapsule --
 	// removal from a list does not delete or untag it.
-	if !lists.capsules.IsCapsule(g, capsuleB) {
+	if !mustIsCapsule(t, lists.capsules, g, capsuleB) {
 		t.Fatal("removed capsuleB lost its AllElementCapsules tag")
 	}
 
@@ -5463,11 +5604,11 @@ func TestListDeleteListFailsIfNotEmpty(t *testing.T) {
 		t.Fatalf("DeleteList() error = %v, want %v", err, ErrNodeNotEmpty)
 	}
 
-	if !g.NodeExists(list) {
+	if !mustNodeExists(t, g, list) {
 		t.Fatalf("list %d disappeared even though deletion should have failed", list)
 	}
 
-	if !lists.IsList(g, list) {
+	if !mustIsList(t, lists, g, list) {
 		t.Fatal("AllLists tag was not restored after a failed DeleteList()")
 	}
 }
@@ -5484,7 +5625,7 @@ func TestListDeleteListSucceedsWhenEmpty(t *testing.T) {
 		t.Fatalf("DeleteList(): %v", err)
 	}
 
-	if g.NodeExists(list) {
+	if mustNodeExists(t, g, list) {
 		t.Fatalf("list %d still exists after successful DeleteList()", list)
 	}
 }
@@ -5515,7 +5656,7 @@ func TestListRemoveWithoutDeletingCapsuleThenDeleteListSucceeds(t *testing.T) {
 		t.Fatalf("DeleteList() after RemoveWithoutDeletingCapsule(): %v", err)
 	}
 
-	if g.NodeExists(list) {
+	if mustNodeExists(t, g, list) {
 		t.Fatalf("list %d still exists after successful DeleteList()", list)
 	}
 }
@@ -5546,11 +5687,11 @@ func TestListRemoveDeletesUnreferencedCapsule(t *testing.T) {
 		t.Fatal("Remove() reported deleted=false for an unreferenced capsule")
 	}
 
-	if g.NodeExists(capsule) {
+	if mustNodeExists(t, g, capsule) {
 		t.Fatalf("capsule %d still exists after Remove()", capsule)
 	}
 
-	if g.HasRelationship(list, capsule) {
+	if mustHasRelationship(t, g, list, capsule) {
 		t.Fatal("capsule is still linked into list after Remove()")
 	}
 
@@ -5607,7 +5748,7 @@ func TestListRemoveKeepsCapsuleIfStillReferencedElsewhere(t *testing.T) {
 	}
 
 	// The removal half must still have fully succeeded.
-	if g.HasRelationship(list, capsule) {
+	if mustHasRelationship(t, g, list, capsule) {
 		t.Fatal("capsule is still linked into list after Remove()")
 	}
 	elements, err := lists.Elements(g, list)
@@ -5619,10 +5760,10 @@ func TestListRemoveKeepsCapsuleIfStillReferencedElsewhere(t *testing.T) {
 	}
 
 	// But the capsule itself, being undeletable, must remain intact.
-	if !g.NodeExists(capsule) {
+	if !mustNodeExists(t, g, capsule) {
 		t.Fatal("capsule was deleted despite still being referenced elsewhere")
 	}
-	if !capsules.IsCapsule(g, capsule) {
+	if !mustIsCapsule(t, capsules, g, capsule) {
 		t.Fatal("capsule lost its AllElementCapsules tag despite deletion being refused")
 	}
 }
@@ -5839,7 +5980,7 @@ func TestAdversarialDetachedCapsuleDoesNotBecomeListMember(t *testing.T) {
 	if err := lists.RemoveWithoutDeletingCapsule(g, list, capsule); !errors.Is(err, ErrCapsuleNotInList) {
 		t.Fatalf("RemoveWithoutDeletingCapsule() error = %v, want %v", err, ErrCapsuleNotInList)
 	}
-	if !capsules.IsCapsule(g, capsule) || !g.NodeExists(capsule) {
+	if !mustIsCapsule(t, capsules, g, capsule) || !mustNodeExists(t, g, capsule) {
 		t.Fatal("detached capsule was unexpectedly deleted or untagged")
 	}
 }
@@ -6456,7 +6597,7 @@ func TestAdversarialSelfReferentialCapsuleValueIsAllowed(t *testing.T) {
 	if !hasValue || got != created {
 		t.Fatalf("Value() = (%d,%v), want (%d,true)", got, hasValue, created)
 	}
-	if !g.NodeExists(capsule) {
+	if !mustNodeExists(t, g, capsule) {
 		t.Fatal("unused test node unexpectedly absent")
 	}
 }
@@ -6645,11 +6786,11 @@ func TestNewSetTagsSetAndStartsEmpty(t *testing.T) {
 		t.Fatalf("NewSet(): %v", err)
 	}
 
-	if !g.NodeExists(set) {
+	if !mustNodeExists(t, g, set) {
 		t.Fatalf("NewSet() returned NodeID %d that does not exist", set)
 	}
 
-	if !sets.IsSet(g, set) {
+	if !mustIsSet(t, sets, g, set) {
 		t.Fatalf("NewSet() did not tag %d as a set", set)
 	}
 
@@ -6678,7 +6819,7 @@ func TestSetTagAsSetTagsFreshNode(t *testing.T) {
 		t.Fatalf("CreateNode(): %v", err)
 	}
 
-	if sets.IsSet(g, id) {
+	if mustIsSet(t, sets, g, id) {
 		t.Fatalf("node %d is unexpectedly already tagged Set-kind", id)
 	}
 
@@ -6686,7 +6827,7 @@ func TestSetTagAsSetTagsFreshNode(t *testing.T) {
 		t.Fatalf("TagAsSet(%d): %v", id, err)
 	}
 
-	if !sets.IsSet(g, id) {
+	if !mustIsSet(t, sets, g, id) {
 		t.Fatalf("TagAsSet(%d) did not tag the node", id)
 	}
 }
@@ -7116,7 +7257,7 @@ func TestSetDeleteSetSucceedsWhenEmpty(t *testing.T) {
 		t.Fatalf("DeleteSet(): %v", err)
 	}
 
-	if g.NodeExists(set) {
+	if mustNodeExists(t, g, set) {
 		t.Fatalf("set %d still exists after successful DeleteSet()", set)
 	}
 }
@@ -7143,10 +7284,10 @@ func TestSetDeleteSetFailsIfNotEmpty(t *testing.T) {
 		t.Fatalf("DeleteSet() error = %v, want %v", err, ErrNodeNotEmpty)
 	}
 
-	if !g.NodeExists(set) {
+	if !mustNodeExists(t, g, set) {
 		t.Fatal("set disappeared despite a failed DeleteSet()")
 	}
-	if !sets.IsSet(g, set) {
+	if !mustIsSet(t, sets, g, set) {
 		t.Fatal("set lost its AllSets tag despite a failed DeleteSet()")
 	}
 
@@ -7186,13 +7327,13 @@ func TestSetDeleteSetFailsIfReferencedElsewhere(t *testing.T) {
 		t.Fatalf("DeleteSet() error = %v, want %v", err, ErrNodeNotEmpty)
 	}
 
-	if !g.NodeExists(set) {
+	if !mustNodeExists(t, g, set) {
 		t.Fatal("set disappeared despite a failed DeleteSet()")
 	}
-	if !sets.IsSet(g, set) {
+	if !mustIsSet(t, sets, g, set) {
 		t.Fatal("set lost its AllSets tag despite a failed DeleteSet()")
 	}
-	if !g.HasRelationship(referrer, set) {
+	if !mustHasRelationship(t, g, referrer, set) {
 		t.Fatal("referrer's relationship to set was disturbed by a failed DeleteSet()")
 	}
 }
@@ -7288,7 +7429,7 @@ func TestSetRegistryTagAsSetRejectsCompositeSetConflict(t *testing.T) {
 		t.Fatalf("TagAsSet() error = %v, want %v", err, ErrSetRepresentationConflict)
 	}
 
-	if sets.IsSet(g, composite) {
+	if mustIsSet(t, sets, g, composite) {
 		t.Fatal("node was tagged AllSets despite already being AllCompositeSets-tagged")
 	}
 }
@@ -7391,10 +7532,10 @@ func TestNewCompositeSetStartsEmpty(t *testing.T) {
 		t.Fatalf("NewCompositeSet(): %v", err)
 	}
 
-	if !g.NodeExists(set) {
+	if !mustNodeExists(t, g, set) {
 		t.Fatalf("NewCompositeSet() returned NodeID %d that does not exist", set)
 	}
-	if !composites.IsCompositeSet(g, set) {
+	if !mustIsCompositeSet(t, composites, g, set) {
 		t.Fatalf("NewCompositeSet() did not tag %d as a composite set", set)
 	}
 
@@ -7680,7 +7821,7 @@ func TestCompositeSetRemoveOperandDeletesDescriptor(t *testing.T) {
 		t.Fatalf("RemoveOperand(): %v", err2)
 	}
 
-	if g.NodeExists(u) {
+	if mustNodeExists(t, g, u) {
 		t.Fatalf("descriptor %d still exists after RemoveOperand()", u)
 	}
 
@@ -7692,7 +7833,7 @@ func TestCompositeSetRemoveOperandDeletesDescriptor(t *testing.T) {
 		t.Fatalf("Evaluate() = %v, want empty after RemoveOperand()", got)
 	}
 
-	if !g.NodeExists(x) {
+	if !mustNodeExists(t, g, x) {
 		t.Fatal("RemoveOperand() incorrectly deleted the operand target")
 	}
 }
@@ -7734,7 +7875,7 @@ func TestCompositeSetDeleteCompositeSetSucceedsWhenEmpty(t *testing.T) {
 	if err := composites.DeleteCompositeSet(g, set); err != nil {
 		t.Fatalf("DeleteCompositeSet(): %v", err)
 	}
-	if g.NodeExists(set) {
+	if mustNodeExists(t, g, set) {
 		t.Fatalf("composite set %d still exists after successful DeleteCompositeSet()", set)
 	}
 }
@@ -7758,10 +7899,10 @@ func TestCompositeSetDeleteCompositeSetFailsIfNotEmpty(t *testing.T) {
 	if !errors.Is(err, ErrNodeNotEmpty) {
 		t.Fatalf("DeleteCompositeSet() error = %v, want %v", err, ErrNodeNotEmpty)
 	}
-	if !g.NodeExists(set) {
+	if !mustNodeExists(t, g, set) {
 		t.Fatal("composite set disappeared despite a failed DeleteCompositeSet()")
 	}
-	if !composites.IsCompositeSet(g, set) {
+	if !mustIsCompositeSet(t, composites, g, set) {
 		t.Fatal("composite set lost its tag despite a failed DeleteCompositeSet()")
 	}
 }
@@ -8097,13 +8238,13 @@ func TestNewCompositeSetLogTagsBothAllListsAndAllCompositeSetLogs(t *testing.T) 
 		t.Fatalf("NewCompositeSetLog(): %v", err)
 	}
 
-	if !g.NodeExists(log) {
+	if !mustNodeExists(t, g, log) {
 		t.Fatalf("NewCompositeSetLog() returned NodeID %d that does not exist", log)
 	}
-	if !logs.IsCompositeSetLog(g, log) {
+	if !mustIsCompositeSetLog(t, logs, g, log) {
 		t.Fatalf("NewCompositeSetLog() did not tag %d as a composite set log", log)
 	}
-	if !logs.lists.IsList(g, log) {
+	if !mustIsList(t, logs.lists, g, log) {
 		t.Fatalf("NewCompositeSetLog() did not also tag %d as a list", log)
 	}
 
@@ -8142,7 +8283,7 @@ func TestCompositeSetLogAppendOperationScalarAdditive(t *testing.T) {
 		t.Fatalf("AppendOperation(x, additive, scalar): %v", err)
 	}
 
-	if !g.HasRelationship(log, capsule) {
+	if !mustHasRelationship(t, g, log, capsule) {
 		t.Fatalf("capsule %d is not linked into log", capsule)
 	}
 
@@ -8626,13 +8767,13 @@ func TestCompositeSetLogRemoveOperationDeletesDescriptorAndCapsule(t *testing.T)
 		t.Fatalf("RemoveOperation(): %v", err2)
 	}
 
-	if g.NodeExists(u) {
+	if mustNodeExists(t, g, u) {
 		t.Fatalf("descriptor %d still exists after RemoveOperation()", u)
 	}
-	if g.NodeExists(capsule) {
+	if mustNodeExists(t, g, capsule) {
 		t.Fatalf("capsule %d still exists after RemoveOperation()", capsule)
 	}
-	if !g.NodeExists(x) {
+	if !mustNodeExists(t, g, x) {
 		t.Fatal("RemoveOperation() incorrectly deleted the operand target")
 	}
 
@@ -8682,7 +8823,7 @@ func TestCompositeSetLogDeleteCompositeSetLogSucceedsWhenEmpty(t *testing.T) {
 	if err := logs.DeleteCompositeSetLog(g, log); err != nil {
 		t.Fatalf("DeleteCompositeSetLog(): %v", err)
 	}
-	if g.NodeExists(log) {
+	if mustNodeExists(t, g, log) {
 		t.Fatalf("log %d still exists after successful DeleteCompositeSetLog()", log)
 	}
 }
@@ -8706,13 +8847,13 @@ func TestCompositeSetLogDeleteCompositeSetLogFailsIfNotEmpty(t *testing.T) {
 	if !errors.Is(err, ErrNodeNotEmpty) {
 		t.Fatalf("DeleteCompositeSetLog() error = %v, want %v", err, ErrNodeNotEmpty)
 	}
-	if !g.NodeExists(log) {
+	if !mustNodeExists(t, g, log) {
 		t.Fatal("log disappeared despite a failed DeleteCompositeSetLog()")
 	}
-	if !logs.IsCompositeSetLog(g, log) {
+	if !mustIsCompositeSetLog(t, logs, g, log) {
 		t.Fatal("log lost its AllCompositeSetLogs tag despite a failed DeleteCompositeSetLog()")
 	}
-	if !logs.lists.IsList(g, log) {
+	if !mustIsList(t, logs.lists, g, log) {
 		t.Fatal("log lost its AllLists tag despite a failed DeleteCompositeSetLog()")
 	}
 }
@@ -8884,7 +9025,7 @@ func TestSetRegistryTagAsSetRejectsCompositeSetLogConflict(t *testing.T) {
 		t.Fatalf("TagAsSet() error = %v, want %v", err, ErrSetRepresentationConflict)
 	}
 
-	if sets.IsSet(g, log) {
+	if mustIsSet(t, sets, g, log) {
 		t.Fatal("node was tagged AllSets despite already being AllCompositeSetLogs-tagged")
 	}
 }
@@ -10071,7 +10212,7 @@ func TestCrossRoleSetRegistryConflictCheckExercisedWhileSetIsDomainAndOperand(t 
 		t.Fatalf("TagAsSet(c) error = %v, want %v", err, ErrSetRepresentationConflict)
 	}
 
-	if fx.sets.IsSet(fx.graph, c) {
+	if mustIsSet(t, fx.sets, fx.graph, c) {
 		t.Fatal("c was tagged AllSets despite already being AllCompositeSets-tagged")
 	}
 
@@ -10866,7 +11007,7 @@ func TestSetAddAndRemoveAreVisibleToCommitTimeCheckers(t *testing.T) {
 	if added {
 		t.Fatal("Add() reported added=true for a vetoed commit")
 	}
-	if g.HasRelationship(set, member) {
+	if mustHasRelationship(t, g, set, member) {
 		t.Fatal("member is present after a vetoed Add()")
 	}
 
@@ -10883,7 +11024,7 @@ func TestSetAddAndRemoveAreVisibleToCommitTimeCheckers(t *testing.T) {
 	if removed {
 		t.Fatal("Remove() reported removed=true for a vetoed commit")
 	}
-	if !g.HasRelationship(set, member) {
+	if !mustHasRelationship(t, g, set, member) {
 		t.Fatal("member is missing after a vetoed Remove()")
 	}
 }
@@ -11049,18 +11190,18 @@ func (g *stagedGraph) findNodesCore() []NodeID {
 // backend's reads see only the last committed revision, never another
 // client's in-flight, not-yet-committed transaction.
 
-func (g *stagedGraph) NodeExists(id NodeID) bool {
+func (g *stagedGraph) NodeExists(id NodeID) (bool, error) {
 	release := g.guard.acquire()
 	defer release()
 
-	return g.nodeExistsCore(id)
+	return g.nodeExistsCore(id), nil
 }
 
-func (g *stagedGraph) HasRelationship(a, b NodeID) bool {
+func (g *stagedGraph) HasRelationship(a, b NodeID) (bool, error) {
 	release := g.guard.acquire()
 	defer release()
 
-	return g.hasRelationshipCore(a, b)
+	return g.hasRelationshipCore(a, b), nil
 }
 
 func (g *stagedGraph) FindRelationship(from, to NodeID) (Relationship, bool, error) {
@@ -11094,18 +11235,18 @@ func (g *stagedGraph) FindIncoming(to NodeID) ([]Relationship, error) {
 	return g.findIncomingCore(to)
 }
 
-func (g *stagedGraph) FindRelationships() []Relationship {
+func (g *stagedGraph) FindRelationships() ([]Relationship, error) {
 	release := g.guard.acquire()
 	defer release()
 
-	return g.findRelationshipsCore()
+	return g.findRelationshipsCore(), nil
 }
 
-func (g *stagedGraph) FindNodes() []NodeID {
+func (g *stagedGraph) FindNodes() ([]NodeID, error) {
 	release := g.guard.acquire()
 	defer release()
 
-	return g.findNodesCore()
+	return g.findNodesCore(), nil
 }
 
 // RegisterChecker behaves exactly like Graph.RegisterChecker.
@@ -11340,8 +11481,8 @@ func (ov *stagedOverlay) nodeExists(id NodeID) bool {
 	return ov.base.nodeExistsCore(id)
 }
 
-func (ov *stagedOverlay) NodeExists(id NodeID) bool {
-	return ov.nodeExists(id)
+func (ov *stagedOverlay) NodeExists(id NodeID) (bool, error) {
+	return ov.nodeExists(id), nil
 }
 
 func (ov *stagedOverlay) hasRelationship(a, b NodeID) bool {
@@ -11358,8 +11499,8 @@ func (ov *stagedOverlay) hasRelationship(a, b NodeID) bool {
 	return ov.base.hasRelationshipCore(a, b)
 }
 
-func (ov *stagedOverlay) HasRelationship(a, b NodeID) bool {
-	return ov.hasRelationship(a, b)
+func (ov *stagedOverlay) HasRelationship(a, b NodeID) (bool, error) {
+	return ov.hasRelationship(a, b), nil
 }
 
 func (ov *stagedOverlay) FindRelationship(from, to NodeID) (Relationship, bool, error) {
@@ -11470,7 +11611,7 @@ func (ov *stagedOverlay) FindIncoming(to NodeID) ([]Relationship, error) {
 	return relationships, nil
 }
 
-func (ov *stagedOverlay) FindRelationships() []Relationship {
+func (ov *stagedOverlay) FindRelationships() ([]Relationship, error) {
 	merged := make(map[NodeID]map[NodeID]struct{})
 
 	for _, rel := range ov.base.findRelationshipsCore() {
@@ -11514,10 +11655,10 @@ func (ov *stagedOverlay) FindRelationships() []Relationship {
 		return relationships[i].To < relationships[j].To
 	})
 
-	return relationships
+	return relationships, nil
 }
 
-func (ov *stagedOverlay) FindNodes() []NodeID {
+func (ov *stagedOverlay) FindNodes() ([]NodeID, error) {
 	merged := make(map[NodeID]struct{})
 	for _, id := range ov.base.findNodesCore() {
 		merged[id] = struct{}{}
@@ -11535,7 +11676,7 @@ func (ov *stagedOverlay) FindNodes() []NodeID {
 	}
 	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
 
-	return ids
+	return ids, nil
 }
 
 // CreateNode reserves a fresh NodeID from the shared backing counter
@@ -11708,7 +11849,7 @@ func TestStagedGraphBasicOperations(t *testing.T) {
 		t.Fatalf("CreateNode() for b: %v", err)
 	}
 
-	if !g.NodeExists(a) || !g.NodeExists(b) {
+	if !mustNodeExists(t, g, a) || !mustNodeExists(t, g, b) {
 		t.Fatal("created nodes do not both exist")
 	}
 
@@ -11720,7 +11861,7 @@ func TestStagedGraphBasicOperations(t *testing.T) {
 		t.Fatal("AddRelationship(a,b) reported that nothing was created")
 	}
 
-	if !g.HasRelationship(a, b) {
+	if !mustHasRelationship(t, g, a, b) {
 		t.Fatal("HasRelationship(a,b) = false, want true")
 	}
 
@@ -11752,7 +11893,7 @@ func TestStagedGraphBasicOperations(t *testing.T) {
 		t.Fatalf("FindIncoming(b) = %v, want %v", incoming, []Relationship{want})
 	}
 
-	all := g.FindRelationships()
+	all := mustFindRelationships(t, g)
 	if !reflect.DeepEqual(all, []Relationship{want}) {
 		t.Fatalf("FindRelationships() = %v, want %v", all, []Relationship{want})
 	}
@@ -11765,14 +11906,14 @@ func TestStagedGraphBasicOperations(t *testing.T) {
 		t.Fatal("RemoveRelationship(a,b) reported that nothing was removed")
 	}
 
-	if g.HasRelationship(a, b) {
+	if mustHasRelationship(t, g, a, b) {
 		t.Fatal("relationship still exists after removal")
 	}
 
 	if err2 := g.DeleteNode(a); err2 != nil {
 		t.Fatalf("DeleteNode(a): %v", err2)
 	}
-	if g.NodeExists(a) {
+	if mustNodeExists(t, g, a) {
 		t.Fatal("node a still exists after DeleteNode()")
 	}
 }
@@ -11800,7 +11941,7 @@ func TestStagedGraphFailedTransactLeavesNoTrace(t *testing.T) {
 		t.Fatalf("Transact() error = %v, want %v", err, errBoom)
 	}
 
-	if g.NodeExists(id) {
+	if mustNodeExists(t, g, id) {
 		t.Fatalf("node %d created by a failed attempt is visible in the backing store", id)
 	}
 }
@@ -11836,14 +11977,14 @@ func TestStagedGraphForceConflictRerunsFn(t *testing.T) {
 
 	firstAttemptID, secondAttemptID := ids[0], ids[1]
 
-	if g.NodeExists(firstAttemptID) {
+	if mustNodeExists(t, g, firstAttemptID) {
 		t.Fatalf("node %d from the discarded first attempt is visible in the backing store", firstAttemptID)
 	}
-	if !g.NodeExists(secondAttemptID) {
+	if !mustNodeExists(t, g, secondAttemptID) {
 		t.Fatalf("node %d from the committed second attempt does not exist", secondAttemptID)
 	}
 
-	if got := len(g.FindNodes()); got != 1 {
+	if got := len(mustFindNodes(t, g)); got != 1 {
 		t.Fatalf("FindNodes() has %d node(s), want exactly 1 (the discarded attempt's node must not linger)", got)
 	}
 }
@@ -11889,13 +12030,13 @@ func TestStagedGraphNestedTransactRollsBackOnlyInnerSteps(t *testing.T) {
 		t.Fatalf("Transact() error = %v", err)
 	}
 
-	if !g.NodeExists(kept) {
+	if !mustNodeExists(t, g, kept) {
 		t.Fatal("the outer step was lost although only the nested transaction failed")
 	}
-	if g.NodeExists(dropped) {
+	if mustNodeExists(t, g, dropped) {
 		t.Fatal("the nested step survived its own failed transaction")
 	}
-	if g.HasRelationship(kept, dropped) {
+	if mustHasRelationship(t, g, kept, dropped) {
 		t.Fatal("a relationship added inside the failed nested transaction survived")
 	}
 }
@@ -11936,10 +12077,10 @@ func TestStagedGraphCheckerDeclineLeavesNoTrace(t *testing.T) {
 		t.Fatalf("Transact() error = %v, want %v", err, errVeto)
 	}
 
-	if g.NodeExists(id) {
+	if mustNodeExists(t, g, id) {
 		t.Fatalf("node %d created by a declined attempt is visible in the backing store", id)
 	}
-	if g.HasRelationship(tag, id) {
+	if mustHasRelationship(t, g, tag, id) {
 		t.Fatal("relationship created by a declined attempt is visible in the backing store")
 	}
 }
@@ -12025,7 +12166,7 @@ func TestStagedGraphPointerRegistryPortability(t *testing.T) {
 		t.Fatalf("SetTarget(p, y): %v", err3)
 	}
 
-	if g.HasRelationship(p, x) {
+	if mustHasRelationship(t, g, p, x) {
 		t.Fatal("old target relationship survived a replacement SetTarget()")
 	}
 
@@ -12065,7 +12206,7 @@ func TestGraphActorOverStagedGraphBasicOperations(t *testing.T) {
 		t.Fatal("AddRelationship(a,b) reported that nothing was created")
 	}
 
-	if !actor.HasRelationship(a, b) {
+	if !mustHasRelationship(t, actor, a, b) {
 		t.Fatal("HasRelationship(a,b) = false, want true")
 	}
 
@@ -12098,11 +12239,11 @@ func TestRootGraphOverStagedGraphBasicOperations(t *testing.T) {
 		t.Fatalf("NewRootGraph(): %v", err)
 	}
 
-	if !r.HasRelationship(root, a) {
+	if !mustHasRelationship(t, r, root, a) {
 		t.Fatal("a is not visible as a virtual ROOT child")
 	}
 
-	if r.HasRelationship(root, root) {
+	if mustHasRelationship(t, r, root, root) {
 		t.Fatal("ROOT incorrectly has a relationship to itself")
 	}
 }
@@ -12185,7 +12326,7 @@ func TestBoltGraphBasicOperations(t *testing.T) {
 		t.Fatalf("first two NodeIDs = %d, %d, want 0, 1", a, b)
 	}
 
-	if !g.NodeExists(a) || !g.NodeExists(b) {
+	if !mustNodeExists(t, g, a) || !mustNodeExists(t, g, b) {
 		t.Fatal("created nodes do not both exist")
 	}
 
@@ -12205,7 +12346,7 @@ func TestBoltGraphBasicOperations(t *testing.T) {
 		t.Fatal("second AddRelationship(a,b) reported creating a duplicate")
 	}
 
-	if !g.HasRelationship(a, b) || g.HasRelationship(b, a) {
+	if !mustHasRelationship(t, g, a, b) || mustHasRelationship(t, g, b, a) {
 		t.Fatal("relationship direction is wrong")
 	}
 
@@ -12230,7 +12371,7 @@ func TestBoltGraphBasicOperations(t *testing.T) {
 		t.Fatalf("FindIncoming(b) = (%v,%v), want (%v,nil)", incoming, err, []Relationship{want})
 	}
 
-	if all := g.FindRelationships(); !reflect.DeepEqual(all, []Relationship{want}) {
+	if all := mustFindRelationships(t, g); !reflect.DeepEqual(all, []Relationship{want}) {
 		t.Fatalf("FindRelationships() = %v, want %v", all, []Relationship{want})
 	}
 
@@ -12270,7 +12411,7 @@ func TestBoltGraphBasicOperations(t *testing.T) {
 		t.Fatalf("DeleteNode(c) after removing its relationship: %v", deleteErr)
 	}
 
-	if nodes := g.FindNodes(); !reflect.DeepEqual(nodes, []NodeID{a, b}) {
+	if nodes := mustFindNodes(t, g); !reflect.DeepEqual(nodes, []NodeID{a, b}) {
 		t.Fatalf("FindNodes() = %v, want %v", nodes, []NodeID{a, b})
 	}
 }
@@ -12299,10 +12440,10 @@ func TestBoltGraphPersistsGraphAndNeverReusesIDsAcrossReopen(t *testing.T) {
 
 	second := openBoltTestGraph(t, path)
 
-	if nodes := second.FindNodes(); !reflect.DeepEqual(nodes, []NodeID{a, b}) {
+	if nodes := mustFindNodes(t, second); !reflect.DeepEqual(nodes, []NodeID{a, b}) {
 		t.Fatalf("FindNodes() after reopen = %v, want %v", nodes, []NodeID{a, b})
 	}
-	if !second.HasRelationship(a, b) {
+	if !mustHasRelationship(t, second, a, b) {
 		t.Fatal("relationship (a,b) did not survive the reopen")
 	}
 	if incoming, err := second.FindIncoming(b); err != nil || len(incoming) != 1 {
@@ -12352,7 +12493,7 @@ func TestBoltGraphExhaustedCounterPersists(t *testing.T) {
 	if _, createErr := second.CreateNode(); !errors.Is(createErr, ErrNodeIDExhausted) {
 		t.Fatalf("CreateNode() after reopen error = %v, want %v (exhausted flag must persist)", createErr, ErrNodeIDExhausted)
 	}
-	if !second.NodeExists(last) {
+	if !mustNodeExists(t, second, last) {
 		t.Fatal("the last node did not survive the reopen")
 	}
 }
@@ -12376,10 +12517,10 @@ func TestBoltGraphFailedTransactLeavesNoTrace(t *testing.T) {
 		t.Fatalf("Transact() error = %v, want %v", err, errBoom)
 	}
 
-	if g.NodeExists(id) {
+	if mustNodeExists(t, g, id) {
 		t.Fatalf("node %d created by a failed transaction is visible", id)
 	}
-	if nodes := g.FindNodes(); len(nodes) != 0 {
+	if nodes := mustFindNodes(t, g); len(nodes) != 0 {
 		t.Fatalf("FindNodes() = %v, want none", nodes)
 	}
 }
@@ -12412,7 +12553,7 @@ func TestBoltGraphPanicRollsBackRunsRollbackHookAndStaysUsable(t *testing.T) {
 		})
 	}()
 
-	if g.NodeExists(id) {
+	if mustNodeExists(t, g, id) {
 		t.Fatalf("node %d survived a panicking transaction", id)
 	}
 	if !rolledBack {
@@ -12436,7 +12577,15 @@ func TestBoltGraphReadsInsideTransactSeeUncommittedWrites(t *testing.T) {
 			return linkErr
 		}
 
-		if !tx.NodeExists(created) || !tx.HasRelationship(existing, created) {
+		existsCreated, existsErr := tx.NodeExists(created)
+		if existsErr != nil {
+			return wrapInterfaceErr(existsErr)
+		}
+		hasExistingCreated, hasErr := tx.HasRelationship(existing, created)
+		if hasErr != nil {
+			return wrapInterfaceErr(hasErr)
+		}
+		if !existsCreated || !hasExistingCreated {
 			t.Error("the transaction does not see its own uncommitted writes")
 		}
 
@@ -12456,7 +12605,11 @@ func TestBoltGraphReadsInsideTransactSeeUncommittedWrites(t *testing.T) {
 			t.Errorf("tx.FindIncoming() = %v, want %v", incoming, want)
 		}
 
-		if nodes := tx.FindNodes(); !reflect.DeepEqual(nodes, []NodeID{existing, created}) {
+		nodes, nodesErr := tx.FindNodes()
+		if nodesErr != nil {
+			return wrapInterfaceErr(nodesErr)
+		}
+		if !reflect.DeepEqual(nodes, []NodeID{existing, created}) {
 			t.Errorf("tx.FindNodes() = %v, want %v", nodes, []NodeID{existing, created})
 		}
 
@@ -12509,13 +12662,27 @@ func TestBoltGraphNestedTransactRollsBackOnlyInnerSteps(t *testing.T) {
 			t.Errorf("nested Transact() error = %v, want %v", innerErr, errInner)
 		}
 
-		if tx.NodeExists(dropped) {
+		droppedExists, droppedErr := tx.NodeExists(dropped)
+		if droppedErr != nil {
+			return wrapInterfaceErr(droppedErr)
+		}
+		if droppedExists {
 			t.Error("the nested node survived its own failed transaction")
 		}
-		if !tx.NodeExists(victim) {
+
+		victimExists, victimErr := tx.NodeExists(victim)
+		if victimErr != nil {
+			return wrapInterfaceErr(victimErr)
+		}
+		if !victimExists {
 			t.Error("the node deleted inside the failed nested transaction was not restored")
 		}
-		if !tx.HasRelationship(kept, other) {
+
+		keptOtherLinked, linkedErr := tx.HasRelationship(kept, other)
+		if linkedErr != nil {
+			return wrapInterfaceErr(linkedErr)
+		}
+		if !keptOtherLinked {
 			t.Error("the relationship removed inside the failed nested transaction was not restored")
 		}
 
@@ -12525,10 +12692,10 @@ func TestBoltGraphNestedTransactRollsBackOnlyInnerSteps(t *testing.T) {
 		t.Fatalf("Transact() error = %v", err)
 	}
 
-	if g.NodeExists(dropped) || g.HasRelationship(kept, dropped) {
+	if mustNodeExists(t, g, dropped) || mustHasRelationship(t, g, kept, dropped) {
 		t.Fatal("the nested transaction's steps were committed")
 	}
-	if !g.NodeExists(victim) || !g.HasRelationship(kept, other) {
+	if !mustNodeExists(t, g, victim) || !mustHasRelationship(t, g, kept, other) {
 		t.Fatal("the restored state was not committed")
 	}
 }
@@ -12546,7 +12713,11 @@ func TestBoltGraphCheckerSeesWritesAndDeclineLeavesNoTrace(t *testing.T) {
 		Tags: []NodeID{tag},
 		Check: func(view GraphReader, touched map[NodeID]struct{}) error {
 			for node := range touched {
-				if view.HasRelationship(tag, node) {
+				has, hasErr := view.HasRelationship(tag, node)
+				if hasErr != nil {
+					return wrapInterfaceErr(hasErr)
+				}
+				if has {
 					sawTagged = true
 				}
 			}
@@ -12585,13 +12756,13 @@ func TestBoltGraphCheckerSeesWritesAndDeclineLeavesNoTrace(t *testing.T) {
 	if !errors.Is(err, errVeto) {
 		t.Fatalf("Transact() error = %v, want %v", err, errVeto)
 	}
-	if g.NodeExists(second) || g.HasRelationship(tag, second) {
+	if mustNodeExists(t, g, second) || mustHasRelationship(t, g, tag, second) {
 		t.Fatal("a declined transaction left a node or relationship behind")
 	}
 
 	// A transaction that touches nothing tagged does not consult it.
 	untagged := mustCreateNode(t, g)
-	if !g.NodeExists(untagged) {
+	if !mustNodeExists(t, g, untagged) {
 		t.Fatal("an irrelevant transaction was declined by a Checker it does not concern")
 	}
 }
@@ -12684,7 +12855,7 @@ func TestBoltGraphPointerRegistryPortability(t *testing.T) {
 		t.Fatalf("SetTarget(p, y): %v", setErr)
 	}
 
-	if g.HasRelationship(p, x) {
+	if mustHasRelationship(t, g, p, x) {
 		t.Fatal("old target relationship survived a replacement SetTarget()")
 	}
 
@@ -12781,7 +12952,7 @@ func TestGraphActorOverBoltGraphConcurrentCreateNodeProducesUniqueIDs(t *testing
 		seen[id] = struct{}{}
 	}
 
-	if nodes := actor.FindNodes(); len(nodes) != goroutines {
+	if nodes := mustFindNodes(t, actor); len(nodes) != goroutines {
 		t.Fatalf("FindNodes() has %d nodes, want %d", len(nodes), goroutines)
 	}
 }
@@ -12797,13 +12968,13 @@ func TestRootGraphOverBoltGraphBasicOperations(t *testing.T) {
 		t.Fatalf("NewRootGraph(): %v", err)
 	}
 
-	if !r.HasRelationship(root, a) {
+	if !mustHasRelationship(t, r, root, a) {
 		t.Fatal("a is not visible as a virtual ROOT child")
 	}
-	if r.HasRelationship(root, root) {
+	if mustHasRelationship(t, r, root, root) {
 		t.Fatal("ROOT incorrectly has a relationship to itself")
 	}
-	if g.HasRelationship(root, a) {
+	if mustHasRelationship(t, g, root, a) {
 		t.Fatal("the virtual ROOT relationship was physically stored")
 	}
 }
@@ -12848,8 +13019,8 @@ func TestTxTouchRunsRelevantCheckersWithoutMutation(t *testing.T) {
 				},
 			})
 
-			relationshipsBefore := api.FindRelationships()
-			nodesBefore := api.FindNodes()
+			relationshipsBefore := mustFindRelationships(t, api)
+			nodesBefore := mustFindNodes(t, api)
 
 			if err := api.Transact(func(tx Tx) error {
 				tx.Touch(untagged)
@@ -12871,7 +13042,7 @@ func TestTxTouchRunsRelevantCheckersWithoutMutation(t *testing.T) {
 				t.Fatalf("runs=%d sawTagged=%v, want 1,true after touching a tagged node", runs, sawTagged)
 			}
 
-			if !reflect.DeepEqual(api.FindRelationships(), relationshipsBefore) || !reflect.DeepEqual(api.FindNodes(), nodesBefore) {
+			if !reflect.DeepEqual(mustFindRelationships(t, api), relationshipsBefore) || !reflect.DeepEqual(mustFindNodes(t, api), nodesBefore) {
 				t.Fatal("Touch changed the graph")
 			}
 
@@ -12971,7 +13142,7 @@ func TestNameRegistryUnbindRetiresNameButKeepsNode(t *testing.T) {
 	if removed, unbindErr := names.Unbind(&g, "B"); unbindErr != nil || !removed {
 		t.Fatalf("Unbind() = (%v,%v), want (true,nil)", removed, unbindErr)
 	}
-	if !g.NodeExists(id) {
+	if !mustNodeExists(t, &g, id) {
 		t.Fatal("Unbind() deleted the node")
 	}
 
@@ -13013,7 +13184,7 @@ func TestBoltGraphNamesPersistAcrossReopen(t *testing.T) {
 		t.Fatalf("BootstrapNames(): %v", err)
 	}
 
-	nodeCount := len(first.FindNodes())
+	nodeCount := len(mustFindNodes(t, first))
 
 	if closeErr := first.Close(); closeErr != nil {
 		t.Fatalf("Close(): %v", closeErr)
@@ -13046,7 +13217,7 @@ func TestBoltGraphNamesPersistAcrossReopen(t *testing.T) {
 	if !reflect.DeepEqual(again, ids) {
 		t.Fatalf("BootstrapNames() after reopen = %v, want the original %v", again, ids)
 	}
-	if got := len(second.FindNodes()); got != nodeCount {
+	if got := len(mustFindNodes(t, second)); got != nodeCount {
 		t.Fatalf("BootstrapNames() after reopen changed the node count from %d to %d", nodeCount, got)
 	}
 }
@@ -13070,7 +13241,7 @@ func TestBoltGraphForgettingLoadNamesIsDetected(t *testing.T) {
 		t.Fatalf("EnsureNamedNode() without LoadNames() error = %v, want %v", err, ErrNamesNotLoaded)
 	}
 
-	if nodes := second.FindNodes(); len(nodes) != 1 {
+	if nodes := mustFindNodes(t, second); len(nodes) != 1 {
 		t.Fatalf("FindNodes() = %v, want only the original node (the failed Ensure must roll back)", nodes)
 	}
 }
@@ -13301,7 +13472,8 @@ func TestBoltGraphReportCommitLatencyAndFileSize(t *testing.T) {
 		t.Fatalf("bulk Transact(): %v", err)
 	}
 
-	t.Logf("one transaction: %d nodes and %d relationships in %v", len(ids), len(g.FindRelationships()), time.Since(start))
+	relationships := mustFindRelationships(t, g)
+	t.Logf("one transaction: %d nodes and %d relationships in %v", len(ids), len(relationships), time.Since(start))
 	logSize("after the bulk transaction")
 
 	const commits = 200
@@ -13414,7 +13586,7 @@ func TestBoltGraphFindNodesAfterMatchesFindNodes(t *testing.T) {
 		mustCreateNode(t, g)
 	}
 
-	all := g.FindNodes()
+	all := mustFindNodes(t, g)
 
 	// Every page size and every cursor must agree with slicing FindNodes.
 	for limit := 1; limit <= len(all)+1; limit++ {
@@ -13425,7 +13597,10 @@ func TestBoltGraphFindNodesAfterMatchesFindNodes(t *testing.T) {
 		hasAfter := false
 
 		for {
-			page := boltMust(g, func(v boltView) []NodeID { return v.findNodesAfter(after, hasAfter, limit) })
+			page, pageErr := boltRead(g, func(v boltView) ([]NodeID, error) { return v.findNodesAfter(after, hasAfter, limit) })
+			if pageErr != nil {
+				t.Fatalf("findNodesAfter(): %v", pageErr)
+			}
 			paged = append(paged, page...)
 
 			if len(page) < limit {
@@ -13819,7 +13994,7 @@ func TestGraphActorBasicOperations(t *testing.T) {
 		t.Fatalf("CreateNode() for b: %v", err)
 	}
 
-	if !actor.NodeExists(a) || !actor.NodeExists(b) {
+	if !mustNodeExists(t, actor, a) || !mustNodeExists(t, actor, b) {
 		t.Fatal("created nodes do not both exist")
 	}
 
@@ -13831,7 +14006,7 @@ func TestGraphActorBasicOperations(t *testing.T) {
 		t.Fatal("AddRelationship(a,b) reported that nothing was created")
 	}
 
-	if !actor.HasRelationship(a, b) {
+	if !mustHasRelationship(t, actor, a, b) {
 		t.Fatal("HasRelationship(a,b) = false, want true")
 	}
 
@@ -13863,7 +14038,7 @@ func TestGraphActorBasicOperations(t *testing.T) {
 		t.Fatalf("FindIncoming(b) = %v, want %v", incoming, []Relationship{want})
 	}
 
-	all := actor.FindRelationships()
+	all := mustFindRelationships(t, actor)
 	if !reflect.DeepEqual(all, []Relationship{want}) {
 		t.Fatalf("FindRelationships() = %v, want %v", all, []Relationship{want})
 	}
@@ -13876,14 +14051,14 @@ func TestGraphActorBasicOperations(t *testing.T) {
 		t.Fatal("RemoveRelationship(a,b) reported that nothing was removed")
 	}
 
-	if actor.HasRelationship(a, b) {
+	if mustHasRelationship(t, actor, a, b) {
 		t.Fatal("relationship still exists after removal")
 	}
 
 	if err := actor.DeleteNode(a); err != nil {
 		t.Fatalf("DeleteNode(a): %v", err)
 	}
-	if actor.NodeExists(a) {
+	if mustNodeExists(t, actor, a) {
 		t.Fatal("node a still exists after DeleteNode()")
 	}
 }
@@ -13906,7 +14081,7 @@ func TestGraphActorFindNodes(t *testing.T) {
 		t.Fatalf("DeleteNode(a): %v", err2)
 	}
 
-	got := actor.FindNodes()
+	got := mustFindNodes(t, actor)
 	want := []NodeID{b}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("FindNodes() = %v, want %v", got, want)
@@ -13935,7 +14110,7 @@ func TestGraphActorTransactRollsBackOnFailure(t *testing.T) {
 		t.Fatalf("Transact() error = %v, want %v", err, ErrNodeNotFound)
 	}
 
-	if actor.NodeExists(id) {
+	if mustNodeExists(t, actor, id) {
 		t.Fatalf("node %d still exists after its creating transaction rolled back", id)
 	}
 }
@@ -13967,7 +14142,7 @@ func TestGraphActorTransactPanicPropagatesAndActorSurvives(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateNode() after a panicking Transact(): %v", err)
 	}
-	if !actor.NodeExists(id) {
+	if !mustNodeExists(t, actor, id) {
 		t.Fatalf("node %d does not exist after a panicking Transact()", id)
 	}
 }
@@ -14012,7 +14187,7 @@ func TestGraphActorReentrancyTripwireFiresAndActorSurvives(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateNode() after the tripwire panicked: %v", err)
 	}
-	if !actor.NodeExists(id) {
+	if !mustNodeExists(t, actor, id) {
 		t.Fatalf("node %d does not exist after the tripwire panicked", id)
 	}
 }
@@ -14444,7 +14619,7 @@ func TestGraphActorConcurrentCreateNamedNodeSameNameBindsExactlyOnce(t *testing.
 		t.Fatalf("Lookup(\"contended\") = (%d,%v), want (%d,true)", bound, ok, winner)
 	}
 
-	if nodes := actor.FindNodes(); len(nodes) != 1 {
+	if nodes := mustFindNodes(t, actor); len(nodes) != 1 {
 		t.Fatalf("FindNodes() = %v, want exactly the winning node (losers must roll back)", nodes)
 	}
 }
@@ -14527,7 +14702,7 @@ func TestNestedTransactCommitsWithOuter(t *testing.T) {
 		t.Fatalf("Transact() error = %v", err)
 	}
 
-	if !g.NodeExists(a) || !g.NodeExists(b) || !g.HasRelationship(a, b) {
+	if !mustNodeExists(t, &g, a) || !mustNodeExists(t, &g, b) || !mustHasRelationship(t, &g, a, b) {
 		t.Fatalf("nodes %d, %d and relationship (%d,%d) must all exist after the outermost commit", a, b, a, b)
 	}
 }
@@ -14574,10 +14749,10 @@ func TestNestedTransactFailureRollsBackOnlyTheInnerSteps(t *testing.T) {
 		t.Fatalf("Transact() error = %v", err)
 	}
 
-	if !g.NodeExists(kept) {
+	if !mustNodeExists(t, &g, kept) {
 		t.Fatal("the outer step was lost although only the nested transaction failed")
 	}
-	if g.NodeExists(dropped) {
+	if mustNodeExists(t, &g, dropped) {
 		t.Fatal("the nested step survived its own failed transaction")
 	}
 	if want := []string{"outer"}; !reflect.DeepEqual(hooks, want) {
@@ -14607,7 +14782,7 @@ func TestNestedTransactSuccessIsRolledBackWithOuterFailure(t *testing.T) {
 		t.Fatalf("Transact() error = %v, want %v", err, errOuter)
 	}
 
-	if g.NodeExists(id) {
+	if mustNodeExists(t, &g, id) {
 		t.Fatalf("node %d created by a successful nested transaction survived the outer failure", id)
 	}
 }
@@ -14629,7 +14804,19 @@ func TestNestedTransactRunsCheckersOnlyAtOutermostCommit(t *testing.T) {
 			runs++
 
 			for node := range touched {
-				if view.HasRelationship(flag, node) && !view.HasRelationship(node, okNode) {
+				hasFlag, err := view.HasRelationship(flag, node)
+				if err != nil {
+					return wrapInterfaceErr(err)
+				}
+				if !hasFlag {
+					continue
+				}
+
+				hasOK, err := view.HasRelationship(node, okNode)
+				if err != nil {
+					return wrapInterfaceErr(err)
+				}
+				if !hasOK {
 					return errUnsatisfied
 				}
 			}
@@ -14673,7 +14860,7 @@ func TestNestedTransactRunsCheckersOnlyAtOutermostCommit(t *testing.T) {
 	if !errors.Is(err, errUnsatisfied) {
 		t.Fatalf("Transact(unrepaired) error = %v, want %v", err, errUnsatisfied)
 	}
-	if g.HasRelationship(flag, y) {
+	if mustHasRelationship(t, &g, flag, y) {
 		t.Fatal("a nested step that succeeded provisionally survived the declined outermost commit")
 	}
 }
@@ -14715,10 +14902,10 @@ func TestNestedTransactPanicRollsBackToSavepointAndPropagates(t *testing.T) {
 		t.Fatalf("Transact() error = %v", err)
 	}
 
-	if !g.NodeExists(kept) {
+	if !mustNodeExists(t, &g, kept) {
 		t.Fatal("the outer step was lost although the enclosing closure recovered the nested panic")
 	}
-	if g.NodeExists(dropped) {
+	if mustNodeExists(t, &g, dropped) {
 		t.Fatal("the panicking nested transaction's step survived")
 	}
 }
@@ -14739,7 +14926,11 @@ func TestRootGraphNestedTransactPresentsOverlayAndForwardsOnCommit(t *testing.T)
 
 	err = rootGraph.Transact(func(tx Tx) error {
 		return wrapInterfaceErr(tx.Transact(func(inner Tx) error {
-			sawVirtual = inner.HasRelationship(root, x)
+			has, hasErr := inner.HasRelationship(root, x)
+			if hasErr != nil {
+				return wrapInterfaceErr(hasErr)
+			}
+			sawVirtual = has
 			deleteRootErr = inner.DeleteNode(root)
 			inner.OnCommit(func() { ran = true })
 
@@ -14794,10 +14985,10 @@ func TestGraphActorNestedTransactRollsBackOnlyInnerSteps(t *testing.T) {
 		t.Fatalf("Transact() error = %v", err)
 	}
 
-	if !actor.NodeExists(kept) {
+	if !mustNodeExists(t, actor, kept) {
 		t.Fatal("the outer step was lost although only the nested transaction failed")
 	}
-	if actor.NodeExists(dropped) {
+	if mustNodeExists(t, actor, dropped) {
 		t.Fatal("the nested step survived its own failed transaction")
 	}
 }
@@ -14987,7 +15178,7 @@ func TestNameRegistryCreateNamedNodeComposesAndRollsBackWithEnclosingTransaction
 	if _, ok := names.Lookup("A"); ok {
 		t.Fatal("name \"A\" is bound after its enclosing transaction rolled back")
 	}
-	if g.NodeExists(rolledBack) {
+	if mustNodeExists(t, &g, rolledBack) {
 		t.Fatalf("node %d survived its enclosing transaction's rollback", rolledBack)
 	}
 
@@ -15292,7 +15483,7 @@ func TestListMutatorsComposeInsideOneTransactionAndRollBackTogether(t *testing.T
 	}
 
 	requireListElements(t, lists, g, list, []NodeID{c, b})
-	if g.NodeExists(capsuleA) {
+	if mustNodeExists(t, g, capsuleA) {
 		t.Fatalf("capsule %d survived a Remove() that reported deleting it", capsuleA)
 	}
 
@@ -15320,7 +15511,7 @@ func TestListMutatorsComposeInsideOneTransactionAndRollBackTogether(t *testing.T
 	}
 
 	requireListElements(t, lists, g, list, []NodeID{c, b})
-	if !capsules.IsCapsule(g, capsuleB) || !g.HasRelationship(list, capsuleB) {
+	if !mustIsCapsule(t, capsules, g, capsuleB) || !mustHasRelationship(t, g, list, capsuleB) {
 		t.Fatal("capsuleB was not restored by the rollback of the enclosing transaction")
 	}
 }
@@ -15418,7 +15609,7 @@ func TestCapsuleLinkAndDeleteComposeAndRollBackWithEnclosingTransaction(t *testi
 		t.Fatalf("Transact(delete, fail) error = %v, want %v", err, errOuter)
 	}
 
-	if !g.NodeExists(c2) || !capsules.IsCapsule(g, c2) {
+	if !mustNodeExists(t, g, c2) || !mustIsCapsule(t, capsules, g, c2) {
 		t.Fatal("c2 was not restored after its deleting transaction rolled back")
 	}
 
@@ -15739,7 +15930,7 @@ func TestNameRegistryCreateThenDeleteInOneTransactionLeavesNoBinding(t *testing.
 	if _, ok := names.Lookup("T"); ok {
 		t.Fatal("name \"T\" is bound to a node deleted in the same transaction")
 	}
-	if g.NodeExists(id) {
+	if mustNodeExists(t, &g, id) {
 		t.Fatalf("node %d survived its own deletion", id)
 	}
 	requireNoStagedNames(t, names)
@@ -15790,7 +15981,7 @@ func TestSetMutatorsComposeInsideOneTransactionAndRollBackTogether(t *testing.T)
 		t.Fatalf("Transact(fail) error = %v, want %v", err, errOuter)
 	}
 
-	if !g.NodeExists(set) || !sets.IsSet(g, set) {
+	if !mustNodeExists(t, g, set) || !mustIsSet(t, sets, g, set) {
 		t.Fatal("the set was not restored after its deleting transaction rolled back")
 	}
 	if found, containsErr := sets.Contains(g, set, member); containsErr != nil || !found {
@@ -15977,10 +16168,10 @@ func TestCompositeSetLogRemoveOperationIsAtomicWhenCapsuleCannotBeDeleted(t *tes
 		t.Fatalf("RemoveOperation() error = %v, want %v", err, ErrCapsuleNotEmpty)
 	}
 
-	if !g.HasRelationship(log, capsule) {
+	if !mustHasRelationship(t, g, log, capsule) {
 		t.Fatal("capsule was unlinked from the log despite the failed RemoveOperation()")
 	}
-	if !g.NodeExists(u) || !g.HasRelationship(u, x) {
+	if !mustNodeExists(t, g, u) || !mustHasRelationship(t, g, u, x) {
 		t.Fatal("descriptor was disturbed by the failed RemoveOperation()")
 	}
 

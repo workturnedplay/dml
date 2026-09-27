@@ -2671,10 +2671,11 @@ func (t *boltTxn) forEachNameRecord(fn func(name string, rec nameRecord)) error 
 // OnCommit hooks run only after that commit has succeeded, and OnRollback
 // hooks run on any abort, including a failed commit.
 //
-// The GraphReader methods with no error result (NodeExists, HasRelationship,
-// FindRelationships, FindNodes) panic if the store itself fails (for
-// example after Close); giving them error results belongs to the paged-read
-// rework of theorystate.md section 105.
+// NodeExists, HasRelationship, FindRelationships, and FindNodes return
+// ErrGraphStoreUnavailable (wrapping the underlying failure) if the store
+// itself fails, rather than panicking, per GraphReader's own doc comment.
+// Paged reads remain the separate, still-open rework of theorystate.md
+// section 105.
 type BoltGraph struct {
 	guard    concurrentAccessGuard
 	db       *bolt.DB
@@ -2793,17 +2794,6 @@ func boltRead[T any](g *BoltGraph, fn func(v boltView) (T, error)) (T, error) {
 	}
 
 	return result, nil
-}
-
-// boltMust is boltRead for reads whose GraphReader method has no error
-// result: a store failure panics (see the BoltGraph doc comment).
-func boltMust[T any](g *BoltGraph, fn func(v boltView) T) T {
-	result, err := boltRead(g, func(v boltView) (T, error) { return fn(v), nil })
-	if err != nil {
-		panic(fmt.Sprintf("dml: reading the persistent store failed: %v", err))
-	}
-
-	return result
 }
 
 // NodeExists reports whether id exists.
