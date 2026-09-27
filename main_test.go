@@ -2389,7 +2389,7 @@ func TestRootGraphTransactAndCheckerSeeOverlay(t *testing.T) {
 		Check: func(view GraphReader, _ map[NodeID]struct{}) error {
 			has, hasErr := view.HasRelationship(root, x)
 			if hasErr != nil {
-				return hasErr
+				return wrapInterfaceErr(hasErr)
 			}
 			checkerSawVirtual = has
 			return nil
