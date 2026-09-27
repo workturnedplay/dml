@@ -1822,12 +1822,22 @@ Currently unaddressed yet:
   on BoltGraph.
 - The operation-level protocol between other processes and the graph host
   (theorystate.md section 107).
-- Nested transactions as a production-backend feature are realized for
-  the in-memory backend only (savepoints over the undo log); a
-  structurally different, test-only realization also exists for
-  stagedGraph (item 38). A real non-memory production backend's own
-  savepoint mechanism remains theorystate.md section 45 / 89a. Txn.
-  DeleteNode is supported -- see item 15.
+- Nested transactions as a production-backend feature are also realized
+  on BoltGraph (item 40), via the same shared txLog (undo log, commit
+  and rollback hooks, savepoints) mechanism Txn already uses -- not a
+  separate, backend-specific mechanism, since bbolt's own writes are
+  visible to the same update transaction immediately, which tolerates
+  the identical undo-log approach the in-memory backend uses. The
+  test-only stagedGraph's nested transactions (item 38) are likewise
+  undo-log-style, over its own local per-attempt buffer, not the "child
+  write buffer merged into its parent" shape theorystate.md section 45 /
+  89a describes as the eventual approach for a true CAS-based backend
+  (theorystate.md sections 93-97): no backend in this codebase actually
+  needs that shape yet, because none of them keep writes invisible to
+  their own in-flight transaction the way a real networked CAS store
+  would. That specific savepoint mechanism therefore remains
+  unimplemented and OPEN, not merely "for a non-memory backend" in
+  general. Txn.DeleteNode is supported -- see item 15.
 - Domain-pointer staleness residuals (theorystate.md section 86): raw
   non-Transact mutations, out-of-band tag removal or descriptor
   re-pointing inside a Transact, and O(pointers-per-domain) validation

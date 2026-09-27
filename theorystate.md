@@ -3820,11 +3820,19 @@ kept current as sections above resolve or split further.)*
   question only now (§61).
 - Exact cross-graph teardown protocol (§43); rebase algorithm (§24);
   processor execution semantics.
-- Nested transactions (§45) beyond the in-memory backend: how a
-  non-memory backend realizes savepoints (a child write buffer merged
-  into its parent), and whether some Checkers should be able to run at
-  inner boundaries. An opt-in "immediate" Checker tier was considered and
-  not built; today every Checker runs once, at the outermost commit.
+- Nested transactions (§45) for a backend whose writes are not visible to
+  its own in-flight transaction until a final commit (a true CAS-based
+  store, §93-97): there, a savepoint most likely needs a child write
+  buffer merged into its parent on success, rather than an undo log.
+  Nothing in this codebase has built or exercised that shape yet --
+  BoltGraph's nested transactions (§108) are undo-log savepoints, exactly
+  like Txn's, because bbolt's own writes are visible to the same update
+  transaction immediately; the test-only stagedGraph's nested
+  transactions (§97) are likewise undo-log savepoints over its own local
+  buffer, not a merge-on-success design. Also open: whether some
+  Checkers should be able to run at inner boundaries. An opt-in
+  "immediate" Checker tier was considered and not built; today every
+  Checker runs once, at the outermost commit.
 - Domain Pointer staleness residuals (§86): per-commit memoization of
   domain membership if the O(pointers-per-domain) validation cost matters,
   and whether the out-of-band-inside-`Transact` gaps (tag removal,
