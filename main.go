@@ -1481,14 +1481,7 @@ type nodePager interface {
 // separate flag because NodeID 0 is a valid cursor. A non-positive limit
 // returns nothing.
 func pageNodeIDs(sorted []NodeID, after NodeID, hasAfter bool, limit int) []NodeID {
-	start := 0
-	if hasAfter {
-		start = sort.Search(len(sorted), func(i int) bool { return sorted[i] > after })
-	}
-
-	count := min(max(limit, 0), len(sorted)-start)
-
-	return sorted[start : start+count]
+	return pageSorted(sorted, after, hasAfter, limit, func(id NodeID) NodeID { return id })
 }
 
 // nodesAfter returns a page of node IDs from reader, using its paging if it
@@ -1515,9 +1508,10 @@ func nodesAfter(reader GraphReader, after NodeID, hasAfter bool, limit int) ([]N
 // page of one node's own outgoing relationships without materializing
 // every one of them (BoltGraph's boltView, and the ROOT overlay for any
 // anchor -- ROOT's own virtual outgoing set pages over node IDs; see
-// rootReader.findOutgoingAfter). Any other reader falls back to
-// FindOutgoing, sliced client-side (see outgoingAfter), which is fine for
-// the memory-bound backends. Like nodePager, this stays an unexported
+// rootReader.findOutgoingAfter). An implementation that cannot page a
+// particular request returns errPagingUnsupported, and outgoingPages then
+// reads the full FindOutgoing once and slices it; a reader that does not
+// implement this at all gets the same treatment. Like nodePager, this stays an unexported
 // optional interface until the paged-read rework of theorystate.md
 // section 105 decides the exported shape.
 type outgoingPager interface {
@@ -1525,7 +1519,8 @@ type outgoingPager interface {
 }
 
 // incomingPager is outgoingPager's mirror for incoming relationships.
-// Implemented by BoltGraph's boltView only for now: the ROOT overlay's
+// Implemented by BoltGraph (its boltView, and BoltGraph and GraphActor
+// forwarding to it) only for now: the ROOT overlay's
 // FindIncoming always potentially adds one virtual (ROOT, to) relationship
 // and hides any physically-stored ROOT-sourced one (theorystate.md section
 // 12a), and splicing that correctly into a bounded page is not yet built --
@@ -1539,7 +1534,7 @@ type incomingPager interface {
 // from the start if hasAfter is false. This is the relationship-level
 // counterpart of pageNodeIDs, parameterized over which endpoint the caller
 // is paging by (To for an outgoing page, From for an incoming page).
-func pageRelationships(sorted []Relationship, after NodeID, hasAfter bool, limit int, key func(Relationship) NodeID) []Relationship {
+func pageSorted[T any](sorted []T, after NodeID, hasAfter bool, limit int, key func(T) NodeID) []T {
 	start := 0
 	if hasAfter {
 		start = sort.Search(len(sorted), func(i int) bool { return key(sorted[i]) > after })
@@ -1550,42 +1545,126 @@ func pageRelationships(sorted []Relationship, after NodeID, hasAfter bool, limit
 	return sorted[start : start+count]
 }
 
-// outgoingAfter returns a page of from's own outgoing relationships from
-// reader, using its paging if it has any (see outgoingPager) and
-// FindOutgoing otherwise. As with nodesAfter, a caller looping this over
-// successive pages against a reader with no native paging re-fetches and
-// re-slices FindOutgoing's full result on every call -- harmless for the
-// memory-bound backends, where nothing is gained by pretending otherwise,
-// and exactly the shape VerifyAll's own nodesAfter loop already accepts
-// for FindNodes.
-func outgoingAfter(reader GraphReader, from, after NodeID, hasAfter bool, limit int) ([]Relationship, error) {
-	if pager, ok := reader.(outgoingPager); ok {
-		relationships, err := pager.findOutgoingAfter(from, after, hasAfter, limit)
-		return relationships, wrapInterfaceErr(err)
-	}
+// errPagingUnsupported is returned by an outgoingPager/incomingPager that
+// cannot page natively for this particular request -- most importantly a
+// forwarding layer (the ROOT overlay, GraphActor) whose inner reader does
+// not page. It is a signal, not a failure: pageIterator reacts by
+// switching, permanently, to fetching the full result once and slicing it,
+// so a backend with no native paging costs one full read per walk instead
+// of one per page (theorystate.md section 105).
+var errPagingUnsupported = errors.New("this reader cannot page natively for this request")
 
-	all, err := reader.FindOutgoing(from)
-	if err != nil {
-		return nil, wrapInterfaceErr(err)
-	}
+func relationshipTarget(r Relationship) NodeID { return r.To }
 
-	return pageRelationships(all, after, hasAfter, limit, func(r Relationship) NodeID { return r.To }), nil
+func relationshipSource(r Relationship) NodeID { return r.From }
+
+// pageIterator walks one sorted sequence in bounded pages. With a native
+// pager each page is a bounded read; without one (or once the native
+// pager reports errPagingUnsupported) the full sequence is read exactly
+// once and sliced, so the total work is linear either way. Callers loop
+// next until it returns an empty page.
+type pageIterator[T any] struct {
+	limit    int
+	key      func(T) NodeID
+	native   func(after NodeID, hasAfter bool, pageLimit int) ([]T, error)
+	loadAll  func() ([]T, error)
+	after    NodeID
+	hasAfter bool
+	snapshot []T
+	loaded   bool
+	done     bool
 }
 
-// incomingAfter is outgoingAfter's mirror for to's own incoming
-// relationships (see incomingPager).
-func incomingAfter(reader GraphReader, to, after NodeID, hasAfter bool, limit int) ([]Relationship, error) {
-	if pager, ok := reader.(incomingPager); ok {
-		relationships, err := pager.findIncomingAfter(to, after, hasAfter, limit)
-		return relationships, wrapInterfaceErr(err)
+// next returns the next page, or an empty page once the sequence is
+// exhausted. A non-positive limit yields nothing.
+func (it *pageIterator[T]) next() ([]T, error) {
+	if it.done || it.limit <= 0 {
+		return nil, nil
 	}
 
-	all, err := reader.FindIncoming(to)
+	page, err := it.fetch()
 	if err != nil {
-		return nil, wrapInterfaceErr(err)
+		return nil, err
 	}
 
-	return pageRelationships(all, after, hasAfter, limit, func(r Relationship) NodeID { return r.From }), nil
+	if len(page) < it.limit {
+		it.done = true
+	}
+
+	if len(page) > 0 {
+		it.after = it.key(page[len(page)-1])
+		it.hasAfter = true
+	}
+
+	return page, nil
+}
+
+// fetch reads the next page natively if it still can, otherwise from the
+// once-loaded snapshot.
+func (it *pageIterator[T]) fetch() ([]T, error) {
+	if it.native != nil {
+		page, err := it.native(it.after, it.hasAfter, it.limit)
+		if !errors.Is(err, errPagingUnsupported) {
+			return page, wrapInterfaceErr(err)
+		}
+
+		it.native = nil
+	}
+
+	if !it.loaded {
+		all, err := it.loadAll()
+		if err != nil {
+			return nil, wrapInterfaceErr(err)
+		}
+
+		it.snapshot, it.loaded = all, true
+	}
+
+	return pageSorted(it.snapshot, it.after, it.hasAfter, it.limit, it.key), nil
+}
+
+// outgoingPages returns an iterator over from's own outgoing relationships,
+// limit at a time, sorted by target.
+func outgoingPages(reader GraphReader, from NodeID, limit int) *pageIterator[Relationship] {
+	it := &pageIterator[Relationship]{
+		limit: limit,
+		key:   relationshipTarget,
+		loadAll: func() ([]Relationship, error) {
+			relationships, err := reader.FindOutgoing(from)
+			return relationships, wrapInterfaceErr(err)
+		},
+	}
+
+	if pager, ok := reader.(outgoingPager); ok {
+		it.native = func(after NodeID, hasAfter bool, pageLimit int) ([]Relationship, error) {
+			relationships, err := pager.findOutgoingAfter(from, after, hasAfter, pageLimit)
+			return relationships, wrapInterfaceErr(err)
+		}
+	}
+
+	return it
+}
+
+// incomingPages is outgoingPages' mirror for to's own incoming
+// relationships, sorted by source.
+func incomingPages(reader GraphReader, to NodeID, limit int) *pageIterator[Relationship] {
+	it := &pageIterator[Relationship]{
+		limit: limit,
+		key:   relationshipSource,
+		loadAll: func() ([]Relationship, error) {
+			relationships, err := reader.FindIncoming(to)
+			return relationships, wrapInterfaceErr(err)
+		},
+	}
+
+	if pager, ok := reader.(incomingPager); ok {
+		it.native = func(after NodeID, hasAfter bool, pageLimit int) ([]Relationship, error) {
+			relationships, err := pager.findIncomingAfter(to, after, hasAfter, pageLimit)
+			return relationships, wrapInterfaceErr(err)
+		}
+	}
+
+	return it
 }
 
 // defaultVerifyPageSize is the page size VerifyAll uses when given a
@@ -2007,6 +2086,55 @@ func (ga *GraphActor) Transact(fn func(tx Tx) error) (err error) {
 
 	return wrapInterfaceErr(err)
 }
+
+// actorPage runs one bounded page read as a single job on ga's goroutine.
+func actorPage[T any](ga *GraphActor, fetch func(g GraphAPI) ([]T, error)) ([]T, error) {
+	var page []T
+	var err error
+
+	ga.do(func(g GraphAPI) {
+		page, err = fetch(g)
+	})
+
+	return page, wrapInterfaceErr(err)
+}
+
+// findOutgoingAfter forwards one page read to the backend's own pager, as
+// one short job, so a long walk never holds the actor for longer than one
+// page. If the backend cannot page, errPagingUnsupported tells
+// pageIterator to fall back to one full read.
+func (ga *GraphActor) findOutgoingAfter(from, after NodeID, hasAfter bool, limit int) ([]Relationship, error) {
+	return actorPage(ga, func(g GraphAPI) ([]Relationship, error) {
+		pager, ok := g.(outgoingPager)
+		if !ok {
+			return nil, errPagingUnsupported
+		}
+
+		page, err := pager.findOutgoingAfter(from, after, hasAfter, limit)
+
+		return page, wrapInterfaceErr(err)
+	})
+}
+
+// findIncomingAfter is findOutgoingAfter's mirror.
+func (ga *GraphActor) findIncomingAfter(to, after NodeID, hasAfter bool, limit int) ([]Relationship, error) {
+	return actorPage(ga, func(g GraphAPI) ([]Relationship, error) {
+		pager, ok := g.(incomingPager)
+		if !ok {
+			return nil, errPagingUnsupported
+		}
+
+		page, err := pager.findIncomingAfter(to, after, hasAfter, limit)
+
+		return page, wrapInterfaceErr(err)
+	})
+}
+
+// Compile-time assertions that GraphActor forwards paging.
+var (
+	_ outgoingPager = (*GraphActor)(nil)
+	_ incomingPager = (*GraphActor)(nil)
+)
 
 // RegisterChecker behaves exactly like the backend's RegisterChecker,
 // routed through ga's dedicated goroutine.
@@ -3013,6 +3141,44 @@ func (g *BoltGraph) FindNodes() ([]NodeID, error) {
 
 	return boltRead(g, func(v boltView) ([]NodeID, error) { return v.FindNodes() })
 }
+
+// findNodesAfter, findOutgoingAfter and findIncomingAfter let BoltGraph
+// itself, not only a transaction over it, page natively (see nodePager,
+// outgoingPager, incomingPager): each is one short read transaction
+// returning one bounded page. This is what makes paged reads effective
+// for a caller that holds the graph outside a Transact, including through
+// a RootGraph or GraphActor forwarding to it.
+func (g *BoltGraph) findNodesAfter(after NodeID, hasAfter bool, limit int) ([]NodeID, error) {
+	release := g.guard.acquire()
+	defer release()
+
+	return boltRead(g, func(v boltView) ([]NodeID, error) { return v.findNodesAfter(after, hasAfter, limit) })
+}
+
+func (g *BoltGraph) findOutgoingAfter(from, after NodeID, hasAfter bool, limit int) ([]Relationship, error) {
+	release := g.guard.acquire()
+	defer release()
+
+	return boltRead(g, func(v boltView) ([]Relationship, error) {
+		return v.findOutgoingAfter(from, after, hasAfter, limit)
+	})
+}
+
+func (g *BoltGraph) findIncomingAfter(to, after NodeID, hasAfter bool, limit int) ([]Relationship, error) {
+	release := g.guard.acquire()
+	defer release()
+
+	return boltRead(g, func(v boltView) ([]Relationship, error) {
+		return v.findIncomingAfter(to, after, hasAfter, limit)
+	})
+}
+
+// Compile-time assertions that BoltGraph pages.
+var (
+	_ nodePager     = (*BoltGraph)(nil)
+	_ outgoingPager = (*BoltGraph)(nil)
+	_ incomingPager = (*BoltGraph)(nil)
+)
 
 // RegisterChecker registers c, exactly like Graph.RegisterChecker.
 func (g *BoltGraph) RegisterChecker(c Checker) {
@@ -4089,7 +4255,20 @@ var _ nodePager = rootReader{}
 // existing, complete, unpaged FindIncoming.
 func (v rootReader) findOutgoingAfter(from, after NodeID, hasAfter bool, limit int) ([]Relationship, error) {
 	if from != v.root {
-		return outgoingAfter(v.inner, from, after, hasAfter, limit)
+		pager, ok := v.inner.(outgoingPager)
+		if !ok {
+			return nil, errPagingUnsupported
+		}
+
+		relationships, err := pager.findOutgoingAfter(from, after, hasAfter, limit)
+
+		return relationships, wrapInterfaceErr(err)
+	}
+
+	// ROOT's outgoing set pages over node IDs, which needs a pager for
+	// them underneath; otherwise let the caller fall back to one full read.
+	if _, ok := v.inner.(nodePager); !ok {
+		return nil, errPagingUnsupported
 	}
 
 	rootExists, err := v.inner.NodeExists(v.root)
@@ -6458,32 +6637,24 @@ func (c *CapsuleRegistry) SetValue(graph Transactor, capsule, value NodeID) erro
 // value referenced from a very large number of places -- the "very popular
 // value node" case that section names directly -- does not require
 // materializing its entire incoming edge list in memory just to filter it
-// down to genuine value-slot owners. This only changes anything for a
-// backend that implements incomingPager (BoltGraph's boltView, and
-// anything built on it, including through a GraphActor): such a backend
-// reads one bounded page at a time via a cursor. A backend without native
-// paging (the in-memory *Graph, stagedGraph) still ends up re-fetching and
-// re-slicing FindIncoming's full result on every page, exactly like
-// VerifyAll's own nodesAfter loop already accepts for FindNodes -- harmless
-// for a backend where the whole graph already fits in memory regardless.
-
-// capsulesWithValuePageSize bounds each internal page CapsulesWithValue
-// reads while walking a value's incoming relationships (theorystate.md
-// section 105). A var, not a const, specifically so tests can shrink it to
-// exercise the multi-page loop without needing thousands of capsules.
-var capsulesWithValuePageSize = 1000
-
+// down to genuine value-slot owners. A backend that pages natively
+// (BoltGraph, a transaction over it, and BoltGraph or GraphActor
+// forwarding to it) reads one bounded page at a time. Any other reader is
+// read in full exactly once and sliced (see pageIterator), so this never
+// costs more than the single FindIncoming it replaced.
 func (c *CapsuleRegistry) CapsulesWithValue(graph GraphReader, value NodeID) ([]NodeID, error) {
 	var capsules []NodeID
 
-	var after NodeID
-
-	hasAfter := false
+	pages := incomingPages(graph, value, capsulesWithValuePageSize)
 
 	for {
-		page, err := incomingAfter(graph, value, after, hasAfter, capsulesWithValuePageSize)
+		page, err := pages.next()
 		if err != nil {
 			return nil, err
+		}
+
+		if len(page) == 0 {
+			return capsules, nil
 		}
 
 		for _, rel := range page {
@@ -6507,15 +6678,14 @@ func (c *CapsuleRegistry) CapsulesWithValue(graph GraphReader, value NodeID) ([]
 
 			capsules = append(capsules, capsule)
 		}
-
-		if len(page) < capsulesWithValuePageSize {
-			return capsules, nil
-		}
-
-		after = page[len(page)-1].From
-		hasAfter = true
 	}
 }
+
+// capsulesWithValuePageSize bounds each internal page CapsulesWithValue
+// reads while walking a value's incoming relationships (theorystate.md
+// section 105). A var, not a const, specifically so tests can shrink it to
+// exercise the multi-page loop without needing thousands of capsules.
+var capsulesWithValuePageSize = 1000
 
 // Prev returns capsule's previous-capsule link, if any. hasPrev is false
 // for a capsule currently at the head of its list.
@@ -9624,7 +9794,8 @@ type anchorTargetFunc func(g GraphReader, anchor NodeID) (target NodeID, hasTarg
 // AllPointerMetadataTargetSlot) and targetOf.
 //
 // The Checker fires when a transaction touches a domain slot, a target
-// holder, or a node carrying any Set-representation tag. It finds every
+// holder, a node carrying any Set-representation tag, or an operand
+// descriptor (an axis-tagged node). It finds every
 // affected anchor via affectedAnchors, then for each anchor that has both
 // a target and a domain, re-validates membership against live state. Any
 // error from evaluating the domain (cycle, malformed descriptor, ...) is
@@ -9636,7 +9807,7 @@ type anchorTargetFunc func(g GraphReader, anchor NodeID) (target NodeID, hasTarg
 // composites via CompositeSetRegistry.SetLogs, and must exist before
 // this registry is constructed.
 func (d *domainConstraint) registerChecker(graph GraphAPI, name string, targetTag NodeID, targetOf anchorTargetFunc) {
-	tags := []NodeID{d.domainSlots.allPointers, targetTag, d.sets.allSets, d.composites.allCompositeSets}
+	tags := append([]NodeID{d.domainSlots.allPointers, targetTag, d.sets.allSets, d.composites.allCompositeSets}, d.composites.operandAxisTags()...)
 	if d.logs != nil {
 		tags = append(tags, d.logs.allCompositeSetLogs)
 	}
@@ -9677,7 +9848,12 @@ func (d *domainConstraint) registerChecker(graph GraphAPI, name string, targetTa
 //   - a touched node is Set-kind (any of the three representations):
 //     that node, and every composite/log that transitively expands it,
 //     may be some pointer's domain, so the owners of every domain slot
-//     referencing any of them are affected.
+//     referencing any of them are affected; or
+//   - a touched node is an operand descriptor (carries an axis tag): its
+//     composite(s)/log(s) changed definition (for example its operand was
+//     re-pointed), so they are treated exactly like a touched Set-kind
+//     node. The walk up uses the descriptor's intact incoming edge, not
+//     the edge that may just have been removed, so no diff is needed.
 //
 // Candidates are collected via reverse lookups only (Graph.incoming is
 // the reverse index -- nothing is stored or kept in sync; see
@@ -9716,30 +9892,81 @@ func (d *domainConstraint) affectedAnchors(g GraphReader, targetTag NodeID, touc
 		if err != nil {
 			return nil, err
 		}
-		if !known {
+		if known {
+			if expandErr := d.addAnchorsExpanding(g, targetTag, node, anchors); expandErr != nil {
+				return nil, expandErr
+			}
+		}
+
+		isDescriptor, err := d.isOperandDescriptor(g, node)
+		if err != nil {
+			return nil, err
+		}
+		if !isDescriptor {
 			continue
 		}
 
-		containers, containersErr := d.transitiveSetContainers(g, node)
-		if containersErr != nil {
-			return nil, containersErr
+		owners, ownersErr := d.descriptorOwners(g, node)
+		if ownersErr != nil {
+			return nil, ownersErr
 		}
 
-		for _, candidate := range append([]NodeID{node}, containers...) {
-			slots, slotsErr := d.domainSlotsOf(g, candidate)
-			if slotsErr != nil {
-				return nil, slotsErr
-			}
-
-			for _, slot := range slots {
-				if ownersErr := d.addSlotOwners(g, slot, targetTag, anchors); ownersErr != nil {
-					return nil, ownersErr
-				}
+		for _, owner := range owners {
+			if expandErr := d.addAnchorsExpanding(g, targetTag, owner, anchors); expandErr != nil {
+				return nil, expandErr
 			}
 		}
 	}
 
 	return sortedNodeSet(anchors), nil
+}
+
+// addAnchorsExpanding adds to anchors the owners of every domain slot
+// referencing node or any composite/log that transitively expands it:
+// every pointer whose domain could have changed membership because node's
+// own definition or membership changed.
+func (d *domainConstraint) addAnchorsExpanding(g GraphReader, targetTag, node NodeID, anchors map[NodeID]struct{}) error {
+	containers, err := d.transitiveSetContainers(g, node)
+	if err != nil {
+		return err
+	}
+
+	for _, candidate := range append([]NodeID{node}, containers...) {
+		slots, slotsErr := d.domainSlotsOf(g, candidate)
+		if slotsErr != nil {
+			return slotsErr
+		}
+
+		for _, slot := range slots {
+			if ownersErr := d.addSlotOwners(g, slot, targetTag, anchors); ownersErr != nil {
+				return ownersErr
+			}
+		}
+	}
+
+	return nil
+}
+
+// isOperandDescriptor reports whether node carries any operand-descriptor
+// axis tag (theorystate.md section 80).
+func (d *domainConstraint) isOperandDescriptor(g GraphReader, node NodeID) (bool, error) {
+	for _, tag := range d.composites.operandAxisTags() {
+		has, err := g.HasRelationship(tag, node)
+		if err != nil {
+			return false, wrapInterfaceErr(err)
+		}
+		if has {
+			return true, nil
+		}
+	}
+
+	return false, nil
+}
+
+// operandAxisTags returns the four operand-descriptor axis tags
+// (theorystate.md section 80).
+func (c *CompositeSetRegistry) operandAxisTags() []NodeID {
+	return []NodeID{c.allAdditiveOp, c.allSubtractiveOp, c.allScalarOperand, c.allSetOperand}
 }
 
 // addSlotOwners adds every candidate owner (parent) of slot to anchors.

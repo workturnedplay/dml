@@ -2017,10 +2017,31 @@ pointers' targets and domains.
 **Residual gaps, accepted.**
 - Raw non-`Transact` mutations bypass every Checker (as documented on
   `Checker`).
-- Removing a Set-kind tag out-of-band inside a `Transact` is not seen:
-  the node no longer carries the tag the relevance filter keys on.
-- Re-pointing a descriptor's operand out-of-band inside a `Transact`
-  touches the descriptor, which is not Set-kind, and is not seen.
+- Removing a Set-kind tag out-of-band inside a `Transact` is not seen by
+  this Checker, and that is deliberate rather than a gap to close: the tag
+  is what makes a node a Set, so a node that has lost it has no membership
+  left to validate a target against. What is left is referential
+  integrity -- a domain slot or an `AllSetOperand` descriptor now pointing
+  at a node that is no longer Set-kind -- which is not silent: write-time
+  attach (`ErrInvalidSetOperand`) and every read that resolves it
+  (`checkAllowed`, `Evaluate`) fail loudly. No registry API removes a
+  Set-kind tag (`DeleteSet` removes it only together with the node, which a
+  referencing slot blocks), so only foreign or hand-written writes reach
+  this. Enforcing it at commit would be possible without diffs (key a
+  Checker on the tag hub node being touched and look for referrers of
+  non-Set touched nodes) and is a policy choice, not a missing mechanism.
+  An earlier version of this section said it needed a diff-aware `Checker`
+  contract; that was wrong.
+- Re-pointing a descriptor's operand inside a `Transact` (remove `U -> O`,
+  add `U -> O'`) is now seen. Removing the operand leaving none or several
+  was already declined by the operand-descriptor Checker, which is keyed
+  on the axis tags. Re-pointing to another valid operand leaves a
+  well-formed descriptor but changes its composite's membership, so it can
+  strand a pointer; the walk up from a touched descriptor uses its
+  intact incoming edge (`composite -> U`), not the removed `U -> O`, so it
+  needs no diffs either. `registerChecker` now also keys on the four axis
+  tags, and `affectedAnchors` treats a touched descriptor's owners like a
+  touched Set-kind node.
 - A domain already corrupt (e.g. a cycle created by a raw mutation) makes
   every later transaction touching it fail until repaired in a single
   transaction that makes it valid.
@@ -3398,10 +3419,12 @@ cursor and forwarded by the ROOT overlay; `VerifyAll` is built on it.
 same shape, mirrored for a single node's own outgoing or incoming
 relationships: `outgoingPager`/`incomingPager` (`findOutgoingAfter`/
 `findIncomingAfter`), implemented by `boltView` with a cursor over the
-`out`/`in` buckets, dispatched through `outgoingAfter`/`incomingAfter`
-(falling back to `FindOutgoing`/`FindIncoming` sliced client-side via
-`pageRelationships` for a reader with no native paging). This closes two
-of the specific unbounded call sites named below:
+`out`/`in` buckets and by `BoltGraph` and `GraphActor` forwarding to it,
+walked through the stateful `pageIterator` (`outgoingPages`/
+`incomingPages`). A pager that cannot page a request returns
+`errPagingUnsupported` and the iterator then reads the full result once
+and slices it. This closes two of the specific unbounded call sites named
+below:
 
 - `rootReader.FindOutgoing(ROOT)`: ROOT's entire outgoing set is virtual
   (section 12a), so `rootReader.findOutgoingAfter` pages over existing node
@@ -3419,19 +3442,20 @@ of the specific unbounded call sites named below:
   relationships in bounded pages (`capsulesWithValuePageSize`, a `var` so
   tests can shrink it) rather than materializing the whole list at once.
 
-**Accepted trade-off, not a new one.** For a reader with no native pager
-(the in-memory `*Graph`, `stagedGraph`), looping `outgoingAfter`/
-`incomingAfter` (or `nodesAfter`) over successive pages re-fetches and
-re-slices the full unpaged result on every call -- quadratic in the total
-edge/node count for that loop, not linear. This is not a regression
-introduced here: `VerifyAll`'s own `nodesAfter` loop already has the
-identical shape for `FindNodes` and was accepted without comment, because a
-backend where "everything already fits in memory" was never the paging
-problem this exists to solve; it is recorded explicitly here rather than
-left to be independently rediscovered as a surprise. A caller that would
-call one of these paged helpers in a loop against an *arbitrary* reader
-(the way `CapsulesWithValue` does) must accept the same trade-off, not
-assume the fallback path is cheap.
+**The fallback is linear, not quadratic.** A stateless "page after key K"
+helper over a reader with no native pager re-reads and re-slices the whole
+result on every page, which is quadratic over a walk. The first version of
+this work did exactly that, and also claimed paging worked through
+`GraphActor` when neither it nor `BoltGraph` implemented the pagers, so
+the production stack silently took the slow path. `pageIterator` fixes
+both: a walk over a reader with no native pager (the in-memory `*Graph`,
+`stagedGraph`, or a forwarding layer whose inner reader cannot page, which
+says so with `errPagingUnsupported`) reads the full result exactly once,
+the same cost as the unpaged call it replaced. The one remaining quadratic
+loop is `VerifyAll`: each page is its own transaction, so a snapshot
+cannot be carried across pages, and `nodesAfter` re-reads `FindNodes` per
+page on a backend with no node pager. That is accepted for memory-bound
+backends only.
 
 **Still unbounded, per the grep this section already called for:**
 `FindRelationships`, `rootReader.FindRelationships`, `rootReader.FindIncoming`
@@ -3888,8 +3912,9 @@ kept current as sections above resolve or split further.)*
   Checker runs once, at the outermost commit.
 - Domain Pointer staleness residuals (§86): per-commit memoization of
   domain membership if the O(pointers-per-domain) validation cost matters,
-  and whether the out-of-band-inside-`Transact` gaps (tag removal,
-  descriptor re-pointing) are worth closing.
+  and whether commit-time referential integrity for a domain or set
+  operand that loses its Set-kind tag is wanted (today: fails loudly on
+  read, see §86).
 - Generalized "find the bridging node(s) given both path endpoints" query
   for arbitrary, not-necessarily-tag-shaped paths (§85).
 - Backend selection timing: fixed at construction vs. runtime-swappable,

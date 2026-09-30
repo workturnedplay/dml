@@ -1797,6 +1797,24 @@ could be called directly.
  TestBoltGraphReportCommitLatencyAndFileSize and BenchmarkBoltGraphCommit
  for measurement.
 
+42. Startup integrity sweep (theorystate.md sections 104, 110). Added
+ VerifyAll(graph, pageSize) (one Transact per page of node IDs, each
+ calling Tx.Touch; fail-closed, ErrLoadVerification), the unexported
+ nodePager interface with pageNodeIDs/nodesAfter (implemented by boltView
+ with a cursor, forwarded by rootReader, fallback to FindNodes elsewhere),
+ BoltGraph.CheckStore (bolt's Tx.Check plus boltView.checkLayout/checkEdges)
+ and NameRegistry.VerifyBindings. Test-only: testBackends() replaces an
+ inline backend list in TestTxTouchRunsRelevantCheckersWithoutMutation.
+ Covered by TestPageNodeIDs,
+ TestBoltGraphFindNodesAfterMatchesFindNodes,
+ TestVerifyAllTouchesEveryNodeInPagesOnEveryBackend,
+ TestVerifyAllDefaultsPageSizeAndHandlesAnEmptyGraph,
+ TestVerifyAllFindsViolationsThatBypassedCheckersOnBoltGraph,
+ TestVerifyAllThroughRootGraphInsideGraphActorOverBoltGraph,
+ TestBoltGraphCheckStore, TestNameRegistryVerifyBindings and
+ TestBoltGraphStartupSequence. The benchmark now uses b.Loop.
+ Measurements are recorded in theorystate.md section 108.
+
 43. Paged reads for one node's own outgoing/incoming relationships
  (theorystate.md section 105), mirroring item 42's node paging. Added
  outgoingPager/incomingPager (findOutgoingAfter/findIncomingAfter),
@@ -1852,23 +1870,38 @@ could be called directly.
  TestRootReaderFindOutgoingAfterMatchesFindOutgoing, and
  TestCapsulesWithValuePagesAcrossMultipleFetches.
 
-44. Startup integrity sweep (theorystate.md sections 104, 110). Added
- VerifyAll(graph, pageSize) (one Transact per page of node IDs, each
- calling Tx.Touch; fail-closed, ErrLoadVerification), the unexported
- nodePager interface with pageNodeIDs/nodesAfter (implemented by boltView
- with a cursor, forwarded by rootReader, fallback to FindNodes elsewhere),
- BoltGraph.CheckStore (bolt's Tx.Check plus boltView.checkLayout/checkEdges)
- and NameRegistry.VerifyBindings. Test-only: testBackends() replaces an
- inline backend list in TestTxTouchRunsRelevantCheckersWithoutMutation.
- Covered by TestPageNodeIDs,
- TestBoltGraphFindNodesAfterMatchesFindNodes,
- TestVerifyAllTouchesEveryNodeInPagesOnEveryBackend,
- TestVerifyAllDefaultsPageSizeAndHandlesAnEmptyGraph,
- TestVerifyAllFindsViolationsThatBypassedCheckersOnBoltGraph,
- TestVerifyAllThroughRootGraphInsideGraphActorOverBoltGraph,
- TestBoltGraphCheckStore, TestNameRegistryVerifyBindings and
- TestBoltGraphStartupSequence. The benchmark now uses b.Loop.
- Measurements are recorded in theorystate.md section 108.
+44. Corrected item 43's paging (theorystate.md sections 105, 86).
+ (a) The stateless outgoingAfter/incomingAfter/pageRelationships helpers
+ are gone: looped against a reader with no native pager they re-read the
+ full result per page (quadratic), and item 43's claim that paging worked
+ through GraphActor was false, since only boltView implemented the
+ pagers. Replaced by the generic pageIterator (outgoingPages/
+ incomingPages over pageSorted, which pageNodeIDs now shares): native
+ paging where available, otherwise one full read sliced. A pager returns
+ the new errPagingUnsupported to ask for that fallback, which lets the
+ ROOT overlay (non-ROOT anchors need an outgoingPager underneath; ROOT
+ itself needs a nodePager) and GraphActor forward honestly. BoltGraph
+ gained findNodesAfter/findOutgoingAfter/findIncomingAfter and GraphActor
+ forwards both relationship pagers (actorPage), so paging is effective
+ outside a Transact. CapsulesWithValue uses incomingPages, and its doc
+ comment, detached from the function by item 43's edit, is reattached.
+ (b) Domain-pointer staleness: re-pointing a descriptor's operand inside
+ a Transact is now detected. registerChecker also keys on the four axis
+ tags; affectedAnchors treats a touched descriptor's owners like a
+ touched Set-kind node, sharing addAnchorsExpanding with the Set branch.
+ Set-kind tag removal is documented as deliberately not enforced (the
+ node stops being a Set; dependents fail loudly on read), superseding the
+ claim that it needed a diff-aware Checker.
+
+ Still quadratic: VerifyAll's per-page-transaction loop over a backend
+ with no node pager.
+
+ Covered by TestRootReaderFindOutgoingAfterReportsUnsupportedOverNonPagingBackend,
+ TestPageIteratorsMatchFullReadsOnEveryBackendAndThroughGraphActor,
+ TestCapsulesWithValueFallsBackToOneFullReadPerCall and
+ TestDomainStalenessRepointingDescriptorOperandIsRejected;
+ TestRootReaderFindOutgoingAfterMatchesFindOutgoing now runs over a
+ BoltGraph.
 
 Currently unaddressed yet:
 - Paged reads beyond a single node's own outgoing/incoming edges, and
@@ -1897,9 +1930,9 @@ Currently unaddressed yet:
   unimplemented and OPEN, not merely "for a non-memory backend" in
   general. Txn.DeleteNode is supported -- see item 15.
 - Domain-pointer staleness residuals (theorystate.md section 86): raw
-  non-Transact mutations, out-of-band tag removal or descriptor
-  re-pointing inside a Transact, and O(pointers-per-domain) validation
-  cost per commit (unmemoized) remain accepted.
+  non-Transact mutations, Set-kind tag removal inside a Transact (by
+  design, it fails loudly on read), and O(pointers-per-domain)
+  validation cost per commit (unmemoized) remain accepted.
 - A bare *Graph is not safe for concurrent use. concurrentAccessGuard
   panics on detected overlap instead of corrupting state (theorystate.md
   section 89b); it cannot catch a non-overlapping handoff with no

@@ -13762,17 +13762,17 @@ func TestBoltGraphFindIncomingAfterMatchesFindIncoming(t *testing.T) {
 // silently shorten a page if filtering ROOT back out (the overlay's own
 // irreflexivity) were not compensated for.
 func TestRootReaderFindOutgoingAfterMatchesFindOutgoing(t *testing.T) {
-	var g Graph
+	g := newBoltTestGraph(t)
 
-	newTestNode(t, &g)
-	newTestNode(t, &g)
-	root := newTestNode(t, &g)
+	mustCreateNode(t, g)
+	mustCreateNode(t, g)
+	root := mustCreateNode(t, g)
 
 	for range 4 {
-		newTestNode(t, &g)
+		mustCreateNode(t, g)
 	}
 
-	r, err := NewRootGraph(&g, root)
+	r, err := NewRootGraph(g, root)
 	if err != nil {
 		t.Fatalf("NewRootGraph(): %v", err)
 	}
@@ -13808,6 +13808,266 @@ func TestRootReaderFindOutgoingAfterMatchesFindOutgoing(t *testing.T) {
 			t.Fatalf("paging with limit %d gave %v, want %v", limit, paged, all)
 		}
 	}
+}
+
+// TestRootReaderFindOutgoingAfterReportsUnsupportedOverNonPagingBackend
+// pins down the fix for the ROOT overlay silently re-fetching on every
+// page: over a backend that cannot page, it must say so, and the iterator
+// must then fall back to one full read and still return the right answer.
+func TestRootReaderFindOutgoingAfterReportsUnsupportedOverNonPagingBackend(t *testing.T) {
+	var g Graph
+
+	root := newTestNode(t, &g)
+	other := newTestNode(t, &g)
+
+	for range 4 {
+		newTestNode(t, &g)
+	}
+
+	r, err := NewRootGraph(&g, root)
+	if err != nil {
+		t.Fatalf("NewRootGraph(): %v", err)
+	}
+
+	for _, from := range []NodeID{root, other} {
+		if _, pageErr := r.findOutgoingAfter(from, 0, false, 2); !errors.Is(pageErr, errPagingUnsupported) {
+			t.Fatalf("findOutgoingAfter(%d) error = %v, want %v", from, pageErr, errPagingUnsupported)
+		}
+	}
+
+	want, err := r.FindOutgoing(root)
+	if err != nil {
+		t.Fatalf("FindOutgoing(root): %v", err)
+	}
+
+	if got := collectPages(t, outgoingPages(r, root, 2)); !reflect.DeepEqual(got, want) {
+		t.Fatalf("outgoingPages(root) = %v, want %v", got, want)
+	}
+}
+
+func collectPages(t *testing.T, it *pageIterator[Relationship]) []Relationship {
+	t.Helper()
+
+	var all []Relationship
+
+	for {
+		page, err := it.next()
+		if err != nil {
+			t.Fatalf("next(): %v", err)
+		}
+
+		if len(page) == 0 {
+			return all
+		}
+
+		all = append(all, page...)
+	}
+}
+
+// TestPageIteratorsMatchFullReadsOnEveryBackendAndThroughGraphActor checks
+// both iterators against the unpaged reads on every backend, directly and
+// behind a GraphActor: native paging where there is one, the snapshot
+// fallback where there is not.
+func TestPageIteratorsMatchFullReadsOnEveryBackendAndThroughGraphActor(t *testing.T) {
+	for _, backend := range testBackends() {
+		for _, viaActor := range []bool{false, true} {
+			name := backend.name
+			if viaActor {
+				name += "/GraphActor"
+			}
+
+			t.Run(name, func(t *testing.T) {
+				graph := backend.open(t)
+
+				if viaActor {
+					actor := NewGraphActor(graph)
+					t.Cleanup(actor.Close)
+
+					graph = actor
+				}
+
+				hub := mustCreateNode(t, graph)
+
+				for range 7 {
+					spoke := mustCreateNode(t, graph)
+
+					if _, err := addRelationshipVia(graph, hub, spoke); err != nil {
+						t.Fatalf("AddRelationship(hub, spoke): %v", err)
+					}
+					if _, err := addRelationshipVia(graph, spoke, hub); err != nil {
+						t.Fatalf("AddRelationship(spoke, hub): %v", err)
+					}
+				}
+
+				wantOut, err := graph.FindOutgoing(hub)
+				if err != nil {
+					t.Fatalf("FindOutgoing(hub): %v", err)
+				}
+
+				wantIn, err2 := graph.FindIncoming(hub)
+				if err2 != nil {
+					t.Fatalf("FindIncoming(hub): %v", err2)
+				}
+
+				for limit := 1; limit <= len(wantOut)+1; limit++ {
+					if got := collectPages(t, outgoingPages(graph, hub, limit)); !reflect.DeepEqual(got, wantOut) {
+						t.Fatalf("outgoingPages(limit %d) = %v, want %v", limit, got, wantOut)
+					}
+
+					if got := collectPages(t, incomingPages(graph, hub, limit)); !reflect.DeepEqual(got, wantIn) {
+						t.Fatalf("incomingPages(limit %d) = %v, want %v", limit, got, wantIn)
+					}
+				}
+			})
+		}
+	}
+}
+
+// countingReader counts FindIncoming calls for one watched node. Embedding
+// the GraphReader interface deliberately hides any optional pager the
+// wrapped value has, so this reader looks like a backend with no paging.
+type countingReader struct {
+	GraphReader
+	watched           NodeID
+	findIncomingCalls int
+}
+
+func (r *countingReader) FindIncoming(to NodeID) ([]Relationship, error) {
+	if to == r.watched {
+		r.findIncomingCalls++
+	}
+
+	relationships, err := r.GraphReader.FindIncoming(to)
+
+	return relationships, wrapInterfaceErr(err)
+}
+
+// unsupportedPagerReader additionally claims incomingPager but always
+// reports errPagingUnsupported, like a forwarding layer over a backend
+// that cannot page.
+type unsupportedPagerReader struct {
+	countingReader
+	nativeCalls int
+}
+
+func (r *unsupportedPagerReader) findIncomingAfter(_, _ NodeID, _ bool, _ int) ([]Relationship, error) {
+	r.nativeCalls++
+
+	return nil, errPagingUnsupported
+}
+
+// TestCapsulesWithValueFallsBackToOneFullReadPerCall is the regression
+// test for the quadratic fallback: over a reader with no paging, and over
+// one whose pager reports errPagingUnsupported, CapsulesWithValue must
+// read the watched node's incoming relationships exactly once, however
+// many internal pages it walks.
+func TestCapsulesWithValueFallsBackToOneFullReadPerCall(t *testing.T) {
+	original := capsulesWithValuePageSize
+	capsulesWithValuePageSize = 3
+	t.Cleanup(func() { capsulesWithValuePageSize = original })
+
+	g, capsules := newCapsuleTestFixture(t)
+
+	value, err := g.CreateNode()
+	if err != nil {
+		t.Fatalf("CreateNode() for value: %v", err)
+	}
+
+	const occurrences = 7
+
+	for range occurrences {
+		if _, err2 := capsules.NewCapsule(g, value); err2 != nil {
+			t.Fatalf("NewCapsule(): %v", err2)
+		}
+	}
+
+	plain := &countingReader{GraphReader: g, watched: value}
+
+	got, err := capsules.CapsulesWithValue(plain, value)
+	if err != nil {
+		t.Fatalf("CapsulesWithValue(plain): %v", err)
+	}
+	if len(got) != occurrences {
+		t.Fatalf("CapsulesWithValue(plain) returned %d capsules, want %d", len(got), occurrences)
+	}
+	if plain.findIncomingCalls != 1 {
+		t.Fatalf("FindIncoming(value) ran %d times, want exactly 1 (a full read per page is quadratic)", plain.findIncomingCalls)
+	}
+
+	unsupported := &unsupportedPagerReader{countingReader: countingReader{GraphReader: g, watched: value}}
+
+	got, err = capsules.CapsulesWithValue(unsupported, value)
+	if err != nil {
+		t.Fatalf("CapsulesWithValue(unsupported): %v", err)
+	}
+	if len(got) != occurrences {
+		t.Fatalf("CapsulesWithValue(unsupported) returned %d capsules, want %d", len(got), occurrences)
+	}
+	if unsupported.nativeCalls != 1 || unsupported.findIncomingCalls != 1 {
+		t.Fatalf("native pager called %d times and FindIncoming %d times, want 1 and 1", unsupported.nativeCalls, unsupported.findIncomingCalls)
+	}
+}
+
+// TestDomainStalenessRepointingDescriptorOperandIsRejected covers
+// re-pointing a descriptor's operand inside one transaction: the
+// descriptor stays well-formed, so only the domain Checker can notice that
+// the composite no longer contains the pointer's target.
+func TestDomainStalenessRepointingDescriptorOperandIsRejected(t *testing.T) {
+	forEachDomainPointerKind(t, func(t *testing.T, fx *domainPointerTestFixture, handle domainPointerHandle) {
+		composite, err := fx.composites.NewCompositeSet(fx.graph)
+		if err != nil {
+			t.Fatalf("NewCompositeSet(): %v", err)
+		}
+
+		target := newTestNode(t, fx.graph)
+		other := newTestNode(t, fx.graph)
+
+		u, err := fx.composites.AddOperand(fx.graph, composite, target, true, false)
+		if err != nil {
+			t.Fatalf("AddOperand(target): %v", err)
+		}
+
+		if setErr := handle.setDomain(composite); setErr != nil {
+			t.Fatalf("setDomain(): %v", setErr)
+		}
+		if setErr := handle.setTarget(target); setErr != nil {
+			t.Fatalf("setTarget(): %v", setErr)
+		}
+
+		err = fx.graph.Transact(func(tx Tx) error {
+			if removeErr := removeRelationshipTx(tx, u, target); removeErr != nil {
+				return removeErr
+			}
+
+			return addRelationshipTx(tx, u, other)
+		})
+		if !errors.Is(err, ErrTargetOutsideDomain) {
+			t.Fatalf("Transact(repoint) error = %v, want %v", err, ErrTargetOutsideDomain)
+		}
+
+		requireHandleTarget(t, handle, target)
+
+		if !mustHasRelationship(t, fx.graph, u, target) {
+			t.Fatal("the declined re-point was not rolled back")
+		}
+
+		// The same re-point is accepted when the target stays in the domain.
+		err = fx.graph.Transact(func(tx Tx) error {
+			if removeErr := removeRelationshipTx(tx, u, target); removeErr != nil {
+				return removeErr
+			}
+			if addErr := addRelationshipTx(tx, u, other); addErr != nil {
+				return addErr
+			}
+
+			_, operandErr := fx.composites.AddOperand(tx, composite, target, true, false)
+
+			return operandErr
+		})
+		if err != nil {
+			t.Fatalf("Transact(repoint and keep target) error = %v, want nil", err)
+		}
+	})
 }
 
 func TestVerifyAllTouchesEveryNodeInPagesOnEveryBackend(t *testing.T) {
