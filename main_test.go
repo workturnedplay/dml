@@ -11382,33 +11382,64 @@ func (g *stagedGraph) publish(ov *stagedOverlay) {
 // forceConflict causes: from the outside, one Transact call is one
 // atomic unit regardless of how many internal attempts it took, exactly
 // mirroring Graph.Transact's own guard discipline. Unlike Graph.Transact,
-// no rollback step is needed on failure or panic: an attempt's overlay
+// no data rollback is needed on failure or panic: an attempt's overlay
 // never touches the backing store until publish, so a discarded overlay
-// simply leaves nothing behind to undo.
+// leaves no data behind to undo. Its OnRollback hooks must still run,
+// though (see runAttempt).
 func (g *stagedGraph) Transact(fn func(tx Tx) error) error {
 	release := g.guard.acquire()
 	defer release()
 
 	for attempt := 1; ; attempt++ {
-		ov := newStagedOverlay(g)
-
-		if fnErr := fn(ov); fnErr != nil {
-			return fnErr
+		committed, err := g.runAttempt(attempt, fn)
+		if err != nil {
+			return err
 		}
 
-		if checkErr := g.runCheckers(ov); checkErr != nil {
-			return checkErr
+		if committed {
+			return nil
 		}
-
-		if g.forceConflict != nil && g.forceConflict(attempt) {
-			continue
-		}
-
-		g.publish(ov)
-		ov.runCommitHooks()
-
-		return nil
 	}
+}
+
+// runAttempt runs one attempt of Transact against a fresh overlay. It
+// reports committed == false with a nil error when forceConflict discarded
+// the attempt and Transact should rerun fn. Every attempt that is not
+// published -- fn failed, a Checker declined, forceConflict discarded it, or
+// anything panicked -- runs the overlay's rollback, so OnRollback hooks (for
+// example NameRegistry's unstaging) run exactly as they do on the other
+// backends; without this a discarded attempt's staged state would leak into
+// the retry.
+func (g *stagedGraph) runAttempt(attempt int, fn func(tx Tx) error) (committed bool, err error) {
+	ov := newStagedOverlay(g)
+
+	defer func() {
+		if !committed {
+			ov.rollback()
+		}
+	}()
+
+	if fnErr := fn(ov); fnErr != nil {
+		return false, fnErr
+	}
+
+	if checkErr := g.runCheckers(ov); checkErr != nil {
+		return false, checkErr
+	}
+
+	if g.forceConflict != nil && g.forceConflict(attempt) {
+		return false, nil
+	}
+
+	g.publish(ov)
+
+	// Set before the hooks run: the attempt is published, so a panicking
+	// hook must not run rollback hooks for it.
+	committed = true
+
+	ov.runCommitHooks()
+
+	return true, nil
 }
 
 // The methods below exist ONLY in test builds, exactly mirroring the
@@ -12291,10 +12322,10 @@ func TestRootGraphOverStagedGraphBasicOperations(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------
-// BoltGraph tests (theorystate.md sections 100-108). Names are not
-// persisted yet, so a reopened store's NameRegistry starts empty: tests
-// that reopen a file reuse the NodeIDs they already know instead of
-// calling BootstrapNames again.
+// BoltGraph tests (theorystate.md sections 100-110). Names are persisted
+// (section 109), so a test that reopens a file either calls LoadNames on a
+// fresh NameRegistry or, where names are not the point, carries the
+// NodeIDs it already knows across the reopen.
 
 // The methods below exist ONLY in test builds, exactly like the ones for
 // stagedGraph: GraphAPI has no raw writes, so these run as one-operation
@@ -12918,8 +12949,9 @@ func TestBoltGraphPointerRegistryPortability(t *testing.T) {
 
 // TestBoltGraphPointerStateSurvivesReopen checks that graph structure
 // written through a registry is still there, and still guarded by a freshly
-// constructed registry's Checker, after a reopen. NameRegistry bindings are
-// not persisted yet, so the tag's NodeID is carried across by the test.
+// constructed registry's Checker, after a reopen. NameRegistry bindings do
+// persist (TestBoltGraphNamesPersistAcrossReopen), but names are not the
+// point here, so the tag's NodeID is simply carried across by the test.
 func TestBoltGraphPointerStateSurvivesReopen(t *testing.T) {
 	path := boltTestPath(t)
 	first := openBoltTestGraph(t, path)
@@ -16634,5 +16666,165 @@ func TestCompositeSetLogRemoveOperationIsAtomicWhenCapsuleCannotBeDeleted(t *tes
 	}
 	if want := []NodeID{u}; !reflect.DeepEqual(operations, want) {
 		t.Fatalf("Operations() = %v, want %v", operations, want)
+	}
+}
+
+// TestStagedGraphRollbackHooksRunForEveryDiscardedAttempt pins down that
+// stagedGraph runs OnRollback hooks for an attempt that is not published,
+// whatever the reason: a forced conflict, an error from fn, or a panic.
+func TestStagedGraphRollbackHooksRunForEveryDiscardedAttempt(t *testing.T) {
+	g := newStagedGraph()
+
+	var events []string
+
+	register := func(tx Tx) {
+		tx.OnRollback(func() { events = append(events, "rollback") })
+		tx.OnCommit(func() { events = append(events, "commit") })
+	}
+
+	// The first attempt is discarded by a forced conflict: its rollback
+	// hook runs, then the retry commits.
+	g.forceConflict = func(attempt int) bool { return attempt == 1 }
+
+	err := g.Transact(func(tx Tx) error {
+		register(tx)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Transact(conflict, then commit) error = %v", err)
+	}
+	if want := []string{"rollback", "commit"}; !reflect.DeepEqual(events, want) {
+		t.Fatalf("hooks ran %v, want %v", events, want)
+	}
+
+	g.forceConflict = nil
+	events = nil
+	errBoom := errors.New("boom")
+
+	err = g.Transact(func(tx Tx) error {
+		register(tx)
+		return errBoom
+	})
+	if !errors.Is(err, errBoom) {
+		t.Fatalf("Transact(fail) error = %v, want %v", err, errBoom)
+	}
+	if want := []string{"rollback"}; !reflect.DeepEqual(events, want) {
+		t.Fatalf("hooks ran %v after a failed attempt, want %v", events, want)
+	}
+
+	events = nil
+
+	func() {
+		defer func() {
+			if r := recover(); r == nil {
+				t.Fatal("expected the panic to propagate out of Transact()")
+			}
+		}()
+
+		//nolint:errcheck // the closure panics before Transact can return
+		_ = g.Transact(func(tx Tx) error {
+			register(tx)
+			panic("boom")
+		})
+	}()
+
+	if want := []string{"rollback"}; !reflect.DeepEqual(events, want) {
+		t.Fatalf("hooks ran %v after a panicking attempt, want %v", events, want)
+	}
+}
+
+// TestStagedGraphDiscardedAttemptsUnstageNameBindings is the NameRegistry
+// consequence of the test above: a binding staged by a discarded attempt
+// must not leak into the retry (it used to fail with
+// ErrNameBoundToDeletedNode, since the staged node only existed in the
+// discarded overlay).
+func TestStagedGraphDiscardedAttemptsUnstageNameBindings(t *testing.T) {
+	g := newStagedGraph()
+	g.forceConflict = func(attempt int) bool { return attempt == 1 }
+
+	names := NewNameRegistry(g)
+
+	id, err := names.CreateNamedNode(g, "A")
+	if err != nil {
+		t.Fatalf("CreateNamedNode() error = %v (the discarded attempt's staged binding leaked into the retry)", err)
+	}
+
+	if found, ok := names.Lookup("A"); !ok || found != id {
+		t.Fatalf("Lookup(\"A\") = (%d,%v), want (%d,true)", found, ok, id)
+	}
+	if !mustNodeExists(t, g, id) {
+		t.Fatalf("node %d does not exist after the committed retry", id)
+	}
+	if got := len(mustFindNodes(t, g)); got != 1 {
+		t.Fatalf("FindNodes() has %d node(s), want exactly 1", got)
+	}
+
+	requireNoStagedNames(t, names)
+}
+
+// TestBoltGraphReadsAfterCloseReportStoreUnavailable checks that a failure
+// of bolt's own read channel is reported as ErrGraphStoreUnavailable, as
+// GraphReader documents, and not confused with a request-level error.
+func TestBoltGraphReadsAfterCloseReportStoreUnavailable(t *testing.T) {
+	g := newBoltTestGraph(t)
+	id := mustCreateNode(t, g)
+
+	if closeErr := g.Close(); closeErr != nil {
+		t.Fatalf("Close(): %v", closeErr)
+	}
+
+	if _, err := g.NodeExists(id); !errors.Is(err, ErrGraphStoreUnavailable) {
+		t.Fatalf("NodeExists() on a closed store error = %v, want %v", err, ErrGraphStoreUnavailable)
+	}
+	if _, err := g.FindNodes(); !errors.Is(err, ErrGraphStoreUnavailable) {
+		t.Fatalf("FindNodes() on a closed store error = %v, want %v", err, ErrGraphStoreUnavailable)
+	}
+}
+
+// TestRootReaderFindOutgoingAfterOfMissingRootIsNotFound: a paged read of
+// ROOT's outgoing set must answer like FindOutgoing(ROOT) when ROOT no
+// longer exists, not with an empty page.
+func TestRootReaderFindOutgoingAfterOfMissingRootIsNotFound(t *testing.T) {
+	g := newBoltTestGraph(t)
+
+	root := mustCreateNode(t, g)
+	mustCreateNode(t, g)
+
+	r, err := NewRootGraph(g, root)
+	if err != nil {
+		t.Fatalf("NewRootGraph(): %v", err)
+	}
+
+	// Deleted through the underlying graph, bypassing RootGraph's
+	// ErrCannotDeleteRoot protection.
+	if deleteErr := g.DeleteNode(root); deleteErr != nil {
+		t.Fatalf("raw DeleteNode(ROOT): %v", deleteErr)
+	}
+
+	if _, pageErr := r.findOutgoingAfter(root, 0, false, 2); !errors.Is(pageErr, ErrNodeNotFound) {
+		t.Fatalf("findOutgoingAfter(deleted ROOT) error = %v, want %v", pageErr, ErrNodeNotFound)
+	}
+}
+
+// TestRootReaderFindOutgoingAfterToleratesHugeLimit: the page limit is
+// only an upper bound and must never be used to size an allocation.
+func TestRootReaderFindOutgoingAfterToleratesHugeLimit(t *testing.T) {
+	g := newBoltTestGraph(t)
+
+	root := mustCreateNode(t, g)
+	a := mustCreateNode(t, g)
+
+	r, err := NewRootGraph(g, root)
+	if err != nil {
+		t.Fatalf("NewRootGraph(): %v", err)
+	}
+
+	got, err := r.findOutgoingAfter(root, 0, false, int(^uint(0)>>1))
+	if err != nil {
+		t.Fatalf("findOutgoingAfter() with the largest possible limit: %v", err)
+	}
+
+	if want := []Relationship{{From: root, To: a}}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("findOutgoingAfter() = %v, want %v", got, want)
 	}
 }

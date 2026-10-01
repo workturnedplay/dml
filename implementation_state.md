@@ -1903,14 +1903,40 @@ could be called directly.
  TestRootReaderFindOutgoingAfterMatchesFindOutgoing now runs over a
  BoltGraph.
 
+45. Review pass: fixes and DRY. (a) stagedGraph.Transact never ran
+ OnRollback hooks for an attempt that was not published (fn error,
+ declined Checker, forceConflict, panic), so NameRegistry's staged
+ bindings leaked into the retry and failed it with
+ ErrNameBoundToDeletedNode. Attempts now run through runAttempt, which
+ runs the overlay's rollback unless the attempt was published.
+ (b) ErrGraphStoreUnavailable was documented but never returned;
+ boltRead now reports a failure of bolt's own read channel with it,
+ keeping request-level errors (ErrNodeNotFound, ErrStoreCorrupt)
+ distinct. (c) rootReader.findOutgoingAfter answered a missing ROOT with
+ an empty page (FindOutgoing says ErrNodeNotFound) and sized its result
+ with the caller's limit, which panics for a huge one; both fixed.
+ (d) DRY: CompositeSetLogRegistry.evaluate uses sortedNodeSet,
+ ListRegistry.Head/Tail share boundary, and Elements, OccurrencesOf,
+ SetRegistry.Contains/Members, CompositeSetRegistry.Operands/Evaluate and
+ CompositeSetLogRegistry.Operations/Evaluate use the requireX helpers
+ instead of repeating the exists-then-tag check. (e) test.bat printed an
+ empty %lintexe% (the variable does not survive prebuildcheck.bat's
+ setlocal), and prebuildcheck.bat paused in silent mode. Stale comments
+ corrected (pageSorted, Txn durability, two BoltGraph test comments).
+ Covered by TestStagedGraphRollbackHooksRunForEveryDiscardedAttempt,
+ TestStagedGraphDiscardedAttemptsUnstageNameBindings,
+ TestBoltGraphReadsAfterCloseReportStoreUnavailable,
+ TestRootReaderFindOutgoingAfterOfMissingRootIsNotFound and
+ TestRootReaderFindOutgoingAfterToleratesHugeLimit.
+
 Currently unaddressed yet:
-- Paged reads beyond a single node's own outgoing/incoming edges, and
-  error results for the GraphReader methods that lack them
+- Paged reads beyond a single node's own outgoing/incoming edges
   (theorystate.md section 105, item 43): FindRelationships,
   rootReader.FindRelationships, and rootReader.FindIncoming (no
   virtual-aware paged incoming yet) are still O(graph) on BoltGraph, as
   are ListRegistry.validateStructure's and CompositeSetRegistry's own
-  full-child-set reads.
+  full-child-set reads. (The GraphReader methods that lacked error
+  results now have them; see ErrGraphStoreUnavailable.)
 - The operation-level protocol between other processes and the graph host
   (theorystate.md section 107).
 - Nested transactions as a production-backend feature are also realized

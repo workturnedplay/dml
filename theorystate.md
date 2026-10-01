@@ -3577,7 +3577,7 @@ hosts on different machines coordinate is Part C.
   bookkeeping and the duplicated checker loop.
 - **`Tx.Touch(ids...)`** exists on every `Tx`. It marks nodes as touched
   without mutating, so Checkers run for them at commit (§104's mechanism).
-  `VerifyAll` itself is not built yet.
+  `VerifyAll` is built on it (§110).
 - **ID counter.** `nextID` and the exhausted flag are stored in the same
   bolt transaction as the nodes, so committed IDs are never reused, even
   across restarts (§40, §78). One difference from `*Graph`: an outermost
@@ -3585,9 +3585,12 @@ hosts on different machines coordinate is Part C.
   transaction that never committed can be issued again. That ID was never
   observable outside the transaction; a nested rollback does not restore the
   counter, as with `*Graph`.
-- **Interface limit found.** `NodeExists`, `HasRelationship`,
-  `FindRelationships` and `FindNodes` have no error result, so on a disk
-  backend a store failure can only panic. Fixing this belongs with §105.
+- **Interface limit found, and fixed.** `NodeExists`, `HasRelationship`,
+  `FindRelationships` and `FindNodes` originally had no error result, so on
+  a disk backend a store failure could only panic. They now return an
+  error, and a failure of bolt's own read channel is reported as
+  `ErrGraphStoreUnavailable`, distinct from a request-level error
+  (`ErrNodeNotFound`) and from a damaged file (`ErrStoreCorrupt`).
 
 **Measured** (`TestBoltGraphReportCommitLatencyAndFileSize` and
 `BenchmarkBoltGraphCommit`, run without `-race`; Windows, i7-8700K, disk

@@ -148,12 +148,13 @@ rem "%goexe%" build !MOD_FLAG! -o bin\dnsbollocks.exe ./cmd/dnsbollocks
 rem if errorlevel 1 goto :fail
 
 echo Check succeeded.
-pause
+rem A caller passing "silent" (test.bat) must not be blocked on a keypress.
+if NOT "%1" == "silent" pause
 goto :eof
 
 :fail
 echo.
 echo *** CHECK FAILED ***
-pause
+if NOT "%1" == "silent" pause
 exit /b 1
 

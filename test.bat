@@ -19,7 +19,7 @@ echo Current DIR: "!SCRIPT_DIR!"
 call .\prebuildcheck.bat silent
 if errorlevel 1 (
     echo.
-    choice /c NY /m "%lintexe% found issues. Stop tests?"
+    choice /c NY /m "Vet/lint found issues. Stop tests?"
     if errorlevel 2 goto :fail
 )
 
