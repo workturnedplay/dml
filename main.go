@@ -27,7 +27,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"log"
+	ilog "log"
 	"maps"
 	"runtime"
 	"slices"
@@ -11176,7 +11176,7 @@ func positiveOrDefault(v, def time.Duration) time.Duration {
 }
 
 func defaultHostOnError(op string, err error) {
-	log.Printf("dml host: %s: %v", op, err)
+	ilog.Printf("dml host: %s: %v", op, err)
 }
 
 // withDefaults returns c with every unset field replaced by its default.
