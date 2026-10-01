@@ -3685,6 +3685,54 @@ relevance filter looks at stored facts only (§87b). The view can shift
 between pages, which is acceptable because later changes go through
 commit-time Checkers. `CheckStore` is O(store).
 
+## 111. Sessions and holds: reference counting that knows who holds (TENTATIVE, implemented)
+
+**Motivation (a worked example).** Several independent clients each want
+the same shared, externally-effective thing for a while (a temporary
+firewall rule), and it must be set up once and torn down once no matter
+how many want it, even if some of them die. A counter cannot do this: it
+cannot say *who* is missing a decrement, so a crashed client leaves it
+stuck forever.
+
+**Representation.** A session is a node tagged `(AllSessions, s)`: the
+liveness identity of one client. A resource is a plain Set (§79) used as
+a holder set; a session holds it exactly when it is a member. Nothing new
+is stored: membership is a unique pair (§2.6), so acquiring twice cannot
+double count; "what does session s hold" is `FindIncoming(s)` filtered to
+Set-kind parents (the reverse-lookup realization of §86, no index);
+"wanted" is "holder set non-empty". `LeaseRegistry` implements this on
+`SetRegistry`: `NewSession`, `Acquire`, `Release`, `Held`, `Holders`,
+`CloseSession`, `CloseAllSessions`. A session holds a resource at most
+once; several independent holds would need the occurrence descriptor of
+§75.
+
+**Three failures, three answers.**
+- *A client dies.* The owner of its connection (the host, §107) notices
+  the drop, or a missed keepalive, and calls `CloseSession`: every hold is
+  removed and the session deleted in one transaction, reporting which
+  resources lost their last holder. This is the lease idea of §47c/§58
+  applied to a client instead of a mirror.
+- *The host dies.* Sessions are ephemeral: every client connection died
+  with it, so `CloseAllSessions` at startup is correct, not lossy.
+- *The effect is half-applied.* An effect outside the graph must be driven
+  from the level (`Held`), by a reconciler that compares desired and
+  actual state and repeats, never only from the 0->1 / 1->0 transitions
+  `Acquire`/`Release` report: a crash between commit and effect would lose
+  an edge-triggered effect forever. This is the same "recompute from the
+  graph, never cache" discipline as §9a/§35.
+
+**Two protocol consequences (OPEN, for the host).**
+- `first == false` means the resource is wanted, not that its effect is in
+  place. A client that needs the effect must wait for the reconciler to
+  report it applied.
+- Teardown needs a short grace period, or release-then-acquire races
+  remove and immediately re-add the effect with a gap in between.
+
+**OPEN.** Liveness detection itself (connection drop plus a keepalive
+TTL for partitions) belongs to the host, not the registry, and the
+reconciler contract (how a host reports "applied") is part of the
+operation protocol of §107.
+
 ---
 
 ## PART D — STATUS SUMMARY (consolidated)
@@ -3847,6 +3895,9 @@ kept current as sections above resolve or split further.)*
   `GraphActor`, registries and Checkers; other processes ask the host for
   named operations. A shared server store with client-side registry code is
   not adopted (§107).
+- Reference counting that must survive client death is a holder Set of
+  ephemeral sessions, not a counter; an external effect is driven from the
+  level (`Held`) by a reconciler, never only from transitions (§111).
 
 ### TENTATIVE
 - bbolt as the first persistent-backend spike, with the layout and

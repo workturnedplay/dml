@@ -1949,6 +1949,35 @@ could be called directly.
  TestRootReaderFindIncomingAfterWithoutRootNodeHasNoVirtualParent and
  TestRootGraphInsideGraphActorPagesIncomingNatively.
 
+47. Sessions and holds (theorystate.md section 111): LeaseRegistry, built
+ on SetRegistry, the first piece of the client-facing layer. A session is
+ a node tagged (AllSessions, s) (NameAllSessions added to
+ FoundationalNames, ErrNotSession added); a resource is a plain Set used
+ as a holder set. NewSession/IsSession/Sessions, Acquire/Release
+ (reporting first/last: whether the holder set became non-empty/empty),
+ Held/Holders (the level-triggered desired state), CloseSession (releases
+ every hold found by a reverse FindIncoming lookup filtered to Set-kind
+ parents and deletes the session, one transaction, reporting the
+ resources that lost their last holder; refused with ErrNodeNotEmpty,
+ changing nothing, if something else references the session) and
+ CloseAllSessions (the startup sweep, fail-closed). Every mutator takes a
+ Transactor, so it composes and nests like the other registries. No new
+ Checker (a holder Set has no invariant beyond its tag). Deliberately not
+ here: liveness detection (connection drop, keepalive TTL) and the
+ reconciler/"applied" contract, both of which belong to the Host.
+ Covered by TestFoundationalNamesIncludesAllSessions,
+ TestNewLeaseRegistryRequiresExistingAllSessions,
+ TestLeaseNewSessionIsTaggedAndListed,
+ TestLeaseAcquireReportsFirstHolderOnly,
+ TestLeaseReleaseReportsLastHolderOnly,
+ TestLeaseOperationsRequireOpenSessionAndSet,
+ TestLeaseCloseSessionReleasesEveryHoldAndReportsFreedResources,
+ TestLeaseCloseSessionRollsBackIfSessionIsReferencedElsewhere,
+ TestLeaseCloseAllSessionsIsTheStartupSweep,
+ TestLeaseAcquireComposesAndRollsBackWithEnclosingTransaction,
+ TestGraphActorConcurrentLeasesReportExactlyOneFirstAndOneLast and
+ TestGraphActorCrashedHolderIsFoundAndReleasedByClosingItsSession.
+
 Currently unaddressed yet:
 - Paged reads beyond a single node's own outgoing/incoming edges
   (theorystate.md section 105, items 43/46): FindRelationships and
