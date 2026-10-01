@@ -23,10 +23,14 @@ package dml
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"log"
+	"maps"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"sync"
@@ -2152,6 +2156,16 @@ func (ga *GraphActor) RegisterChecker(c Checker) {
 // record. It indicates a damaged or foreign file, never a caller mistake.
 var ErrStoreCorrupt = errors.New("persistent graph store is corrupt")
 
+// ErrStoreFormat is returned when the store's format version record is
+// malformed or names a version this build does not read. The version is
+// stored because on-disk keys are 8-byte big-endian NodeIDs; a future layout
+// change must be detected, never guessed at (theorystate.md section 112).
+var ErrStoreFormat = errors.New("persistent graph store has an unsupported format version")
+
+// ErrStoreLocked is returned when the store file is already open in another
+// process (or elsewhere in this one), see openBoltDB.
+var ErrStoreLocked = errors.New("persistent graph store is already open")
+
 // ErrLoadVerification wraps the error VerifyAll returns when a Checker
 // declines a node at startup: data already in the store (written by an
 // older build, restored from a backup, or changed by another tool) violates
@@ -2177,9 +2191,15 @@ var (
 	boltBucketNames = []byte("names")
 	boltCounterKey  = []byte("counter")
 	boltPresent     = []byte{1}
+	boltFormatKey   = []byte("format")
 )
 
 const boltIDSize = 8
+
+// boltFormatVersion is the store layout version this build reads and
+// writes: the layout described at boltBucketNodes. It is stored in the meta
+// bucket under boltFormatKey as 8 bytes, big-endian.
+const boltFormatVersion uint64 = 1
 
 // boltKey8 encodes id as an 8-byte big-endian key.
 func boltKey8(id NodeID) []byte {
@@ -2968,15 +2988,145 @@ type BoltGraph struct {
 // Compile-time assertion that *BoltGraph satisfies GraphAPI.
 var _ GraphAPI = (*BoltGraph)(nil)
 
-// OpenBoltGraph opens, creating if necessary, the store at path. The open
-// waits at most one second for the file lock (bbolt documents that option
-// for Darwin and Linux only, so on Windows a second open of a locked file
-// may block; the graph host must not be started twice, theorystate.md
-// section 107).
-func OpenBoltGraph(path string) (*BoltGraph, error) {
-	db, err := bolt.Open(path, 0o600, &bolt.Options{Timeout: time.Second})
+// boltOpenTimeout is how long bolt waits for the file lock. A var, not a
+// const, so tests can shrink it.
+var boltOpenTimeout = time.Second
+
+// boltOpenGuardFactor times boltOpenTimeout is how long openBoltDB waits for
+// bolt.Open before giving up on it.
+const boltOpenGuardFactor = 5
+
+// boltOpenResult is what the goroutine running bolt.Open reports.
+type boltOpenResult struct {
+	db  *bolt.DB
+	err error
+}
+
+// finishBoltOpen turns bolt.Open's outcome into this package's errors: a
+// lock timeout becomes ErrStoreLocked.
+func finishBoltOpen(path string, res boltOpenResult) (*bolt.DB, error) {
+	switch {
+	case res.err == nil:
+		return res.db, nil
+	case errors.Is(res.err, bolt.ErrTimeout):
+		return nil, fmt.Errorf("%w: %s: %w", ErrStoreLocked, path, res.err)
+	default:
+		return nil, fmt.Errorf("bolt: opening %s: %w", path, res.err)
+	}
+}
+
+// openBoltDB opens the bolt file at path, failing fast with ErrStoreLocked
+// if it is already open. bbolt documents its Timeout option for Darwin and
+// Linux only, so on Windows a second open of a locked file might block
+// forever. bolt.Open therefore runs in its own goroutine and openBoltDB
+// gives up after boltOpenGuardFactor times the timeout; if that abandoned
+// open ever succeeds later, the late handle is closed at once so it cannot
+// keep the file locked. An OS-held lock needs no cleanup after a crash,
+// unlike a lock file (theorystate.md section 112).
+func openBoltDB(path string) (*bolt.DB, error) {
+	timeout := boltOpenTimeout
+	if timeout <= 0 {
+		timeout = time.Second
+	}
+
+	results := make(chan boltOpenResult, 1)
+
+	go func() {
+		db, openErr := bolt.Open(path, 0o600, &bolt.Options{Timeout: timeout})
+		results <- boltOpenResult{db: db, err: openErr}
+	}()
+
+	guard := time.NewTimer(boltOpenGuardFactor * timeout)
+	defer guard.Stop()
+
+	select {
+	case res := <-results:
+		return finishBoltOpen(path, res)
+	case <-guard.C:
+		go func() {
+			if late := <-results; late.db != nil {
+				if closeErr := late.db.Close(); closeErr != nil {
+					_ = closeErr
+				}
+			}
+		}()
+
+		return nil, fmt.Errorf("%w: %s did not open within %v", ErrStoreLocked, path, boltOpenGuardFactor*timeout)
+	}
+}
+
+// encodeBoltFormat encodes a format version as the 8-byte record.
+func encodeBoltFormat(version uint64) []byte {
+	raw := make([]byte, boltIDSize)
+	binary.BigEndian.PutUint64(raw, version)
+
+	return raw
+}
+
+// readBoltFormat returns the stored format version; present is false if the
+// meta bucket has no record. A record of the wrong size is ErrStoreFormat.
+func readBoltFormat(meta *bolt.Bucket) (version uint64, present bool, err error) {
+	raw := meta.Get(boltFormatKey)
+	if raw == nil {
+		return 0, false, nil
+	}
+
+	if len(raw) != boltIDSize {
+		return 0, false, fmt.Errorf("%w: format record of %d bytes, want %d", ErrStoreFormat, len(raw), boltIDSize)
+	}
+
+	return binary.BigEndian.Uint64(raw), true, nil
+}
+
+// requireBoltFormat accepts only the version this build reads.
+func requireBoltFormat(version uint64) error {
+	if version != boltFormatVersion {
+		return fmt.Errorf("%w: the store is version %d, this build reads version %d", ErrStoreFormat, version, boltFormatVersion)
+	}
+
+	return nil
+}
+
+// ensureBoltFormat checks the store's format record, writing it if there is
+// none (a new store, or a store from before the record existed, which has
+// exactly this layout), and fails loudly on any other version.
+func ensureBoltFormat(meta *bolt.Bucket) error {
+	version, present, err := readBoltFormat(meta)
 	if err != nil {
-		return nil, fmt.Errorf("bolt: opening %s: %w", path, err)
+		return err
+	}
+
+	if present {
+		return requireBoltFormat(version)
+	}
+
+	return wrapBoltErr("write format version", meta.Put(boltFormatKey, encodeBoltFormat(boltFormatVersion)))
+}
+
+// checkFormat is ensureBoltFormat's read-only counterpart for CheckStore: a
+// missing record is corruption here, since opening a store always writes one.
+func (t *boltTxn) checkFormat() error {
+	version, present, err := readBoltFormat(t.meta)
+	if err != nil {
+		return err
+	}
+
+	if !present {
+		return fmt.Errorf("%w: the store has no format version record", ErrStoreCorrupt)
+	}
+
+	return requireBoltFormat(version)
+}
+
+// OpenBoltGraph opens, creating if necessary, the store at path. It fails
+// with ErrStoreLocked if the file is already open (see openBoltDB; the graph
+// host must not be started twice, theorystate.md section 107) and with
+// ErrStoreFormat if the store's format version is not the one this build
+// reads (see ensureBoltFormat).
+func OpenBoltGraph(path string) (*BoltGraph, error) {
+	db, err := openBoltDB(path)
+	if err != nil {
+		return nil, err
 	}
 
 	initErr := db.Update(func(btx *bolt.Tx) error {
@@ -2986,7 +3136,7 @@ func OpenBoltGraph(path string) (*BoltGraph, error) {
 			}
 		}
 
-		return nil
+		return ensureBoltFormat(btx.Bucket(boltBucketMeta))
 	})
 	if initErr != nil {
 		if closeErr := db.Close(); closeErr != nil {
@@ -3041,6 +3191,10 @@ func (g *BoltGraph) CheckStore() error {
 		txn, openErr := newBoltTxn(btx)
 		if openErr != nil {
 			return openErr
+		}
+
+		if formatErr := txn.checkFormat(); formatErr != nil {
+			return formatErr
 		}
 
 		next, exhausted, counterErr := txn.counter()
@@ -4109,6 +4263,12 @@ const (
 	// resources are membership of the session in the resource's holder
 	// Set. Sessions are ephemeral. See LeaseRegistry.
 	NameAllSessions = "AllSessions"
+
+	// NameRoot is the name of the ROOT node (theorystate.md section 12).
+	// It is deliberately NOT in FoundationalNames: RootGraph needs ROOT to
+	// exist before the graph stack is built, so Host ensures it directly on
+	// the raw store first (theorystate.md section 112).
+	NameRoot = "ROOT"
 )
 
 // FoundationalNames lists every name that setup code should bootstrap via
@@ -10779,4 +10939,1205 @@ func (l *LeaseRegistry) CloseAllSessions(graph Transactor) (freed []NodeID, err 
 
 		return emptied, nil
 	})
+}
+
+// ---------------------------------------------------------------------
+// Host: the single owner process of one graph (theorystate.md sections 107
+// and 112). It owns the store, the GraphActor, every registry and every
+// Checker; clients (goroutines now, other processes and machines later)
+// connect to it and call named operations, each run as one Transact.
+
+var (
+	// ErrHostClosed is returned for any operation attempted on, or still
+	// running when, the Host is closed.
+	ErrHostClosed = errors.New("host is closed")
+
+	// ErrConnClosed is returned for any operation on a connection that has
+	// been closed, dropped by its context, or expired by the keepalive TTL.
+	ErrConnClosed = errors.New("connection is closed")
+
+	// ErrUnknownResource is returned for a resource name that was never
+	// registered with Host.RegisterResource.
+	ErrUnknownResource = errors.New("resource is not registered")
+
+	// ErrResourceRegistered is returned when a resource name is registered
+	// twice.
+	ErrResourceRegistered = errors.New("resource is already registered")
+
+	// ErrResourceName is returned for an empty resource name.
+	ErrResourceName = errors.New("resource name must not be empty")
+
+	// ErrHoldLost is returned by WaitApplied when the session no longer
+	// holds the resource it is waiting for.
+	ErrHoldLost = errors.New("the session no longer holds the resource")
+
+	// ErrEffectNotConverged is returned (inside the reconciler's error
+	// report) when an effect's Apply/Remove succeeded but Present still
+	// disagrees.
+	ErrEffectNotConverged = errors.New("effect did not reach the wanted state")
+)
+
+// resourcePrefix namespaces resource names inside the NameRegistry, so they
+// can never collide with a foundational name.
+const resourcePrefix = "resource/"
+
+// Effect is something outside the graph that exists exactly while a
+// resource is held, for example a temporary firewall rule. The Host's
+// reconciler drives it from the level (LeaseRegistry.Held), never only from
+// acquire/release transitions, so every method must be idempotent and safe
+// to repeat after a crash: Apply of a present effect and Remove of an absent
+// one are successes. Present reports the real state of the outside world,
+// not a cached belief. Implementations must not touch the graph.
+type Effect interface {
+	// Present reports whether the effect is currently in place.
+	Present(ctx context.Context) (bool, error)
+	// Apply puts the effect in place.
+	Apply(ctx context.Context) error
+	// Remove takes the effect away.
+	Remove(ctx context.Context) error
+}
+
+// Registries bundles every registry the Host constructs over its graph.
+// Constructing them registers their commit-time Checkers, which is why they
+// are built before the startup sweep (VerifyAll). Representation C
+// (PointerMetadataRegistry) is deliberately absent: it exists as a
+// deliberately stricter test representation (theorystate.md section 10a).
+type Registries struct {
+	Pointers    *PointerRegistry
+	SubPointers *PointerRegistry
+	Metadata    *PointerMetadataRegistryD
+	Capsules    *CapsuleRegistry
+	Lists       *ListRegistry
+	Sets        *SetRegistry
+	Composites  *CompositeSetRegistry
+	Logs        *CompositeSetLogRegistry
+	DomainSlots *PointerRegistry
+	DomainB     *DomainPointerRegistryB
+	DomainD     *DomainPointerRegistryD
+	Leases      *LeaseRegistry
+}
+
+// NewRegistries constructs every registry over graph. ids must hold an
+// entry for every name in FoundationalNames (as returned by
+// NameRegistry.BootstrapNames); a missing one is ErrNameNotFound, never a
+// silent NodeID 0.
+func NewRegistries(graph GraphAPI, ids map[string]NodeID) (*Registries, error) {
+	for _, name := range FoundationalNames {
+		if _, ok := ids[name]; !ok {
+			return nil, fmt.Errorf("%w: %q", ErrNameNotFound, name)
+		}
+	}
+
+	pointers, err := NewPointerRegistry(graph, ids[NameAllPointers])
+	if err != nil {
+		return nil, err
+	}
+
+	subPointers, err := NewPointerRegistry(graph, ids[NameAllSubPointers])
+	if err != nil {
+		return nil, err
+	}
+
+	metadata, err := NewPointerMetadataRegistryD(graph, ids[NameAllPointerMetadata], ids[NameAllPointerMetadataSubjectSlot], ids[NameAllPointerMetadataTargetSlot])
+	if err != nil {
+		return nil, err
+	}
+
+	capsules, err := NewCapsuleRegistry(graph, ids[NameAllElementCapsules], ids[NameAllElementCapsulePrevSlot], ids[NameAllElementCapsuleValueSlot], ids[NameAllElementCapsuleNextSlot])
+	if err != nil {
+		return nil, err
+	}
+
+	lists, err := NewListRegistry(graph, capsules, ids[NameAllLists], ids[NameAllHeads], ids[NameAllTails])
+	if err != nil {
+		return nil, err
+	}
+
+	sets, err := NewSetRegistry(graph, ids[NameAllSets], ids[NameAllCompositeSets], ids[NameAllCompositeSetLogs])
+	if err != nil {
+		return nil, err
+	}
+
+	composites, err := NewCompositeSetRegistry(graph, sets, ids[NameAllCompositeSets], ids[NameAllAdditiveOp], ids[NameAllSubtractiveOp], ids[NameAllScalarOperand], ids[NameAllSetOperand])
+	if err != nil {
+		return nil, err
+	}
+
+	logs, err := NewCompositeSetLogRegistry(graph, lists, composites, ids[NameAllCompositeSetLogs], ids[NameAllAdditiveOp], ids[NameAllSubtractiveOp], ids[NameAllScalarOperand], ids[NameAllSetOperand])
+	if err != nil {
+		return nil, err
+	}
+
+	composites.SetLogs(logs)
+
+	domainSlots, err := NewPointerRegistry(graph, ids[NameAllDomainSlot])
+	if err != nil {
+		return nil, err
+	}
+
+	leases, err := NewLeaseRegistry(graph, sets, ids[NameAllSessions])
+	if err != nil {
+		return nil, err
+	}
+
+	return &Registries{
+		Pointers:    pointers,
+		SubPointers: subPointers,
+		Metadata:    metadata,
+		Capsules:    capsules,
+		Lists:       lists,
+		Sets:        sets,
+		Composites:  composites,
+		Logs:        logs,
+		DomainSlots: domainSlots,
+		DomainB:     NewDomainPointerRegistryB(graph, subPointers, domainSlots, sets, composites, logs),
+		DomainD:     NewDomainPointerRegistryD(graph, metadata, domainSlots, sets, composites, logs),
+		Leases:      leases,
+	}, nil
+}
+
+// Defaults for HostConfig fields left at zero.
+const (
+	defaultKeepaliveTTL    = 15 * time.Second
+	defaultTeardownGrace   = 2 * time.Second
+	defaultReapInterval    = time.Second
+	defaultResyncInterval  = 30 * time.Second
+	defaultRetryInterval   = 2 * time.Second
+	defaultShutdownTimeout = 10 * time.Second
+)
+
+// HostConfig configures a Host. Only Path is required.
+//
+// For KeepaliveTTL and TeardownGrace, zero means "use the default" and a
+// negative value means "disabled". The other durations must be positive;
+// zero or negative means the default.
+type HostConfig struct {
+	// Path is the bbolt file. Exactly one Host may own it.
+	Path string
+
+	// KeepaliveTTL is how long a connection may stay silent before the Host
+	// treats it as dead. Connection drop is the primary liveness signal;
+	// this is the backstop for partitions where no drop is ever seen. The
+	// clock lives in host memory only. Any operation counts as a sign of
+	// life, as does Conn.Keepalive. A client that waits for longer than the
+	// TTL inside WaitApplied must keep calling Keepalive from elsewhere.
+	KeepaliveTTL time.Duration
+
+	// TeardownGrace is how long a resource must stay unheld before its
+	// effect is removed, so that release-then-acquire races do not flap the
+	// effect. Applying is never delayed.
+	TeardownGrace time.Duration
+
+	// ReapInterval is how often expired connections are collected and failed
+	// session closes are retried.
+	ReapInterval time.Duration
+
+	// ResyncInterval is the longest the reconciler sleeps: every resource is
+	// re-compared with the outside world at least this often, which repairs
+	// drift.
+	ResyncInterval time.Duration
+
+	// RetryInterval is how soon a failed effect is retried.
+	RetryInterval time.Duration
+
+	// ShutdownTimeout bounds the final reconcile pass in Close.
+	ShutdownTimeout time.Duration
+
+	// VerifyPageSize is the page size of the startup VerifyAll sweep (zero
+	// means VerifyAll's own default).
+	VerifyPageSize int
+
+	// OnError receives errors from background work (effects that failed,
+	// sessions that could not be closed). Nil means log.Printf.
+	OnError func(op string, err error)
+}
+
+// durationOrDefault implements the "zero is default, negative is disabled"
+// rule: it returns the default for zero, 0 (disabled) for a negative value,
+// and v otherwise.
+func durationOrDefault(v, def time.Duration) time.Duration {
+	switch {
+	case v == 0:
+		return def
+	case v < 0:
+		return 0
+	default:
+		return v
+	}
+}
+
+// positiveOrDefault returns v if it is positive and def otherwise.
+func positiveOrDefault(v, def time.Duration) time.Duration {
+	if v <= 0 {
+		return def
+	}
+
+	return v
+}
+
+func defaultHostOnError(op string, err error) {
+	log.Printf("dml host: %s: %v", op, err)
+}
+
+// withDefaults returns c with every unset field replaced by its default.
+// After this, KeepaliveTTL and TeardownGrace of 0 mean "disabled".
+func (c HostConfig) withDefaults() HostConfig {
+	c.KeepaliveTTL = durationOrDefault(c.KeepaliveTTL, defaultKeepaliveTTL)
+	c.TeardownGrace = durationOrDefault(c.TeardownGrace, defaultTeardownGrace)
+	c.ReapInterval = positiveOrDefault(c.ReapInterval, defaultReapInterval)
+	c.ResyncInterval = positiveOrDefault(c.ResyncInterval, defaultResyncInterval)
+	c.RetryInterval = positiveOrDefault(c.RetryInterval, defaultRetryInterval)
+	c.ShutdownTimeout = positiveOrDefault(c.ShutdownTimeout, defaultShutdownTimeout)
+
+	if c.OnError == nil {
+		c.OnError = defaultHostOnError
+	}
+
+	return c
+}
+
+// AcquireResult is what Client.Acquire returns.
+type AcquireResult struct {
+	// First reports whether this call made the resource's holder set
+	// non-empty. It is a transition hint: it means "wanted", never "in
+	// effect".
+	First bool
+
+	// Mark is the token to pass to WaitApplied. It identifies the last
+	// reconcile pass of the resource that may have started before this
+	// acquire committed; the effect is applied for this hold once a later
+	// pass has completed with it present.
+	Mark uint64
+}
+
+// Client is the named-operation surface the Host offers one connection.
+// Every method is one request to the host, run there as one Transact (or a
+// short read). It deliberately contains no closures and no NodeIDs, so a
+// network transport can implement it by sending each call to the Host and
+// the in-process Conn is a client exactly like a remote one will be.
+type Client interface {
+	// Acquire makes the connection's session a holder of resource.
+	Acquire(ctx context.Context, resource string) (AcquireResult, error)
+
+	// Release drops the hold; last reports whether nobody else holds it.
+	Release(ctx context.Context, resource string) (last bool, err error)
+
+	// WaitApplied blocks until the effect of resource is confirmed in place
+	// for a hold taken by the Acquire that returned mark, the hold is lost
+	// (ErrHoldLost), the connection dies (ErrConnClosed), the host closes
+	// (ErrHostClosed), or ctx ends (the error then also carries the last
+	// effect failure, if any).
+	WaitApplied(ctx context.Context, resource string, mark uint64) error
+
+	// Keepalive tells the host the client is alive (any operation does).
+	Keepalive(ctx context.Context) error
+
+	// Close ends the connection and releases everything it holds.
+	Close() error
+
+	// Done is closed when the connection has ended for any reason.
+	Done() <-chan struct{}
+}
+
+// AcquireAndWait acquires resource and waits until its effect is in place.
+// It is built only on the Client interface, so it works over any transport.
+func AcquireAndWait(ctx context.Context, client Client, resource string) error {
+	result, err := client.Acquire(ctx, resource)
+	if err != nil {
+		return fmt.Errorf("acquiring %q: %w", resource, err)
+	}
+
+	return wrapInterfaceErr(client.WaitApplied(ctx, resource, result.Mark))
+}
+
+// passOutcome is a snapshot of one resource's reconcile progress.
+type passOutcome struct {
+	completed uint64
+	applied   bool
+	err       error
+	changed   <-chan struct{}
+}
+
+// hostResource is one registered resource: its holder Set, its optional
+// effect, and the reconciler's progress on it.
+type hostResource struct {
+	name   string
+	node   NodeID
+	effect Effect
+
+	mu        sync.Mutex
+	started   uint64
+	completed uint64
+	applied   bool
+	lastErr   error
+	changed   chan struct{}
+
+	// Touched only by the reconciler goroutine (and by Close after that
+	// goroutine has exited): when the resource first became unheld while its
+	// effect was still present.
+	unheld      bool
+	unheldSince time.Duration
+}
+
+func newHostResource(name string, node NodeID, effect Effect) *hostResource {
+	return &hostResource{name: name, node: node, effect: effect, changed: make(chan struct{})}
+}
+
+// beginPass numbers a new reconcile pass. It must be called before the
+// pass reads the holder set.
+func (r *hostResource) beginPass() uint64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.started++
+
+	return r.started
+}
+
+// mark returns the number of the latest pass that has begun. A client calls
+// it after its hold has committed: every pass numbered above it begins after
+// the commit and therefore sees the hold.
+func (r *hostResource) mark() uint64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return r.started
+}
+
+// finishPass records the outcome of pass and wakes every waiter. applied
+// means: the resource was held, and its effect is confirmed present.
+func (r *hostResource) finishPass(pass uint64, applied bool, err error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.completed = pass
+	r.applied = applied
+	r.lastErr = err
+
+	close(r.changed)
+	r.changed = make(chan struct{})
+}
+
+func (r *hostResource) outcome() passOutcome {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return passOutcome{completed: r.completed, applied: r.applied, err: r.lastErr, changed: r.changed}
+}
+
+// converge applies or removes the effect and verifies the result against
+// the real state.
+func (r *hostResource) converge(ctx context.Context, want bool) error {
+	var opErr error
+
+	if want {
+		opErr = r.effect.Apply(ctx)
+	} else {
+		opErr = r.effect.Remove(ctx)
+	}
+
+	if opErr != nil {
+		return fmt.Errorf("changing effect of %q to present=%v: %w", r.name, want, opErr)
+	}
+
+	present, err := r.effect.Present(ctx)
+	if err != nil {
+		return fmt.Errorf("verifying effect of %q: %w", r.name, err)
+	}
+
+	if present != want {
+		return fmt.Errorf("%w: %q, wanted present=%v", ErrEffectNotConverged, r.name, want)
+	}
+
+	return nil
+}
+
+// Host owns one graph: the bbolt store, the GraphActor over RootGraph over
+// BoltGraph, every registry and every Checker (theorystate.md sections 107
+// and 112). Create it with OpenHost; it must be closed exactly once with
+// Close.
+//
+// Liveness. Every client connection owns one session node. A connection is
+// dropped when its context ends (the in-process stand-in for a socket
+// closing), when Close is called on it, or when it stays silent past
+// KeepaliveTTL. Dropping calls LeaseRegistry.CloseSession and wakes the
+// reconciler. A session whose close fails is retried by the reaper.
+//
+// Effects. The reconciler compares, for every registered resource, the
+// desired state (LeaseRegistry.Held) with the actual one (Effect.Present)
+// and converges them. It runs on every wake-up (an acquire, a release, a
+// dropped connection, a registration), at least every ResyncInterval, and
+// after a failed effect every RetryInterval.
+type Host struct {
+	cfg   HostConfig
+	store *BoltGraph
+	actor *GraphActor
+	names *NameRegistry
+	reg   *Registries
+	root  NodeID
+
+	epoch  time.Time
+	stop   chan struct{}
+	cancel context.CancelFunc
+	kickCh chan struct{}
+	bg     sync.WaitGroup
+	ops    sync.WaitGroup
+
+	mu      sync.Mutex
+	closed  bool
+	conns   map[NodeID]*Conn
+	closing map[NodeID]struct{}
+
+	resMu     sync.RWMutex
+	resources map[string]*hostResource
+}
+
+// OpenHost performs the startup order of theorystate.md sections 110 and
+// 112 and returns a running Host:
+//
+//  1. OpenBoltGraph (single-open guard, format version check);
+//  2. CheckStore (physical and layout check);
+//  3. NameRegistry.LoadNames and the ROOT node, on the raw store: RootGraph
+//     needs ROOT to exist before the stack can be built;
+//  4. GraphActor over RootGraph over BoltGraph (actor outermost);
+//  5. BootstrapNames(FoundationalNames) and every registry (this registers
+//     the Checkers);
+//  6. CloseAllSessions: sessions are ephemeral, every client died with the
+//     previous process;
+//  7. VerifyAll and NameRegistry.VerifyBindings, both fail-closed.
+//
+// Any failure closes whatever was opened and returns the error.
+func OpenHost(cfg HostConfig) (*Host, error) {
+	if cfg.Path == "" {
+		return nil, errors.New("host: HostConfig.Path is required")
+	}
+
+	cfg = cfg.withDefaults()
+
+	store, err := OpenBoltGraph(cfg.Path)
+	if err != nil {
+		return nil, fmt.Errorf("host startup: %w", err)
+	}
+
+	h, startErr := startHost(cfg, store)
+	if startErr != nil {
+		if closeErr := store.Close(); closeErr != nil {
+			return nil, errors.Join(startErr, closeErr)
+		}
+
+		return nil, startErr
+	}
+
+	return h, nil
+}
+
+// startHost runs startup steps 2 to 4 and hands over to finishHostStart.
+func startHost(cfg HostConfig, store *BoltGraph) (*Host, error) {
+	if checkErr := store.CheckStore(); checkErr != nil {
+		return nil, fmt.Errorf("host startup: checking the store: %w", checkErr)
+	}
+
+	names := NewNameRegistry(store)
+
+	if loadErr := names.LoadNames(store); loadErr != nil {
+		return nil, fmt.Errorf("host startup: loading names: %w", loadErr)
+	}
+
+	root, rootErr := names.EnsureNamedNode(store, NameRoot)
+	if rootErr != nil {
+		return nil, fmt.Errorf("host startup: ensuring ROOT: %w", rootErr)
+	}
+
+	rootGraph, layerErr := NewRootGraph(store, root)
+	if layerErr != nil {
+		return nil, fmt.Errorf("host startup: building the ROOT layer: %w", layerErr)
+	}
+
+	actor := NewGraphActor(rootGraph)
+
+	h, finishErr := finishHostStart(cfg, store, actor, names, root)
+	if finishErr != nil {
+		actor.Close()
+		return nil, finishErr
+	}
+
+	return h, nil
+}
+
+// finishHostStart runs startup steps 5 to 7 and starts the background
+// goroutines. Nothing is started before every fallible step has passed.
+func finishHostStart(cfg HostConfig, store *BoltGraph, actor *GraphActor, names *NameRegistry, root NodeID) (*Host, error) {
+	ids, idsErr := names.BootstrapNames(actor, FoundationalNames)
+	if idsErr != nil {
+		return nil, fmt.Errorf("host startup: bootstrapping names: %w", idsErr)
+	}
+
+	reg, regErr := NewRegistries(actor, ids)
+	if regErr != nil {
+		return nil, fmt.Errorf("host startup: constructing registries: %w", regErr)
+	}
+
+	if _, sweepErr := reg.Leases.CloseAllSessions(actor); sweepErr != nil {
+		return nil, fmt.Errorf("host startup: closing stale sessions: %w", sweepErr)
+	}
+
+	if verifyErr := VerifyAll(actor, cfg.VerifyPageSize); verifyErr != nil {
+		return nil, fmt.Errorf("host startup: %w", verifyErr)
+	}
+
+	if bindErr := names.VerifyBindings(actor); bindErr != nil {
+		return nil, fmt.Errorf("host startup: verifying names: %w", bindErr)
+	}
+
+	h := &Host{
+		cfg:       cfg,
+		store:     store,
+		actor:     actor,
+		names:     names,
+		reg:       reg,
+		root:      root,
+		epoch:     time.Now(),
+		stop:      make(chan struct{}),
+		kickCh:    make(chan struct{}, 1),
+		conns:     make(map[NodeID]*Conn),
+		closing:   make(map[NodeID]struct{}),
+		resources: make(map[string]*hostResource),
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	h.cancel = cancel
+
+	h.bg.Go(func() { h.reconcileLoop(ctx) })
+	h.bg.Go(h.reapLoop)
+
+	return h, nil
+}
+
+// Registries returns the registries, for the owner process's own use.
+func (h *Host) Registries() *Registries {
+	return h.reg
+}
+
+// Graph returns the actor-fronted graph, for the owner process's own use.
+func (h *Host) Graph() *GraphActor {
+	return h.actor
+}
+
+// monoNow is the host's monotonic clock: time since the host started.
+func (h *Host) monoNow() time.Duration {
+	return time.Since(h.epoch)
+}
+
+// report hands a background error to cfg.OnError.
+func (h *Host) report(op string, err error) {
+	if err != nil {
+		h.cfg.OnError(op, err)
+	}
+}
+
+// enter registers an operation that uses the actor. It fails once Close has
+// begun, and Close waits for every entered operation, so no operation can
+// reach the actor after it has been closed. Every successful enter must be
+// paired with leave.
+func (h *Host) enter() bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	if h.closed {
+		return false
+	}
+
+	h.ops.Add(1)
+
+	return true
+}
+
+func (h *Host) leave() {
+	h.ops.Done()
+}
+
+// kickReconciler wakes the reconciler. The channel is buffered with one
+// token, so a kick that arrives during a pass triggers another pass after
+// it: a pass that began before a commit can never be the last one.
+func (h *Host) kickReconciler() {
+	select {
+	case h.kickCh <- struct{}{}:
+	default:
+	}
+}
+
+// Close shuts the host down: operations stop, every connection is dropped
+// and its session closed, a final reconcile pass removes every effect that
+// is no longer held (without the teardown grace), and the actor and store
+// are closed. It is safe to call more than once; later calls return nil.
+func (h *Host) Close() error {
+	h.mu.Lock()
+	if h.closed {
+		h.mu.Unlock()
+		return nil
+	}
+
+	h.closed = true
+	close(h.stop)
+	h.mu.Unlock()
+
+	h.cancel()
+	h.bg.Wait()
+	h.ops.Wait()
+
+	// Nothing else uses the actor from here on.
+	errs := h.shutdownConns()
+
+	finalCtx, finalCancel := context.WithTimeout(context.Background(), h.cfg.ShutdownTimeout)
+	h.reconcileAll(finalCtx, true)
+	finalCancel()
+
+	h.actor.Close()
+	errs = append(errs, h.store.Close())
+
+	return errors.Join(errs...)
+}
+
+// shutdownConns drops every remaining connection and retries every session
+// close that had failed. Only Close calls it, after all other users of the
+// actor have finished.
+func (h *Host) shutdownConns() []error {
+	h.mu.Lock()
+	conns := slices.Collect(maps.Values(h.conns))
+	pending := slices.Collect(maps.Keys(h.closing))
+	h.mu.Unlock()
+
+	var errs []error
+
+	for _, c := range conns {
+		c.markDone()
+		errs = append(errs, h.releaseConn(c))
+	}
+
+	for _, session := range pending {
+		errs = append(errs, h.closeSession(session))
+	}
+
+	return errs
+}
+
+// RegisterResource declares a resource and its effect (nil for a pure
+// lease with no outside effect). It creates the resource's holder Set,
+// named resource/<name>, once and idempotently across restarts. Clients can
+// acquire only registered resources. The effect is only held in memory, so
+// it must be registered again after every restart; the reconciler then
+// compares it with reality at once and removes a rule left behind by a
+// previous run.
+func (h *Host) RegisterResource(name string, effect Effect) error {
+	if name == "" {
+		return ErrResourceName
+	}
+
+	if !h.enter() {
+		return ErrHostClosed
+	}
+	defer h.leave()
+
+	node, err := transactValue(h.actor, func(tx Tx) (NodeID, error) {
+		id, nameErr := h.names.EnsureNamedNode(tx, resourcePrefix+name)
+		if nameErr != nil {
+			return 0, nameErr
+		}
+
+		if tagErr := h.reg.Sets.TagAsSet(tx, id); tagErr != nil {
+			return 0, tagErr
+		}
+
+		return id, nil
+	})
+	if err != nil {
+		return fmt.Errorf("registering resource %q: %w", name, err)
+	}
+
+	if !h.addResource(newHostResource(name, node, effect)) {
+		return fmt.Errorf("%w: %q", ErrResourceRegistered, name)
+	}
+
+	h.kickReconciler()
+
+	return nil
+}
+
+// addResource records r unless its name is taken, and reports whether it did.
+func (h *Host) addResource(r *hostResource) bool {
+	h.resMu.Lock()
+	defer h.resMu.Unlock()
+
+	if _, taken := h.resources[r.name]; taken {
+		return false
+	}
+
+	h.resources[r.name] = r
+
+	return true
+}
+
+func (h *Host) lookupResource(name string) (*hostResource, error) {
+	h.resMu.RLock()
+	defer h.resMu.RUnlock()
+
+	r, ok := h.resources[name]
+	if !ok {
+		return nil, fmt.Errorf("%w: %q", ErrUnknownResource, name)
+	}
+
+	return r, nil
+}
+
+// resourceSnapshot returns the registered resources sorted by name.
+func (h *Host) resourceSnapshot() []*hostResource {
+	h.resMu.RLock()
+	defer h.resMu.RUnlock()
+
+	names := slices.Sorted(maps.Keys(h.resources))
+	snapshot := make([]*hostResource, 0, len(names))
+
+	for _, name := range names {
+		snapshot = append(snapshot, h.resources[name])
+	}
+
+	return snapshot
+}
+
+// Conn is one client's connection to the Host, in-process. It implements
+// Client. A remote transport would implement Client over the network and
+// call the same Host methods on the far side.
+type Conn struct {
+	host     *Host
+	session  NodeID
+	done     chan struct{}
+	doneFlag atomic.Bool
+	lastSeen atomic.Int64
+}
+
+// Compile-time assertion that *Conn satisfies Client.
+var _ Client = (*Conn)(nil)
+
+// Connect opens a connection and its session. The connection lives until
+// Close is called on it, ctx ends (the in-process equivalent of a dropped
+// socket), or it stays silent past KeepaliveTTL.
+func (h *Host) Connect(ctx context.Context) (*Conn, error) {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, fmt.Errorf("connecting: %w", ctxErr)
+	}
+
+	if !h.enter() {
+		return nil, ErrHostClosed
+	}
+	defer h.leave()
+
+	session, err := h.reg.Leases.NewSession(h.actor)
+	if err != nil {
+		return nil, fmt.Errorf("opening a session: %w", err)
+	}
+
+	c := &Conn{host: h, session: session, done: make(chan struct{})}
+	c.touch()
+
+	h.mu.Lock()
+	h.conns[session] = c
+	h.mu.Unlock()
+
+	go h.watchConn(ctx, c)
+
+	return c, nil
+}
+
+// watchConn drops c when its context ends, and ends when c ends first.
+func (h *Host) watchConn(ctx context.Context, c *Conn) {
+	select {
+	case <-ctx.Done():
+		h.report("dropping a connection whose context ended", h.dropConn(c))
+	case <-c.done:
+	}
+}
+
+// dropConn ends c and closes its session. Only the first caller does the
+// work. If the host is already closing, Close closes the session instead.
+func (h *Host) dropConn(c *Conn) error {
+	if !c.markDone() {
+		return nil
+	}
+
+	if !h.enter() {
+		return nil
+	}
+	defer h.leave()
+
+	return h.releaseConn(c)
+}
+
+// releaseConn forgets c and closes its session; a failed close stays
+// pending for the reaper to retry.
+func (h *Host) releaseConn(c *Conn) error {
+	h.mu.Lock()
+	delete(h.conns, c.session)
+	h.closing[c.session] = struct{}{}
+	h.mu.Unlock()
+
+	return h.closeSession(c.session)
+}
+
+// closeSession releases every hold of session and deletes it, then wakes
+// the reconciler. A session that is already gone counts as closed. On any
+// other failure the session stays in h.closing and is retried.
+func (h *Host) closeSession(session NodeID) error {
+	freed, err := h.reg.Leases.CloseSession(h.actor, session)
+	if err != nil && !errors.Is(err, ErrNodeNotFound) {
+		return fmt.Errorf("closing session %d: %w", session, err)
+	}
+
+	h.mu.Lock()
+	delete(h.closing, session)
+	h.mu.Unlock()
+
+	// The reconciler is level-driven and re-reads every resource, so freed
+	// is only a reason to wake it.
+	if len(freed) > 0 {
+		h.kickReconciler()
+	}
+
+	return nil
+}
+
+// reapLoop expires silent connections and retries failed session closes.
+func (h *Host) reapLoop() {
+	ticker := time.NewTicker(h.cfg.ReapInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-h.stop:
+			return
+		case <-ticker.C:
+			h.reapOnce()
+		}
+	}
+}
+
+func (h *Host) reapOnce() {
+	for _, c := range h.expiredConns() {
+		if c.markDone() {
+			h.report("expiring a silent connection", h.releaseConn(c))
+		}
+	}
+
+	h.mu.Lock()
+	pending := slices.Collect(maps.Keys(h.closing))
+	h.mu.Unlock()
+
+	for _, session := range pending {
+		h.report("retrying a session close", h.closeSession(session))
+	}
+}
+
+// expiredConns returns the connections silent for longer than KeepaliveTTL.
+func (h *Host) expiredConns() []*Conn {
+	ttl := h.cfg.KeepaliveTTL
+	if ttl <= 0 {
+		return nil
+	}
+
+	now := h.monoNow()
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	var expired []*Conn
+
+	for _, c := range h.conns {
+		if now-time.Duration(c.lastSeen.Load()) > ttl {
+			expired = append(expired, c)
+		}
+	}
+
+	return expired
+}
+
+// reconcileLoop is the reconciler goroutine.
+func (h *Host) reconcileLoop(ctx context.Context) {
+	for {
+		wait := h.cfg.ResyncInterval
+		if next := h.reconcileAll(ctx, false); next > 0 {
+			wait = min(wait, next)
+		}
+
+		timer := time.NewTimer(wait)
+
+		select {
+		case <-h.stop:
+			timer.Stop()
+			return
+		case <-h.kickCh:
+			timer.Stop()
+		case <-timer.C:
+		}
+	}
+}
+
+// reconcileAll runs one pass over every registered resource and returns how
+// soon the earliest of them needs another look (0 if none does). final is
+// set by Close and skips the teardown grace.
+func (h *Host) reconcileAll(ctx context.Context, final bool) time.Duration {
+	var next time.Duration
+
+	for _, r := range h.resourceSnapshot() {
+		if wait := h.reconcile(ctx, r, final); wait > 0 && (next == 0 || wait < next) {
+			next = wait
+		}
+	}
+
+	return next
+}
+
+// graceRemaining starts (or continues) the teardown grace of an unheld,
+// still present resource and returns how much of it is left.
+func (h *Host) graceRemaining(r *hostResource, final bool) time.Duration {
+	if final || h.cfg.TeardownGrace <= 0 {
+		return 0
+	}
+
+	now := h.monoNow()
+
+	if !r.unheld {
+		r.unheld = true
+		r.unheldSince = now
+	}
+
+	return max(r.unheldSince+h.cfg.TeardownGrace-now, 0)
+}
+
+// failPass records a failed pass, reports it, and returns the retry delay.
+func (h *Host) failPass(r *hostResource, pass uint64, err error) time.Duration {
+	r.finishPass(pass, false, err)
+	h.report("reconciling "+r.name, err)
+
+	return h.cfg.RetryInterval
+}
+
+// reconcile brings one resource's effect in line with its holders and
+// returns how soon it wants another look (0 for none).
+//
+// The pass is numbered before it reads the holder set. A client whose
+// acquire committed before that read is covered by this pass; WaitApplied
+// waits for a pass numbered above the client's mark, which cannot have begun
+// before the commit.
+func (h *Host) reconcile(ctx context.Context, r *hostResource, final bool) time.Duration {
+	pass := r.beginPass()
+
+	held, err := h.reg.Leases.Held(h.actor, r.node)
+	if err != nil {
+		return h.failPass(r, pass, fmt.Errorf("reading the holders of %q: %w", r.name, err))
+	}
+
+	if held {
+		r.unheld = false
+	}
+
+	if r.effect == nil {
+		r.finishPass(pass, held, nil)
+		return 0
+	}
+
+	present, err := r.effect.Present(ctx)
+	if err != nil {
+		return h.failPass(r, pass, fmt.Errorf("checking the effect of %q: %w", r.name, err))
+	}
+
+	if held == present {
+		r.unheld = false
+		r.finishPass(pass, held, nil)
+
+		return 0
+	}
+
+	if !held {
+		if wait := h.graceRemaining(r, final); wait > 0 {
+			r.finishPass(pass, false, nil)
+			return wait
+		}
+	}
+
+	if convergeErr := r.converge(ctx, held); convergeErr != nil {
+		return h.failPass(r, pass, convergeErr)
+	}
+
+	r.unheld = false
+	r.finishPass(pass, held, nil)
+
+	return 0
+}
+
+// touch records a sign of life.
+func (c *Conn) touch() {
+	c.lastSeen.Store(int64(c.host.monoNow()))
+}
+
+func (c *Conn) isDone() bool {
+	return c.doneFlag.Load()
+}
+
+// markDone ends the connection and reports whether this call was the one
+// that did.
+func (c *Conn) markDone() bool {
+	if !c.doneFlag.CompareAndSwap(false, true) {
+		return false
+	}
+
+	close(c.done)
+
+	return true
+}
+
+// Done is closed when the connection has ended for any reason.
+func (c *Conn) Done() <-chan struct{} {
+	return c.done
+}
+
+// Close ends the connection and releases every hold of its session.
+func (c *Conn) Close() error {
+	return c.host.dropConn(c)
+}
+
+// Keepalive records a sign of life. It never touches the graph.
+func (c *Conn) Keepalive(ctx context.Context) error {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return fmt.Errorf("keepalive: %w", ctxErr)
+	}
+
+	if c.isDone() {
+		return ErrConnClosed
+	}
+
+	c.touch()
+
+	return nil
+}
+
+// enterResource validates the request and enters the host; on success the
+// caller must call host.leave.
+func (c *Conn) enterResource(ctx context.Context, name string) (*hostResource, error) {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, fmt.Errorf("resource %q: %w", name, ctxErr)
+	}
+
+	if c.isDone() {
+		return nil, ErrConnClosed
+	}
+
+	res, err := c.host.lookupResource(name)
+	if err != nil {
+		return nil, err
+	}
+
+	if !c.host.enter() {
+		return nil, ErrHostClosed
+	}
+
+	c.touch()
+
+	return res, nil
+}
+
+// opErr turns a graph error into the connection's own: if the connection
+// ended in the meantime (so its session may be gone) the real cause is
+// ErrConnClosed.
+func (c *Conn) opErr(op, resource string, err error) error {
+	if c.isDone() {
+		return fmt.Errorf("%w (%s %q: %w)", ErrConnClosed, op, resource, err)
+	}
+
+	return fmt.Errorf("%s %q: %w", op, resource, err)
+}
+
+// Acquire implements Client: one Transact adding the session to the
+// resource's holder Set.
+func (c *Conn) Acquire(ctx context.Context, resource string) (AcquireResult, error) {
+	res, err := c.enterResource(ctx, resource)
+	if err != nil {
+		return AcquireResult{}, err
+	}
+	defer c.host.leave()
+
+	first, acquireErr := c.host.reg.Leases.Acquire(c.host.actor, res.node, c.session)
+	if acquireErr != nil {
+		return AcquireResult{}, c.opErr("acquire", resource, acquireErr)
+	}
+
+	mark := res.mark()
+	c.host.kickReconciler()
+
+	return AcquireResult{First: first, Mark: mark}, nil
+}
+
+// Release implements Client: one Transact removing the session from the
+// resource's holder Set. The effect itself is removed by the reconciler,
+// after the teardown grace.
+func (c *Conn) Release(ctx context.Context, resource string) (bool, error) {
+	res, err := c.enterResource(ctx, resource)
+	if err != nil {
+		return false, err
+	}
+	defer c.host.leave()
+
+	last, releaseErr := c.host.reg.Leases.Release(c.host.actor, res.node, c.session)
+	if releaseErr != nil {
+		return false, c.opErr("release", resource, releaseErr)
+	}
+
+	c.host.kickReconciler()
+
+	return last, nil
+}
+
+// waitErr builds WaitApplied's context-ended error, carrying the last
+// effect failure if there was one.
+func waitErr(cause error, resource string, last error) error {
+	if last == nil {
+		return fmt.Errorf("waiting for %q to be applied: %w", resource, cause)
+	}
+
+	return fmt.Errorf("waiting for %q to be applied: %w (last effect error: %w)", resource, cause, last)
+}
+
+// WaitApplied implements Client. Each time it wakes it first checks that
+// the session still holds the resource, then whether a pass numbered above
+// mark has completed with the effect present. See AcquireResult.Mark.
+func (c *Conn) WaitApplied(ctx context.Context, resource string, mark uint64) error {
+	res, err := c.enterResource(ctx, resource)
+	if err != nil {
+		return err
+	}
+	defer c.host.leave()
+
+	for {
+		holder, holdErr := c.host.reg.Sets.Contains(c.host.actor, res.node, c.session)
+		if holdErr != nil {
+			return c.opErr("wait for", resource, holdErr)
+		}
+
+		if !holder {
+			return fmt.Errorf("%w: %q", ErrHoldLost, resource)
+		}
+
+		out := res.outcome()
+		if out.completed > mark && out.applied {
+			return nil
+		}
+
+		select {
+		case <-ctx.Done():
+			return waitErr(ctx.Err(), resource, out.err)
+		case <-c.done:
+			return ErrConnClosed
+		case <-c.host.stop:
+			return ErrHostClosed
+		case <-out.changed:
+		}
+	}
 }

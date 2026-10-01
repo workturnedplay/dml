@@ -1978,6 +1978,44 @@ could be called directly.
  TestGraphActorConcurrentLeasesReportExactlyOneFirstAndOneLast and
  TestGraphActorCrashedHolderIsFoundAndReleasedByClosingItsSession.
 
+48. Host (theorystate.md section 112): the production owner process.
+ OpenBoltGraph now guards against a second open (openBoltDB: bolt.Open runs
+ in a goroutine abandoned after boltOpenGuardFactor times boltOpenTimeout,
+ ErrStoreLocked; a late success is closed) and writes/checks a format
+ version record in the meta bucket (ensureBoltFormat; ErrStoreFormat; an
+ unversioned store is adopted as version 1; CheckStore treats a missing
+ record as corruption via boltTxn.checkFormat). OpenHost runs the startup
+ order: store, CheckStore, NameRegistry.LoadNames and the ROOT node
+ (NameRoot, not in FoundationalNames) on the raw store, GraphActor over
+ RootGraph over BoltGraph, BootstrapNames, NewRegistries (every registry
+ except Representation C), CloseAllSessions, VerifyAll, VerifyBindings.
+ Clients use the Client interface (Acquire, Release, WaitApplied, Keepalive,
+ Close, Done), implemented in-process by Conn; AcquireAndWait is built on the
+ interface. Liveness: a connection ends on context cancel, Close or
+ KeepaliveTTL expiry, then CloseSession; failed closes are retried by the
+ reaper. The reconciler is level-driven over hostResource (numbered passes,
+ mark/WaitApplied handshake, TeardownGrace, retry/resync intervals); Effect
+ is the interface for what lives outside the graph. Close drops
+ connections, runs a final pass without the grace, and closes the actor and
+ the store. Host operations are gated by enter/leave so none can reach the
+ actor after Close. Covered by
+ TestOpenBoltGraphWritesFormatVersionAndAdoptsUnversionedStore,
+ TestOpenBoltGraphRejectsUnknownFormatVersion,
+ TestOpenBoltGraphFailsFastWhenStoreIsAlreadyOpen,
+ TestNewRegistriesRejectsMissingNames, TestOpenHostRequiresPath,
+ TestOpenHostFailsFastWhenTheStoreIsAlreadyOwned,
+ TestHostManyHoldersApplyOnceAndRemoveOnce,
+ TestHostCrashedHolderIsReleasedByConnectionDrop,
+ TestHostKeepaliveTTLExpiresSilentConnectionsOnly,
+ TestHostReacquireWithinGraceNeverRemovesTheEffect,
+ TestHostWaitAppliedRetriesFailingEffectsAndReportsTheLastError,
+ TestHostRemovesStaleEffectLeftByAPreviousRun,
+ TestHostOperationsFailLoudly,
+ TestHostCloseRemovesEffectsAndRejectsFurtherWork and
+ TestHostRestartSweepsSessionsAndKeepsNames. Not done: network transport,
+ authentication, production Effect implementations, per-resource dirty
+ tracking.
+
 Currently unaddressed yet:
 - Paged reads beyond a single node's own outgoing/incoming edges
   (theorystate.md section 105, items 43/46): FindRelationships and
@@ -1985,8 +2023,9 @@ Currently unaddressed yet:
   are ListRegistry.validateStructure's and CompositeSetRegistry's own
   full-child-set reads. (The GraphReader methods that lacked error
   results now have them; see ErrGraphStoreUnavailable.)
-- The operation-level protocol between other processes and the graph host
-  (theorystate.md section 107).
+- The network transport and authentication of the Client interface, and
+  production Effect implementations (theorystate.md sections 107, 112; the
+  in-process Host is item 48).
 - Nested transactions as a production-backend feature are also realized
   on BoltGraph (item 40), via the same shared txLog (undo log, commit
   and rollback hooks, savepoints) mechanism Txn already uses -- not a

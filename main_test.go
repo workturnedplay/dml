@@ -17,6 +17,7 @@
 package dml
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -17536,4 +17537,656 @@ func TestGraphActorCrashedHolderIsFoundAndReleasedByClosingItsSession(t *testing
 	if err != nil || len(remaining) != 0 {
 		t.Fatalf("Sessions() = (%v,%v), want none after the sweep", remaining, err)
 	}
+}
+
+// ---------------------------------------------------------------------
+// Store format version and single-open guard (theorystate.md section 112).
+
+func readFormatForTest(t *testing.T, g *BoltGraph) (version uint64, present bool) {
+	t.Helper()
+
+	viewErr := g.db.View(func(btx *bolt.Tx) error {
+		var readErr error
+		version, present, readErr = readBoltFormat(btx.Bucket(boltBucketMeta))
+
+		return readErr
+	})
+	if viewErr != nil {
+		t.Fatalf("reading the format record: %v", viewErr)
+	}
+
+	return version, present
+}
+
+func putFormatForTest(t *testing.T, g *BoltGraph, version uint64) {
+	t.Helper()
+
+	err := g.db.Update(func(btx *bolt.Tx) error {
+		return wrapBoltErr("put format", btx.Bucket(boltBucketMeta).Put(boltFormatKey, encodeBoltFormat(version)))
+	})
+	if err != nil {
+		t.Fatalf("writing the format record: %v", err)
+	}
+}
+
+func deleteFormatForTest(t *testing.T, g *BoltGraph) {
+	t.Helper()
+
+	err := g.db.Update(func(btx *bolt.Tx) error {
+		return wrapBoltErr("delete format", btx.Bucket(boltBucketMeta).Delete(boltFormatKey))
+	})
+	if err != nil {
+		t.Fatalf("deleting the format record: %v", err)
+	}
+}
+
+func TestOpenBoltGraphWritesFormatVersionAndAdoptsUnversionedStore(t *testing.T) {
+	path := boltTestPath(t)
+	first := openBoltTestGraph(t, path)
+
+	if version, present := readFormatForTest(t, first); !present || version != boltFormatVersion {
+		t.Fatalf("format record = (%d,%v), want (%d,true) on a new store", version, present, boltFormatVersion)
+	}
+
+	node := mustCreateNode(t, first)
+
+	// Simulate a store written before the record existed.
+	deleteFormatForTest(t, first)
+
+	if checkErr := first.CheckStore(); !errors.Is(checkErr, ErrStoreCorrupt) {
+		t.Fatalf("CheckStore() without a format record error = %v, want %v", checkErr, ErrStoreCorrupt)
+	}
+
+	if closeErr := first.Close(); closeErr != nil {
+		t.Fatalf("Close(): %v", closeErr)
+	}
+
+	second := openBoltTestGraph(t, path)
+
+	if version, present := readFormatForTest(t, second); !present || version != boltFormatVersion {
+		t.Fatalf("format record after adoption = (%d,%v), want (%d,true)", version, present, boltFormatVersion)
+	}
+	if !mustNodeExists(t, second, node) {
+		t.Fatal("the adopted store lost its node")
+	}
+	if checkErr := second.CheckStore(); checkErr != nil {
+		t.Fatalf("CheckStore() after adoption: %v", checkErr)
+	}
+}
+
+func TestOpenBoltGraphRejectsUnknownFormatVersion(t *testing.T) {
+	path := boltTestPath(t)
+	first := openBoltTestGraph(t, path)
+
+	putFormatForTest(t, first, boltFormatVersion+1)
+
+	if closeErr := first.Close(); closeErr != nil {
+		t.Fatalf("Close(): %v", closeErr)
+	}
+
+	if _, err := OpenBoltGraph(path); !errors.Is(err, ErrStoreFormat) {
+		t.Fatalf("OpenBoltGraph() of a newer store error = %v, want %v", err, ErrStoreFormat)
+	}
+
+	// A record of the wrong size is just as loud.
+	reopened, err := bolt.Open(path, 0o600, nil)
+	if err != nil {
+		t.Fatalf("bolt.Open(): %v", err)
+	}
+
+	rawErr := reopened.Update(func(btx *bolt.Tx) error {
+		return wrapBoltErr("put short format", btx.Bucket(boltBucketMeta).Put(boltFormatKey, []byte{1}))
+	})
+	if closeErr := reopened.Close(); closeErr != nil {
+		t.Fatalf("closing the raw handle: %v", closeErr)
+	}
+	if rawErr != nil {
+		t.Fatalf("writing a short format record: %v", rawErr)
+	}
+
+	if _, openErr := OpenBoltGraph(path); !errors.Is(openErr, ErrStoreFormat) {
+		t.Fatalf("OpenBoltGraph() with a malformed record error = %v, want %v", openErr, ErrStoreFormat)
+	}
+}
+
+func TestOpenBoltGraphFailsFastWhenStoreIsAlreadyOpen(t *testing.T) {
+	original := boltOpenTimeout
+	boltOpenTimeout = 50 * time.Millisecond
+
+	t.Cleanup(func() { boltOpenTimeout = original })
+
+	path := boltTestPath(t)
+	openBoltTestGraph(t, path)
+
+	start := time.Now()
+
+	if _, err := OpenBoltGraph(path); !errors.Is(err, ErrStoreLocked) {
+		t.Fatalf("second OpenBoltGraph() error = %v, want %v", err, ErrStoreLocked)
+	}
+
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("the second open took %v, want a fast failure", elapsed)
+	}
+}
+
+// ---------------------------------------------------------------------
+// Host (theorystate.md section 112). The driving consumer is a temporary
+// firewall rule that many processes want at once; fakeEffect stands in for
+// the real thing.
+
+var errFakeEffect = errors.New("fake effect failure")
+
+// fakeEffect is an in-memory Effect that records how it was driven.
+type fakeEffect struct {
+	mu            sync.Mutex
+	present       bool
+	applies       int
+	removes       int
+	applyFailures int
+}
+
+func (f *fakeEffect) Present(_ context.Context) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	return f.present, nil
+}
+
+func (f *fakeEffect) Apply(_ context.Context) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.applies++
+
+	if f.applyFailures > 0 {
+		f.applyFailures--
+		return errFakeEffect
+	}
+
+	f.present = true
+
+	return nil
+}
+
+func (f *fakeEffect) Remove(_ context.Context) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.removes++
+	f.present = false
+
+	return nil
+}
+
+func (f *fakeEffect) counts() (applies, removes int, present bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	return f.applies, f.removes, f.present
+}
+
+// eventually polls cond until it holds or a generous deadline passes.
+func eventually(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+
+	deadline := time.Now().Add(10 * time.Second)
+
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func hostTestContext(t *testing.T) context.Context {
+	t.Helper()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	t.Cleanup(cancel)
+
+	return ctx
+}
+
+// openTestHost opens a Host with short intervals and closes it when the
+// test ends. KeepaliveTTL is disabled unless mutate sets it.
+func openTestHost(t *testing.T, path string, mutate func(cfg *HostConfig)) *Host {
+	t.Helper()
+
+	cfg := HostConfig{
+		Path:           path,
+		KeepaliveTTL:   -1,
+		TeardownGrace:  60 * time.Millisecond,
+		ReapInterval:   10 * time.Millisecond,
+		ResyncInterval: 50 * time.Millisecond,
+		RetryInterval:  10 * time.Millisecond,
+		OnError:        func(string, error) {},
+	}
+
+	if mutate != nil {
+		mutate(&cfg)
+	}
+
+	h, err := OpenHost(cfg)
+	if err != nil {
+		t.Fatalf("OpenHost(): %v", err)
+	}
+
+	t.Cleanup(func() {
+		if closeErr := h.Close(); closeErr != nil {
+			t.Errorf("Close(): %v", closeErr)
+		}
+	})
+
+	return h
+}
+
+func registerTestResource(t *testing.T, h *Host, name string, effect Effect) {
+	t.Helper()
+
+	if err := h.RegisterResource(name, effect); err != nil {
+		t.Fatalf("RegisterResource(%q): %v", name, err)
+	}
+}
+
+func connectTest(t *testing.T, h *Host) *Conn {
+	t.Helper()
+
+	c, err := h.Connect(context.Background())
+	if err != nil {
+		t.Fatalf("Connect(): %v", err)
+	}
+
+	return c
+}
+
+func requireEffectCounts(t *testing.T, fw *fakeEffect, wantApplies, wantRemoves int, wantPresent bool) {
+	t.Helper()
+
+	applies, removes, present := fw.counts()
+	if applies != wantApplies || removes != wantRemoves || present != wantPresent {
+		t.Fatalf("effect applies=%d removes=%d present=%v, want %d,%d,%v", applies, removes, present, wantApplies, wantRemoves, wantPresent)
+	}
+}
+
+func TestNewRegistriesRejectsMissingNames(t *testing.T) {
+	if _, err := NewRegistries(&Graph{}, map[string]NodeID{}); !errors.Is(err, ErrNameNotFound) {
+		t.Fatalf("NewRegistries() error = %v, want %v", err, ErrNameNotFound)
+	}
+}
+
+func TestOpenHostRequiresPath(t *testing.T) {
+	if _, err := OpenHost(HostConfig{}); err == nil {
+		t.Fatal("OpenHost() without a path succeeded")
+	}
+}
+
+func TestOpenHostFailsFastWhenTheStoreIsAlreadyOwned(t *testing.T) {
+	original := boltOpenTimeout
+	boltOpenTimeout = 50 * time.Millisecond
+
+	t.Cleanup(func() { boltOpenTimeout = original })
+
+	path := boltTestPath(t)
+	openTestHost(t, path, nil)
+
+	if _, err := OpenHost(HostConfig{Path: path}); !errors.Is(err, ErrStoreLocked) {
+		t.Fatalf("second OpenHost() error = %v, want %v", err, ErrStoreLocked)
+	}
+}
+
+// TestHostManyHoldersApplyOnceAndRemoveOnce is the driving example: ten
+// parallel clients want the same temporary rule; it is added once, and
+// removed once after the last of them lets go.
+func TestHostManyHoldersApplyOnceAndRemoveOnce(t *testing.T) {
+	ctx := hostTestContext(t)
+	h := openTestHost(t, boltTestPath(t), nil)
+	fw := &fakeEffect{}
+	registerTestResource(t, h, "dns-out", fw)
+
+	const clients = 10
+
+	conns := make([]*Conn, clients)
+	for i := range conns {
+		conns[i] = connectTest(t, h)
+	}
+
+	errs := make([]error, clients)
+
+	runConcurrently(clients, func(i int) { errs[i] = AcquireAndWait(ctx, conns[i], "dns-out") })
+
+	for i, acquireErr := range errs {
+		if acquireErr != nil {
+			t.Fatalf("client %d: AcquireAndWait(): %v", i, acquireErr)
+		}
+	}
+
+	requireEffectCounts(t, fw, 1, 0, true)
+
+	runConcurrently(clients, func(i int) { _, errs[i] = conns[i].Release(ctx, "dns-out") })
+
+	for i, releaseErr := range errs {
+		if releaseErr != nil {
+			t.Fatalf("client %d: Release(): %v", i, releaseErr)
+		}
+	}
+
+	eventually(t, "the effect to be removed", func() bool {
+		_, _, present := fw.counts()
+		return !present
+	})
+
+	requireEffectCounts(t, fw, 1, 1, false)
+}
+
+// TestHostCrashedHolderIsReleasedByConnectionDrop: nine clients release, the
+// tenth "crashes" (its connection context ends). The rule must stay while it
+// is held and go once the drop is noticed.
+func TestHostCrashedHolderIsReleasedByConnectionDrop(t *testing.T) {
+	ctx := hostTestContext(t)
+	h := openTestHost(t, boltTestPath(t), nil)
+	fw := &fakeEffect{}
+	registerTestResource(t, h, "dns-out", fw)
+
+	crashCtx, crash := context.WithCancel(context.Background())
+	defer crash()
+
+	crashed, err := h.Connect(crashCtx)
+	if err != nil {
+		t.Fatalf("Connect(): %v", err)
+	}
+
+	const survivors = 9
+
+	conns := make([]*Conn, survivors)
+	for i := range conns {
+		conns[i] = connectTest(t, h)
+	}
+
+	for _, c := range append([]*Conn{crashed}, conns...) {
+		if acquireErr := AcquireAndWait(ctx, c, "dns-out"); acquireErr != nil {
+			t.Fatalf("AcquireAndWait(): %v", acquireErr)
+		}
+	}
+
+	for i, c := range conns {
+		if _, releaseErr := c.Release(ctx, "dns-out"); releaseErr != nil {
+			t.Fatalf("survivor %d: Release(): %v", i, releaseErr)
+		}
+	}
+
+	// Well past the grace: the crashed holder keeps the rule alive.
+	time.Sleep(4 * h.cfg.TeardownGrace)
+	requireEffectCounts(t, fw, 1, 0, true)
+
+	crash()
+
+	select {
+	case <-crashed.Done():
+	case <-time.After(10 * time.Second):
+		t.Fatal("the connection did not end after its context was cancelled")
+	}
+
+	eventually(t, "the crashed holder's effect to be removed", func() bool {
+		_, _, present := fw.counts()
+		return !present
+	})
+
+	requireEffectCounts(t, fw, 1, 1, false)
+
+	if _, releaseErr := crashed.Release(ctx, "dns-out"); !errors.Is(releaseErr, ErrConnClosed) {
+		t.Fatalf("Release() on a dropped connection error = %v, want %v", releaseErr, ErrConnClosed)
+	}
+}
+
+func TestHostKeepaliveTTLExpiresSilentConnectionsOnly(t *testing.T) {
+	ctx := hostTestContext(t)
+	h := openTestHost(t, boltTestPath(t), func(cfg *HostConfig) { cfg.KeepaliveTTL = 500 * time.Millisecond })
+
+	fw := &fakeEffect{}
+	registerTestResource(t, h, "dns-out", fw)
+
+	silent := connectTest(t, h)
+	alive := connectTest(t, h)
+
+	if err := AcquireAndWait(ctx, silent, "dns-out"); err != nil {
+		t.Fatalf("silent: AcquireAndWait(): %v", err)
+	}
+
+	// The alive client keeps its session fresh well past the TTL.
+	deadline := time.Now().Add(1500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if err := alive.Keepalive(ctx); err != nil {
+			t.Fatalf("Keepalive(): %v", err)
+		}
+
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	select {
+	case <-silent.Done():
+	default:
+		t.Fatal("the silent connection was not expired")
+	}
+
+	select {
+	case <-alive.Done():
+		t.Fatal("the connection that kept calling Keepalive was expired")
+	default:
+	}
+
+	eventually(t, "the expired holder's effect to be removed", func() bool {
+		_, _, present := fw.counts()
+		return !present
+	})
+
+	if _, err := silent.Acquire(ctx, "dns-out"); !errors.Is(err, ErrConnClosed) {
+		t.Fatalf("Acquire() on an expired connection error = %v, want %v", err, ErrConnClosed)
+	}
+}
+
+func TestHostReacquireWithinGraceNeverRemovesTheEffect(t *testing.T) {
+	ctx := hostTestContext(t)
+	h := openTestHost(t, boltTestPath(t), func(cfg *HostConfig) { cfg.TeardownGrace = 700 * time.Millisecond })
+
+	fw := &fakeEffect{}
+	registerTestResource(t, h, "dns-out", fw)
+
+	first := connectTest(t, h)
+	if err := AcquireAndWait(ctx, first, "dns-out"); err != nil {
+		t.Fatalf("first: AcquireAndWait(): %v", err)
+	}
+
+	if _, err := first.Release(ctx, "dns-out"); err != nil {
+		t.Fatalf("first: Release(): %v", err)
+	}
+
+	second := connectTest(t, h)
+	if err := AcquireAndWait(ctx, second, "dns-out"); err != nil {
+		t.Fatalf("second: AcquireAndWait(): %v", err)
+	}
+
+	requireEffectCounts(t, fw, 1, 0, true)
+
+	if _, err := second.Release(ctx, "dns-out"); err != nil {
+		t.Fatalf("second: Release(): %v", err)
+	}
+
+	eventually(t, "the effect to be removed after the grace", func() bool {
+		_, _, present := fw.counts()
+		return !present
+	})
+
+	requireEffectCounts(t, fw, 1, 1, false)
+}
+
+func TestHostWaitAppliedRetriesFailingEffectsAndReportsTheLastError(t *testing.T) {
+	ctx := hostTestContext(t)
+	h := openTestHost(t, boltTestPath(t), nil)
+
+	flaky := &fakeEffect{applyFailures: 3}
+	registerTestResource(t, h, "flaky", flaky)
+
+	c := connectTest(t, h)
+	if err := AcquireAndWait(ctx, c, "flaky"); err != nil {
+		t.Fatalf("AcquireAndWait() with a flaky effect: %v", err)
+	}
+
+	if applies, _, present := flaky.counts(); applies != 4 || !present {
+		t.Fatalf("applies=%d present=%v, want 4,true (three failures, then success)", applies, present)
+	}
+
+	broken := &fakeEffect{applyFailures: 1 << 30}
+	registerTestResource(t, h, "broken", broken)
+
+	shortCtx, cancel := context.WithTimeout(ctx, 300*time.Millisecond)
+	defer cancel()
+
+	err := AcquireAndWait(shortCtx, c, "broken")
+	if !errors.Is(err, context.DeadlineExceeded) || !errors.Is(err, errFakeEffect) {
+		t.Fatalf("AcquireAndWait() with a broken effect error = %v, want the deadline and the last effect error", err)
+	}
+}
+
+func TestHostRemovesStaleEffectLeftByAPreviousRun(t *testing.T) {
+	h := openTestHost(t, boltTestPath(t), nil)
+	fw := &fakeEffect{present: true}
+	registerTestResource(t, h, "stale", fw)
+
+	eventually(t, "the stale effect to be removed", func() bool {
+		_, _, present := fw.counts()
+		return !present
+	})
+}
+
+func TestHostOperationsFailLoudly(t *testing.T) {
+	ctx := hostTestContext(t)
+	h := openTestHost(t, boltTestPath(t), nil)
+	registerTestResource(t, h, "dns-out", nil)
+
+	if err := h.RegisterResource("dns-out", nil); !errors.Is(err, ErrResourceRegistered) {
+		t.Fatalf("second RegisterResource() error = %v, want %v", err, ErrResourceRegistered)
+	}
+	if err := h.RegisterResource("", nil); !errors.Is(err, ErrResourceName) {
+		t.Fatalf("RegisterResource(\"\") error = %v, want %v", err, ErrResourceName)
+	}
+
+	c := connectTest(t, h)
+
+	if _, err := c.Acquire(ctx, "nope"); !errors.Is(err, ErrUnknownResource) {
+		t.Fatalf("Acquire(unknown) error = %v, want %v", err, ErrUnknownResource)
+	}
+
+	result, err := c.Acquire(ctx, "dns-out")
+	if err != nil || !result.First {
+		t.Fatalf("Acquire() = (%+v,%v), want First=true", result, err)
+	}
+
+	if last, releaseErr := c.Release(ctx, "dns-out"); releaseErr != nil || !last {
+		t.Fatalf("Release() = (%v,%v), want last=true", last, releaseErr)
+	}
+
+	if waitErr := c.WaitApplied(ctx, "dns-out", result.Mark); !errors.Is(waitErr, ErrHoldLost) {
+		t.Fatalf("WaitApplied() after the release error = %v, want %v", waitErr, ErrHoldLost)
+	}
+
+	if closeErr := c.Close(); closeErr != nil {
+		t.Fatalf("Close(): %v", closeErr)
+	}
+	if closeErr := c.Close(); closeErr != nil {
+		t.Fatalf("second Close(): %v", closeErr)
+	}
+
+	if _, acquireErr := c.Acquire(ctx, "dns-out"); !errors.Is(acquireErr, ErrConnClosed) {
+		t.Fatalf("Acquire() after Close error = %v, want %v", acquireErr, ErrConnClosed)
+	}
+	if keepErr := c.Keepalive(ctx); !errors.Is(keepErr, ErrConnClosed) {
+		t.Fatalf("Keepalive() after Close error = %v, want %v", keepErr, ErrConnClosed)
+	}
+}
+
+func TestHostCloseRemovesEffectsAndRejectsFurtherWork(t *testing.T) {
+	ctx := hostTestContext(t)
+	h := openTestHost(t, boltTestPath(t), func(cfg *HostConfig) { cfg.TeardownGrace = time.Hour })
+
+	fw := &fakeEffect{}
+	registerTestResource(t, h, "dns-out", fw)
+
+	c := connectTest(t, h)
+	if err := AcquireAndWait(ctx, c, "dns-out"); err != nil {
+		t.Fatalf("AcquireAndWait(): %v", err)
+	}
+
+	if err := h.Close(); err != nil {
+		t.Fatalf("Close(): %v", err)
+	}
+
+	// The grace is an hour, so only the final shutdown pass can have
+	// removed the rule.
+	requireEffectCounts(t, fw, 1, 1, false)
+
+	if _, err := h.Connect(ctx); !errors.Is(err, ErrHostClosed) {
+		t.Fatalf("Connect() after Close error = %v, want %v", err, ErrHostClosed)
+	}
+	if err := h.RegisterResource("late", nil); !errors.Is(err, ErrHostClosed) {
+		t.Fatalf("RegisterResource() after Close error = %v, want %v", err, ErrHostClosed)
+	}
+	if _, err := c.Acquire(ctx, "dns-out"); !errors.Is(err, ErrConnClosed) {
+		t.Fatalf("Acquire() on a connection of a closed host error = %v, want %v", err, ErrConnClosed)
+	}
+
+	select {
+	case <-c.Done():
+	default:
+		t.Fatal("the connection of a closed host is not done")
+	}
+}
+
+// TestHostRestartSweepsSessionsAndKeepsNames covers startup: a session left
+// behind (as after a crash, when nobody could close it) is swept, its holds
+// vanish, and the resource name keeps its node.
+func TestHostRestartSweepsSessionsAndKeepsNames(t *testing.T) {
+	path := boltTestPath(t)
+	first := openTestHost(t, path, nil)
+	registerTestResource(t, first, "dns-out", nil)
+
+	node, ok := first.names.Lookup(resourcePrefix + "dns-out")
+	if !ok {
+		t.Fatal("the resource name is not bound")
+	}
+
+	// A session the host does not track, like one a crash left behind.
+	leases := first.Registries().Leases
+
+	orphan, err := leases.NewSession(first.Graph())
+	if err != nil {
+		t.Fatalf("NewSession(): %v", err)
+	}
+	if _, acquireErr := leases.Acquire(first.Graph(), node, orphan); acquireErr != nil {
+		t.Fatalf("Acquire(): %v", acquireErr)
+	}
+
+	if closeErr := first.Close(); closeErr != nil {
+		t.Fatalf("Close(): %v", closeErr)
+	}
+
+	second := openTestHost(t, path, nil)
+
+	sessions, err := second.Registries().Leases.Sessions(second.Graph())
+	if err != nil || len(sessions) != 0 {
+		t.Fatalf("Sessions() after restart = (%v,%v), want none", sessions, err)
+	}
+
+	held, err := second.Registries().Leases.Held(second.Graph(), node)
+	if err != nil || held {
+		t.Fatalf("Held() after restart = (%v,%v), want (false,nil)", held, err)
+	}
+
+	if again, found := second.names.Lookup(resourcePrefix + "dns-out"); !found || again != node {
+		t.Fatalf("Lookup() after restart = (%d,%v), want (%d,true)", again, found, node)
+	}
+
+	// Registering the resource again finds the same node and works.
+	registerTestResource(t, second, "dns-out", nil)
 }

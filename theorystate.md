@@ -3556,10 +3556,12 @@ of the store choice. A git-like commit log (§17, §36, §66) remains a
 possible later layer, for example as another bucket in the store; nothing is
 decided about it here.
 
-**OPEN.** The operation-level protocol between other processes and the host:
-transport, authentication, the set of operations, and how results and errors
-cross the boundary (related to §89c's transaction-descriptor vocabulary). How
-hosts on different machines coordinate is Part C.
+**Partly resolved (§112).** The operation shape (the `Client` interface:
+named operations, each one Transact on the host), liveness and the reconciler
+contract are built for an in-process transport. **OPEN:** the network
+transport, authentication, how errors cross the boundary (related to §89c's
+transaction-descriptor vocabulary), and how hosts on different machines
+coordinate (Part C).
 
 ## 108. BoltGraph spike: graph half (TENTATIVE, implemented)
 
@@ -3728,10 +3730,85 @@ once; several independent holds would need the occurrence descriptor of
 - Teardown needs a short grace period, or release-then-acquire races
   remove and immediately re-add the effect with a gap in between.
 
-**OPEN.** Liveness detection itself (connection drop plus a keepalive
-TTL for partitions) belongs to the host, not the registry, and the
-reconciler contract (how a host reports "applied") is part of the
-operation protocol of §107.
+Liveness detection (connection drop plus a keepalive TTL for partitions)
+and the reconciler contract (how a host reports "applied", the teardown
+grace) belong to the host, not the registry, and are built in §112.
+
+---
+
+## 112. The Host: startup, liveness, named operations, reconciler (TENTATIVE, implemented)
+
+§107 decided one owner process per graph. `Host` (`OpenHost`) is that process.
+
+**Startup order (as built).** `OpenBoltGraph` (single-open guard, format
+version) -> `CheckStore` -> `NameRegistry.LoadNames` and `EnsureNamedNode("ROOT")`
+on the *raw* store (RootGraph needs ROOT to exist before the stack can be
+built, so this one step precedes the actor) -> `GraphActor` over `RootGraph`
+over `BoltGraph` (§87b) -> `BootstrapNames(FoundationalNames)` -> every
+registry (registers the Checkers) -> `LeaseRegistry.CloseAllSessions` (§111)
+-> `VerifyAll` -> `VerifyBindings`. Any failure closes what was opened.
+`NameRoot` is not in `FoundationalNames`.
+
+**Store format version.** The meta bucket holds a `format` record (8 bytes,
+big-endian), written on creation. `OpenBoltGraph` fails with `ErrStoreFormat`
+for any other version or a malformed record; `CheckStore` treats a missing
+record as corruption. A store with no record (written before the record
+existed, same layout) is adopted as version 1 when opened.
+
+**Double start.** No lock file (a crash would leave it stale). bbolt's own
+file lock is the lock, and `bolt.Open` runs in a goroutine abandoned after
+five times the timeout, because the Timeout option is documented only for
+Darwin and Linux. A late successful open is closed at once. The failure is
+`ErrStoreLocked`.
+
+**Liveness.** Each client connection owns one session. A connection ends
+when its context ends (the in-process stand-in for a socket closing), when
+`Close` is called, or when it is silent longer than `KeepaliveTTL`
+(host-memory monotonic clock; any operation or `Keepalive` is a sign of
+life). Ending calls `LeaseRegistry.CloseSession`; a failed close stays
+pending and is retried by the reaper. The first caller to end a connection
+does the work (`markDone` is a compare-and-swap).
+
+**Named operations.** `Client` is the operation surface: `Acquire`,
+`Release`, `WaitApplied`, `Keepalive`, `Close`, `Done`. Each is one request
+the host runs as one Transact (or a short read); no closures or NodeIDs
+cross it. `Conn` is the in-process implementation; a network transport only
+implements `Client` and calls the same host methods. Resources are named
+holder Sets (`resource/<name>`) registered with `RegisterResource(name,
+effect)`; acquiring an unregistered name is `ErrUnknownResource`.
+
+**Reconciler contract.** For every registered resource the reconciler
+compares the desired state (`Held`) with the actual one (`Effect.Present`)
+and converges them, verifying the result with `Present` afterwards. It runs
+on every wake (acquire, release, dropped connection, registration), every
+`ResyncInterval`, and `RetryInterval` after a failure. `Effect` methods must
+be idempotent. The `freed` list from `CloseSession` is only a wake-up hint.
+
+*"Applied".* `first == false` means "wanted", not "in effect". Each
+resource numbers its passes, numbering a pass before it reads `Held`.
+`Acquire` returns a `Mark`: the highest pass number begun, read after the
+hold committed. Every pass numbered above it began after the commit and so
+sees the hold. `WaitApplied(resource, mark)` returns when the session still
+holds the resource and a pass above the mark has completed with the effect
+present and no error. Without the numbering, a client could accept a stale
+"present" while a removal was in flight. A kick during a pass leaves a token,
+so a pass that began before a commit is never the last one.
+
+*Teardown grace.* An unheld but present effect is removed only after the
+resource has been unheld for `TeardownGrace` (host-memory clock), so
+release-then-acquire races do not flap the effect. Applying is immediate.
+`Close` runs a final pass without the grace.
+
+**Shutdown.** `Close` sets the closed flag (new operations fail), cancels the
+background context, waits for the reconciler, reaper and in-flight
+operations, closes every session, runs the final reconcile pass, then closes
+the actor and the store. Waiters wake with `ErrHostClosed`.
+
+**Still OPEN.** The wire transport and authentication (only the `Client`
+shape is fixed); production `Effect` implementations (the example firewall
+rule is a fake in the tests); per-resource dirty tracking, since every wake
+reads every resource; a keepalive helper for clients that wait longer than
+the TTL; and how hosts on different machines coordinate (Part C).
 
 ---
 
@@ -3898,6 +3975,12 @@ kept current as sections above resolve or split further.)*
 - Reference counting that must survive client death is a holder Set of
   ephemeral sessions, not a counter; an external effect is driven from the
   level (`Held`) by a reconciler, never only from transitions (§111).
+- The store carries a format version; an unknown version fails loudly. The
+  Host starts in the order of §112 and guards against a second owner with
+  bbolt's file lock (§112).
+- "Applied" is a numbered-pass handshake: `Acquire` returns a mark,
+  `WaitApplied` waits for a later completed pass with the effect present;
+  teardown has a grace period (§112).
 
 ### TENTATIVE
 - bbolt as the first persistent-backend spike, with the layout and
@@ -4005,9 +4088,9 @@ kept current as sections above resolve or split further.)*
   to the durable commit; the `NameRegistry` storage seam (§103); paged and
   iterator reads (§105), including the call-site grep. §98 is moot under
   §107, and §99 is answered by §104.
-- The operation-level protocol between other processes and the graph host
-  (transport, authentication, operation set, error transport), and how hosts
-  on different machines coordinate (§107, Part C).
+- The network transport of the `Client` interface, authentication and error
+  transport, production `Effect` implementations, and how hosts on different
+  machines coordinate (§107, §112, Part C).
 - Whether to build a harness that automatically re-runs the existing
   registry test suite against both *Graph and stagedGraph, versus
   writing portability tests by hand as needed; and whether stagedGraph
