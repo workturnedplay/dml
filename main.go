@@ -1522,11 +1522,10 @@ type outgoingPager interface {
 
 // incomingPager is outgoingPager's mirror for incoming relationships.
 // Implemented by BoltGraph (its boltView, and BoltGraph and GraphActor
-// forwarding to it) only for now: the ROOT overlay's
-// FindIncoming always potentially adds one virtual (ROOT, to) relationship
-// and hides any physically-stored ROOT-sourced one (theorystate.md section
-// 12a), and splicing that correctly into a bounded page is not yet built --
-// see the rootReader doc comment and theorystate.md section 105.
+// forwarding to it) and by the ROOT overlay, which splices its virtual
+// (ROOT, to) parent into each page and hides any physically-stored
+// ROOT-sourced relationship (theorystate.md sections 12a and 105; see
+// rootReader.findIncomingAfter).
 type incomingPager interface {
 	findIncomingAfter(to, after NodeID, hasAfter bool, limit int) ([]Relationship, error)
 }
@@ -4262,12 +4261,7 @@ var _ nodePager = rootReader{}
 // rather than under-reporting a page that only looks short because ROOT
 // happened to fall inside it.
 //
-// This does not cover FindIncoming: the ROOT overlay always potentially
-// adds one virtual (ROOT, to) relationship and hides any physically-stored
-// ROOT-sourced one, and correctly splicing that into a bounded page is not
-// yet built (theorystate.md section 105) -- rootReader deliberately does
-// not implement incomingPager, so a paged caller falls back to the
-// existing, complete, unpaged FindIncoming.
+// findIncomingAfter is the incoming counterpart (see incomingPager).
 func (v rootReader) findOutgoingAfter(from, after NodeID, hasAfter bool, limit int) ([]Relationship, error) {
 	if from != v.root {
 		pager, ok := v.inner.(outgoingPager)
@@ -4329,10 +4323,111 @@ func (v rootReader) findOutgoingAfter(from, after NodeID, hasAfter bool, limit i
 	return relationships, nil
 }
 
-// Compile-time assertion that the ROOT overlay pages outgoing
-// relationships. It deliberately does not implement incomingPager -- see
-// findOutgoingAfter's doc comment.
-var _ outgoingPager = rootReader{}
+// Compile-time assertions that the ROOT overlay pages outgoing and
+// incoming relationships.
+var (
+	_ outgoingPager = rootReader{}
+	_ incomingPager = rootReader{}
+)
+
+// hideRootSourced returns stored without any relationship whose source is
+// ROOT: the overlay represents ROOT's outgoing side entirely virtually, so
+// a physically stored (ROOT, X) must not be reported a second time and a
+// stored (ROOT, ROOT) must stay hidden (theorystate.md section 12a). The
+// result has room for one more element, the virtual ROOT parent a caller
+// may append.
+func (v rootReader) hideRootSourced(stored []Relationship) []Relationship {
+	visible := make([]Relationship, 0, len(stored)+1)
+
+	for _, relationship := range stored {
+		if relationship.From == v.root {
+			continue
+		}
+
+		visible = append(visible, relationship)
+	}
+
+	return visible
+}
+
+// virtualRootParent returns the virtual (ROOT, to) relationship when the
+// overlay presents one: to must not be ROOT itself (irreflexivity) and ROOT
+// must exist. ok is false otherwise.
+func (v rootReader) virtualRootParent(to NodeID) (relationship Relationship, ok bool, err error) {
+	if to == v.root {
+		return Relationship{}, false, nil
+	}
+
+	rootExists, err := v.inner.NodeExists(v.root)
+	if err != nil {
+		return Relationship{}, false, wrapInterfaceErr(err)
+	}
+	if !rootExists {
+		return Relationship{}, false, nil
+	}
+
+	return Relationship{From: v.root, To: to}, true, nil
+}
+
+// sortBySource sorts relationships by From, the order every incoming read
+// uses. The order has no semantic meaning (theorystate.md section 5).
+func sortBySource(relationships []Relationship) {
+	sort.Slice(relationships, func(i, j int) bool {
+		return relationships[i].From < relationships[j].From
+	})
+}
+
+// findIncomingAfter pages through to's own incoming relationships in the
+// ROOT view (see incomingPager), sorted by source. Stored relationships
+// come from the underlying reader's own paging; the overlay then hides any
+// ROOT-sourced one and adds the virtual (ROOT, to) parent when it belongs
+// after the cursor (see virtualRootParent).
+//
+// One extra stored candidate is fetched: at most one stored relationship is
+// sourced at ROOT (pairs are unique) and it is hidden, so want+1 stored
+// candidates still leave want visible ones whenever that many exist. The
+// merged page is then cut to want. A virtual parent that falls outside the
+// cut is not lost: the cursor is the last returned source, ROOT is past it,
+// and the next page adds it again.
+//
+// If the underlying reader cannot page, errPagingUnsupported tells
+// pageIterator to fall back to one full FindIncoming.
+func (v rootReader) findIncomingAfter(to, after NodeID, hasAfter bool, limit int) ([]Relationship, error) {
+	pager, ok := v.inner.(incomingPager)
+	if !ok {
+		return nil, errPagingUnsupported
+	}
+
+	want := max(limit, 0)
+
+	// Guarded against overflow for a limit already at the edge of int's
+	// range, which no realistic caller passes.
+	fetchWant := want + 1
+	if fetchWant <= want {
+		fetchWant = want
+	}
+
+	stored, err := pager.findIncomingAfter(to, after, hasAfter, fetchWant)
+	if err != nil {
+		return nil, wrapInterfaceErr(err)
+	}
+
+	relationships := v.hideRootSourced(stored)
+
+	if !hasAfter || v.root > after {
+		virtual, hasVirtual, virtualErr := v.virtualRootParent(to)
+		if virtualErr != nil {
+			return nil, virtualErr
+		}
+		if hasVirtual {
+			relationships = append(relationships, virtual)
+		}
+	}
+
+	sortBySource(relationships)
+
+	return relationships[:min(want, len(relationships))], nil
+}
 
 // HasRelationship reports whether the relationship exists in the ROOT
 // view: ROOT has a virtual relationship to every existing node other than
@@ -4423,32 +4518,17 @@ func (v rootReader) FindIncoming(to NodeID) ([]Relationship, error) {
 		return nil, wrapInterfaceErr(err)
 	}
 
-	relationships := make([]Relationship, 0, len(stored)+1)
+	relationships := v.hideRootSourced(stored)
 
-	for _, relationship := range stored {
-		if relationship.From == v.root {
-			continue
-		}
-
-		relationships = append(relationships, relationship)
+	virtual, hasVirtual, err := v.virtualRootParent(to)
+	if err != nil {
+		return nil, err
+	}
+	if hasVirtual {
+		relationships = append(relationships, virtual)
 	}
 
-	if to != v.root {
-		rootExists, rootErr := v.inner.NodeExists(v.root)
-		if rootErr != nil {
-			return nil, wrapInterfaceErr(rootErr)
-		}
-		if rootExists {
-			relationships = append(relationships, Relationship{
-				From: v.root,
-				To:   to,
-			})
-		}
-	}
-
-	sort.Slice(relationships, func(i, j int) bool {
-		return relationships[i].From < relationships[j].From
-	})
+	sortBySource(relationships)
 
 	return relationships, nil
 }

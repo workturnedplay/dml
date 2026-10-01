@@ -3431,12 +3431,17 @@ below:
   IDs instead (reusing `nodesAfter`) and translates each into a virtual
   relationship, fetching one extra candidate so filtering ROOT itself back
   out (irreflexivity) never silently shortens an otherwise-full page.
-  `rootReader` deliberately implements only `outgoingPager`, not
-  `incomingPager`: `FindIncoming` always potentially adds one virtual
-  `(ROOT, to)` relationship and hides any physically-stored ROOT-sourced
-  one, and splicing that correctly into a bounded page is real remaining
-  work (see below), not a trivial extension of the outgoing case, which has
-  nothing virtual on the non-ROOT side to reconcile.
+  `rootReader` also implements `incomingPager` (`findIncomingAfter`):
+  `FindIncoming` always potentially adds one virtual `(ROOT, to)`
+  relationship and hides any physically-stored ROOT-sourced one. A page
+  fetches `limit+1` stored candidates (at most one stored relationship is
+  sourced at ROOT, and it is hidden, so `limit` visible ones remain
+  whenever that many exist), adds the virtual parent when `to != ROOT`,
+  ROOT exists and ROOT's NodeID is past the cursor, sorts by source, and
+  cuts to `limit`. A virtual parent that falls outside the cut is not
+  lost: the cursor is the last returned source, so the next page adds it
+  again. Over an underlying reader with no incoming pager it reports
+  `errPagingUnsupported` and the iterator falls back to one full read.
 - `FindIncoming` on a very popular value node (`CapsulesWithValue`):
   `CapsuleRegistry.CapsulesWithValue` now walks `value`'s incoming
   relationships in bounded pages (`capsulesWithValuePageSize`, a `var` so
@@ -3458,8 +3463,7 @@ page on a backend with no node pager. That is accepted for memory-bound
 backends only.
 
 **Still unbounded, per the grep this section already called for:**
-`FindRelationships`, `rootReader.FindRelationships`, `rootReader.FindIncoming`
-on any node (no virtual-aware paged incoming yet, see above), the whole-set
+`FindRelationships`, `rootReader.FindRelationships`, the whole-set
 APIs (`Members`, `Elements`, `Evaluate`, `Operands`), and two internal
 full-child-set reads not previously named here:
 `ListRegistry.validateStructure`'s `FindOutgoing(list)` (every list's

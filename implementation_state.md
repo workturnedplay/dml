@@ -1929,11 +1929,30 @@ could be called directly.
  TestRootReaderFindOutgoingAfterOfMissingRootIsNotFound and
  TestRootReaderFindOutgoingAfterToleratesHugeLimit.
 
+46. Virtual-aware paged incoming reads on the ROOT overlay (theorystate.md
+ section 105), closing the one paging gap items 43/44 left on purpose.
+ rootReader now implements incomingPager (findIncomingAfter). A page
+ fetches limit+1 stored candidates from the underlying reader's own
+ incomingPager (at most one stored relationship is sourced at ROOT, and
+ the overlay hides it, so limit visible ones remain whenever that many
+ exist), adds the virtual (ROOT, to) parent when to != ROOT, ROOT exists
+ and ROOT's NodeID is past the cursor, sorts by source and cuts to limit;
+ a virtual parent outside the cut reappears on the next page because the
+ cursor is the last returned source. Over a reader with no incoming pager
+ it reports errPagingUnsupported, so pageIterator falls back to one full
+ read exactly as for outgoing. GraphActor and rootTx pick it up through
+ their existing forwarding/promotion with no change. DRY: FindIncoming and
+ findIncomingAfter share hideRootSourced, virtualRootParent and
+ sortBySource (FindIncoming previously inlined all three).
+ Covered by TestRootReaderFindIncomingAfterMatchesFindIncoming,
+ TestRootReaderFindIncomingAfterReportsUnsupportedOverNonPagingBackend,
+ TestRootReaderFindIncomingAfterWithoutRootNodeHasNoVirtualParent and
+ TestRootGraphInsideGraphActorPagesIncomingNatively.
+
 Currently unaddressed yet:
 - Paged reads beyond a single node's own outgoing/incoming edges
-  (theorystate.md section 105, item 43): FindRelationships,
-  rootReader.FindRelationships, and rootReader.FindIncoming (no
-  virtual-aware paged incoming yet) are still O(graph) on BoltGraph, as
+  (theorystate.md section 105, items 43/46): FindRelationships and
+  rootReader.FindRelationships are still O(graph) on BoltGraph, as
   are ListRegistry.validateStructure's and CompositeSetRegistry's own
   full-child-set reads. (The GraphReader methods that lacked error
   results now have them; see ErrGraphStoreUnavailable.)

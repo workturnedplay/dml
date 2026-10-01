@@ -16828,3 +16828,205 @@ func TestRootReaderFindOutgoingAfterToleratesHugeLimit(t *testing.T) {
 		t.Fatalf("findOutgoingAfter() = %v, want %v", got, want)
 	}
 }
+
+// TestRootReaderFindIncomingAfterMatchesFindIncoming exercises
+// rootReader.findIncomingAfter (theorystate.md section 105). ROOT's NodeID
+// sits in the middle of the sources paged over, so the virtual (ROOT, to)
+// parent has to be spliced into the middle of a page, and a physically
+// stored (ROOT, hub) and (ROOT, ROOT) must be hidden rather than duplicated
+// or leaked. Every page size must agree with the unpaged FindIncoming.
+func TestRootReaderFindIncomingAfterMatchesFindIncoming(t *testing.T) {
+	g := newBoltTestGraph(t)
+
+	low1 := mustCreateNode(t, g)
+	low2 := mustCreateNode(t, g)
+	root := mustCreateNode(t, g)
+	high1 := mustCreateNode(t, g)
+	high2 := mustCreateNode(t, g)
+	hub := mustCreateNode(t, g)
+
+	for _, from := range []NodeID{low1, low2, root, high1, high2} {
+		if _, addErr := g.AddRelationship(from, hub); addErr != nil {
+			t.Fatalf("AddRelationship(%d, hub): %v", from, addErr)
+		}
+	}
+
+	for _, from := range []NodeID{low1, high1, root} {
+		if _, addErr := g.AddRelationship(from, root); addErr != nil {
+			t.Fatalf("AddRelationship(%d, root): %v", from, addErr)
+		}
+	}
+
+	r, newErr := NewRootGraph(g, root)
+	if newErr != nil {
+		t.Fatalf("NewRootGraph(): %v", newErr)
+	}
+
+	maxLimit := int(^uint(0) >> 1)
+
+	for _, tc := range []struct {
+		name string
+		to   NodeID
+	}{
+		{name: "hub", to: hub},
+		{name: "root", to: root},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			all, allErr := r.FindIncoming(tc.to)
+			if allErr != nil {
+				t.Fatalf("FindIncoming(%d): %v", tc.to, allErr)
+			}
+
+			for limit := 1; limit <= len(all)+1; limit++ {
+				var paged []Relationship
+
+				var after NodeID
+
+				hasAfter := false
+
+				for {
+					page, pageErr := r.findIncomingAfter(tc.to, after, hasAfter, limit)
+					if pageErr != nil {
+						t.Fatalf("findIncomingAfter() with limit %d: %v", limit, pageErr)
+					}
+					paged = append(paged, page...)
+
+					if len(page) < limit {
+						break
+					}
+
+					after = page[len(page)-1].From
+					hasAfter = true
+				}
+
+				if !reflect.DeepEqual(paged, all) {
+					t.Fatalf("paging with limit %d gave %v, want %v", limit, paged, all)
+				}
+			}
+
+			huge, hugeErr := r.findIncomingAfter(tc.to, 0, false, maxLimit)
+			if hugeErr != nil {
+				t.Fatalf("findIncomingAfter() with the largest possible limit: %v", hugeErr)
+			}
+			if !reflect.DeepEqual(huge, all) {
+				t.Fatalf("findIncomingAfter() with the largest possible limit = %v, want %v", huge, all)
+			}
+		})
+	}
+}
+
+// TestRootReaderFindIncomingAfterReportsUnsupportedOverNonPagingBackend:
+// over a backend that cannot page, the overlay must say so, and the
+// iterator must then fall back to one full read and still be right.
+func TestRootReaderFindIncomingAfterReportsUnsupportedOverNonPagingBackend(t *testing.T) {
+	var g Graph
+
+	root := newTestNode(t, &g)
+	a := newTestNode(t, &g)
+	hub := newTestNode(t, &g)
+
+	if _, addErr := g.AddRelationship(a, hub); addErr != nil {
+		t.Fatalf("AddRelationship(a, hub): %v", addErr)
+	}
+
+	r, err := NewRootGraph(&g, root)
+	if err != nil {
+		t.Fatalf("NewRootGraph(): %v", err)
+	}
+
+	if _, pageErr := r.findIncomingAfter(hub, 0, false, 2); !errors.Is(pageErr, errPagingUnsupported) {
+		t.Fatalf("findIncomingAfter() error = %v, want %v", pageErr, errPagingUnsupported)
+	}
+
+	want, err := r.FindIncoming(hub)
+	if err != nil {
+		t.Fatalf("FindIncoming(hub): %v", err)
+	}
+
+	if got := collectPages(t, incomingPages(r, hub, 1)); !reflect.DeepEqual(got, want) {
+		t.Fatalf("incomingPages(hub) = %v, want %v", got, want)
+	}
+}
+
+// TestRootReaderFindIncomingAfterWithoutRootNodeHasNoVirtualParent: with
+// ROOT deleted through the raw graph the overlay adds nothing virtual (the
+// same answer as FindIncoming), and a missing target is still
+// ErrNodeNotFound.
+func TestRootReaderFindIncomingAfterWithoutRootNodeHasNoVirtualParent(t *testing.T) {
+	g := newBoltTestGraph(t)
+
+	root := mustCreateNode(t, g)
+	a := mustCreateNode(t, g)
+	hub := mustCreateNode(t, g)
+
+	if _, addErr := g.AddRelationship(a, hub); addErr != nil {
+		t.Fatalf("AddRelationship(a, hub): %v", addErr)
+	}
+
+	r, err := NewRootGraph(g, root)
+	if err != nil {
+		t.Fatalf("NewRootGraph(): %v", err)
+	}
+
+	// Deleted through the underlying graph, bypassing RootGraph's
+	// ErrCannotDeleteRoot protection.
+	if deleteErr := g.DeleteNode(root); deleteErr != nil {
+		t.Fatalf("raw DeleteNode(ROOT): %v", deleteErr)
+	}
+
+	got, err := r.findIncomingAfter(hub, 0, false, 5)
+	if err != nil {
+		t.Fatalf("findIncomingAfter(): %v", err)
+	}
+	if want := []Relationship{{From: a, To: hub}}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("findIncomingAfter() = %v, want %v", got, want)
+	}
+
+	const missing NodeID = 999999
+
+	if _, pageErr := r.findIncomingAfter(missing, 0, false, 5); !errors.Is(pageErr, ErrNodeNotFound) {
+		t.Fatalf("findIncomingAfter(missing) error = %v, want %v", pageErr, ErrNodeNotFound)
+	}
+}
+
+// TestRootGraphInsideGraphActorPagesIncomingNatively checks the production
+// stack: the actor forwards to the RootGraph, whose promoted
+// findIncomingAfter now pages natively over the BoltGraph underneath, so
+// the first page must not report errPagingUnsupported.
+func TestRootGraphInsideGraphActorPagesIncomingNatively(t *testing.T) {
+	g := newBoltTestGraph(t)
+
+	root := mustCreateNode(t, g)
+	a := mustCreateNode(t, g)
+	b := mustCreateNode(t, g)
+	hub := mustCreateNode(t, g)
+
+	rootGraph, err := NewRootGraph(g, root)
+	if err != nil {
+		t.Fatalf("NewRootGraph(): %v", err)
+	}
+
+	actor := NewGraphActor(rootGraph)
+	defer actor.Close()
+
+	for _, from := range []NodeID{a, b} {
+		if _, addErr := addRelationshipVia(actor, from, hub); addErr != nil {
+			t.Fatalf("AddRelationship(%d, hub): %v", from, addErr)
+		}
+	}
+
+	if _, pageErr := actor.findIncomingAfter(hub, 0, false, 1); pageErr != nil {
+		t.Fatalf("findIncomingAfter() through the actor: %v (want native paging)", pageErr)
+	}
+
+	want, err := actor.FindIncoming(hub)
+	if err != nil {
+		t.Fatalf("FindIncoming(hub): %v", err)
+	}
+
+	for limit := 1; limit <= len(want)+1; limit++ {
+		if got := collectPages(t, incomingPages(actor, hub, limit)); !reflect.DeepEqual(got, want) {
+			t.Fatalf("incomingPages(limit %d) = %v, want %v", limit, got, want)
+		}
+	}
+}
