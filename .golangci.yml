@@ -3,6 +3,8 @@ version: "2"
 run:
   timeout: 5m
   tests: true
+  build-tags:
+    - portmasterFirewalled
   # 'skip-dirs-use-default' was removed here. Default excludes are now handled automatically.
 
 # In v2, custom severity rules belong in this top-level block

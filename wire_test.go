@@ -30,11 +30,13 @@ import (
 	"time"
 )
 
-// wireRig is a Host served over loopback TCP, so these tests run on any OS.
+// wireRig is a Host served over in-memory pipes (net.Pipe), so these tests
+// need no network and therefore no firewall exception, on any OS. The one test
+// that uses a real TCP socket is TestFWNeededWireOverLoopbackTCP, behind the
+// portmasterFirewalled build tag (wire_firewalled_test.go).
 type wireRig struct {
 	host   *Host
 	server *WireServer
-	addr   string
 }
 
 func newWireRig(t *testing.T, mutate func(cfg *HostConfig)) *wireRig {
@@ -43,42 +45,49 @@ func newWireRig(t *testing.T, mutate func(cfg *HostConfig)) *wireRig {
 	h := openTestHost(t, boltTestPath(t), mutate)
 	server := NewWireServer(h)
 
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("Listen(): %v", err)
-	}
-
-	served := make(chan error, 1)
-
-	go func() { served <- server.Serve(listener) }()
-
 	// Registered after the host's own cleanup, so it runs first.
 	t.Cleanup(func() {
 		if closeErr := server.Close(); closeErr != nil {
 			t.Errorf("server Close(): %v", closeErr)
 		}
-
-		if serveErr := <-served; serveErr != nil && !errors.Is(serveErr, ErrWireServerClosed) {
-			t.Errorf("Serve(): %v", serveErr)
-		}
 	})
 
-	return &wireRig{host: h, server: server, addr: listener.Addr().String()}
+	return &wireRig{host: h, server: server}
 }
 
 func (r *wireRig) dial(t *testing.T) *WireClient {
 	t.Helper()
 
-	ctx := hostTestContext(t)
+	return startWireClient(t, serveInMemory(t, r.server))
+}
 
-	var dialer net.Dialer
+// serveInMemory serves one in-memory connection on server and returns the
+// client side. It is closed, and the handler awaited, when the test ends.
+func serveInMemory(t *testing.T, server *WireServer) net.Conn {
+	t.Helper()
 
-	nc, err := dialer.DialContext(ctx, "tcp", r.addr)
-	if err != nil {
-		t.Fatalf("DialContext(): %v", err)
-	}
+	clientSide, serverSide := net.Pipe()
+	done := make(chan struct{})
 
-	client, err := NewWireClient(ctx, nc)
+	go func() {
+		defer close(done)
+		server.ServeConn(serverSide)
+	}()
+
+	t.Cleanup(func() {
+		closeQuietly(clientSide)
+		<-done
+	})
+
+	return clientSide
+}
+
+// startWireClient performs the wire handshake over nc and closes the client
+// (gracefully) when the test ends. It works over any net.Conn.
+func startWireClient(t *testing.T, nc net.Conn) *WireClient {
+	t.Helper()
+
+	client, err := NewWireClient(hostTestContext(t), nc)
 	if err != nil {
 		t.Fatalf("NewWireClient(): %v", err)
 	}
@@ -96,18 +105,7 @@ func (r *wireRig) dial(t *testing.T) *WireClient {
 func newRawWirePeer(t *testing.T, server *WireServer) (net.Conn, *bufio.Reader) {
 	t.Helper()
 
-	clientSide, serverSide := net.Pipe()
-	done := make(chan struct{})
-
-	go func() {
-		defer close(done)
-		server.ServeConn(serverSide)
-	}()
-
-	t.Cleanup(func() {
-		closeQuietly(clientSide)
-		<-done
-	})
+	clientSide := serveInMemory(t, server)
 
 	return clientSide, bufio.NewReader(clientSide)
 }

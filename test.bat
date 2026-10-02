@@ -24,7 +24,25 @@ if errorlevel 1 (
 )
 
 go test -race ./...
-echo Tests succeeded.
+if errorlevel 1 goto :fail
+echo Those tests succeeded.
+
+echo Compiling firewall-requiring ^(ie. Portmaster-ready^) test binary...
+rem The tag includes wire_firewalled_test.go, which the run above does not compile.
+go test -race -c -tags portmasterFirewalled -o dml_fw_test.exe .
+if errorlevel 1 (
+    echo Compilation failed.
+    goto :fail
+)
+
+echo Running only the firewall-requiring ^(loopback TCP^) tests...
+.\dml_fw_test.exe -test.run "^TestFWNeeded"
+if errorlevel 1 (
+    echo You will have to allow "127.0.0.1 tcp/49152-65535" in firewall ^(eg. Portmaster^), both IN and OUT, for dml_fw_test.exe for these tests to pass
+    goto :fail
+)
+
+echo All tests succeeded.
 pause
 goto :eof
 
