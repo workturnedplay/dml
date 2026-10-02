@@ -38,6 +38,7 @@ import (
 	"time"
 
 	bolt "go.etcd.io/bbolt"
+	berrors "go.etcd.io/bbolt/errors"
 )
 
 type NodeID uint64
@@ -3008,7 +3009,7 @@ func finishBoltOpen(path string, res boltOpenResult) (*bolt.DB, error) {
 	switch {
 	case res.err == nil:
 		return res.db, nil
-	case errors.Is(res.err, bolt.ErrTimeout):
+	case errors.Is(res.err, berrors.ErrTimeout):
 		return nil, fmt.Errorf("%w: %s: %w", ErrStoreLocked, path, res.err)
 	default:
 		return nil, fmt.Errorf("bolt: opening %s: %w", path, res.err)
@@ -5162,6 +5163,15 @@ func wrapInterfaceErr(err error) error {
 		return nil
 	}
 	return fmt.Errorf("%w", err)
+}
+
+// joinErrors is errors.Join with its result passed through
+// wrapInterfaceErr, so wrapcheck does not flag the "unwrapped error from an
+// external package". Nil errors are dropped, and if every error is nil the
+// result is nil. errors.Is/errors.As still see every joined error, and the
+// message is unchanged.
+func joinErrors(errs ...error) error {
+	return wrapInterfaceErr(errors.Join(errs...))
 }
 
 // transactValue runs step as one Transact call on graph and returns its
@@ -11421,11 +11431,9 @@ func OpenHost(cfg HostConfig) (*Host, error) {
 
 	h, startErr := startHost(cfg, store)
 	if startErr != nil {
-		if closeErr := store.Close(); closeErr != nil {
-			return nil, errors.Join(startErr, closeErr)
-		}
-
-		return nil, startErr
+		// store.Close() returns nil on success, and joinErrors drops nils,
+		// so this is just startErr unless closing failed too.
+		return nil, joinErrors(startErr, store.Close())
 	}
 
 	return h, nil
@@ -11595,7 +11603,7 @@ func (h *Host) Close() error {
 	h.actor.Close()
 	errs = append(errs, h.store.Close())
 
-	return errors.Join(errs...)
+	return joinErrors(errs...)
 }
 
 // shutdownConns drops every remaining connection and retries every session
@@ -11607,7 +11615,7 @@ func (h *Host) shutdownConns() []error {
 	pending := slices.Collect(maps.Keys(h.closing))
 	h.mu.Unlock()
 
-	var errs []error
+	errs := make([]error, 0, len(conns)+len(pending))
 
 	for _, c := range conns {
 		c.markDone()
