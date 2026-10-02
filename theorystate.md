@@ -3804,11 +3804,45 @@ background context, waits for the reconciler, reaper and in-flight
 operations, closes every session, runs the final reconcile pass, then closes
 the actor and the store. Waiters wake with `ErrHostClosed`.
 
-**Still OPEN.** The wire transport and authentication (only the `Client`
-shape is fixed); production `Effect` implementations (the example firewall
+**Still OPEN.** Production `Effect` implementations (the example firewall
 rule is a fake in the tests); per-resource dirty tracking, since every wake
-reads every resource; a keepalive helper for clients that wait longer than
-the TTL; and how hosts on different machines coordinate (Part C).
+reads every resource; and how hosts on different machines coordinate (Part
+C). The wire transport and the keepalive helper are §113.
+
+---
+
+## 113. The wire transport of the Client interface (TENTATIVE, implemented)
+
+§107 fixed that other processes ask the owner to perform named operations,
+and §112 fixed the `Client` shape. This is its first transport.
+
+**DECIDED.**
+- Requests are multiplexed on one connection by numeric ID. `WaitApplied`
+  blocks, and a client waiting on one resource must still be able to release
+  another, so one in-flight request per connection was rejected, as was one
+  connection per call (it would lose the session identity).
+- Encoding is length-prefixed JSON: debuggable, no Go-only dependency, and
+  stable error codes. The first frame is a hello with the protocol version;
+  its reply carries the host's keepalive TTL so the client library heartbeats
+  at TTL/3 without being configured twice.
+- Cancelling a request (a client `ctx` ending) is a `cancel` frame for that
+  request, never a disconnect. A disconnect ends the session (§111), so
+  treating a timed-out wait as one would release every hold of the client.
+- Errors cross as stable codes mapped to the package's sentinels, so
+  `errors.Is` works on the client. An unknown code becomes `ErrRemote`, so
+  the host can add codes without breaking older clients.
+- One connection is one session, and any disconnect releases it: no resume
+  tokens. A resume window would keep a crashed holder's effect alive, which
+  is exactly what §111 exists to prevent.
+- Authorization is the transport's own: on Windows, the named pipe's DACL
+  decides who may connect (default: current user and SYSTEM, network logons
+  denied). The heartbeat proves the process is alive, not that its logic is
+  making progress.
+
+**OPEN.** Per-resource authorization (needs the peer's identity, for example
+the pipe client's SID, and a policy), transports beyond named pipes and
+loopback TCP (TLS), and how an error crosses when §89c's transaction
+descriptors exist.
 
 ---
 
@@ -4088,9 +4122,9 @@ kept current as sections above resolve or split further.)*
   to the durable commit; the `NameRegistry` storage seam (§103); paged and
   iterator reads (§105), including the call-site grep. §98 is moot under
   §107, and §99 is answered by §104.
-- The network transport of the `Client` interface, authentication and error
-  transport, production `Effect` implementations, and how hosts on different
-  machines coordinate (§107, §112, Part C).
+- Production `Effect` implementations, per-resource authorization and
+  transports beyond named pipes and loopback TCP (§113), and how hosts on
+  different machines coordinate (§107, §112, Part C).
 - Whether to build a harness that automatically re-runs the existing
   registry test suite against both *Graph and stagedGraph, versus
   writing portability tests by hand as needed; and whether stagedGraph

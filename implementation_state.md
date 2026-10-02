@@ -2016,6 +2016,40 @@ could be called directly.
  authentication, production Effect implementations, per-resource dirty
  tracking.
 
+49. Wire transport for the Client interface (theorystate.md section 113),
+ in new files because of a build tag: wire.go and wire_test.go
+ (platform-neutral), pipe_windows.go and pipe_windows_test.go (Windows).
+ WireServer serves a Host over any net.Listener/net.Conn (Serve, ServeConn,
+ Close); WireClient implements Client over a net.Conn (NewWireClient).
+ Framing is a 4-byte length plus JSON (wireMaxFrame 1 MiB). The first frame
+ is a hello carrying the protocol version; the reply carries the host's
+ KeepaliveTTL, and the client then heartbeats every TTL/3 automatically.
+ Requests carry IDs and are answered out of order, so requests are
+ multiplexed (up to wireMaxInFlight per connection, else ErrWireBusy). A
+ client whose ctx ends sends a cancel frame for that one request and keeps
+ the connection and hold; it waits briefly for the host's answer so the last
+ effect error is not lost. Close is a close frame answered after the
+ session's holds are released. Errors cross as stable codes (wireErrorTable);
+ the client rebuilds a *RemoteError whose Unwrap is the sentinel, or
+ ErrRemote for an unknown code. One connection is one session, ended by any
+ disconnect; there is no resume. The server closes the transport when the
+ host ends the connection (keepalive expiry, shutdown). Both sides write
+ through a watchdog (writeWireFrameWithin) so a peer that stops reading
+ cannot hold a writer. Windows: ListenPipe/DialPipe/PipePath over go-winio
+ (byte mode); DefaultPipeSecurity is a protected DACL denying network
+ logons, then allowing the current user and SYSTEM. Covered by
+ TestWireManyHoldersApplyOnceAndRemoveOnce, TestWireErrorsKeepTheirIdentity,
+ TestWireWaitAppliedCancelKeepsTheConnectionAndReportsTheLastEffectError,
+ TestWireCloseReleasesHoldsBeforeReturning,
+ TestWireDroppedConnectionReleasesTheSession,
+ TestWireClientHeartbeatKeepsAnIdleConnectionAliveAcrossTheTTL,
+ TestWireSilentRawPeerIsExpiredAndDisconnected,
+ TestWireHandshakeRejectsWrongVersionAndMissingHello,
+ TestWireFrameRoundTripAndLimits,
+ TestDefaultPipeSecurityNamesTheCurrentUserAndDeniesNetworkLogons and
+ TestPipeEndToEnd. Not done: per-resource authorization beyond the pipe's
+ DACL, a production Effect, other transports, TLS.
+
 Currently unaddressed yet:
 - Paged reads beyond a single node's own outgoing/incoming edges
   (theorystate.md section 105, items 43/46): FindRelationships and
@@ -2023,9 +2057,9 @@ Currently unaddressed yet:
   are ListRegistry.validateStructure's and CompositeSetRegistry's own
   full-child-set reads. (The GraphReader methods that lacked error
   results now have them; see ErrGraphStoreUnavailable.)
-- The network transport and authentication of the Client interface, and
-  production Effect implementations (theorystate.md sections 107, 112; the
-  in-process Host is item 48).
+- Production Effect implementations, transports other than the named pipe
+  (item 49), and per-client authorization beyond the pipe's DACL
+  (theorystate.md sections 107, 112, 113).
 - Nested transactions as a production-backend feature are also realized
   on BoltGraph (item 40), via the same shared txLog (undo log, commit
   and rollback hooks, savepoints) mechanism Txn already uses -- not a
