@@ -1815,7 +1815,10 @@ could be called directly.
  TestBoltGraphStartupSequence. The benchmark now uses b.Loop.
  Measurements are recorded in theorystate.md section 108.
 
-43. Paged reads for one node's own outgoing/incoming relationships
+43. [Partly superseded by items 44 and 46: the stateless helpers, the
+ "rootReader implements only outgoingPager" decision and the GraphActor
+ paging claim below were corrected there.] Paged reads for one node's own
+ outgoing/incoming relationships
  (theorystate.md section 105), mirroring item 42's node paging. Added
  outgoingPager/incomingPager (findOutgoingAfter/findIncomingAfter),
  implemented on BoltGraph's boltView with a cursor over the out/in
@@ -2012,9 +2015,9 @@ could be called directly.
  TestHostRemovesStaleEffectLeftByAPreviousRun,
  TestHostOperationsFailLoudly,
  TestHostCloseRemovesEffectsAndRejectsFurtherWork and
- TestHostRestartSweepsSessionsAndKeepsNames. Not done: network transport,
- authentication, production Effect implementations, per-resource dirty
- tracking.
+ TestHostRestartSweepsSessionsAndKeepsNames. (Network transport is item 49 and
+ per-resource dirty tracking is item 50. Production Effect implementations
+ are not dml's, theorystate.md section 112.)
 
 49. Wire transport for the Client interface (theorystate.md section 113),
  in new files because of a build tag: wire.go and wire_test.go
@@ -2048,7 +2051,8 @@ could be called directly.
  TestWireFrameRoundTripAndLimits,
  TestDefaultPipeSecurityNamesTheCurrentUserAndDeniesNetworkLogons and
  TestPipeEndToEnd. Not done: per-resource authorization beyond the pipe's
- DACL, a production Effect, other transports, TLS.
+ DACL, other transports, TLS. (A production Effect is not dml's,
+ theorystate.md section 112.)
 
 50. Reconciler dirty tracking, and the in-flight limit test. The reconciler
  no longer reads every resource on every wake (this closes the "per-resource
@@ -2073,6 +2077,18 @@ could be called directly.
  wireMaxInFlight get ErrWireBusy, the rest are cancelled cleanly, and the
  connection and the hold survive).
 
+51. Documentation hygiene and scope (theorystate.md sections 94, 98, 99,
+ 111, 112). Section 94 is marked historical (etcd withdrawn), sections
+ 98/99 are marked moot or answered, and the stale OPEN entries for them and
+ for the finished bbolt spike were removed from Part D. Item 43 is marked
+ partly superseded. Recorded as DECIDED that dml owns only the generic
+ mechanism (sessions, holds, the Effect contract, the reconciler, the
+ transport): no production Effect implementations, no consumer vocabulary,
+ and no sweep hook for effects left by a crash. Recorded as a known gap
+ (fix next): effect calls have no per-call deadline. Test and comment
+ wording that suggested a specific consumer was neutralized. No behavior
+ change.
+
 Currently unaddressed yet:
 - Paged reads beyond a single node's own outgoing/incoming edges
   (theorystate.md section 105, items 43/46): FindRelationships and
@@ -2080,9 +2096,13 @@ Currently unaddressed yet:
   are ListRegistry.validateStructure's and CompositeSetRegistry's own
   full-child-set reads. (The GraphReader methods that lacked error
   results now have them; see ErrGraphStoreUnavailable.)
-- Production Effect implementations, transports other than the named pipe
-  (item 49), and per-client authorization beyond the pipe's DACL
-  (theorystate.md sections 107, 112, 113).
+- Transports other than the named pipe (item 49) and per-client
+  authorization beyond the pipe's DACL (theorystate.md sections 107, 112,
+  113). Production Effect implementations are deliberately not dml's
+  (theorystate.md section 112).
+- Effect calls have no per-call deadline: one hung Present/Apply/Remove
+  stalls the single reconciler goroutine and Close. To be fixed next with
+  HostConfig.EffectTimeout (theorystate.md section 112).
 - Nested transactions as a production-backend feature are also realized
   on BoltGraph (item 40), via the same shared txLog (undo log, commit
   and rollback hooks, savepoints) mechanism Txn already uses -- not a

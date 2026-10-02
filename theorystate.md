@@ -2869,6 +2869,11 @@ load time belongs with any persistence work.
 
 ## PART G — PERSISTENCE AND NETWORKED BACKENDS (new this session)
 
+> **Reading note (this revision).** The etcd framing below is historical:
+> etcd was withdrawn (§100), and §98/§99 are moot under the single-owner
+> decision (§107). What is current is §100–§113. §93–§97 remain valid
+> backend-neutral design material.
+
 This part resumes Part F's storage-backend discussion (§87-92) with a
 concrete second backend in mind — an etcd-backed `GraphStore` — used
 throughout as the running example specifically because it is the hard
@@ -2929,7 +2934,13 @@ prohibition is scoped to a *persistent, cross-attempt* mirror of the
 whole graph, never to a per-attempt buffer bounded by the size of one
 transaction.
 
-## 94. etcd-backed GraphStore — concrete design surface (OPEN; etcd withdrawn as the leading candidate, see §100)
+## 94. etcd-backed GraphStore — concrete design surface (HISTORICAL: etcd withdrawn, §100)
+
+**Status.** Kept as design material for any CAS-style backend, not as a plan.
+§94a (key layout), §94b (durable ID counter) and §94c (buffer, then commit)
+remain valid for such a backend. §94d is §95, and §94e is the §89c
+analysis. Nothing here is implemented; the disk backend is BoltGraph
+(§108–§110).
 
 Five sub-questions, each answerable largely by reusing a decision already
 made elsewhere in this document for a different reason:
@@ -3181,7 +3192,7 @@ that redesign is worth the churn versus simply documenting single-writer-
 for-bootstrap as an accepted constraint (mirroring how §38 accepted
 permanent global-discovery limits rather than solving them).
 
-## 99. Load-time reconciliation is backend-relative (extends the existing "run every Checker" note)
+## 99. Load-time reconciliation is backend-relative (answered by §104 and §110; the etcd framing is moot under §107)
 
 `implementation_state.md`'s own "Currently unaddressed yet" list already
 anticipates, for the in-memory backend specifically, that restoring a
@@ -3690,9 +3701,9 @@ commit-time Checkers. `CheckStore` is O(store).
 ## 111. Sessions and holds: reference counting that knows who holds (TENTATIVE, implemented)
 
 **Motivation (a worked example).** Several independent clients each want
-the same shared, externally-effective thing for a while (a temporary
-firewall rule), and it must be set up once and torn down once no matter
-how many want it, even if some of them die. A counter cannot do this: it
+the same shared, externally-effective thing for a while (for example a
+temporary rule in some other system), and it must be set up once and torn
+down once no matter how many want it, even if some of them die. A counter cannot do this: it
 cannot say *who* is missing a decrement, so a crashed client leaves it
 stuck forever.
 
@@ -3809,9 +3820,30 @@ background context, waits for the reconciler, reaper and in-flight
 operations, closes every session, runs the final reconcile pass, then closes
 the actor and the store. Waiters wake with `ErrHostClosed`.
 
-**Still OPEN.** Production `Effect` implementations (the example firewall
-rule is a fake in the tests), and how hosts on different machines
-coordinate (Part C). The wire transport and the keepalive helper are §113.
+**DECIDED — what dml owns and what it does not.** dml provides the generic
+mechanism: sessions and holds (§111), the `Effect` contract, the reconciler,
+and the transport. It does not provide production `Effect` implementations,
+and consumer-specific vocabulary (names for particular rules, hosts or
+programs) never enters dml. A consumer implements `Effect` itself, or
+builds whatever structure it needs in-graph from the existing registries
+(sets, pointers, lists, domains). The `Effect` in the tests is a fake, and
+no production one is planned here.
+
+**Crash leftovers are the implementer's concern.** For a registered
+resource the reconciler already repairs a leftover effect at startup,
+because `Present` reports real state and the resource is marked dirty on
+registration. An effect whose resource is never registered again is
+invisible to dml. An implementation that can enumerate what it created
+should clean that up itself before registering. dml gets no sweep hook.
+
+**Known gap, to be fixed next (not deferred for lack of a caller, §7b).**
+Effect calls run with no per-call deadline. The reconciler is one
+goroutine, so a hung `Present`/`Apply`/`Remove` stalls every resource, and
+`Close` waits for it. The fix is a `HostConfig.EffectTimeout` applied to
+each call and reported as an ordinary effect error, retried like any other.
+
+**Still OPEN.** How hosts on different machines coordinate (Part C). The
+wire transport and the keepalive helper are §113.
 
 ---
 
@@ -4019,6 +4051,9 @@ kept current as sections above resolve or split further.)*
 - "Applied" is a numbered-pass handshake: `Acquire` returns a mark,
   `WaitApplied` waits for a later completed pass with the effect present;
   teardown has a grace period (§112).
+- dml owns the generic mechanism (sessions, holds, the `Effect` contract,
+  the reconciler, the transport) and no consumer vocabulary or production
+  `Effect`; consumers build those themselves, in-graph where they can (§112).
 
 ### TENTATIVE
 - bbolt as the first persistent-backend spike, with the layout and
@@ -4120,28 +4155,21 @@ kept current as sections above resolve or split further.)*
   arbitration, or a bounded-retry escape hatch to full serialization —
   for preventing livelock/starvation among repeatedly-conflicting
   optimistic retries (§89c).
-- Persistent backend (§100-§102): whether bbolt survives the spike
-  (registry portability, Windows file growth, commit latency), and if not,
-  Badger next; savepoints via an undo log; `OnCommit` hook timing relative
-  to the durable commit; the `NameRegistry` storage seam (§103); paged and
-  iterator reads (§105), including the call-site grep. §98 is moot under
-  §107, and §99 is answered by §104.
-- Production `Effect` implementations, per-resource authorization and
-  transports beyond named pipes and loopback TCP (§113), and how hosts on
-  different machines coordinate (§107, §112, Part C).
+- Persistent backend (§100–§110): the bbolt spike is built and measured
+  (§108–§110). Remaining: whether about 3 ms per commit is acceptable for
+  the real workload, Badger as the fallback if write parallelism is ever
+  needed, and the reads still unbounded in §105. §98 is moot under §107,
+  and §99 is answered by §104 and §110.
+- Per-resource authorization and transports beyond named pipes and
+  loopback TCP (§113), and how hosts on different machines coordinate
+  (§107, §112, Part C). Production `Effect` implementations are not
+  dml's (§112).
 - Whether to build a harness that automatically re-runs the existing
   registry test suite against both *Graph and stagedGraph, versus
   writing portability tests by hand as needed; and whether stagedGraph
   should ever gain real (rather than externally forced) conflict
   detection (§97).
-- How NameRegistry bindings should be arbitrated once more than one
-  process shares a single persistent backend — representing bindings as
-  ordinary graph structure versus accepting single-writer-for-bootstrap
-  as a documented constraint (§98).
-- Whether an etcd-backed backend needs a process-start "verify everything
-  currently stored" pass analogous to the in-memory backend's already-
-  anticipated load-time Checker pass, or whether on-read fail-loud
-  validation is sufficient (§99).
+- Effect calls have no per-call deadline (§112); to be fixed next.
 
 ### REJECTED FOR NOW
 - Giving primitive relationships their own NodeIDs.

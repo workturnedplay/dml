@@ -41,7 +41,7 @@ func TestPipeEndToEnd(t *testing.T) {
 	ctx := hostTestContext(t)
 	h := openTestHost(t, boltTestPath(t), nil)
 	fw := &fakeEffect{}
-	registerTestResource(t, h, "dns-out", fw)
+	registerTestResource(t, h, "example-resource", fw)
 
 	server := NewWireServer(h)
 	path := PipePath(fmt.Sprintf("dml-test-%d", time.Now().UnixNano()))
@@ -76,13 +76,13 @@ func TestPipeEndToEnd(t *testing.T) {
 		}
 	})
 
-	if acquireErr := AcquireAndWait(ctx, client, "dns-out"); acquireErr != nil {
+	if acquireErr := AcquireAndWait(ctx, client, "example-resource"); acquireErr != nil {
 		t.Fatalf("AcquireAndWait(): %v", acquireErr)
 	}
 
 	requireEffectCounts(t, fw, 1, 0, true)
 
-	if last, releaseErr := client.Release(ctx, "dns-out"); releaseErr != nil || !last {
+	if last, releaseErr := client.Release(ctx, "example-resource"); releaseErr != nil || !last {
 		t.Fatalf("Release() = (%v,%v), want last=true", last, releaseErr)
 	}
 

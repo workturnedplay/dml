@@ -17429,7 +17429,7 @@ func newActorLeaseRig(t *testing.T) (*GraphActor, *SetRegistry, *LeaseRegistry) 
 }
 
 // TestGraphActorConcurrentLeasesReportExactlyOneFirstAndOneLast is the
-// "ten processes want the temporary DNS rule" scenario: however the
+// "ten processes want the same temporary resource" scenario: however the
 // goroutines interleave, exactly one acquire sees the 0 -> 1 transition
 // (so the effect is requested once) and exactly one release sees 1 -> 0.
 func TestGraphActorConcurrentLeasesReportExactlyOneFirstAndOneLast(t *testing.T) {
@@ -17670,9 +17670,9 @@ func TestOpenBoltGraphFailsFastWhenStoreIsAlreadyOpen(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------
-// Host (theorystate.md section 112). The driving consumer is a temporary
-// firewall rule that many processes want at once; fakeEffect stands in for
-// the real thing.
+// Host (theorystate.md section 112). The driving scenario is one external
+// effect that many processes want at once; fakeEffect stands in for it,
+// and no production Effect lives in dml.
 
 var errFakeEffect = errors.New("fake effect failure")
 
@@ -17855,7 +17855,7 @@ func TestHostManyHoldersApplyOnceAndRemoveOnce(t *testing.T) {
 	ctx := hostTestContext(t)
 	h := openTestHost(t, boltTestPath(t), nil)
 	fw := &fakeEffect{}
-	registerTestResource(t, h, "dns-out", fw)
+	registerTestResource(t, h, "example-resource", fw)
 
 	const clients = 10
 
@@ -17866,7 +17866,7 @@ func TestHostManyHoldersApplyOnceAndRemoveOnce(t *testing.T) {
 
 	errs := make([]error, clients)
 
-	runConcurrently(clients, func(i int) { errs[i] = AcquireAndWait(ctx, conns[i], "dns-out") })
+	runConcurrently(clients, func(i int) { errs[i] = AcquireAndWait(ctx, conns[i], "example-resource") })
 
 	for i, acquireErr := range errs {
 		if acquireErr != nil {
@@ -17876,7 +17876,7 @@ func TestHostManyHoldersApplyOnceAndRemoveOnce(t *testing.T) {
 
 	requireEffectCounts(t, fw, 1, 0, true)
 
-	runConcurrently(clients, func(i int) { _, errs[i] = conns[i].Release(ctx, "dns-out") })
+	runConcurrently(clients, func(i int) { _, errs[i] = conns[i].Release(ctx, "example-resource") })
 
 	for i, releaseErr := range errs {
 		if releaseErr != nil {
@@ -17899,7 +17899,7 @@ func TestHostCrashedHolderIsReleasedByConnectionDrop(t *testing.T) {
 	ctx := hostTestContext(t)
 	h := openTestHost(t, boltTestPath(t), nil)
 	fw := &fakeEffect{}
-	registerTestResource(t, h, "dns-out", fw)
+	registerTestResource(t, h, "example-resource", fw)
 
 	crashCtx, crash := context.WithCancel(context.Background())
 	defer crash()
@@ -17917,13 +17917,13 @@ func TestHostCrashedHolderIsReleasedByConnectionDrop(t *testing.T) {
 	}
 
 	for _, c := range append([]*Conn{crashed}, conns...) {
-		if acquireErr := AcquireAndWait(ctx, c, "dns-out"); acquireErr != nil {
+		if acquireErr := AcquireAndWait(ctx, c, "example-resource"); acquireErr != nil {
 			t.Fatalf("AcquireAndWait(): %v", acquireErr)
 		}
 	}
 
 	for i, c := range conns {
-		if _, releaseErr := c.Release(ctx, "dns-out"); releaseErr != nil {
+		if _, releaseErr := c.Release(ctx, "example-resource"); releaseErr != nil {
 			t.Fatalf("survivor %d: Release(): %v", i, releaseErr)
 		}
 	}
@@ -17947,7 +17947,7 @@ func TestHostCrashedHolderIsReleasedByConnectionDrop(t *testing.T) {
 
 	requireEffectCounts(t, fw, 1, 1, false)
 
-	if _, releaseErr := crashed.Release(ctx, "dns-out"); !errors.Is(releaseErr, ErrConnClosed) {
+	if _, releaseErr := crashed.Release(ctx, "example-resource"); !errors.Is(releaseErr, ErrConnClosed) {
 		t.Fatalf("Release() on a dropped connection error = %v, want %v", releaseErr, ErrConnClosed)
 	}
 }
@@ -17957,12 +17957,12 @@ func TestHostKeepaliveTTLExpiresSilentConnectionsOnly(t *testing.T) {
 	h := openTestHost(t, boltTestPath(t), func(cfg *HostConfig) { cfg.KeepaliveTTL = 500 * time.Millisecond })
 
 	fw := &fakeEffect{}
-	registerTestResource(t, h, "dns-out", fw)
+	registerTestResource(t, h, "example-resource", fw)
 
 	silent := connectTest(t, h)
 	alive := connectTest(t, h)
 
-	if err := AcquireAndWait(ctx, silent, "dns-out"); err != nil {
+	if err := AcquireAndWait(ctx, silent, "example-resource"); err != nil {
 		t.Fatalf("silent: AcquireAndWait(): %v", err)
 	}
 
@@ -17993,7 +17993,7 @@ func TestHostKeepaliveTTLExpiresSilentConnectionsOnly(t *testing.T) {
 		return !present
 	})
 
-	if _, err := silent.Acquire(ctx, "dns-out"); !errors.Is(err, ErrConnClosed) {
+	if _, err := silent.Acquire(ctx, "example-resource"); !errors.Is(err, ErrConnClosed) {
 		t.Fatalf("Acquire() on an expired connection error = %v, want %v", err, ErrConnClosed)
 	}
 }
@@ -18003,25 +18003,25 @@ func TestHostReacquireWithinGraceNeverRemovesTheEffect(t *testing.T) {
 	h := openTestHost(t, boltTestPath(t), func(cfg *HostConfig) { cfg.TeardownGrace = 700 * time.Millisecond })
 
 	fw := &fakeEffect{}
-	registerTestResource(t, h, "dns-out", fw)
+	registerTestResource(t, h, "example-resource", fw)
 
 	first := connectTest(t, h)
-	if err := AcquireAndWait(ctx, first, "dns-out"); err != nil {
+	if err := AcquireAndWait(ctx, first, "example-resource"); err != nil {
 		t.Fatalf("first: AcquireAndWait(): %v", err)
 	}
 
-	if _, err := first.Release(ctx, "dns-out"); err != nil {
+	if _, err := first.Release(ctx, "example-resource"); err != nil {
 		t.Fatalf("first: Release(): %v", err)
 	}
 
 	second := connectTest(t, h)
-	if err := AcquireAndWait(ctx, second, "dns-out"); err != nil {
+	if err := AcquireAndWait(ctx, second, "example-resource"); err != nil {
 		t.Fatalf("second: AcquireAndWait(): %v", err)
 	}
 
 	requireEffectCounts(t, fw, 1, 0, true)
 
-	if _, err := second.Release(ctx, "dns-out"); err != nil {
+	if _, err := second.Release(ctx, "example-resource"); err != nil {
 		t.Fatalf("second: Release(): %v", err)
 	}
 
@@ -18075,9 +18075,9 @@ func TestHostRemovesStaleEffectLeftByAPreviousRun(t *testing.T) {
 func TestHostOperationsFailLoudly(t *testing.T) {
 	ctx := hostTestContext(t)
 	h := openTestHost(t, boltTestPath(t), nil)
-	registerTestResource(t, h, "dns-out", nil)
+	registerTestResource(t, h, "example-resource", nil)
 
-	if err := h.RegisterResource("dns-out", nil); !errors.Is(err, ErrResourceRegistered) {
+	if err := h.RegisterResource("example-resource", nil); !errors.Is(err, ErrResourceRegistered) {
 		t.Fatalf("second RegisterResource() error = %v, want %v", err, ErrResourceRegistered)
 	}
 	if err := h.RegisterResource("", nil); !errors.Is(err, ErrResourceName) {
@@ -18090,16 +18090,16 @@ func TestHostOperationsFailLoudly(t *testing.T) {
 		t.Fatalf("Acquire(unknown) error = %v, want %v", err, ErrUnknownResource)
 	}
 
-	result, err := c.Acquire(ctx, "dns-out")
+	result, err := c.Acquire(ctx, "example-resource")
 	if err != nil || !result.First {
 		t.Fatalf("Acquire() = (%+v,%v), want First=true", result, err)
 	}
 
-	if last, releaseErr := c.Release(ctx, "dns-out"); releaseErr != nil || !last {
+	if last, releaseErr := c.Release(ctx, "example-resource"); releaseErr != nil || !last {
 		t.Fatalf("Release() = (%v,%v), want last=true", last, releaseErr)
 	}
 
-	if waitErr := c.WaitApplied(ctx, "dns-out", result.Mark); !errors.Is(waitErr, ErrHoldLost) {
+	if waitErr := c.WaitApplied(ctx, "example-resource", result.Mark); !errors.Is(waitErr, ErrHoldLost) {
 		t.Fatalf("WaitApplied() after the release error = %v, want %v", waitErr, ErrHoldLost)
 	}
 
@@ -18110,7 +18110,7 @@ func TestHostOperationsFailLoudly(t *testing.T) {
 		t.Fatalf("second Close(): %v", closeErr)
 	}
 
-	if _, acquireErr := c.Acquire(ctx, "dns-out"); !errors.Is(acquireErr, ErrConnClosed) {
+	if _, acquireErr := c.Acquire(ctx, "example-resource"); !errors.Is(acquireErr, ErrConnClosed) {
 		t.Fatalf("Acquire() after Close error = %v, want %v", acquireErr, ErrConnClosed)
 	}
 	if keepErr := c.Keepalive(ctx); !errors.Is(keepErr, ErrConnClosed) {
@@ -18123,10 +18123,10 @@ func TestHostCloseRemovesEffectsAndRejectsFurtherWork(t *testing.T) {
 	h := openTestHost(t, boltTestPath(t), func(cfg *HostConfig) { cfg.TeardownGrace = time.Hour })
 
 	fw := &fakeEffect{}
-	registerTestResource(t, h, "dns-out", fw)
+	registerTestResource(t, h, "example-resource", fw)
 
 	c := connectTest(t, h)
-	if err := AcquireAndWait(ctx, c, "dns-out"); err != nil {
+	if err := AcquireAndWait(ctx, c, "example-resource"); err != nil {
 		t.Fatalf("AcquireAndWait(): %v", err)
 	}
 
@@ -18144,7 +18144,7 @@ func TestHostCloseRemovesEffectsAndRejectsFurtherWork(t *testing.T) {
 	if err := h.RegisterResource("late", nil); !errors.Is(err, ErrHostClosed) {
 		t.Fatalf("RegisterResource() after Close error = %v, want %v", err, ErrHostClosed)
 	}
-	if _, err := c.Acquire(ctx, "dns-out"); !errors.Is(err, ErrConnClosed) {
+	if _, err := c.Acquire(ctx, "example-resource"); !errors.Is(err, ErrConnClosed) {
 		t.Fatalf("Acquire() on a connection of a closed host error = %v, want %v", err, ErrConnClosed)
 	}
 
@@ -18161,9 +18161,9 @@ func TestHostCloseRemovesEffectsAndRejectsFurtherWork(t *testing.T) {
 func TestHostRestartSweepsSessionsAndKeepsNames(t *testing.T) {
 	path := boltTestPath(t)
 	first := openTestHost(t, path, nil)
-	registerTestResource(t, first, "dns-out", nil)
+	registerTestResource(t, first, "example-resource", nil)
 
-	node, ok := first.names.Lookup(resourcePrefix + "dns-out")
+	node, ok := first.names.Lookup(resourcePrefix + "example-resource")
 	if !ok {
 		t.Fatal("the resource name is not bound")
 	}
@@ -18195,12 +18195,12 @@ func TestHostRestartSweepsSessionsAndKeepsNames(t *testing.T) {
 		t.Fatalf("Held() after restart = (%v,%v), want (false,nil)", held, err)
 	}
 
-	if again, found := second.names.Lookup(resourcePrefix + "dns-out"); !found || again != node {
+	if again, found := second.names.Lookup(resourcePrefix + "example-resource"); !found || again != node {
 		t.Fatalf("Lookup() after restart = (%d,%v), want (%d,true)", again, found, node)
 	}
 
 	// Registering the resource again finds the same node and works.
-	registerTestResource(t, second, "dns-out", nil)
+	registerTestResource(t, second, "example-resource", nil)
 }
 
 // TestHostReconcilerLooksOnlyAtResourcesThatChanged: with the resync an hour
@@ -18294,10 +18294,10 @@ func TestHostResyncRepairsDriftNobodyTouched(t *testing.T) {
 	ctx := hostTestContext(t)
 	h := openTestHost(t, boltTestPath(t), nil)
 	fw := &fakeEffect{}
-	registerTestResource(t, h, "dns-out", fw)
+	registerTestResource(t, h, "example-resource", fw)
 
 	c := connectTest(t, h)
-	if err := AcquireAndWait(ctx, c, "dns-out"); err != nil {
+	if err := AcquireAndWait(ctx, c, "example-resource"); err != nil {
 		t.Fatalf("AcquireAndWait(): %v", err)
 	}
 

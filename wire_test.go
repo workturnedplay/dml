@@ -114,7 +114,7 @@ func TestWireManyHoldersApplyOnceAndRemoveOnce(t *testing.T) {
 	ctx := hostTestContext(t)
 	rig := newWireRig(t, nil)
 	fw := &fakeEffect{}
-	registerTestResource(t, rig.host, "dns-out", fw)
+	registerTestResource(t, rig.host, "example-resource", fw)
 
 	const clients = 10
 
@@ -125,7 +125,7 @@ func TestWireManyHoldersApplyOnceAndRemoveOnce(t *testing.T) {
 
 	errs := make([]error, clients)
 
-	runConcurrently(clients, func(i int) { errs[i] = AcquireAndWait(ctx, remote[i], "dns-out") })
+	runConcurrently(clients, func(i int) { errs[i] = AcquireAndWait(ctx, remote[i], "example-resource") })
 
 	for i, acquireErr := range errs {
 		if acquireErr != nil {
@@ -135,7 +135,7 @@ func TestWireManyHoldersApplyOnceAndRemoveOnce(t *testing.T) {
 
 	requireEffectCounts(t, fw, 1, 0, true)
 
-	runConcurrently(clients, func(i int) { _, errs[i] = remote[i].Release(ctx, "dns-out") })
+	runConcurrently(clients, func(i int) { _, errs[i] = remote[i].Release(ctx, "example-resource") })
 
 	for i, releaseErr := range errs {
 		if releaseErr != nil {
@@ -154,7 +154,7 @@ func TestWireManyHoldersApplyOnceAndRemoveOnce(t *testing.T) {
 func TestWireErrorsKeepTheirIdentity(t *testing.T) {
 	ctx := hostTestContext(t)
 	rig := newWireRig(t, nil)
-	registerTestResource(t, rig.host, "dns-out", nil)
+	registerTestResource(t, rig.host, "example-resource", nil)
 	client := rig.dial(t)
 
 	_, err := client.Acquire(ctx, "nope")
@@ -167,16 +167,16 @@ func TestWireErrorsKeepTheirIdentity(t *testing.T) {
 		t.Fatalf("Acquire(unknown) error = %#v, want a *RemoteError with code unknown_resource", err)
 	}
 
-	result, err := client.Acquire(ctx, "dns-out")
+	result, err := client.Acquire(ctx, "example-resource")
 	if err != nil || !result.First {
 		t.Fatalf("Acquire() = (%+v,%v), want First=true", result, err)
 	}
 
-	if last, releaseErr := client.Release(ctx, "dns-out"); releaseErr != nil || !last {
+	if last, releaseErr := client.Release(ctx, "example-resource"); releaseErr != nil || !last {
 		t.Fatalf("Release() = (%v,%v), want last=true", last, releaseErr)
 	}
 
-	if waitErr := client.WaitApplied(ctx, "dns-out", result.Mark); !errors.Is(waitErr, ErrHoldLost) {
+	if waitErr := client.WaitApplied(ctx, "example-resource", result.Mark); !errors.Is(waitErr, ErrHoldLost) {
 		t.Fatalf("WaitApplied() after the release error = %v, want %v", waitErr, ErrHoldLost)
 	}
 
@@ -241,14 +241,14 @@ func TestWireCloseReleasesHoldsBeforeReturning(t *testing.T) {
 	ctx := hostTestContext(t)
 	rig := newWireRig(t, nil)
 	fw := &fakeEffect{}
-	registerTestResource(t, rig.host, "dns-out", fw)
+	registerTestResource(t, rig.host, "example-resource", fw)
 
 	client := rig.dial(t)
-	if acquireErr := AcquireAndWait(ctx, client, "dns-out"); acquireErr != nil {
+	if acquireErr := AcquireAndWait(ctx, client, "example-resource"); acquireErr != nil {
 		t.Fatalf("AcquireAndWait(): %v", acquireErr)
 	}
 
-	node, ok := rig.host.names.Lookup(resourcePrefix + "dns-out")
+	node, ok := rig.host.names.Lookup(resourcePrefix + "example-resource")
 	if !ok {
 		t.Fatal("the resource name is not bound")
 	}
@@ -267,7 +267,7 @@ func TestWireCloseReleasesHoldsBeforeReturning(t *testing.T) {
 		return !present
 	})
 
-	if _, acquireErr := client.Acquire(ctx, "dns-out"); !errors.Is(acquireErr, ErrConnClosed) {
+	if _, acquireErr := client.Acquire(ctx, "example-resource"); !errors.Is(acquireErr, ErrConnClosed) {
 		t.Fatalf("Acquire() after Close error = %v, want %v", acquireErr, ErrConnClosed)
 	}
 
@@ -280,10 +280,10 @@ func TestWireDroppedConnectionReleasesTheSession(t *testing.T) {
 	ctx := hostTestContext(t)
 	rig := newWireRig(t, nil)
 	fw := &fakeEffect{}
-	registerTestResource(t, rig.host, "dns-out", fw)
+	registerTestResource(t, rig.host, "example-resource", fw)
 
 	client := rig.dial(t)
-	if acquireErr := AcquireAndWait(ctx, client, "dns-out"); acquireErr != nil {
+	if acquireErr := AcquireAndWait(ctx, client, "example-resource"); acquireErr != nil {
 		t.Fatalf("AcquireAndWait(): %v", acquireErr)
 	}
 
@@ -301,7 +301,7 @@ func TestWireDroppedConnectionReleasesTheSession(t *testing.T) {
 		return !present
 	})
 
-	if _, releaseErr := client.Release(ctx, "dns-out"); !errors.Is(releaseErr, ErrConnClosed) {
+	if _, releaseErr := client.Release(ctx, "example-resource"); !errors.Is(releaseErr, ErrConnClosed) {
 		t.Fatalf("Release() on a dropped connection error = %v, want %v", releaseErr, ErrConnClosed)
 	}
 }
@@ -312,10 +312,10 @@ func TestWireClientHeartbeatKeepsAnIdleConnectionAliveAcrossTheTTL(t *testing.T)
 	const ttl = 200 * time.Millisecond
 
 	rig := newWireRig(t, func(cfg *HostConfig) { cfg.KeepaliveTTL = ttl })
-	registerTestResource(t, rig.host, "dns-out", nil)
+	registerTestResource(t, rig.host, "example-resource", nil)
 
 	client := rig.dial(t)
-	if acquireErr := AcquireAndWait(ctx, client, "dns-out"); acquireErr != nil {
+	if acquireErr := AcquireAndWait(ctx, client, "example-resource"); acquireErr != nil {
 		t.Fatalf("AcquireAndWait(): %v", acquireErr)
 	}
 
@@ -331,7 +331,7 @@ func TestWireClientHeartbeatKeepsAnIdleConnectionAliveAcrossTheTTL(t *testing.T)
 		t.Fatalf("Keepalive() after idling past the TTL: %v", keepErr)
 	}
 
-	node, ok := rig.host.names.Lookup(resourcePrefix + "dns-out")
+	node, ok := rig.host.names.Lookup(resourcePrefix + "example-resource")
 	if !ok {
 		t.Fatal("the resource name is not bound")
 	}
@@ -427,7 +427,7 @@ func TestWireHandshakeRejectsWrongVersionAndMissingHello(t *testing.T) {
 func TestWireFrameRoundTripAndLimits(t *testing.T) {
 	var buf bytes.Buffer
 
-	want := wireRequest{ID: 7, Op: wireOpAcquire, Resource: "dns-out", Mark: ^uint64(0)}
+	want := wireRequest{ID: 7, Op: wireOpAcquire, Resource: "example-resource", Mark: ^uint64(0)}
 	if writeErr := writeWireFrame(&buf, &want); writeErr != nil {
 		t.Fatalf("writeWireFrame(): %v", writeErr)
 	}

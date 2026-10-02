@@ -10695,7 +10695,7 @@ func (d *DomainPointerRegistryD) RemoveDomain(graph Transactor, subject NodeID) 
 //
 // Acquire and Release report first/last: whether this call made the
 // holder set non-empty or empty. These are hints about a transition, and
-// an effect outside the graph (adding a firewall rule) must NOT be driven
+// an effect outside the graph (say, adding a rule in another system) must NOT be driven
 // only from them: a crash between commit and effect would lose the effect
 // forever. Drive effects from the level instead (Held), with a reconciler
 // that compares desired and actual state and repeats. Likewise "first ==
@@ -10992,7 +10992,9 @@ var (
 const resourcePrefix = "resource/"
 
 // Effect is something outside the graph that exists exactly while a
-// resource is held, for example a temporary firewall rule. The Host's
+// resource is held (a rule in some other system, say). dml defines only
+// this contract; implementations, and any vocabulary specific to what they
+// manage, belong to the consumer (theorystate.md section 112). The Host's
 // reconciler drives it from the level (LeaseRegistry.Held), never only from
 // acquire/release transitions, so every method must be idempotent and safe
 // to repeat after a crash: Apply of a present effect and Remove of an absent
