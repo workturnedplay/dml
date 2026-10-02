@@ -3779,10 +3779,15 @@ effect)`; acquiring an unregistered name is `ErrUnknownResource`.
 
 **Reconciler contract.** For every registered resource the reconciler
 compares the desired state (`Held`) with the actual one (`Effect.Present`)
-and converges them, verifying the result with `Present` afterwards. It runs
-on every wake (acquire, release, dropped connection, registration), every
-`ResyncInterval`, and `RetryInterval` after a failure. `Effect` methods must
-be idempotent. The `freed` list from `CloseSession` is only a wake-up hint.
+and converges them, verifying the result with `Present` afterwards. A change
+(acquire, release, a session that freed the resource, registration) marks
+the resource dirty, and a wake looks only at dirty resources and at those
+whose own deadline has come (the teardown grace running, `RetryInterval`
+after a failure). Every `ResyncInterval` it looks at all of them, which
+repairs drift nobody touched. A mark is set after the change commits and
+cleared before the next pass is numbered, so the numbered-pass handshake
+below still holds. `Effect` methods must be idempotent. The `freed` list
+from `CloseSession` is only a hint of which resources to mark.
 
 *"Applied".* `first == false` means "wanted", not "in effect". Each
 resource numbers its passes, numbering a pass before it reads `Held`.
@@ -3805,9 +3810,8 @@ operations, closes every session, runs the final reconcile pass, then closes
 the actor and the store. Waiters wake with `ErrHostClosed`.
 
 **Still OPEN.** Production `Effect` implementations (the example firewall
-rule is a fake in the tests); per-resource dirty tracking, since every wake
-reads every resource; and how hosts on different machines coordinate (Part
-C). The wire transport and the keepalive helper are §113.
+rule is a fake in the tests), and how hosts on different machines
+coordinate (Part C). The wire transport and the keepalive helper are §113.
 
 ---
 

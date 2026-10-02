@@ -471,3 +471,88 @@ func TestWireFrameRoundTripAndLimits(t *testing.T) {
 		t.Fatalf("oversized write error = %v, want %v", writeErr, ErrWireFrameTooLarge)
 	}
 }
+
+// TestWireRequestsBeyondTheInFlightLimitAreRefusedAndTheConnectionSurvives
+// fills one connection with blocked WaitApplied requests: exactly the ones
+// over wireMaxInFlight are refused with ErrWireBusy, the admitted ones go on
+// waiting, and cancelling them leaves the connection, the hold and the freed
+// slots intact.
+func TestWireRequestsBeyondTheInFlightLimitAreRefusedAndTheConnectionSurvives(t *testing.T) {
+	ctx := hostTestContext(t)
+	rig := newWireRig(t, func(cfg *HostConfig) {
+		// Few reconcile passes, so the blocked waiters are not woken constantly.
+		cfg.RetryInterval = time.Hour
+		cfg.ResyncInterval = time.Hour
+	})
+
+	// An effect that never applies keeps every WaitApplied blocked.
+	registerTestResource(t, rig.host, "broken", &fakeEffect{applyFailures: 1 << 30})
+
+	client := rig.dial(t)
+
+	acquired, err := client.Acquire(ctx, "broken")
+	if err != nil {
+		t.Fatalf("Acquire(): %v", err)
+	}
+
+	const refused = 44
+
+	const total = wireMaxInFlight + refused
+
+	waitCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	results := make(chan error, total)
+
+	for range total {
+		go func() { results <- client.WaitApplied(waitCtx, "broken", acquired.Mark) }()
+	}
+
+	// Exactly the requests over the limit come back at once, all refused.
+	for range refused {
+		select {
+		case waitErr := <-results:
+			if !errors.Is(waitErr, ErrWireBusy) {
+				t.Fatalf("an early result was %v, want %v", waitErr, ErrWireBusy)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("timed out waiting for the over-limit requests to be refused")
+		}
+	}
+
+	// The admitted ones are still waiting.
+	select {
+	case early := <-results:
+		t.Fatalf("an admitted request ended early with %v", early)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	cancel()
+
+	for range wireMaxInFlight {
+		select {
+		case waitErr := <-results:
+			if !errors.Is(waitErr, context.Canceled) {
+				t.Fatalf("a cancelled request returned %v, want %v", waitErr, context.Canceled)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("timed out waiting for the cancelled requests to return")
+		}
+	}
+
+	// The host frees a slot only after answering, so allow for a moment of
+	// ErrWireBusy before the connection is fully usable again.
+	eventually(t, "the in-flight slots to be freed", func() bool {
+		keepErr := client.Keepalive(ctx)
+		if keepErr != nil && !errors.Is(keepErr, ErrWireBusy) {
+			t.Fatalf("Keepalive() after the cancellations: %v", keepErr)
+		}
+
+		return keepErr == nil
+	})
+
+	// The cancellations ended requests, not the hold.
+	if last, releaseErr := client.Release(ctx, "broken"); releaseErr != nil || !last {
+		t.Fatalf("Release() = (%v,%v), want last=true: the hold must have survived", last, releaseErr)
+	}
+}

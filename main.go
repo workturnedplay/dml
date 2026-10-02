@@ -11373,11 +11373,13 @@ func (r *hostResource) converge(ctx context.Context, want bool) error {
 // KeepaliveTTL. Dropping calls LeaseRegistry.CloseSession and wakes the
 // reconciler. A session whose close fails is retried by the reaper.
 //
-// Effects. The reconciler compares, for every registered resource, the
-// desired state (LeaseRegistry.Held) with the actual one (Effect.Present)
-// and converges them. It runs on every wake-up (an acquire, a release, a
-// dropped connection, a registration), at least every ResyncInterval, and
-// after a failed effect every RetryInterval.
+// Effects. The reconciler compares, for a registered resource, the desired
+// state (LeaseRegistry.Held) with the actual one (Effect.Present) and
+// converges them. A wake-up looks only at the resources a change marked
+// dirty (an acquire, a release, a session that freed it, its registration)
+// and at those whose own deadline has come (a teardown grace running, a
+// failed effect waiting for RetryInterval). Every ResyncInterval it looks at
+// every resource, which repairs drift nobody touched.
 type Host struct {
 	cfg   HostConfig
 	store *BoltGraph
@@ -11400,6 +11402,12 @@ type Host struct {
 
 	resMu     sync.RWMutex
 	resources map[string]*hostResource
+	byNode    map[NodeID]*hostResource
+
+	// dirty is the set of resources something happened to since the
+	// reconciler last took it (see markDirty).
+	dirtyMu sync.Mutex
+	dirty   map[*hostResource]struct{}
 }
 
 // OpenHost performs the startup order of theorystate.md sections 110 and
@@ -11510,6 +11518,8 @@ func finishHostStart(cfg HostConfig, store *BoltGraph, actor *GraphActor, names 
 		conns:     make(map[NodeID]*Conn),
 		closing:   make(map[NodeID]struct{}),
 		resources: make(map[string]*hostResource),
+		byNode:    make(map[NodeID]*hostResource),
+		dirty:     make(map[*hostResource]struct{}),
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -11572,6 +11582,64 @@ func (h *Host) kickReconciler() {
 	case h.kickCh <- struct{}{}:
 	default:
 	}
+}
+
+// markDirty tells the reconciler that something happened to resources that
+// may change what they should be, and wakes it. Call it AFTER the change has
+// committed (and, for Acquire, after the mark was read): the reconciler clears
+// a mark before it numbers its next pass, so any pass numbered after the
+// clear sees the change, and WaitApplied waits for such a pass.
+func (h *Host) markDirty(resources ...*hostResource) {
+	h.dirtyMu.Lock()
+
+	for _, r := range resources {
+		h.dirty[r] = struct{}{}
+	}
+
+	h.dirtyMu.Unlock()
+
+	h.kickReconciler()
+}
+
+// markDirtyNodes is markDirty for the registered resources whose holder Set
+// is one of nodes. Nodes that are not registered resources are ignored.
+func (h *Host) markDirtyNodes(nodes []NodeID) {
+	h.resMu.RLock()
+
+	found := make([]*hostResource, 0, len(nodes))
+
+	for _, node := range nodes {
+		if r, ok := h.byNode[node]; ok {
+			found = append(found, r)
+		}
+	}
+
+	h.resMu.RUnlock()
+
+	if len(found) > 0 {
+		h.markDirty(found...)
+	}
+}
+
+// takeDirty returns the marked resources and empties the set.
+func (h *Host) takeDirty() map[*hostResource]struct{} {
+	h.dirtyMu.Lock()
+	defer h.dirtyMu.Unlock()
+
+	taken := h.dirty
+	h.dirty = make(map[*hostResource]struct{})
+
+	return taken
+}
+
+// clearDirty drops r's mark. The reconciler calls it just before it numbers
+// a pass for r, so a mark set after that call (a change committed after the
+// pass began) survives and causes another pass.
+func (h *Host) clearDirty(r *hostResource) {
+	h.dirtyMu.Lock()
+	defer h.dirtyMu.Unlock()
+
+	delete(h.dirty, r)
 }
 
 // Close shuts the host down: operations stop, every connection is dropped
@@ -11662,11 +11730,12 @@ func (h *Host) RegisterResource(name string, effect Effect) error {
 		return fmt.Errorf("registering resource %q: %w", name, err)
 	}
 
-	if !h.addResource(newHostResource(name, node, effect)) {
+	res := newHostResource(name, node, effect)
+	if !h.addResource(res) {
 		return fmt.Errorf("%w: %q", ErrResourceRegistered, name)
 	}
 
-	h.kickReconciler()
+	h.markDirty(res)
 
 	return nil
 }
@@ -11681,6 +11750,7 @@ func (h *Host) addResource(r *hostResource) bool {
 	}
 
 	h.resources[r.name] = r
+	h.byNode[r.node] = r
 
 	return true
 }
@@ -11804,11 +11874,9 @@ func (h *Host) closeSession(session NodeID) error {
 	delete(h.closing, session)
 	h.mu.Unlock()
 
-	// The reconciler is level-driven and re-reads every resource, so freed
-	// is only a reason to wake it.
-	if len(freed) > 0 {
-		h.kickReconciler()
-	}
+	// The reconciler is level-driven, so freed is only a wake-up hint: mark
+	// the resources that lost their last holder so it looks at them.
+	h.markDirtyNodes(freed)
 
 	return nil
 }
@@ -11867,15 +11935,16 @@ func (h *Host) expiredConns() []*Conn {
 	return expired
 }
 
-// reconcileLoop is the reconciler goroutine.
+// reconcileLoop is the reconciler goroutine. due holds, for the resources
+// that want another look without anything touching them (a teardown grace
+// running, a failed effect waiting to retry), when that is; only this
+// goroutine uses it.
 func (h *Host) reconcileLoop(ctx context.Context) {
-	for {
-		wait := h.cfg.ResyncInterval
-		if next := h.reconcileAll(ctx, false); next > 0 {
-			wait = min(wait, next)
-		}
+	due := make(map[*hostResource]time.Duration)
+	lastFull := h.monoNow()
 
-		timer := time.NewTimer(wait)
+	for {
+		timer := time.NewTimer(h.nextWake(lastFull, due))
 
 		select {
 		case <-h.stop:
@@ -11885,22 +11954,68 @@ func (h *Host) reconcileLoop(ctx context.Context) {
 			timer.Stop()
 		case <-timer.C:
 		}
+
+		if h.monoNow()-lastFull >= h.cfg.ResyncInterval {
+			h.reconcileSet(ctx, h.resourceSnapshot(), false, due)
+			lastFull = h.monoNow()
+
+			continue
+		}
+
+		h.reconcileSet(ctx, h.pendingResources(due), false, due)
 	}
 }
 
-// reconcileAll runs one pass over every registered resource and returns how
-// soon the earliest of them needs another look (0 if none does). final is
-// set by Close and skips the teardown grace.
-func (h *Host) reconcileAll(ctx context.Context, final bool) time.Duration {
-	var next time.Duration
+// nextWake is how long the reconciler may sleep: until the next full resync
+// or the earliest resource deadline, whichever comes first.
+func (h *Host) nextWake(lastFull time.Duration, due map[*hostResource]time.Duration) time.Duration {
+	now := h.monoNow()
+	wait := h.cfg.ResyncInterval - (now - lastFull)
 
-	for _, r := range h.resourceSnapshot() {
-		if wait := h.reconcile(ctx, r, final); wait > 0 && (next == 0 || wait < next) {
-			next = wait
+	for _, at := range due {
+		wait = min(wait, at-now)
+	}
+
+	return max(wait, 0)
+}
+
+// pendingResources returns, sorted by name, the resources marked dirty plus
+// those whose deadline in due has come.
+func (h *Host) pendingResources(due map[*hostResource]time.Duration) []*hostResource {
+	pending := h.takeDirty()
+	now := h.monoNow()
+
+	for r, at := range due {
+		if at <= now {
+			pending[r] = struct{}{}
 		}
 	}
 
-	return next
+	list := slices.Collect(maps.Keys(pending))
+	sort.Slice(list, func(i, j int) bool { return list[i].name < list[j].name })
+
+	return list
+}
+
+// reconcileSet reconciles each of resources, and records in due when each
+// wants another look (removing it from due if it does not). final is set by
+// Close and skips the teardown grace.
+func (h *Host) reconcileSet(ctx context.Context, resources []*hostResource, final bool, due map[*hostResource]time.Duration) {
+	for _, r := range resources {
+		h.clearDirty(r)
+
+		if wait := h.reconcile(ctx, r, final); wait > 0 {
+			due[r] = h.monoNow() + wait
+		} else {
+			delete(due, r)
+		}
+	}
+}
+
+// reconcileAll runs one pass over every registered resource. Close uses it
+// for its final pass, so nothing is left to remember afterwards.
+func (h *Host) reconcileAll(ctx context.Context, final bool) {
+	h.reconcileSet(ctx, h.resourceSnapshot(), final, make(map[*hostResource]time.Duration))
 }
 
 // graceRemaining starts (or continues) the teardown grace of an unheld,
@@ -12078,7 +12193,7 @@ func (c *Conn) Acquire(ctx context.Context, resource string) (AcquireResult, err
 	}
 
 	mark := res.mark()
-	c.host.kickReconciler()
+	c.host.markDirty(res)
 
 	return AcquireResult{First: first, Mark: mark}, nil
 }
@@ -12098,7 +12213,7 @@ func (c *Conn) Release(ctx context.Context, resource string) (bool, error) {
 		return false, c.opErr("release", resource, releaseErr)
 	}
 
-	c.host.kickReconciler()
+	c.host.markDirty(res)
 
 	return last, nil
 }

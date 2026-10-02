@@ -2050,6 +2050,29 @@ could be called directly.
  TestPipeEndToEnd. Not done: per-resource authorization beyond the pipe's
  DACL, a production Effect, other transports, TLS.
 
+50. Reconciler dirty tracking, and the in-flight limit test. The reconciler
+ no longer reads every resource on every wake (this closes the "per-resource
+ dirty tracking" part of item 48's not-done list). A change marks the
+ resource it touched (Host.markDirty: Acquire and Release after the commit
+ and after the mark is read, RegisterResource, and closeSession for the
+ resources CloseSession reports as freed, found through the new Host.byNode
+ map). The reconciler takes the marked set (takeDirty) and looks only at
+ those plus the resources whose own deadline has come (a teardown grace
+ running, an effect waiting to retry), which it keeps in a due map local to
+ reconcileLoop (reconcileSet, pendingResources, nextWake). Every
+ ResyncInterval it still looks at all resources, which repairs drift nobody
+ touched. A mark is cleared just before the pass is numbered, which keeps
+ the numbered-pass guarantee that a pass that began before a commit is never
+ the last one. reconcileAll has no result now and is used by Close's final
+ pass. fakeEffect counts Present calls. Covered by
+ TestHostReconcilerLooksOnlyAtResourcesThatChanged,
+ TestHostReleaseAndDropRemoveEffectsWithoutWaitingForTheResync,
+ TestHostResyncRepairsDriftNobodyTouched and
+ TestWireRequestsBeyondTheInFlightLimitAreRefusedAndTheConnectionSurvives
+ (300 concurrent WaitApplied on one connection: exactly the 44 over
+ wireMaxInFlight get ErrWireBusy, the rest are cancelled cleanly, and the
+ connection and the hold survive).
+
 Currently unaddressed yet:
 - Paged reads beyond a single node's own outgoing/incoming edges
   (theorystate.md section 105, items 43/46): FindRelationships and

@@ -17680,6 +17680,7 @@ var errFakeEffect = errors.New("fake effect failure")
 type fakeEffect struct {
 	mu            sync.Mutex
 	present       bool
+	presents      int
 	applies       int
 	removes       int
 	applyFailures int
@@ -17688,6 +17689,8 @@ type fakeEffect struct {
 func (f *fakeEffect) Present(_ context.Context) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+
+	f.presents++
 
 	return f.present, nil
 }
@@ -17723,6 +17726,15 @@ func (f *fakeEffect) counts() (applies, removes int, present bool) {
 	defer f.mu.Unlock()
 
 	return f.applies, f.removes, f.present
+}
+
+// presentCalls is how often the reconciler asked this effect whether it is
+// in place, which is how a test sees whether a resource was looked at.
+func (f *fakeEffect) presentCalls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	return f.presents
 }
 
 // eventually polls cond until it holds or a generous deadline passes.
@@ -18189,4 +18201,112 @@ func TestHostRestartSweepsSessionsAndKeepsNames(t *testing.T) {
 
 	// Registering the resource again finds the same node and works.
 	registerTestResource(t, second, "dns-out", nil)
+}
+
+// TestHostReconcilerLooksOnlyAtResourcesThatChanged: with the resync an hour
+// away, activity on one resource must not make the reconciler look at another.
+func TestHostReconcilerLooksOnlyAtResourcesThatChanged(t *testing.T) {
+	ctx := hostTestContext(t)
+	h := openTestHost(t, boltTestPath(t), func(cfg *HostConfig) { cfg.ResyncInterval = time.Hour })
+
+	touched := &fakeEffect{}
+	untouched := &fakeEffect{}
+	registerTestResource(t, h, "touched", touched)
+	registerTestResource(t, h, "untouched", untouched)
+
+	// Registration marks each resource, so each is looked at once.
+	eventually(t, "both resources to be looked at after registration", func() bool {
+		return touched.presentCalls() >= 1 && untouched.presentCalls() >= 1
+	})
+
+	untouchedBefore := untouched.presentCalls()
+	touchedBefore := touched.presentCalls()
+
+	c := connectTest(t, h)
+
+	for range 3 {
+		if err := AcquireAndWait(ctx, c, "touched"); err != nil {
+			t.Fatalf("AcquireAndWait(): %v", err)
+		}
+
+		if _, err := c.Release(ctx, "touched"); err != nil {
+			t.Fatalf("Release(): %v", err)
+		}
+
+		eventually(t, "the touched effect to be removed", func() bool {
+			_, _, present := touched.counts()
+			return !present
+		})
+	}
+
+	if got := touched.presentCalls(); got <= touchedBefore {
+		t.Fatalf("the touched resource was looked at %d times, want more than %d", got, touchedBefore)
+	}
+
+	if got := untouched.presentCalls(); got != untouchedBefore {
+		t.Fatalf("the untouched resource was looked at %d times, want still %d", got, untouchedBefore)
+	}
+}
+
+// TestHostReleaseAndDropRemoveEffectsWithoutWaitingForTheResync: with the
+// resync an hour away, only the dirty marks and the teardown grace can bring
+// the reconciler back, for an explicit release and for a dropped connection.
+func TestHostReleaseAndDropRemoveEffectsWithoutWaitingForTheResync(t *testing.T) {
+	ctx := hostTestContext(t)
+	h := openTestHost(t, boltTestPath(t), func(cfg *HostConfig) { cfg.ResyncInterval = time.Hour })
+
+	released := &fakeEffect{}
+	dropped := &fakeEffect{}
+	registerTestResource(t, h, "released", released)
+	registerTestResource(t, h, "dropped", dropped)
+
+	releasing := connectTest(t, h)
+	dropping := connectTest(t, h)
+
+	if err := AcquireAndWait(ctx, releasing, "released"); err != nil {
+		t.Fatalf("releasing: AcquireAndWait(): %v", err)
+	}
+
+	if err := AcquireAndWait(ctx, dropping, "dropped"); err != nil {
+		t.Fatalf("dropping: AcquireAndWait(): %v", err)
+	}
+
+	if _, err := releasing.Release(ctx, "released"); err != nil {
+		t.Fatalf("releasing: Release(): %v", err)
+	}
+
+	if err := dropping.Close(); err != nil {
+		t.Fatalf("dropping: Close(): %v", err)
+	}
+
+	eventually(t, "both effects to be removed", func() bool {
+		_, _, releasedPresent := released.counts()
+		_, _, droppedPresent := dropped.counts()
+
+		return !releasedPresent && !droppedPresent
+	})
+}
+
+// TestHostResyncRepairsDriftNobodyTouched: the outside world changes behind
+// the host's back, no acquire or release happens, and the periodic full resync
+// still puts the effect back.
+func TestHostResyncRepairsDriftNobodyTouched(t *testing.T) {
+	ctx := hostTestContext(t)
+	h := openTestHost(t, boltTestPath(t), nil)
+	fw := &fakeEffect{}
+	registerTestResource(t, h, "dns-out", fw)
+
+	c := connectTest(t, h)
+	if err := AcquireAndWait(ctx, c, "dns-out"); err != nil {
+		t.Fatalf("AcquireAndWait(): %v", err)
+	}
+
+	fw.mu.Lock()
+	fw.present = false
+	fw.mu.Unlock()
+
+	eventually(t, "the resync to apply the effect again", func() bool {
+		applies, _, present := fw.counts()
+		return applies >= 2 && present
+	})
 }
