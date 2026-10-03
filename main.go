@@ -10985,6 +10985,18 @@ var (
 	// report) when an effect's Apply/Remove succeeded but Present still
 	// disagrees.
 	ErrEffectNotConverged = errors.New("effect did not reach the wanted state")
+
+	// ErrEffectTimeout is returned (inside the reconciler's error report)
+	// when a call to an Effect did not return within
+	// HostConfig.EffectTimeout and was abandoned. The call may still be
+	// running; see ErrEffectBusy.
+	ErrEffectTimeout = errors.New("effect call timed out")
+
+	// ErrEffectBusy is returned (inside the reconciler's error report) when
+	// a call to an Effect was not started because an earlier, abandoned
+	// call to the same effect has not returned yet. It keeps the effect
+	// from ever seeing two overlapping calls.
+	ErrEffectBusy = errors.New("an earlier call to the effect has not returned")
 )
 
 // resourcePrefix namespaces resource names inside the NameRegistry, so they
@@ -10999,7 +11011,10 @@ const resourcePrefix = "resource/"
 // acquire/release transitions, so every method must be idempotent and safe
 // to repeat after a crash: Apply of a present effect and Remove of an absent
 // one are successes. Present reports the real state of the outside world,
-// not a cached belief. Implementations must not touch the graph.
+// not a cached belief. Implementations must not touch the graph. Each call
+// runs under HostConfig.EffectTimeout: honor ctx where possible, since a call
+// that ignores it is abandoned when the deadline passes (it cannot be killed,
+// and no further call to the same effect starts until it returns).
 type Effect interface {
 	// Present reports whether the effect is currently in place.
 	Present(ctx context.Context) (bool, error)
@@ -11116,12 +11131,14 @@ const (
 	defaultResyncInterval  = 30 * time.Second
 	defaultRetryInterval   = 2 * time.Second
 	defaultShutdownTimeout = 10 * time.Second
+	defaultEffectTimeout   = 30 * time.Second
 )
 
 // HostConfig configures a Host. Only Path is required.
 //
-// For KeepaliveTTL and TeardownGrace, zero means "use the default" and a
-// negative value means "disabled". The other durations must be positive;
+// For KeepaliveTTL, TeardownGrace and EffectTimeout, zero means "use the
+// default" and a negative value means "disabled". The other durations must
+// be positive;
 // zero or negative means the default.
 type HostConfig struct {
 	// Path is the bbolt file. Exactly one Host may own it.
@@ -11154,6 +11171,16 @@ type HostConfig struct {
 
 	// ShutdownTimeout bounds the final reconcile pass in Close.
 	ShutdownTimeout time.Duration
+
+	// EffectTimeout bounds each Effect.Present, Apply and Remove call. A call
+	// that does not return in time is abandoned and reported as
+	// ErrEffectTimeout, so one hung effect cannot stall the reconciler (which
+	// serves every resource) or Close. An abandoned call cannot be killed if
+	// it ignores its context, so no further call to that effect starts until
+	// it returns (ErrEffectBusy). Disabled (negative), calls are made
+	// directly, and Close can then wait for an effect that ignores its
+	// context.
+	EffectTimeout time.Duration
 
 	// VerifyPageSize is the page size of the startup VerifyAll sweep (zero
 	// means VerifyAll's own default).
@@ -11196,6 +11223,7 @@ func defaultHostOnError(op string, err error) {
 func (c HostConfig) withDefaults() HostConfig {
 	c.KeepaliveTTL = durationOrDefault(c.KeepaliveTTL, defaultKeepaliveTTL)
 	c.TeardownGrace = durationOrDefault(c.TeardownGrace, defaultTeardownGrace)
+	c.EffectTimeout = durationOrDefault(c.EffectTimeout, defaultEffectTimeout)
 	c.ReapInterval = positiveOrDefault(c.ReapInterval, defaultReapInterval)
 	c.ResyncInterval = positiveOrDefault(c.ResyncInterval, defaultResyncInterval)
 	c.RetryInterval = positiveOrDefault(c.RetryInterval, defaultRetryInterval)
@@ -11277,6 +11305,12 @@ type hostResource struct {
 	node   NodeID
 	effect Effect
 
+	// timeout is HostConfig.EffectTimeout (0: calls are made directly), and
+	// busy is set while a call to effect is running, including one that was
+	// abandoned after the timeout (see callEffect).
+	timeout time.Duration
+	busy    atomic.Bool
+
 	mu        sync.Mutex
 	started   uint64
 	completed uint64
@@ -11291,8 +11325,8 @@ type hostResource struct {
 	unheldSince time.Duration
 }
 
-func newHostResource(name string, node NodeID, effect Effect) *hostResource {
-	return &hostResource{name: name, node: node, effect: effect, changed: make(chan struct{})}
+func newHostResource(name string, node NodeID, effect Effect, timeout time.Duration) *hostResource {
+	return &hostResource{name: name, node: node, effect: effect, timeout: timeout, changed: make(chan struct{})}
 }
 
 // beginPass numbers a new reconcile pass. It must be called before the
@@ -11337,22 +11371,89 @@ func (r *hostResource) outcome() passOutcome {
 	return passOutcome{completed: r.completed, applied: r.applied, err: r.lastErr, changed: r.changed}
 }
 
+// callEffect runs fn, one call to r.effect, under r.timeout (op names the
+// call in errors). With no timeout fn is called directly.
+//
+// Otherwise fn runs on its own goroutine, so an effect that ignores its
+// context cannot hold the caller past the deadline: the call is then
+// abandoned and ErrEffectTimeout returned. The goroutine cannot be killed,
+// so busy stays set until fn returns, and a new call meanwhile fails at once
+// with ErrEffectBusy instead of overlapping the stuck one. If ctx (the
+// host's) ends first, the call is abandoned the same way. Whatever an
+// abandoned call eventually does is seen by a later pass, since Present
+// reports real state.
+func (r *hostResource) callEffect(ctx context.Context, op string, fn func(ctx context.Context) error) error {
+	if r.timeout <= 0 {
+		return fn(ctx)
+	}
+
+	if !r.busy.CompareAndSwap(false, true) {
+		return fmt.Errorf("%w: %s of %q", ErrEffectBusy, op, r.name)
+	}
+
+	callCtx, cancel := context.WithTimeout(ctx, r.timeout)
+	done := make(chan error, 1)
+
+	go func() {
+		callErr := fn(callCtx)
+
+		cancel()
+		r.busy.Store(false)
+
+		done <- callErr
+	}()
+
+	select {
+	case callErr := <-done:
+		return callErr
+	case <-callCtx.Done():
+	}
+
+	// The call may have returned at the same moment the deadline passed.
+	select {
+	case callErr := <-done:
+		return callErr
+	default:
+	}
+
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return fmt.Errorf("%s of %q abandoned: %w", op, r.name, ctxErr)
+	}
+
+	return fmt.Errorf("%w: %s of %q did not return within %v", ErrEffectTimeout, op, r.name, r.timeout)
+}
+
+// checkPresent asks the effect whether it is in place, under the deadline.
+func (r *hostResource) checkPresent(ctx context.Context) (bool, error) {
+	var present bool
+
+	err := r.callEffect(ctx, "present", func(callCtx context.Context) error {
+		var presentErr error
+
+		present, presentErr = r.effect.Present(callCtx)
+
+		return wrapInterfaceErr(presentErr)
+	})
+	if err != nil {
+		return false, err
+	}
+
+	return present, nil
+}
+
 // converge applies or removes the effect and verifies the result against
 // the real state.
 func (r *hostResource) converge(ctx context.Context, want bool) error {
-	var opErr error
-
+	op, run := "remove", r.effect.Remove
 	if want {
-		opErr = r.effect.Apply(ctx)
-	} else {
-		opErr = r.effect.Remove(ctx)
+		op, run = "apply", r.effect.Apply
 	}
 
-	if opErr != nil {
+	if opErr := r.callEffect(ctx, op, run); opErr != nil {
 		return fmt.Errorf("changing effect of %q to present=%v: %w", r.name, want, opErr)
 	}
 
-	present, err := r.effect.Present(ctx)
+	present, err := r.checkPresent(ctx)
 	if err != nil {
 		return fmt.Errorf("verifying effect of %q: %w", r.name, err)
 	}
@@ -11732,7 +11833,7 @@ func (h *Host) RegisterResource(name string, effect Effect) error {
 		return fmt.Errorf("registering resource %q: %w", name, err)
 	}
 
-	res := newHostResource(name, node, effect)
+	res := newHostResource(name, node, effect, h.cfg.EffectTimeout)
 	if !h.addResource(res) {
 		return fmt.Errorf("%w: %q", ErrResourceRegistered, name)
 	}
@@ -12069,7 +12170,7 @@ func (h *Host) reconcile(ctx context.Context, r *hostResource, final bool) time.
 		return 0
 	}
 
-	present, err := r.effect.Present(ctx)
+	present, err := r.checkPresent(ctx)
 	if err != nil {
 		return h.failPass(r, pass, fmt.Errorf("checking the effect of %q: %w", r.name, err))
 	}

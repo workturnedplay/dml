@@ -25,6 +25,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -18309,4 +18310,161 @@ func TestHostResyncRepairsDriftNobodyTouched(t *testing.T) {
 		applies, _, present := fw.counts()
 		return applies >= 2 && present
 	})
+}
+
+// hungEffect is a fakeEffect whose Apply blocks until unblock is called and
+// ignores its context: the shape of an effect stuck in some outside call.
+type hungEffect struct {
+	fakeEffect
+	release chan struct{}
+	once    sync.Once
+	entered atomic.Int32
+}
+
+func newHungEffect() *hungEffect {
+	return &hungEffect{release: make(chan struct{})}
+}
+
+func (h *hungEffect) Apply(ctx context.Context) error {
+	h.entered.Add(1)
+
+	<-h.release
+
+	return h.fakeEffect.Apply(ctx)
+}
+
+func (h *hungEffect) unblock() {
+	h.once.Do(func() { close(h.release) })
+}
+
+// errorLog collects what the Host reports through HostConfig.OnError.
+type errorLog struct {
+	mu   sync.Mutex
+	errs []error
+}
+
+func (l *errorLog) add(_ string, err error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	l.errs = append(l.errs, err)
+}
+
+func (l *errorLog) has(target error) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	for _, err := range l.errs {
+		if errors.Is(err, target) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// TestHostHungEffectTimesOutIsNotCalledAgainWhileStuckAndDoesNotBlockOthers:
+// an Apply that never returns is abandoned at EffectTimeout and reported; no
+// second Apply starts while it is stuck (ErrEffectBusy instead); another
+// resource is still reconciled; and once the stuck call finally returns, its
+// result is picked up without a second Apply.
+func TestHostHungEffectTimesOutIsNotCalledAgainWhileStuckAndDoesNotBlockOthers(t *testing.T) {
+	ctx := hostTestContext(t)
+	reported := &errorLog{}
+	h := openTestHost(t, boltTestPath(t), func(cfg *HostConfig) {
+		cfg.EffectTimeout = 50 * time.Millisecond
+		cfg.OnError = reported.add
+	})
+
+	hung := newHungEffect()
+	t.Cleanup(hung.unblock)
+
+	plain := &fakeEffect{}
+	registerTestResource(t, h, "hung", hung)
+	registerTestResource(t, h, "plain", plain)
+
+	c := connectTest(t, h)
+
+	result, acquireErr := c.Acquire(ctx, "hung")
+	if acquireErr != nil {
+		t.Fatalf("Acquire(hung): %v", acquireErr)
+	}
+
+	if plainErr := AcquireAndWait(ctx, c, "plain"); plainErr != nil {
+		t.Fatalf("AcquireAndWait(plain) while another effect is hung: %v", plainErr)
+	}
+
+	eventually(t, "the timeout to be reported", func() bool { return reported.has(ErrEffectTimeout) })
+
+	// Several retries pass while the first Apply is still stuck.
+	waitCtx, cancel := context.WithTimeout(ctx, 300*time.Millisecond)
+	defer cancel()
+
+	if waitErr := c.WaitApplied(waitCtx, "hung", result.Mark); !errors.Is(waitErr, context.DeadlineExceeded) {
+		t.Fatalf("WaitApplied() on a hung effect error = %v, want %v", waitErr, context.DeadlineExceeded)
+	}
+
+	if got := hung.entered.Load(); got != 1 {
+		t.Fatalf("Apply was entered %d times while stuck, want exactly 1", got)
+	}
+
+	if !reported.has(ErrEffectBusy) {
+		t.Fatal("no ErrEffectBusy was reported for the retries made while the call was stuck")
+	}
+
+	hung.unblock()
+
+	if appliedErr := c.WaitApplied(ctx, "hung", result.Mark); appliedErr != nil {
+		t.Fatalf("WaitApplied() after the stuck call returned: %v", appliedErr)
+	}
+
+	requireEffectCounts(t, &hung.fakeEffect, 1, 0, true)
+}
+
+// TestHostCloseDoesNotWaitForAnEffectThatIgnoresItsContext: with the default
+// (long) EffectTimeout, a call stuck inside Apply must not keep Close from
+// returning.
+func TestHostCloseDoesNotWaitForAnEffectThatIgnoresItsContext(t *testing.T) {
+	ctx := hostTestContext(t)
+	h := openTestHost(t, boltTestPath(t), nil)
+
+	hung := newHungEffect()
+	t.Cleanup(hung.unblock)
+
+	registerTestResource(t, h, "hung", hung)
+
+	c := connectTest(t, h)
+
+	if _, acquireErr := c.Acquire(ctx, "hung"); acquireErr != nil {
+		t.Fatalf("Acquire(): %v", acquireErr)
+	}
+
+	eventually(t, "the effect to be stuck inside Apply", func() bool { return hung.entered.Load() == 1 })
+
+	closed := make(chan error, 1)
+
+	go func() { closed <- h.Close() }()
+
+	select {
+	case closeErr := <-closed:
+		if closeErr != nil {
+			t.Fatalf("Close(): %v", closeErr)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Close() did not return while an effect call ignored its context")
+	}
+}
+
+func TestHostConfigEffectTimeoutDefaultsAndDisable(t *testing.T) {
+	if got := (HostConfig{}).withDefaults().EffectTimeout; got != defaultEffectTimeout {
+		t.Fatalf("default EffectTimeout = %v, want %v", got, defaultEffectTimeout)
+	}
+
+	if got := (HostConfig{EffectTimeout: -1}).withDefaults().EffectTimeout; got != 0 {
+		t.Fatalf("a negative EffectTimeout became %v, want 0 (disabled)", got)
+	}
+
+	if got := (HostConfig{EffectTimeout: time.Second}).withDefaults().EffectTimeout; got != time.Second {
+		t.Fatalf("EffectTimeout = %v, want it kept at %v", got, time.Second)
+	}
 }

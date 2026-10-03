@@ -2089,6 +2089,21 @@ could be called directly.
  wording that suggested a specific consumer was neutralized. No behavior
  change.
 
+52. Per-call deadline for Effect calls (theorystate.md section 112), closing
+ the known gap recorded in item 51. HostConfig.EffectTimeout (zero: 30 s,
+ negative: disabled). hostResource.callEffect runs each Present/Apply/Remove
+ on its own goroutine under the deadline; on timeout (or when the host's
+ context ends) the call is abandoned and ErrEffectTimeout (or the context
+ error) is reported through the normal failPass path, retried after
+ RetryInterval. hostResource.busy stays set until an abandoned call returns,
+ and a new call meanwhile fails at once with ErrEffectBusy, so an effect
+ never sees overlapping calls. checkPresent wraps Present for reconcile and
+ converge; converge picks Apply or Remove as a method value. Close no longer
+ waits for an effect that ignores its context. Covered by
+ TestHostHungEffectTimesOutIsNotCalledAgainWhileStuckAndDoesNotBlockOthers,
+ TestHostCloseDoesNotWaitForAnEffectThatIgnoresItsContext and
+ TestHostConfigEffectTimeoutDefaultsAndDisable.
+
 Currently unaddressed yet:
 - Paged reads beyond a single node's own outgoing/incoming edges
   (theorystate.md section 105, items 43/46): FindRelationships and
@@ -2100,9 +2115,9 @@ Currently unaddressed yet:
   authorization beyond the pipe's DACL (theorystate.md sections 107, 112,
   113). Production Effect implementations are deliberately not dml's
   (theorystate.md section 112).
-- Effect calls have no per-call deadline: one hung Present/Apply/Remove
-  stalls the single reconciler goroutine and Close. To be fixed next with
-  HostConfig.EffectTimeout (theorystate.md section 112).
+- An abandoned effect call (theorystate.md section 112, item 52) cannot be
+  killed if the effect ignores its context; at most one lingers per
+  resource.
 - Nested transactions as a production-backend feature are also realized
   on BoltGraph (item 40), via the same shared txLog (undo log, commit
   and rollback hooks, savepoints) mechanism Txn already uses -- not a

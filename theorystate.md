@@ -3836,11 +3836,20 @@ registration. An effect whose resource is never registered again is
 invisible to dml. An implementation that can enumerate what it created
 should clean that up itself before registering. dml gets no sweep hook.
 
-**Known gap, to be fixed next (not deferred for lack of a caller, §7b).**
-Effect calls run with no per-call deadline. The reconciler is one
-goroutine, so a hung `Present`/`Apply`/`Remove` stalls every resource, and
-`Close` waits for it. The fix is a `HostConfig.EffectTimeout` applied to
-each call and reported as an ordinary effect error, retried like any other.
+**Effect calls have a deadline (DECIDED, implemented).** The reconciler is
+one goroutine, so without one a hung `Present`/`Apply`/`Remove` would stall
+every resource, and `Close` would wait for it. `HostConfig.EffectTimeout`
+(zero: 30 s; negative: disabled) bounds each call. A call runs on its own
+goroutine; if it does not return in time the reconciler abandons it and
+reports `ErrEffectTimeout` as an ordinary effect error, retried after
+`RetryInterval` (`WaitApplied`'s error carries the last one). An effect
+that ignores its context cannot be killed, so while an abandoned call is
+still running no new call to that effect starts: it fails at once with
+`ErrEffectBusy`, so an effect never sees two overlapping calls. What the
+abandoned call eventually did is seen by a later pass, since `Present`
+reports real state. `Close` cancels the context and leaves an abandoned call
+behind instead of waiting for it. With the deadline disabled, calls are
+direct and `Close` can wait for an effect that ignores its context.
 
 **Still OPEN.** How hosts on different machines coordinate (Part C). The
 wire transport and the keepalive helper are §113.
@@ -4054,6 +4063,9 @@ kept current as sections above resolve or split further.)*
 - dml owns the generic mechanism (sessions, holds, the `Effect` contract,
   the reconciler, the transport) and no consumer vocabulary or production
   `Effect`; consumers build those themselves, in-graph where they can (§112).
+- Each `Effect` call runs under `HostConfig.EffectTimeout`; a call that
+  times out is abandoned and reported, and no new call to that effect
+  starts until it returns, so calls never overlap (§112).
 
 ### TENTATIVE
 - bbolt as the first persistent-backend spike, with the layout and
@@ -4169,7 +4181,6 @@ kept current as sections above resolve or split further.)*
   writing portability tests by hand as needed; and whether stagedGraph
   should ever gain real (rather than externally forced) conflict
   detection (§97).
-- Effect calls have no per-call deadline (§112); to be fixed next.
 
 ### REJECTED FOR NOW
 - Giving primitive relationships their own NodeIDs.
