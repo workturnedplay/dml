@@ -26,6 +26,7 @@ import (
 	"net"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -39,11 +40,11 @@ type wireRig struct {
 	server *WireServer
 }
 
-func newWireRig(t *testing.T, mutate func(cfg *HostConfig)) *wireRig {
+func newWireRig(t *testing.T, mutate func(cfg *HostConfig), opts ...WireOption) *wireRig {
 	t.Helper()
 
 	h := openTestHost(t, boltTestPath(t), mutate)
-	server := NewWireServer(h)
+	server := NewWireServer(h, opts...)
 
 	// Registered after the host's own cleanup, so it runs first.
 	t.Cleanup(func() {
@@ -554,5 +555,295 @@ func TestWireRequestsBeyondTheInFlightLimitAreRefusedAndTheConnectionSurvives(t 
 	// The cancellations ended requests, not the hold.
 	if last, releaseErr := client.Release(ctx, "broken"); releaseErr != nil || !last {
 		t.Fatalf("Release() = (%v,%v), want last=true: the hold must have survived", last, releaseErr)
+	}
+}
+
+func TestWireMaxConnsOptionDefaultsAndUnlimited(t *testing.T) {
+	cases := []struct {
+		name string
+		opts []WireOption
+		want int
+	}{
+		{name: "default", want: wireDefaultMaxConns},
+		{name: "zero keeps the default", opts: []WireOption{WithMaxConns(0)}, want: wireDefaultMaxConns},
+		{name: "explicit", opts: []WireOption{WithMaxConns(3)}, want: 3},
+		{name: "negative is unlimited", opts: []WireOption{WithMaxConns(-1)}, want: 0},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := NewWireServer(nil, tc.opts...).maxConns; got != tc.want {
+				t.Fatalf("maxConns = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestWireMaxConnsRefusesTheConnectionOverTheLimitWithoutOpeningASession(t *testing.T) {
+	ctx := hostTestContext(t)
+	rig := newWireRig(t, nil, WithMaxConns(2))
+	registerTestResource(t, rig.host, "example-resource", nil)
+
+	first := rig.dial(t)
+	second := rig.dial(t)
+
+	_, refusedErr := NewWireClient(ctx, serveInMemory(t, rig.server))
+	if !errors.Is(refusedErr, ErrWireTooManyConns) {
+		t.Fatalf("NewWireClient() over the limit error = %v, want %v", refusedErr, ErrWireTooManyConns)
+	}
+
+	var remote *RemoteError
+	if !errors.As(refusedErr, &remote) || remote.Code != "too_many_conns" {
+		t.Fatalf("NewWireClient() over the limit error = %#v, want a *RemoteError with code too_many_conns", refusedErr)
+	}
+
+	sessions, sessionsErr := rig.host.Registries().Leases.Sessions(rig.host.Graph())
+	if sessionsErr != nil || len(sessions) != 2 {
+		t.Fatalf("Sessions() = (%v,%v), want exactly the 2 admitted connections' sessions", sessions, sessionsErr)
+	}
+
+	// The admitted clients are unaffected.
+	for i, client := range []*WireClient{first, second} {
+		if acquireErr := AcquireAndWait(ctx, client, "example-resource"); acquireErr != nil {
+			t.Fatalf("admitted client %d: AcquireAndWait(): %v", i, acquireErr)
+		}
+	}
+}
+
+func TestWireMaxConnsFreesTheSlotWhenAConnectionEnds(t *testing.T) {
+	ctx := hostTestContext(t)
+	rig := newWireRig(t, nil, WithMaxConns(1))
+
+	first := rig.dial(t)
+
+	if _, refusedErr := NewWireClient(ctx, serveInMemory(t, rig.server)); !errors.Is(refusedErr, ErrWireTooManyConns) {
+		t.Fatalf("NewWireClient() over the limit error = %v, want %v", refusedErr, ErrWireTooManyConns)
+	}
+
+	if closeErr := first.Close(); closeErr != nil {
+		t.Fatalf("Close(): %v", closeErr)
+	}
+
+	// The slot is freed just after the host has released the session.
+	var second *WireClient
+
+	eventually(t, "the slot to be freed", func() bool {
+		client, dialErr := NewWireClient(ctx, serveInMemory(t, rig.server))
+		if dialErr != nil {
+			if !errors.Is(dialErr, ErrWireTooManyConns) {
+				t.Fatalf("NewWireClient() error = %v, want nil or %v", dialErr, ErrWireTooManyConns)
+			}
+
+			return false
+		}
+
+		second = client
+
+		return true
+	})
+
+	t.Cleanup(func() {
+		if closeErr := second.Close(); closeErr != nil {
+			t.Errorf("second Close(): %v", closeErr)
+		}
+	})
+}
+
+// newAuthRig serves a host with two registered resources to peers that are
+// all identified as principal, under authorizer.
+func newAuthRig(t *testing.T, principal Principal, authorizer Authorizer) *wireRig {
+	t.Helper()
+
+	identify := func(net.Conn) (Principal, error) { return principal, nil }
+	rig := newWireRig(t, nil, WithPeerIdentifier(identify), WithAuthorizer(authorizer))
+
+	registerTestResource(t, rig.host, "allowed", nil)
+	registerTestResource(t, rig.host, "denied", nil)
+
+	return rig
+}
+
+func TestWireAuthorizerDecidesPerResource(t *testing.T) {
+	ctx := hostTestContext(t)
+	policy := NewResourcePolicy(map[string][]Principal{
+		"allowed": {"S-1-5-test-alice"},
+		"denied":  {"S-1-5-test-bob"},
+	})
+	rig := newAuthRig(t, "S-1-5-test-alice", policy)
+	client := rig.dial(t)
+
+	if allowedErr := AcquireAndWait(ctx, client, "allowed"); allowedErr != nil {
+		t.Fatalf("AcquireAndWait(allowed): %v", allowedErr)
+	}
+
+	_, acquireErr := client.Acquire(ctx, "denied")
+	if !errors.Is(acquireErr, ErrNotAuthorized) {
+		t.Fatalf("Acquire(denied) error = %v, want %v", acquireErr, ErrNotAuthorized)
+	}
+
+	var remote *RemoteError
+	if !errors.As(acquireErr, &remote) || remote.Code != "not_authorized" {
+		t.Fatalf("Acquire(denied) error = %#v, want a *RemoteError with code not_authorized", acquireErr)
+	}
+
+	if _, releaseErr := client.Release(ctx, "denied"); !errors.Is(releaseErr, ErrNotAuthorized) {
+		t.Fatalf("Release(denied) error = %v, want %v", releaseErr, ErrNotAuthorized)
+	}
+
+	if waitErr := client.WaitApplied(ctx, "denied", 0); !errors.Is(waitErr, ErrNotAuthorized) {
+		t.Fatalf("WaitApplied(denied) error = %v, want %v", waitErr, ErrNotAuthorized)
+	}
+
+	// A name that is not a registered resource is refused the same way, not
+	// reported as unknown, so nothing about what exists is revealed.
+	if _, unknownErr := client.Acquire(ctx, "no-such-resource"); !errors.Is(unknownErr, ErrNotAuthorized) {
+		t.Fatalf("Acquire(no-such-resource) error = %v, want %v", unknownErr, ErrNotAuthorized)
+	}
+
+	node, found := rig.host.names.Lookup(resourcePrefix + "denied")
+	if !found {
+		t.Fatal("the resource name is not bound")
+	}
+
+	held, heldErr := rig.host.Registries().Leases.Held(rig.host.Graph(), node)
+	if heldErr != nil || held {
+		t.Fatalf("Held(denied) = (%v,%v), want (false,nil): a refused request must change nothing", held, heldErr)
+	}
+
+	// Operations that name no resource are not subject to it.
+	if keepErr := client.Keepalive(ctx); keepErr != nil {
+		t.Fatalf("Keepalive(): %v", keepErr)
+	}
+}
+
+// recordingAuthorizer denies everything and remembers what it was asked.
+type recordingAuthorizer struct {
+	mu    sync.Mutex
+	calls []recordedAuthorization
+}
+
+type recordedAuthorization struct {
+	principal Principal
+	resource  string
+}
+
+func (r *recordingAuthorizer) Authorize(principal Principal, resource string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.calls = append(r.calls, recordedAuthorization{principal: principal, resource: resource})
+
+	return ErrNotAuthorized
+}
+
+func (r *recordingAuthorizer) recorded() []recordedAuthorization {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return append([]recordedAuthorization(nil), r.calls...)
+}
+
+func TestWireAuthorizerSeesAnUnknownPrincipalWhenThePeerCannotBeIdentified(t *testing.T) {
+	errIdentify := errors.New("no identity available")
+
+	cases := []struct {
+		name string
+		opts []WireOption
+	}{
+		{name: "no identifier"},
+		{
+			name: "identifier fails",
+			opts: []WireOption{WithPeerIdentifier(func(net.Conn) (Principal, error) { return "S-1-5-ignored", errIdentify })},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := hostTestContext(t)
+			recorder := &recordingAuthorizer{}
+			opts := append([]WireOption{WithAuthorizer(recorder)}, tc.opts...)
+
+			rig := newWireRig(t, nil, opts...)
+			registerTestResource(t, rig.host, "example-resource", nil)
+
+			client := rig.dial(t)
+
+			if _, acquireErr := client.Acquire(ctx, "example-resource"); !errors.Is(acquireErr, ErrNotAuthorized) {
+				t.Fatalf("Acquire() error = %v, want %v", acquireErr, ErrNotAuthorized)
+			}
+
+			want := []recordedAuthorization{{principal: "", resource: "example-resource"}}
+			if got := recorder.recorded(); !reflect.DeepEqual(got, want) {
+				t.Fatalf("the authorizer was asked %+v, want %+v (an unidentified peer is the empty principal)", got, want)
+			}
+		})
+	}
+}
+
+func TestWireAuthorizerThatFailsDenies(t *testing.T) {
+	ctx := hostTestContext(t)
+	authorizer := AuthorizerFunc(func(Principal, string) error { return errors.New("policy store unavailable") })
+	rig := newAuthRig(t, "S-1-5-test-alice", authorizer)
+	client := rig.dial(t)
+
+	_, err := client.Acquire(ctx, "allowed")
+	if !errors.Is(err, ErrNotAuthorized) {
+		t.Fatalf("Acquire() with a failing authorizer error = %v, want %v", err, ErrNotAuthorized)
+	}
+
+	if !strings.Contains(err.Error(), "policy store unavailable") {
+		t.Fatalf("Acquire() error = %q, want the authorizer's own failure in it", err)
+	}
+}
+
+func TestWireWithoutAnAuthorizerAllowsEveryResource(t *testing.T) {
+	ctx := hostTestContext(t)
+	rig := newWireRig(t, nil)
+	registerTestResource(t, rig.host, "example-resource", nil)
+
+	if acquireErr := AcquireAndWait(ctx, rig.dial(t), "example-resource"); acquireErr != nil {
+		t.Fatalf("AcquireAndWait() without an authorizer: %v", acquireErr)
+	}
+}
+
+func TestResourcePolicyAuthorize(t *testing.T) {
+	rules := map[string][]Principal{
+		"listed": {"alice", "bob"},
+		"open":   {AnyPrincipal},
+		"empty":  {},
+	}
+	policy := NewResourcePolicy(rules)
+
+	// The policy keeps its own copy of the rules.
+	rules["listed"] = []Principal{"mallory"}
+
+	cases := []struct {
+		name      string
+		principal Principal
+		resource  string
+		allowed   bool
+	}{
+		{name: "listed principal", principal: "alice", resource: "listed", allowed: true},
+		{name: "second listed principal", principal: "bob", resource: "listed", allowed: true},
+		{name: "other principal", principal: "carol", resource: "listed"},
+		{name: "unknown principal", principal: "", resource: "listed"},
+		{name: "open to everyone", principal: "carol", resource: "open", allowed: true},
+		{name: "open to unknown", principal: "", resource: "open", allowed: true},
+		{name: "empty list", principal: "alice", resource: "empty"},
+		{name: "no entry", principal: "alice", resource: "missing"},
+		{name: "rule changed after construction", principal: "mallory", resource: "listed"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := policy.Authorize(tc.principal, tc.resource)
+
+			switch {
+			case tc.allowed && err != nil:
+				t.Fatalf("Authorize(%q, %q) = %v, want nil", tc.principal, tc.resource, err)
+			case !tc.allowed && !errors.Is(err, ErrNotAuthorized):
+				t.Fatalf("Authorize(%q, %q) = %v, want %v", tc.principal, tc.resource, err, ErrNotAuthorized)
+			}
+		})
 	}
 }

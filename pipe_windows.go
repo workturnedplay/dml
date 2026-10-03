@@ -22,6 +22,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"unsafe"
 
 	winio "github.com/Microsoft/go-winio"
 	"golang.org/x/sys/windows"
@@ -91,4 +92,84 @@ func DialPipe(ctx context.Context, path string) (*WireClient, error) {
 	}
 
 	return NewWireClient(ctx, nc)
+}
+
+// procGetNamedPipeClientProcessID is called through a lazy proc so that it
+// does not depend on which functions the vendored x/sys/windows exposes.
+var procGetNamedPipeClientProcessID = windows.NewLazySystemDLL("kernel32.dll").NewProc("GetNamedPipeClientProcessId")
+
+// pipeHandleSource is implemented by the connections ListenPipe accepts, if
+// go-winio exposes their handle.
+type pipeHandleSource interface {
+	Fd() uintptr
+}
+
+// pipeClientProcessID returns the process ID of the client end of the pipe
+// whose server-side handle is handle.
+func pipeClientProcessID(handle uintptr) (uint32, error) {
+	var pid uint32
+
+	result, _, callErr := procGetNamedPipeClientProcessID.Call(handle, uintptr(unsafe.Pointer(&pid))) //nolint:gosec // the call needs the address of pid
+	if result == 0 {
+		return 0, fmt.Errorf("pipe: GetNamedPipeClientProcessId: %w", callErr)
+	}
+
+	return pid, nil
+}
+
+// processUserSID returns the SID of the user process pid runs as.
+func processUserSID(pid uint32) (string, error) {
+	process, openErr := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
+	if openErr != nil {
+		return "", fmt.Errorf("pipe: opening client process %d: %w", pid, openErr)
+	}
+
+	defer func() {
+		if closeErr := windows.CloseHandle(process); closeErr != nil {
+			_ = closeErr
+		}
+	}()
+
+	var token windows.Token
+
+	if tokenErr := windows.OpenProcessToken(process, windows.TOKEN_QUERY, &token); tokenErr != nil {
+		return "", fmt.Errorf("pipe: opening the token of client process %d: %w", pid, tokenErr)
+	}
+
+	defer closeQuietly(token)
+
+	user, userErr := token.GetTokenUser()
+	if userErr != nil {
+		return "", fmt.Errorf("pipe: reading the user of client process %d: %w", pid, userErr)
+	}
+
+	return user.User.Sid.String(), nil
+}
+
+// PipePeerPrincipal is a PeerIdentifier for connections accepted from
+// ListenPipe: the Principal is the SID of the user the client process runs
+// as. A peer it cannot identify (the connection does not expose its handle,
+// or the client process cannot be opened, as for a process of another
+// account) is an error, which the server turns into the empty Principal.
+//
+// With the default pipe security only the current user and SYSTEM can
+// connect, so this tells those two apart. It becomes useful when ListenPipe
+// is given a wider security descriptor.
+func PipePeerPrincipal(nc net.Conn) (Principal, error) {
+	source, ok := nc.(pipeHandleSource)
+	if !ok {
+		return "", fmt.Errorf("%w: %T does not expose its pipe handle", ErrPeerUnidentified, nc)
+	}
+
+	pid, pidErr := pipeClientProcessID(source.Fd())
+	if pidErr != nil {
+		return "", fmt.Errorf("%w: %w", ErrPeerUnidentified, pidErr)
+	}
+
+	sid, sidErr := processUserSID(pid)
+	if sidErr != nil {
+		return "", fmt.Errorf("%w: %w", ErrPeerUnidentified, sidErr)
+	}
+
+	return Principal(sid), nil
 }

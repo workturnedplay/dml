@@ -2104,6 +2104,31 @@ could be called directly.
  TestHostCloseDoesNotWaitForAnEffectThatIgnoresItsContext and
  TestHostConfigEffectTimeoutDefaultsAndDisable.
 
+53. Connection limit and per-resource authorization on the wire transport
+ (theorystate.md section 113). NewWireServer takes options (WithMaxConns,
+ WithAuthorizer, WithPeerIdentifier). A connection over the limit (default
+ 256) is registered, told ErrWireTooManyConns in reply to its hello
+ (WireServer.refuse, within wireRefuseTimeout) and closed without a session;
+ register/unregister keep the count. New file wire_auth.go: Principal,
+ AnyPrincipal, PeerIdentifier, Authorizer, AuthorizerFunc, ResourcePolicy
+ (default deny), ErrNotAuthorized, ErrPeerUnidentified. wireServerConn
+ authorizes acquire, release and wait_applied before the host looks the
+ resource up, fail-closed. pipe_windows.go: PipePeerPrincipal reads the
+ client's SID (GetNamedPipeClientProcessId through a lazy proc, then the
+ process token); it needs the pipe connection to expose its handle
+ (Fd), else it reports ErrPeerUnidentified. Tests: servePipe and
+ currentUserPrincipal helpers replace inline pipe serving. Covered by
+ TestWireMaxConnsOptionDefaultsAndUnlimited,
+ TestWireMaxConnsRefusesTheConnectionOverTheLimitWithoutOpeningASession,
+ TestWireMaxConnsFreesTheSlotWhenAConnectionEnds,
+ TestWireAuthorizerDecidesPerResource,
+ TestWireAuthorizerSeesAnUnknownPrincipalWhenThePeerCannotBeIdentified,
+ TestWireAuthorizerThatFailsDenies,
+ TestWireWithoutAnAuthorizerAllowsEveryResource,
+ TestResourcePolicyAuthorize, TestPipePeerPrincipalIsTheClientUser,
+ TestPipePeerPrincipalRefusesAConnectionThatHidesItsHandle and
+ TestPipeAuthorizationUsesTheClientSID.
+
 Currently unaddressed yet:
 - Paged reads beyond a single node's own outgoing/incoming edges
   (theorystate.md section 105, items 43/46): FindRelationships and
@@ -2111,10 +2136,9 @@ Currently unaddressed yet:
   are ListRegistry.validateStructure's and CompositeSetRegistry's own
   full-child-set reads. (The GraphReader methods that lacked error
   results now have them; see ErrGraphStoreUnavailable.)
-- Transports other than the named pipe (item 49) and per-client
-  authorization beyond the pipe's DACL (theorystate.md sections 107, 112,
-  113). Production Effect implementations are deliberately not dml's
-  (theorystate.md section 112).
+- Transports other than the named pipe (item 49), and peer identity on
+  them (theorystate.md sections 107, 112, 113). Production Effect
+  implementations are deliberately not dml's (theorystate.md section 112).
 - An abandoned effect call (theorystate.md section 112, item 52) cannot be
   killed if the effect ignores its context; at most one lingers per
   resource.

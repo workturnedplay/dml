@@ -3879,14 +3879,31 @@ and §112 fixed the `Client` shape. This is its first transport.
 - One connection is one session, and any disconnect releases it: no resume
   tokens. A resume window would keep a crashed holder's effect alive, which
   is exactly what §111 exists to prevent.
-- Authorization is the transport's own: on Windows, the named pipe's DACL
-  decides who may connect (default: current user and SYSTEM, network logons
-  denied). The heartbeat proves the process is alive, not that its logic is
-  making progress.
+- Authorization has two layers. Who may connect at all is the transport's:
+  on Windows, the named pipe's DACL (default: current user and SYSTEM,
+  network logons denied). Which resource a connection may use is the
+  server's: it asks an `Authorizer` with the connection's `Principal` (what
+  the transport can say about the peer, a SID for a pipe, empty if unknown)
+  and the resource name, before the host looks the resource up, so an
+  unregistered name is refused like a forbidden one. It fails closed: an
+  unidentifiable peer is the empty principal, an authorizer that fails
+  denies, and `ResourcePolicy` (the table-driven authorizer dml ships) denies
+  a resource with no entry. The in-process `Conn` is trusted and not subject
+  to it, and policy is not stored in the graph. With the default pipe
+  security only the current user and SYSTEM can connect, so a SID tells just
+  those two apart (and a SYSTEM client cannot be opened by a non-elevated
+  host, so it is unknown); the layer matters once `ListenPipe` is given a
+  wider security descriptor.
+- A server limits its connections (`WithMaxConns`, default 256, negative:
+  unlimited), because every admitted connection opens a session, which is a
+  durable commit. A connection over the limit is told why (`too_many_conns`,
+  after its hello is read, within 2 s) and closed without a session. The
+  heartbeat proves the process is alive, not that its logic is making
+  progress.
 
-**OPEN.** Per-resource authorization (needs the peer's identity, for example
-the pipe client's SID, and a policy), transports beyond named pipes and
-loopback TCP (TLS), and how an error crosses when §89c's transaction
+**OPEN.** Transports beyond named pipes and loopback TCP (TLS) and a way to
+identify peers on them (loopback TCP has none, so every peer is the empty
+principal there), and how an error crosses when §89c's transaction
 descriptors exist.
 
 ---
@@ -4066,6 +4083,10 @@ kept current as sections above resolve or split further.)*
 - Each `Effect` call runs under `HostConfig.EffectTimeout`; a call that
   times out is abandoned and reported, and no new call to that effect
   starts until it returns, so calls never overlap (§112).
+- Wire clients are authorized per resource by an `Authorizer` over the
+  transport's `Principal`, fail-closed and before the resource is looked up,
+  and a server limits its connections without opening sessions for the
+  refused ones (§113).
 
 ### TENTATIVE
 - bbolt as the first persistent-backend spike, with the layout and
@@ -4172,10 +4193,9 @@ kept current as sections above resolve or split further.)*
   the real workload, Badger as the fallback if write parallelism is ever
   needed, and the reads still unbounded in §105. §98 is moot under §107,
   and §99 is answered by §104 and §110.
-- Per-resource authorization and transports beyond named pipes and
-  loopback TCP (§113), and how hosts on different machines coordinate
-  (§107, §112, Part C). Production `Effect` implementations are not
-  dml's (§112).
+- Transports beyond named pipes and loopback TCP, with peer identity
+  (§113), and how hosts on different machines coordinate (§107, §112,
+  Part C). Production `Effect` implementations are not dml's (§112).
 - Whether to build a harness that automatically re-runs the existing
   registry test suite against both *Graph and stagedGraph, versus
   writing portability tests by hand as needed; and whether stagedGraph

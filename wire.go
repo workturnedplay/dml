@@ -64,6 +64,10 @@ var (
 	// ErrWireServerClosed is returned by Serve when the server is closed.
 	ErrWireServerClosed = errors.New("wire server is closed")
 
+	// ErrWireTooManyConns is returned to a client whose connection the
+	// server refused because it already serves its limit (WithMaxConns).
+	ErrWireTooManyConns = errors.New("the server has too many connections")
+
 	// ErrRemote is the sentinel of a RemoteError whose code this build does
 	// not know: a newer host may add codes without breaking older clients.
 	ErrRemote = errors.New("remote error")
@@ -78,6 +82,15 @@ const (
 	wireWriteTimeout = 10 * time.Second
 	wireCloseTimeout = 10 * time.Second
 	wireCancelGrace  = time.Second
+
+	// wireRefuseTimeout bounds how long the server spends telling a refused
+	// connection why, so refused connections cannot pile up goroutines.
+	wireRefuseTimeout = 2 * time.Second
+
+	// wireDefaultMaxConns is the connection limit of a server given no
+	// WithMaxConns. Every admitted connection opens a session, which is a
+	// durable commit.
+	wireDefaultMaxConns = 256
 
 	// wireHeartbeatsPerTTL is how many keepalives a client sends per host
 	// TTL, so one lost or late heartbeat does not expire the session.
@@ -131,6 +144,8 @@ var wireErrorTable = []struct {
 	code string
 	err  error
 }{
+	{"not_authorized", ErrNotAuthorized},
+	{"too_many_conns", ErrWireTooManyConns},
 	{"host_closed", ErrHostClosed},
 	{"conn_closed", ErrConnClosed},
 	{"hold_lost", ErrHoldLost},
@@ -274,21 +289,65 @@ func readWireFrame(r io.Reader, v any) error {
 type WireServer struct {
 	host *Host
 
+	// Set by NewWireServer and its options, never changed afterwards.
+	maxConns   int // 0: unlimited
+	authorizer Authorizer
+	identifier PeerIdentifier
+
 	mu        sync.Mutex
 	closed    bool
 	listeners map[net.Listener]struct{}
 	conns     map[net.Conn]struct{}
+	admitted  int // connections counted against maxConns
 
 	wg sync.WaitGroup
 }
 
+// WireOption configures a WireServer.
+type WireOption func(s *WireServer)
+
+// WithMaxConns limits how many connections the server serves at once. Zero
+// keeps the default (wireDefaultMaxConns) and a negative n means unlimited.
+// A connection over the limit is told why and closed without a session.
+func WithMaxConns(n int) WireOption {
+	return func(s *WireServer) {
+		switch {
+		case n > 0:
+			s.maxConns = n
+		case n < 0:
+			s.maxConns = 0
+		}
+	}
+}
+
+// WithAuthorizer makes the server ask a before every acquire, release and
+// wait_applied. Without one every connection may use every resource. Peers
+// are named by WithPeerIdentifier; without one they are all the empty
+// Principal.
+func WithAuthorizer(a Authorizer) WireOption {
+	return func(s *WireServer) { s.authorizer = a }
+}
+
+// WithPeerIdentifier sets how the server names the peer of a connection (for
+// a Windows named pipe, PipePeerPrincipal).
+func WithPeerIdentifier(identify PeerIdentifier) WireOption {
+	return func(s *WireServer) { s.identifier = identify }
+}
+
 // NewWireServer returns a server for host.
-func NewWireServer(host *Host) *WireServer {
-	return &WireServer{
+func NewWireServer(host *Host, opts ...WireOption) *WireServer {
+	s := &WireServer{
 		host:      host,
+		maxConns:  wireDefaultMaxConns,
 		listeners: make(map[net.Listener]struct{}),
 		conns:     make(map[net.Conn]struct{}),
 	}
+
+	for _, opt := range opts {
+		opt(s)
+	}
+
+	return s
 }
 
 // track runs add under the server lock unless the server is closed, and
@@ -386,21 +445,93 @@ func (s *WireServer) reportMisbehavior(err error) {
 	}
 }
 
-// ServeConn serves one connection until it ends, then releases its session.
-// It blocks, and takes ownership of nc.
-func (s *WireServer) ServeConn(nc net.Conn) {
-	if !s.track(func() {
+// register tracks nc unless the server is closed (registered), and reports
+// whether it is within the connection limit (admitted). Every registered
+// connection must be passed to unregister.
+func (s *WireServer) register(nc net.Conn) (registered, admitted bool) {
+	registered = s.track(func() {
 		s.conns[nc] = struct{}{}
 		s.wg.Add(1)
-	}) {
+
+		if s.maxConns <= 0 || s.admitted < s.maxConns {
+			s.admitted++
+			admitted = true
+		}
+	})
+
+	return registered, admitted
+}
+
+// unregister undoes register.
+func (s *WireServer) unregister(nc net.Conn, admitted bool) {
+	s.untrack(func() {
+		delete(s.conns, nc)
+
+		if admitted {
+			s.admitted--
+		}
+	})
+}
+
+// refuse answers the first request of a connection the server will not serve
+// with cause, so the client's handshake fails with the reason. It never
+// opens a session, and a peer that is slow to talk or to listen is cut off
+// after wireRefuseTimeout.
+func (s *WireServer) refuse(nc net.Conn, cause error) {
+	watchdog := time.AfterFunc(wireRefuseTimeout, func() { closeQuietly(nc) })
+	defer watchdog.Stop()
+
+	var req wireRequest
+
+	if readErr := readWireFrame(bufio.NewReader(nc), &req); readErr != nil {
+		return
+	}
+
+	resp := wireErrorResponse(cause)
+	resp.ID = req.ID
+
+	if writeErr := writeWireFrame(nc, &resp); writeErr != nil {
+		_ = writeErr // the peer is gone; there is nobody to tell
+	}
+}
+
+// identify names the peer of nc. A peer that cannot be identified is the
+// empty Principal, which an Authorizer must not treat as trusted.
+func (s *WireServer) identify(nc net.Conn) Principal {
+	if s.identifier == nil {
+		return ""
+	}
+
+	principal, err := s.identifier(nc)
+	if err != nil {
+		s.host.report("wire: identifying a peer", err)
+
+		return ""
+	}
+
+	return principal
+}
+
+// ServeConn serves one connection until it ends, then releases its session.
+// It blocks, and takes ownership of nc. A connection over the limit is
+// refused (see WithMaxConns).
+func (s *WireServer) ServeConn(nc net.Conn) {
+	registered, admitted := s.register(nc)
+	if !registered {
 		closeQuietly(nc)
 
 		return
 	}
 
 	defer s.wg.Done()
-	defer s.untrack(func() { delete(s.conns, nc) })
+	defer s.unregister(nc, admitted)
 	defer closeQuietly(nc)
+
+	if !admitted {
+		s.refuse(nc, fmt.Errorf("%w: the server already serves its limit of %d connections", ErrWireTooManyConns, s.maxConns))
+
+		return
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -415,6 +546,8 @@ func (s *WireServer) ServeConn(nc net.Conn) {
 	}
 
 	sc.conn = conn
+	sc.authorizer = s.authorizer
+	sc.principal = s.identify(nc)
 
 	// A connection the host ends (keepalive expiry, shutdown) must also end
 	// the transport, so the client finds out.
@@ -440,6 +573,12 @@ type wireServerConn struct {
 	nc     net.Conn
 	reader *bufio.Reader
 	conn   *Conn // set after the handshake, before anything else reads it
+
+	// authorizer and principal decide who may use which resource. Both are
+	// set after the handshake, before the read loop starts. A nil authorizer
+	// allows everything.
+	authorizer Authorizer
+	principal  Principal
 
 	writeMu sync.Mutex
 
@@ -607,8 +746,40 @@ func (sc *wireServerConn) cancelInflight(id uint64) {
 	}
 }
 
+// wireResourceOps are the operations that name a resource, and so need
+// authorizing.
+var wireResourceOps = []string{wireOpAcquire, wireOpRelease, wireOpWaitApplied}
+
+// authorize reports whether the connection's principal may use resource. It
+// fails closed: an authorizer that fails for any reason other than saying no
+// denies too.
+func (sc *wireServerConn) authorize(resource string) error {
+	if sc.authorizer == nil {
+		return nil
+	}
+
+	authErr := sc.authorizer.Authorize(sc.principal, resource)
+
+	switch {
+	case authErr == nil:
+		return nil
+	case errors.Is(authErr, ErrNotAuthorized):
+		return wrapInterfaceErr(authErr)
+	default:
+		return fmt.Errorf("%w: authorizing resource %q failed: %w", ErrNotAuthorized, resource, authErr)
+	}
+}
+
 // execute runs one operation on the session and builds its response.
 func (sc *wireServerConn) execute(ctx context.Context, req wireRequest) wireResponse {
+	// Before the host looks the resource up, so an unregistered name is
+	// refused exactly like a forbidden one and nothing is revealed.
+	if slices.Contains(wireResourceOps, req.Op) {
+		if authErr := sc.authorize(req.Resource); authErr != nil {
+			return wireErrorResponse(authErr)
+		}
+	}
+
 	switch req.Op {
 	case wireOpAcquire:
 		result, err := sc.conn.Acquire(ctx, req.Resource)
