@@ -19,6 +19,7 @@
 package dml
 
 import (
+	"context"
 	"errors"
 	"net"
 	"testing"
@@ -30,26 +31,28 @@ import (
 // test.bat), into one stable binary, so a single permanent rule covers them.
 // Everything else in the wire tests runs over net.Pipe and needs nothing.
 
-// TestFWNeededWireOverLoopbackTCP runs the whole client/host flow over a real
-// loopback TCP connection.
-func TestFWNeededWireOverLoopbackTCP(t *testing.T) {
-	ctx := hostTestContext(t)
-	h := openTestHost(t, boltTestPath(t), nil)
-	fw := &fakeEffect{}
-	registerTestResource(t, h, "example-resource", fw)
-
-	server := NewWireServer(h)
+// listenLoopback listens on a free loopback TCP port.
+func listenLoopback(t *testing.T) net.Listener {
+	t.Helper()
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("Listen(): %v", err)
 	}
 
+	return listener
+}
+
+// serveListener serves server on listener in the background. When the test
+// ends it closes the server and checks that Serve ended cleanly. Call it after
+// the host is opened, so its cleanup runs before the host's.
+func serveListener(t *testing.T, server *WireServer, listener net.Listener) {
+	t.Helper()
+
 	served := make(chan error, 1)
 
 	go func() { served <- server.Serve(listener) }()
 
-	// Registered after the host's cleanup, so it runs before it.
 	t.Cleanup(func() {
 		if closeErr := server.Close(); closeErr != nil {
 			t.Errorf("server Close(): %v", closeErr)
@@ -59,15 +62,61 @@ func TestFWNeededWireOverLoopbackTCP(t *testing.T) {
 			t.Errorf("Serve(): %v", serveErr)
 		}
 	})
+}
+
+// dialLoopback opens a plain TCP connection to address. The caller hands it
+// to a WireClient, which owns and closes it.
+func dialLoopback(ctx context.Context, t *testing.T, address string) net.Conn {
+	t.Helper()
 
 	var dialer net.Dialer
 
-	nc, dialErr := dialer.DialContext(ctx, "tcp", listener.Addr().String())
-	if dialErr != nil {
-		t.Fatalf("DialContext(): %v", dialErr)
+	nc, err := dialer.DialContext(ctx, "tcp", address)
+	if err != nil {
+		t.Fatalf("DialContext(): %v", err)
 	}
 
-	client := startWireClient(t, nc)
+	return nc
+}
+
+// TestFWNeededWireRefusesPlainTCPByDefault: a plain TCP client gets the
+// refusal and no session is opened.
+func TestFWNeededWireRefusesPlainTCPByDefault(t *testing.T) {
+	ctx := hostTestContext(t)
+	h := openTestHost(t, boltTestPath(t), nil)
+	registerTestResource(t, h, "example-resource", nil)
+
+	listener := listenLoopback(t)
+	serveListener(t, NewWireServer(h), listener)
+
+	_, err := NewWireClient(ctx, dialLoopback(ctx, t, listener.Addr().String()))
+	if !errors.Is(err, ErrWirePlainTCP) {
+		t.Fatalf("NewWireClient() over plain TCP error = %v, want %v", err, ErrWirePlainTCP)
+	}
+
+	var remote *RemoteError
+	if !errors.As(err, &remote) || remote.Code != "plain_tcp_refused" {
+		t.Fatalf("NewWireClient() over plain TCP error = %#v, want a *RemoteError with code plain_tcp_refused", err)
+	}
+
+	sessions, sessionsErr := h.Registries().Leases.Sessions(h.Graph())
+	if sessionsErr != nil || len(sessions) != 0 {
+		t.Fatalf("Sessions() = (%v,%v), want none for a refused connection", sessions, sessionsErr)
+	}
+}
+
+// TestFWNeededWireOverLoopbackTCP runs the whole client/host flow over a real
+// loopback TCP connection, with the opt-out that allows plain TCP.
+func TestFWNeededWireOverLoopbackTCP(t *testing.T) {
+	ctx := hostTestContext(t)
+	h := openTestHost(t, boltTestPath(t), nil)
+	fw := &fakeEffect{}
+	registerTestResource(t, h, "example-resource", fw)
+
+	listener := listenLoopback(t)
+	serveListener(t, NewWireServer(h, WithInsecurePlainTCP()), listener)
+
+	client := startWireClient(t, dialLoopback(ctx, t, listener.Addr().String()))
 
 	if acquireErr := AcquireAndWait(ctx, client, "example-resource"); acquireErr != nil {
 		t.Fatalf("AcquireAndWait(): %v", acquireErr)

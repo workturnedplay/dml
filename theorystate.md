@@ -3915,9 +3915,21 @@ Which resource a client may use is still the `Authorizer`, fail-closed
 (a peer without a verified certificate is the empty principal). Revocation
 is not handled by dml; it is whatever the `tls.Config` does.
 
-**OPEN.** Transports beyond named pipes, loopback TCP and mutual TLS, and a way to
-identify peers on them (loopback TCP has none, so every peer is the empty
-principal there), and how an error crosses when §89c's transaction
+**Plain TCP is refused (DECIDED, implemented).** The server serves a TCP
+connection only if it is TLS. The threat on loopback is not sniffing (reading
+another process's loopback traffic needs administrator rights, and an
+administrator can read the host's memory anyway) but connecting: any local
+process, and a web page through DNS rebinding, can reach a loopback port, and
+plain TCP gives the host no identity to authorize. Mutual TLS closes both. For
+a local client the named pipe is the stronger choice (the identity is the
+operating system's, with no private key file to protect); TLS is the one that
+also works across machines. The check is on the connection, not on how the
+listener was made, so it holds whatever is passed to `Serve`; a
+TLS-terminating proxy next to the host can opt out explicitly
+(`WithInsecurePlainTCP`).
+
+**OPEN.** Transports beyond named pipes and mutual TLS, and a way to
+identify peers on them, and how an error crosses when §89c's transaction
 descriptors exist.
 
 ---
@@ -4207,7 +4219,7 @@ kept current as sections above resolve or split further.)*
   the real workload, Badger as the fallback if write parallelism is ever
   needed, and the reads still unbounded in §105. §98 is moot under §107,
   and §99 is answered by §104 and §110.
-- Transports beyond named pipes, loopback TCP and mutual TLS, with peer identity
+- Transports beyond named pipes and mutual TLS, with peer identity
   (§113), and how hosts on different machines coordinate (§107, §112,
   Part C). Production `Effect` implementations are not dml's (§112).
 - Whether to build a harness that automatically re-runs the existing

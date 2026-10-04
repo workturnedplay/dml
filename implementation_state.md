@@ -2160,6 +2160,29 @@ could be called directly.
  net.Pipe) and TestFWNeededWireOverMutualTLSAuthorizesByCertificate (real
  loopback TCP, same firewall rule as TestFWNeededWireOverLoopbackTCP).
 
+55. Plain TCP is refused by default (theorystate.md section 113).
+ Plain loopback TCP has no peer identity and any local process (or a
+ browser page, via DNS rebinding) can connect to it, so WireServer now
+ refuses a connection whose remote address is a *net.TCPAddr and which is
+ not a *tls.Conn (isPlainTCP, wire_tls.go; a wrapper around a *tls.Conn is
+ not recognized, so the check fails closed). The client is told why, in
+ reply to its hello, with the new ErrWirePlainTCP (code plain_tcp_refused,
+ in wireErrorTable), exactly like ErrWireTooManyConns; WireServer.refusal
+ picks the cause for both refusals, so ServeConn has one refuse path.
+ WithInsecurePlainTCP lifts it, for a TLS-terminating proxy next to the host
+ and nothing else. Named pipes, net.Pipe and unix sockets are not TCP and
+ are unaffected. This supersedes item 54's "peer identity on plain loopback
+ TCP" remark: there is no such thing to give identity to any more. The
+ firewalled test of the whole flow over loopback TCP now uses
+ WithInsecurePlainTCP, a new test asserts the default refusal, and the
+ listen/serve/dial boilerplate of the TestFWNeeded* tests is shared
+ (listenLoopback, serveListener, dialLoopback). Covered by
+ TestIsPlainTCPSeesOnlyUnencryptedTCP,
+ TestWireServerRefusesPlainTCPByDefault and
+ TestWireServerAcceptsPlainTCPWhenToldTo (a TCP address faked over
+ net.Pipe, so no socket), and the firewalled
+ TestFWNeededWireRefusesPlainTCPByDefault and TestFWNeededWireOverLoopbackTCP.
+
 Currently unaddressed yet:
 - Paged reads beyond a single node's own outgoing/incoming edges
   (theorystate.md section 105, items 43/46): FindRelationships and

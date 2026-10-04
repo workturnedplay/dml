@@ -46,8 +46,10 @@ import (
 // connection ends, however it ends, the host releases the session. There is
 // no resume.
 //
-// Everything here works over any net.Conn. The Windows named pipe glue is in
-// pipe_windows.go.
+// Everything here works over any net.Conn except plain, unencrypted TCP, which
+// the server refuses unless told otherwise (WithInsecurePlainTCP; see
+// isPlainTCP). Mutual TLS is in wire_tls.go and the Windows named pipe glue is
+// in pipe_windows.go.
 
 var (
 	// ErrWireProtocol is returned for a frame or request the peer should not
@@ -68,6 +70,11 @@ var (
 	// ErrWireTooManyConns is returned to a client whose connection the
 	// server refused because it already serves its limit (WithMaxConns).
 	ErrWireTooManyConns = errors.New("the server has too many connections")
+
+	// ErrWirePlainTCP is returned to a client whose connection the server
+	// refused because it is plain, unencrypted TCP, which has no identity and
+	// can be reached by any local process (see WithInsecurePlainTCP).
+	ErrWirePlainTCP = errors.New("plain TCP connections are not accepted; use TLS (ListenTLS) or a named pipe")
 
 	// ErrRemote is the sentinel of a RemoteError whose code this build does
 	// not know: a newer host may add codes without breaking older clients.
@@ -147,6 +154,7 @@ var wireErrorTable = []struct {
 }{
 	{"not_authorized", ErrNotAuthorized},
 	{"too_many_conns", ErrWireTooManyConns},
+	{"plain_tcp_refused", ErrWirePlainTCP},
 	{"host_closed", ErrHostClosed},
 	{"conn_closed", ErrConnClosed},
 	{"hold_lost", ErrHoldLost},
@@ -300,9 +308,10 @@ type WireServer struct {
 	host *Host
 
 	// Set by NewWireServer and its options, never changed afterwards.
-	maxConns   int // 0: unlimited
-	authorizer Authorizer
-	identifier PeerIdentifier
+	maxConns      int // 0: unlimited
+	authorizer    Authorizer
+	identifier    PeerIdentifier
+	allowPlainTCP bool
 
 	mu        sync.Mutex
 	closed    bool
@@ -342,6 +351,15 @@ func WithAuthorizer(a Authorizer) WireOption {
 // a Windows named pipe, PipePeerPrincipal).
 func WithPeerIdentifier(identify PeerIdentifier) WireOption {
 	return func(s *WireServer) { s.identifier = identify }
+}
+
+// WithInsecurePlainTCP lets the server serve plain, unencrypted TCP
+// connections, which it refuses by default (ErrWirePlainTCP): they carry no
+// peer identity, so every peer is the empty Principal, and any local process
+// can connect. It exists for a TLS-terminating proxy running next to the
+// host, and for nothing else; use a named pipe or ListenTLS otherwise.
+func WithInsecurePlainTCP() WireOption {
+	return func(s *WireServer) { s.allowPlainTCP = true }
 }
 
 // NewWireServer returns a server for host.
@@ -522,9 +540,24 @@ func (s *WireServer) identify(nc net.Conn) Principal {
 	return principal
 }
 
+// refusal returns why the server will not serve nc, or nil if it will:
+// plain TCP unless WithInsecurePlainTCP was given, or a connection over the
+// limit (admitted is false).
+func (s *WireServer) refusal(nc net.Conn, admitted bool) error {
+	switch {
+	case !s.allowPlainTCP && isPlainTCP(nc):
+		return ErrWirePlainTCP
+	case !admitted:
+		return fmt.Errorf("%w: the server already serves its limit of %d connections", ErrWireTooManyConns, s.maxConns)
+	default:
+		return nil
+	}
+}
+
 // ServeConn serves one connection until it ends, then releases its session.
-// It blocks, and takes ownership of nc. A connection over the limit is
-// refused (see WithMaxConns).
+// It blocks, and takes ownership of nc. A connection the server will not
+// serve is refused (see refusal): one over the limit (WithMaxConns) or plain
+// TCP (WithInsecurePlainTCP).
 func (s *WireServer) ServeConn(nc net.Conn) {
 	registered, admitted := s.register(nc)
 	if !registered {
@@ -537,8 +570,8 @@ func (s *WireServer) ServeConn(nc net.Conn) {
 	defer s.unregister(nc, admitted)
 	defer closeQuietly(nc)
 
-	if !admitted {
-		s.refuse(nc, fmt.Errorf("%w: the server already serves its limit of %d connections", ErrWireTooManyConns, s.maxConns))
+	if cause := s.refusal(nc, admitted); cause != nil {
+		s.refuse(nc, cause)
 
 		return
 	}

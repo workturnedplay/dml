@@ -58,20 +58,7 @@ func TestFWNeededWireOverMutualTLSAuthorizesByCertificate(t *testing.T) {
 		t.Fatalf("ListenTLS(): %v", err)
 	}
 
-	served := make(chan error, 1)
-
-	go func() { served <- server.Serve(listener) }()
-
-	// Registered after the host's cleanup, so it runs before it.
-	t.Cleanup(func() {
-		if closeErr := server.Close(); closeErr != nil {
-			t.Errorf("server Close(): %v", closeErr)
-		}
-
-		if serveErr := <-served; serveErr != nil && !errors.Is(serveErr, ErrWireServerClosed) {
-			t.Errorf("Serve(): %v", serveErr)
-		}
-	})
+	serveListener(t, server, listener)
 
 	address := listener.Addr().String()
 

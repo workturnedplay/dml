@@ -32,9 +32,10 @@ import (
 )
 
 // wireRig is a Host served over in-memory pipes (net.Pipe), so these tests
-// need no network and therefore no firewall exception, on any OS. The one test
-// that uses a real TCP socket is TestFWNeededWireOverLoopbackTCP, behind the
-// portmasterFirewalled build tag (wire_firewalled_test.go).
+// need no network and therefore no firewall exception, on any OS. The tests
+// that use real TCP sockets are the TestFWNeeded* ones, behind the
+// portmasterFirewalled build tag (wire_firewalled_test.go and
+// wire_tls_firewalled_test.go).
 type wireRig struct {
 	host   *Host
 	server *WireServer

@@ -71,6 +71,22 @@ func TLSPeerPrincipal(nc net.Conn) (Principal, error) {
 	return TLSCertificatePrincipal(state.PeerCertificates[0]), nil
 }
 
+// isPlainTCP reports whether nc is an unencrypted TCP connection: its remote
+// address is a TCP address and it is not a *tls.Conn. A TLS connection is not
+// plain even though its address is TCP. Anything else (a named pipe, an
+// in-memory pipe, a unix socket) is not TCP at all. A custom wrapper around a
+// *tls.Conn is not recognized as TLS, so it counts as plain: the check fails
+// closed, and WithInsecurePlainTCP is the way out for such a setup.
+func isPlainTCP(nc net.Conn) bool {
+	if _, isTLS := nc.(*tls.Conn); isTLS {
+		return false
+	}
+
+	_, isTCP := nc.RemoteAddr().(*net.TCPAddr)
+
+	return isTCP
+}
+
 // tlsServerConfig validates cfg and returns a private copy of it for a
 // listener: mutual authentication must be enforced by cfg itself, and the
 // minimum protocol version is raised to TLS 1.2 if it was lower. cfg is not
