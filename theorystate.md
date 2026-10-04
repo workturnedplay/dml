@@ -3901,7 +3901,21 @@ and §112 fixed the `Client` shape. This is its first transport.
   heartbeat proves the process is alive, not that its logic is making
   progress.
 
-**OPEN.** Transports beyond named pipes and loopback TCP (TLS) and a way to
+**Mutual TLS over TCP (DECIDED, implemented).** The TCP counterpart of the
+pipe's DACL is the TLS handshake: a server built with `ListenTLS` refuses to
+start unless its configuration requires and verifies client certificates
+(`ClientAuth` `RequireAndVerifyClientCert`, `ClientCAs` set, no
+`GetConfigForClient`), so a TCP server cannot be left open by accident. The
+`Principal` is the SHA-256 fingerprint of the verified client leaf
+certificate (`tls-sha256:<hex>`), not its subject: a name can be reissued
+to another key by a CA, a fingerprint cannot, and a policy that lists
+fingerprints trusts the listed certificates rather than the CA's naming.
+The cost is that rotating a client certificate means updating the policy.
+Which resource a client may use is still the `Authorizer`, fail-closed
+(a peer without a verified certificate is the empty principal). Revocation
+is not handled by dml; it is whatever the `tls.Config` does.
+
+**OPEN.** Transports beyond named pipes, loopback TCP and mutual TLS, and a way to
 identify peers on them (loopback TCP has none, so every peer is the empty
 principal there), and how an error crosses when §89c's transaction
 descriptors exist.
@@ -4193,7 +4207,7 @@ kept current as sections above resolve or split further.)*
   the real workload, Badger as the fallback if write parallelism is ever
   needed, and the reads still unbounded in §105. §98 is moot under §107,
   and §99 is answered by §104 and §110.
-- Transports beyond named pipes and loopback TCP, with peer identity
+- Transports beyond named pipes, loopback TCP and mutual TLS, with peer identity
   (§113), and how hosts on different machines coordinate (§107, §112,
   Part C). Production `Effect` implementations are not dml's (§112).
 - Whether to build a harness that automatically re-runs the existing

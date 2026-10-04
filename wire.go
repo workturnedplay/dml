@@ -18,6 +18,7 @@ package dml
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/binary"
 	"encoding/json"
@@ -266,13 +267,22 @@ func readWireFrame(r io.Reader, v any) error {
 		return fmt.Errorf("%w: %d bytes announced, limit %d", ErrWireFrameTooLarge, size, wireMaxFrame)
 	}
 
-	payload := make([]byte, size)
+	// The payload buffer grows as bytes arrive, so a peer that announces a
+	// large frame and then sends nothing costs the server almost nothing
+	// (allocating the announced size up front would add up over many
+	// connections).
+	var payload bytes.Buffer
 
-	if _, readErr := io.ReadFull(r, payload); readErr != nil {
-		return fmt.Errorf("wire: reading a frame payload: %w", readErr)
+	if _, copyErr := io.CopyN(&payload, r, int64(size)); copyErr != nil {
+		if errors.Is(copyErr, io.EOF) {
+			// CopyN reports io.EOF only for a payload shorter than announced.
+			copyErr = io.ErrUnexpectedEOF
+		}
+
+		return fmt.Errorf("wire: reading a frame payload: %w", copyErr)
 	}
 
-	if decodeErr := json.Unmarshal(payload, v); decodeErr != nil {
+	if decodeErr := json.Unmarshal(payload.Bytes(), v); decodeErr != nil {
 		return fmt.Errorf("%w: decoding a frame: %w", ErrWireProtocol, decodeErr)
 	}
 

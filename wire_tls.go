@@ -1,0 +1,127 @@
+// Copyright 2026 workturnedplay
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+package dml
+
+import (
+	"context"
+	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"net"
+)
+
+// Mutual-TLS transport for the wire protocol (theorystate.md section 113).
+// Who may connect at all is decided by the TLS handshake (the client's
+// certificate must verify against the server's ClientCAs, the counterpart of
+// the named pipe's DACL); which resource a connection may use is still the
+// server's Authorizer, and the Principal it sees is the certificate's
+// fingerprint (TLSPeerPrincipal).
+
+// ErrTLSClientAuthRequired is returned by ListenTLS for a configuration that
+// would let a client connect without a verified certificate.
+var ErrTLSClientAuthRequired = errors.New("the TLS server configuration must require verified client certificates (ClientAuth RequireAndVerifyClientCert, ClientCAs set, no GetConfigForClient)")
+
+// tlsPrincipalPrefix starts every Principal TLSCertificatePrincipal makes, so
+// a certificate Principal can never be mistaken for another kind (a Windows
+// SID, say).
+const tlsPrincipalPrefix = "tls-sha256:"
+
+// TLSCertificatePrincipal returns the Principal for cert: the SHA-256
+// fingerprint of its DER encoding. Use it to build a ResourcePolicy from the
+// certificates that may use each resource.
+func TLSCertificatePrincipal(cert *x509.Certificate) Principal {
+	sum := sha256.Sum256(cert.Raw)
+
+	return Principal(tlsPrincipalPrefix + hex.EncodeToString(sum[:]))
+}
+
+// TLSPeerPrincipal is a PeerIdentifier for connections accepted from
+// ListenTLS: the Principal is TLSCertificatePrincipal of the client's leaf
+// certificate. A connection that is not a completed TLS connection, or whose
+// client has no verified certificate, is ErrPeerUnidentified (the server
+// turns that into the empty Principal, which a ResourcePolicy denies).
+func TLSPeerPrincipal(nc net.Conn) (Principal, error) {
+	tc, ok := nc.(*tls.Conn)
+	if !ok {
+		return "", fmt.Errorf("%w: %T is not a TLS connection", ErrPeerUnidentified, nc)
+	}
+
+	state := tc.ConnectionState()
+	if !state.HandshakeComplete || len(state.VerifiedChains) == 0 || len(state.PeerCertificates) == 0 {
+		return "", fmt.Errorf("%w: the TLS peer presented no verified certificate", ErrPeerUnidentified)
+	}
+
+	return TLSCertificatePrincipal(state.PeerCertificates[0]), nil
+}
+
+// tlsServerConfig validates cfg and returns a private copy of it for a
+// listener: mutual authentication must be enforced by cfg itself, and the
+// minimum protocol version is raised to TLS 1.2 if it was lower. cfg is not
+// modified.
+func tlsServerConfig(cfg *tls.Config) (*tls.Config, error) {
+	if cfg == nil ||
+		cfg.ClientAuth != tls.RequireAndVerifyClientCert ||
+		cfg.ClientCAs == nil ||
+		cfg.GetConfigForClient != nil {
+		return nil, ErrTLSClientAuthRequired
+	}
+
+	server := cfg.Clone()
+	server.MinVersion = max(server.MinVersion, tls.VersionTLS12)
+
+	return server, nil
+}
+
+// ListenTLS listens on the TCP address and wraps the listener in TLS with
+// cfg, which must require and verify client certificates (see
+// ErrTLSClientAuthRequired). Pass the result to WireServer.Serve together with
+// WithPeerIdentifier(TLSPeerPrincipal) and an Authorizer. The TLS handshake
+// happens on the first read of each connection, inside the server's hello
+// timeout, and a client that fails it never gets a session.
+func ListenTLS(address string, cfg *tls.Config) (net.Listener, error) {
+	serverCfg, cfgErr := tlsServerConfig(cfg)
+	if cfgErr != nil {
+		return nil, cfgErr
+	}
+
+	var lc net.ListenConfig
+
+	listener, listenErr := lc.Listen(context.Background(), "tcp", address)
+	if listenErr != nil {
+		return nil, fmt.Errorf("tls: listening on %s: %w", address, listenErr)
+	}
+
+	return tls.NewListener(listener, serverCfg), nil
+}
+
+// DialTLS connects to a ListenTLS server at address, with cfg (which carries
+// the client certificate and the roots that verify the server), and performs
+// the wire handshake. ctx bounds the dial, the TLS handshake and the wire
+// handshake only.
+func DialTLS(ctx context.Context, address string, cfg *tls.Config) (*WireClient, error) {
+	dialer := tls.Dialer{Config: cfg}
+
+	nc, dialErr := dialer.DialContext(ctx, "tcp", address)
+	if dialErr != nil {
+		return nil, fmt.Errorf("tls: dialing %s: %w", address, dialErr)
+	}
+
+	return NewWireClient(ctx, nc)
+}

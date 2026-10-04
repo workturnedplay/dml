@@ -2129,6 +2129,37 @@ could be called directly.
  TestPipePeerPrincipalRefusesAConnectionThatHidesItsHandle and
  TestPipeAuthorizationUsesTheClientSID.
 
+54. Mutual-TLS transport for the wire protocol (theorystate.md section
+ 113), in new files wire_tls.go, wire_tls_test.go and
+ wire_tls_firewalled_test.go. ListenTLS wraps a TCP listener in TLS and
+ refuses (ErrTLSClientAuthRequired, before binding) any configuration that
+ does not itself enforce mutual authentication: ClientAuth must be
+ RequireAndVerifyClientCert, ClientCAs must be set and GetConfigForClient
+ must be nil; the config is cloned and its MinVersion raised to TLS 1.2 if
+ lower. DialTLS dials, handshakes and runs the wire handshake under one
+ ctx. TLSPeerPrincipal is the PeerIdentifier: the Principal is
+ TLSCertificatePrincipal of the verified client leaf certificate, the
+ "tls-sha256:" prefix plus the SHA-256 fingerprint of its DER encoding, so
+ a ResourcePolicy can be built from the certificates that may use each
+ resource. A connection that is not completed TLS, or has no verified
+ chain, is ErrPeerUnidentified (the empty Principal, denied by default).
+ Also a hardening fix in readWireFrame: the payload is now read with
+ io.CopyN into a growing buffer instead of allocating the announced size
+ (up to wireMaxFrame) before any byte arrived, which mattered little for a
+ pipe behind a DACL and matters for TCP. Short payloads are still
+ io.ErrUnexpectedEOF. Not done: peer identity on plain loopback TCP
+ (still the empty Principal), certificate revocation or rotation (a
+ server's certificates are whatever its tls.Config holds), other
+ transports. Covered by
+ TestTLSCertificatePrincipalIsTheCertificateFingerprint,
+ TestListenTLSRefusesAConfigThatDoesNotEnforceMutualAuthentication,
+ TestTLSServerConfigRaisesTheMinimumVersionOnACopy,
+ TestTLSPeerPrincipalIsTheVerifiedClientCertificate,
+ TestTLSPeerPrincipalRefusesAPeerWithoutAVerifiedCertificate,
+ TestTLSPeerPrincipalRefusesConnectionsThatAreNotCompletedTLS (all over
+ net.Pipe) and TestFWNeededWireOverMutualTLSAuthorizesByCertificate (real
+ loopback TCP, same firewall rule as TestFWNeededWireOverLoopbackTCP).
+
 Currently unaddressed yet:
 - Paged reads beyond a single node's own outgoing/incoming edges
   (theorystate.md section 105, items 43/46): FindRelationships and
@@ -2136,7 +2167,7 @@ Currently unaddressed yet:
   are ListRegistry.validateStructure's and CompositeSetRegistry's own
   full-child-set reads. (The GraphReader methods that lacked error
   results now have them; see ErrGraphStoreUnavailable.)
-- Transports other than the named pipe (item 49), and peer identity on
+- Transports other than the named pipe (item 49) and mutual TLS over TCP (item 54), and peer identity on
   them (theorystate.md sections 107, 112, 113). Production Effect
   implementations are deliberately not dml's (theorystate.md section 112).
 - An abandoned effect call (theorystate.md section 112, item 52) cannot be
