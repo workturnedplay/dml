@@ -40,7 +40,9 @@ type tlsTestPKI struct {
 func newTLSTestPKI(t *testing.T) *tlsTestPKI {
 	t.Helper()
 
-	authority, err := NewCertificateAuthority("dml test CA", time.Hour)
+	// Longer than the one hour its leaves are valid for: a leaf may not
+	// outlive its CA.
+	authority, err := NewCertificateAuthority("dml test CA", 2*time.Hour)
 	if err != nil {
 		t.Fatalf("NewCertificateAuthority(): %v", err)
 	}

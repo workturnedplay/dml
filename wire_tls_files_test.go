@@ -74,12 +74,18 @@ func writeTestFile(t *testing.T, dir, name string, data []byte) string {
 	return path
 }
 
+// leafTestValidity is the validity of the certificates these tests issue. It
+// must be clearly shorter than the validity of the CA they use (an hour here):
+// a leaf may not outlive its CA, and a leaf issued a moment after the CA
+// already would if the two validities were equal.
+const leafTestValidity = 30 * time.Minute
+
 func serverTestSpec() CertificateSpec {
-	return CertificateSpec{CommonName: "srv", Names: []string{"localhost", "127.0.0.1"}, Server: true, Validity: time.Hour}
+	return CertificateSpec{CommonName: "srv", Names: []string{"localhost", "127.0.0.1"}, Server: true, Validity: leafTestValidity}
 }
 
 func clientTestSpec() CertificateSpec {
-	return CertificateSpec{CommonName: "cli", Client: true, Validity: time.Hour}
+	return CertificateSpec{CommonName: "cli", Client: true, Validity: leafTestValidity}
 }
 
 func TestCertificateAuthorityIssuesCertificatesWithTheRequestedUses(t *testing.T) {
@@ -153,6 +159,30 @@ func TestCertificateAuthorityRejectsRequestsItCannotIssue(t *testing.T) {
 
 	if _, err := NewCertificateAuthority("x", 0); !errors.Is(err, ErrCertificateSpec) {
 		t.Fatalf("NewCertificateAuthority(zero validity) error = %v, want %v", err, ErrCertificateSpec)
+	}
+}
+
+// TestCertificateAuthorityRefusesALeafThatWouldOutliveIt pins down the rule
+// the first version of these tests tripped over: the CA's validity counts from
+// when the CA was made, so a leaf issued later with the same validity ends
+// after the CA does and is refused, while a shorter one is fine.
+func TestCertificateAuthorityRefusesALeafThatWouldOutliveIt(t *testing.T) {
+	authority := mustNewCA(t, time.Hour)
+
+	equal := clientTestSpec()
+	equal.Validity = time.Hour
+
+	if _, err := authority.Issue(equal); !errors.Is(err, ErrCertificateSpec) {
+		t.Fatalf("Issue() with the CA's own validity error = %v, want %v", err, ErrCertificateSpec)
+	}
+
+	shorter := clientTestSpec()
+	shorter.Validity = 59 * time.Minute
+
+	issued := mustIssue(t, authority, shorter)
+
+	if issued.Certificate.NotAfter.After(authority.Certificate().NotAfter) {
+		t.Fatalf("the leaf expires at %v, after its CA at %v", issued.Certificate.NotAfter, authority.Certificate().NotAfter)
 	}
 }
 

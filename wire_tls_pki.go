@@ -77,8 +77,10 @@ type CertificateSpec struct {
 	Server bool
 	Client bool
 
-	// Validity is how long the certificate is valid from now; it must not
-	// outlive the CA.
+	// Validity is how long the certificate is valid from now. It must end
+	// before the CA does, so it has to be shorter than the CA's remaining
+	// validity (a CA made for a year cannot issue a certificate "for a year"
+	// a day later); Issue refuses it otherwise instead of shortening it.
 	Validity time.Duration
 }
 
