@@ -3928,6 +3928,19 @@ listener was made, so it holds whatever is passed to `Serve`; a
 TLS-terminating proxy next to the host can opt out explicitly
 (`WithInsecurePlainTCP`).
 
+**Certificates are provisioned by dml's own small CA (DECIDED, implemented).**
+Requiring mutual TLS is only usable if making certificates is easy, so dml
+ships the issuing code (`CertificateAuthority`) and a command (`dmlcert`)
+rather than leaving every deployment to assemble its own. The choices are
+conservative: ECDSA P-256, a CA that can sign leaves but not other CAs, leaf
+certificates that cannot outlive the CA, and a tool that never overwrites a
+file and prints each client's Principal so the policy can be written from its
+output. The CA's private key is the root of trust: whoever has it can make a
+certificate every peer accepts, so it should live where the host does not
+(the host needs only `ca.pem`). Revocation and rotation are not handled: a
+lost client key is dealt with by removing its fingerprint from the policy,
+which is exactly why the Principal is a fingerprint.
+
 **OPEN.** Transports beyond named pipes and mutual TLS, and a way to
 identify peers on them, and how an error crosses when §89c's transaction
 descriptors exist.

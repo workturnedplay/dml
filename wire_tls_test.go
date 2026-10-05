@@ -17,14 +17,9 @@
 package dml
 
 import (
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
-	"crypto/x509/pkix"
 	"errors"
-	"math/big"
 	"net"
 	"testing"
 	"time"
@@ -34,83 +29,48 @@ import (
 // test that uses a real TCP socket is in wire_tls_firewalled_test.go, behind
 // the portmasterFirewalled build tag.
 
-// tlsTestPKI is a throwaway certificate authority that issues leaf
-// certificates usable both as TLS server and as TLS client certificates.
+// tlsTestPKI is a throwaway certificate authority (the same CertificateAuthority
+// dmlcert uses) that issues leaf certificates usable both as TLS server and as
+// TLS client certificates.
 type tlsTestPKI struct {
-	ca     *x509.Certificate
-	key    *ecdsa.PrivateKey
-	pool   *x509.CertPool
-	serial int64
+	ca   *CertificateAuthority
+	pool *x509.CertPool
 }
 
 func newTLSTestPKI(t *testing.T) *tlsTestPKI {
 	t.Helper()
 
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	authority, err := NewCertificateAuthority("dml test CA", time.Hour)
 	if err != nil {
-		t.Fatalf("generating the CA key: %v", err)
+		t.Fatalf("NewCertificateAuthority(): %v", err)
 	}
 
-	template := &x509.Certificate{
-		SerialNumber:          big.NewInt(1),
-		Subject:               pkix.Name{CommonName: "dml test CA"},
-		NotBefore:             time.Now().Add(-time.Hour),
-		NotAfter:              time.Now().Add(time.Hour),
-		IsCA:                  true,
-		BasicConstraintsValid: true,
-		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
-	}
-
-	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
-	if err != nil {
-		t.Fatalf("creating the CA certificate: %v", err)
-	}
-
-	ca, err := x509.ParseCertificate(der)
-	if err != nil {
-		t.Fatalf("parsing the CA certificate: %v", err)
-	}
-
-	pool := x509.NewCertPool()
-	pool.AddCert(ca)
-
-	return &tlsTestPKI{ca: ca, key: key, pool: pool, serial: 1}
+	return &tlsTestPKI{ca: authority, pool: authority.Pool()}
 }
 
 // issue creates a leaf certificate named name, valid for 127.0.0.1 and
-// localhost, signed by the CA.
+// localhost, signed by the CA. It goes through PEM and back, like the files
+// dmlcert writes.
 func (p *tlsTestPKI) issue(t *testing.T, name string) (tls.Certificate, *x509.Certificate) {
 	t.Helper()
 
-	p.serial++
-
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatalf("generating the key of %q: %v", name, err)
+	issued, issueErr := p.ca.Issue(CertificateSpec{
+		CommonName: name,
+		Names:      []string{"localhost", "127.0.0.1"},
+		Server:     true,
+		Client:     true,
+		Validity:   time.Hour,
+	})
+	if issueErr != nil {
+		t.Fatalf("issuing the certificate of %q: %v", name, issueErr)
 	}
 
-	template := &x509.Certificate{
-		SerialNumber: big.NewInt(p.serial),
-		Subject:      pkix.Name{CommonName: name},
-		NotBefore:    time.Now().Add(-time.Hour),
-		NotAfter:     time.Now().Add(time.Hour),
-		KeyUsage:     x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
-		DNSNames:     []string{"localhost"},
-		IPAddresses:  []net.IP{net.IPv4(127, 0, 0, 1)},
+	cert, pairErr := tls.X509KeyPair(issued.CertPEM, issued.KeyPEM)
+	if pairErr != nil {
+		t.Fatalf("loading the certificate of %q: %v", name, pairErr)
 	}
 
-	der, err := x509.CreateCertificate(rand.Reader, template, p.ca, &key.PublicKey, p.key)
-	if err != nil {
-		t.Fatalf("creating the certificate of %q: %v", name, err)
-	}
-
-	leaf, err := x509.ParseCertificate(der)
-	if err != nil {
-		t.Fatalf("parsing the certificate of %q: %v", name, err)
-	}
-
-	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key, Leaf: leaf}, leaf
+	return cert, issued.Certificate
 }
 
 // serverConfig is a valid ListenTLS configuration trusting this CA's clients.

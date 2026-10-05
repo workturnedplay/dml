@@ -5,3 +5,4 @@
 *.old
 *.swp
 bin/
+*-key.pem

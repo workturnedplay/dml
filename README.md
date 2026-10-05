@@ -36,6 +36,21 @@ git config core.hooksPath .githooks
 
 This reduces the post-clone setup to a single, explicit command while keeping the hook version-controlled inside `.githooks/pre-commit`.
 
+## TLS certificates
+
+The wire transport over TCP is mutual TLS only. `cmd/dmlcert` makes the
+certificates; it never overwrites a file and prints the `tls-sha256:`
+Principal a `ResourcePolicy` lists for each client:
+
+```cmd
+go run ./cmd/dmlcert ca     -dir certs
+go run ./cmd/dmlcert server -dir certs -name host1 -hosts localhost,127.0.0.1
+go run ./cmd/dmlcert client -dir certs -name alice
+```
+
+In code: `LoadServerTLS` + `ListenTLS` on the host, `LoadClientTLS` + `DialTLS`
+on the client. Keep every `*-key.pem` secret (they are git-ignored).
+
 ## License
 
 This project and all of its contents (including source code and documentation) are 

@@ -2183,6 +2183,42 @@ could be called directly.
  net.Pipe, so no socket), and the firewalled
  TestFWNeededWireRefusesPlainTCPByDefault and TestFWNeededWireOverLoopbackTCP.
 
+56. Certificate provisioning for the TLS transport (theorystate.md section
+ 113), in new files wire_tls_files.go and wire_tls_pki.go and the new
+ command cmd/dmlcert. LoadServerTLS and LoadClientTLS read PEM files and
+ build the configs ListenTLS/DialTLS need (mutual TLS 1.3 only;
+ LoadServerTLS's result passes tlsServerConfig). CertificateFilePrincipal
+ returns the Principal of a certificate file, replacing the earlier idea of
+ caching fingerprints: it is computed when asked, so nothing can go stale.
+ CertificateAuthority (NewCertificateAuthority, ParseCertificateAuthority,
+ LoadCertificateAuthority, Issue, CertPEM, KeyPEM, Pool) is the issuing code,
+ in the library so the command and the tests share one implementation:
+ ECDSA P-256 keys as PKCS#8, random 127-bit serials, certificates backdated
+ five minutes for clock skew, the CA limited to path length 0, and a leaf may
+ not outlive its CA nor be issued by an expired one (ErrCertificateSpec).
+ CertificateSpec says what a certificate is for (server, client or both; a
+ server certificate needs names, IP addresses becoming IP SANs). A CA given
+ a certificate that is not a CA, or a key that does not belong to it, fails
+ (ErrNotCA, ErrCAKeyMismatch); PEM of the wrong shape is ErrInvalidPEM.
+ dmlcert has ca, server, client and principal commands; it checks that
+ neither output file exists, creates them with O_EXCL and mode 0600 (key
+ first, so a certificate never exists without its key), and rejects names
+ that are not plain file names. .gitignore now ignores *-key.pem. The test
+ PKI of wire_tls_test.go is now a thin wrapper over CertificateAuthority
+ (and goes through PEM, like the files dmlcert writes). Not done:
+ revocation, renewal or rotation tooling, encrypted key files, CA key
+ protection beyond file permissions. Covered by
+ TestCertificateAuthorityIssuesCertificatesWithTheRequestedUses,
+ TestCertificateAuthorityRejectsRequestsItCannotIssue,
+ TestParseCertificateAuthorityRoundTripsAndRejectsWrongInput,
+ TestLoadCertificateAuthorityReadsFilesAndNamesMissingOnes,
+ TestLoadTLSConfigsEnforceMutualAuthenticationAndHandshake,
+ TestLoadTLSFailsLoudlyOnBadFiles, TestCertificateFilePrincipal and, in
+ cmd/dmlcert, TestRunMakesACAServerAndClientThatLoad,
+ TestRunNeverOverwritesAnExistingFile, TestRunRejectsBadInput,
+ TestRunPrincipalPrintsTheFingerprint and TestRunHelpSucceeds. None needs a
+ socket.
+
 Currently unaddressed yet:
 - Paged reads beyond a single node's own outgoing/incoming edges
   (theorystate.md section 105, items 43/46): FindRelationships and
