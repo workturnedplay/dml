@@ -24,6 +24,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 )
 
@@ -37,6 +38,13 @@ import (
 // ErrTLSClientAuthRequired is returned by ListenTLS for a configuration that
 // would let a client connect without a verified certificate.
 var ErrTLSClientAuthRequired = errors.New("the TLS server configuration must require verified client certificates (ClientAuth RequireAndVerifyClientCert, ClientCAs set, no GetConfigForClient)")
+
+// ErrTLSHandshake wraps the error of a connection the server dropped because
+// its TLS handshake failed: the client's certificate did not verify, it
+// presented none, or the peer was not speaking TLS at all. The server reports
+// it (HostConfig.OnError) with the peer's address; the client may see only a
+// TLS alert.
+var ErrTLSHandshake = errors.New("TLS handshake failed")
 
 // tlsPrincipalPrefix starts every Principal TLSCertificatePrincipal makes, so
 // a certificate Principal can never be mistaken for another kind (a Windows
@@ -87,6 +95,40 @@ func isPlainTCP(nc net.Conn) bool {
 	return isTCP
 }
 
+// completeTLS performs the TLS handshake of nc, if it is a TLS connection,
+// within wireHelloTimeout, so that a failure is known as a TLS failure and
+// carries the peer's address instead of surfacing later as an anonymous read
+// error. Any other connection needs no handshake and is left alone.
+func completeTLS(nc net.Conn) error {
+	tc, isTLS := nc.(*tls.Conn)
+	if !isTLS {
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), wireHelloTimeout)
+	defer cancel()
+
+	if handshakeErr := tc.HandshakeContext(ctx); handshakeErr != nil {
+		return fmt.Errorf("%w from %v: %w", ErrTLSHandshake, nc.RemoteAddr(), handshakeErr)
+	}
+
+	return nil
+}
+
+// reportTLSFailure reports a failed TLS handshake (see completeTLS) through
+// the host's error hook. It is how an operator learns that a client with an
+// unknown or missing certificate is being turned away; nothing else records
+// it. Two cases are routine and stay silent: a peer that connected and left
+// without sending a byte (io.EOF), such as a TCP health probe, and a handshake
+// cut short because the server is closing.
+func (s *WireServer) reportTLSFailure(err error) {
+	if errors.Is(err, io.EOF) || s.isClosed() {
+		return
+	}
+
+	s.host.report("wire: rejecting a TLS connection", err)
+}
+
 // tlsServerConfig validates cfg and returns a private copy of it for a
 // listener: mutual authentication must be enforced by cfg itself, and the
 // minimum protocol version is raised to TLS 1.2 if it was lower. cfg is not
@@ -108,9 +150,10 @@ func tlsServerConfig(cfg *tls.Config) (*tls.Config, error) {
 // ListenTLS listens on the TCP address and wraps the listener in TLS with
 // cfg, which must require and verify client certificates (see
 // ErrTLSClientAuthRequired). Pass the result to WireServer.Serve together with
-// WithPeerIdentifier(TLSPeerPrincipal) and an Authorizer. The TLS handshake
-// happens on the first read of each connection, inside the server's hello
-// timeout, and a client that fails it never gets a session.
+// WithPeerIdentifier(TLSPeerPrincipal) and an Authorizer. The server completes
+// the TLS handshake of each connection itself, within its hello timeout, and
+// a client that fails it never gets a session: the failure is reported to the
+// host's error hook (ErrTLSHandshake).
 func ListenTLS(address string, cfg *tls.Config) (net.Listener, error) {
 	serverCfg, cfgErr := tlsServerConfig(cfg)
 	if cfgErr != nil {

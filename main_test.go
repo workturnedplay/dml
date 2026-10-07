@@ -22,6 +22,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -18340,14 +18341,24 @@ func (h *hungEffect) unblock() {
 // errorLog collects what the Host reports through HostConfig.OnError.
 type errorLog struct {
 	mu   sync.Mutex
+	ops  []string
 	errs []error
 }
 
-func (l *errorLog) add(_ string, err error) {
+func (l *errorLog) add(op string, err error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
+	l.ops = append(l.ops, op)
 	l.errs = append(l.errs, err)
+}
+
+// hasOp reports whether anything was reported under op.
+func (l *errorLog) hasOp(op string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	return slices.Contains(l.ops, op)
 }
 
 func (l *errorLog) has(target error) bool {

@@ -42,7 +42,8 @@ func TestFWNeededWireOverMutualTLSAuthorizesByCertificate(t *testing.T) {
 	bobCert, _ := pki.issue(t, "bob")
 	foreignCert, _ := newTLSTestPKI(t).issue(t, "mallory")
 
-	h := openTestHost(t, boltTestPath(t), nil)
+	reported := &errorLog{}
+	h := openTestHost(t, boltTestPath(t), func(cfg *HostConfig) { cfg.OnError = reported.add })
 	registerTestResource(t, h, "allowed-resource", nil)
 	registerTestResource(t, h, "other-resource", nil)
 
@@ -99,6 +100,9 @@ func TestFWNeededWireOverMutualTLSAuthorizesByCertificate(t *testing.T) {
 		closeQuietly(stranger)
 		t.Fatal("a client with a certificate from an unknown CA was admitted")
 	}
+
+	// The server must have said why it turned the stranger away.
+	eventually(t, "the rejected handshake to be reported", func() bool { return reported.has(ErrTLSHandshake) })
 
 	sessions, sessionsErr := h.Registries().Leases.Sessions(h.Graph())
 	if sessionsErr != nil || len(sessions) != 2 {

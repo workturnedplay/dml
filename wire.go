@@ -81,12 +81,16 @@ var (
 	ErrRemote = errors.New("remote error")
 )
 
+// wireHelloTimeout is how long a connection has to deliver its hello. A TLS
+// connection gets the same allowance for its TLS handshake first (see
+// completeTLS). A var, not a const, so tests can shrink it.
+var wireHelloTimeout = 10 * time.Second
+
 const (
 	wireVersion      = 1
 	wireHeaderSize   = 4
 	wireMaxFrame     = 1 << 20
 	wireMaxInFlight  = 256
-	wireHelloTimeout = 10 * time.Second
 	wireWriteTimeout = 10 * time.Second
 	wireCloseTimeout = 10 * time.Second
 	wireCancelGrace  = time.Second
@@ -557,7 +561,8 @@ func (s *WireServer) refusal(nc net.Conn, admitted bool) error {
 // ServeConn serves one connection until it ends, then releases its session.
 // It blocks, and takes ownership of nc. A connection the server will not
 // serve is refused (see refusal): one over the limit (WithMaxConns) or plain
-// TCP (WithInsecurePlainTCP).
+// TCP (WithInsecurePlainTCP). A TLS connection first completes its TLS
+// handshake (see completeTLS); a failed one is reported (ErrTLSHandshake).
 func (s *WireServer) ServeConn(nc net.Conn) {
 	registered, admitted := s.register(nc)
 	if !registered {
@@ -572,6 +577,14 @@ func (s *WireServer) ServeConn(nc net.Conn) {
 
 	if cause := s.refusal(nc, admitted); cause != nil {
 		s.refuse(nc, cause)
+
+		return
+	}
+
+	// Done here, and not implicitly inside the hello read, so that a failure
+	// is known to be a TLS failure and can be reported with its cause.
+	if tlsErr := completeTLS(nc); tlsErr != nil {
+		s.reportTLSFailure(tlsErr)
 
 		return
 	}
@@ -655,21 +668,51 @@ func (sc *wireServerConn) respond(id uint64, resp wireResponse) {
 	}
 }
 
+// isTimeout reports whether err is, or wraps, a timeout reported by a
+// connection (an expired deadline), whatever the transport.
+func isTimeout(err error) bool {
+	var timeoutErr net.Error
+
+	return errors.As(err, &timeoutErr) && timeoutErr.Timeout()
+}
+
+// readHello reads the first frame, which must arrive within wireHelloTimeout.
+// The limit is a read deadline, not a timer that closes the connection, so a
+// peer that sends nothing gets a recognizable timeout: it is told (a protocol
+// error frame) and the error is reported like any other protocol violation.
+// The deadline is cleared once the frame is in.
+func (sc *wireServerConn) readHello() (wireRequest, error) {
+	var hello wireRequest
+
+	if deadlineErr := sc.nc.SetReadDeadline(time.Now().Add(wireHelloTimeout)); deadlineErr != nil {
+		return hello, fmt.Errorf("wire: setting the hello deadline: %w", deadlineErr)
+	}
+
+	readErr := readWireFrame(sc.reader, &hello)
+
+	switch {
+	case isTimeout(readErr):
+		timeoutErr := fmt.Errorf("%w: no hello within %v", ErrWireProtocol, wireHelloTimeout)
+		sc.respond(0, wireErrorResponse(timeoutErr))
+
+		return hello, timeoutErr
+	case readErr != nil:
+		return hello, readErr
+	}
+
+	if clearErr := sc.nc.SetReadDeadline(time.Time{}); clearErr != nil {
+		return hello, fmt.Errorf("wire: clearing the hello deadline: %w", clearErr)
+	}
+
+	return hello, nil
+}
+
 // handshake reads the hello within wireHelloTimeout, opens the session and
 // answers with the host's keepalive TTL.
 func (sc *wireServerConn) handshake(ctx context.Context) (*Conn, error) {
-	var hello wireRequest
-
-	watchdog := time.AfterFunc(wireHelloTimeout, func() { closeQuietly(sc.nc) })
-	readErr := readWireFrame(sc.reader, &hello)
-	inTime := watchdog.Stop()
-
+	hello, readErr := sc.readHello()
 	if readErr != nil {
 		return nil, readErr
-	}
-
-	if !inTime {
-		return nil, fmt.Errorf("%w: no hello within %v", ErrWireProtocol, wireHelloTimeout)
 	}
 
 	if hello.Op != wireOpHello || hello.Version != wireVersion {
@@ -681,6 +724,13 @@ func (sc *wireServerConn) handshake(ctx context.Context) (*Conn, error) {
 
 	conn, connectErr := sc.host.Connect(ctx)
 	if connectErr != nil {
+		// A host that is closing is just shutting down; any other failure
+		// (the store could not commit the session) is the operator's to see,
+		// and the client only learns a generic code.
+		if !errors.Is(connectErr, ErrHostClosed) {
+			sc.host.report("wire: opening a session", connectErr)
+		}
+
 		sc.respond(hello.ID, wireErrorResponse(connectErr))
 
 		return nil, connectErr

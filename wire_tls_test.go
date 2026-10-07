@@ -285,3 +285,70 @@ func TestTLSPeerPrincipalRefusesConnectionsThatAreNotCompletedTLS(t *testing.T) 
 		t.Fatalf("TLSPeerPrincipal(before the handshake) error = %v, want %v", err, ErrPeerUnidentified)
 	}
 }
+
+// serveInMemoryTLS is serveInMemory with a TLS server on the server side of
+// the pipe, so the server runs its own TLS handshake on whatever the peer
+// sends. It returns the raw client side, which is closed (and the handler
+// awaited) when the test ends.
+func serveInMemoryTLS(t *testing.T, server *WireServer, cfg *tls.Config) net.Conn {
+	t.Helper()
+
+	clientSide, serverSide := net.Pipe()
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+		server.ServeConn(tls.Server(serverSide, cfg))
+	}()
+
+	t.Cleanup(func() {
+		closeQuietly(clientSide)
+		<-done
+	})
+
+	return clientSide
+}
+
+// TestWireServerReportsAPeerThatDoesNotSpeakTLS: an HTTP request sent to the
+// TLS port is a mistake that really happens. It fails the handshake, and the
+// server must say so.
+func TestWireServerReportsAPeerThatDoesNotSpeakTLS(t *testing.T) {
+	pki := newTLSTestPKI(t)
+	serverCert, _ := pki.issue(t, "server")
+
+	reported := &errorLog{}
+	rig := newWireRig(t, func(cfg *HostConfig) { cfg.OnError = reported.add })
+
+	peer := serveInMemoryTLS(t, rig.server, pki.serverConfig(serverCert))
+
+	if _, writeErr := peer.Write([]byte("GET / HTTP/1.1\r\n\r\n")); writeErr != nil {
+		t.Fatalf("writing to the server: %v", writeErr)
+	}
+
+	eventually(t, "the failed TLS handshake to be reported", func() bool { return reported.has(ErrTLSHandshake) })
+
+	sessions, sessionsErr := rig.host.Registries().Leases.Sessions(rig.host.Graph())
+	if sessionsErr != nil || len(sessions) != 0 {
+		t.Fatalf("Sessions() = (%v,%v), want none for a failed handshake", sessions, sessionsErr)
+	}
+}
+
+// TestWireServerDoesNotReportAPeerThatLeavesBeforeTheTLSHandshake: a probe
+// that connects and closes without a byte is routine, not a failure to report.
+func TestWireServerDoesNotReportAPeerThatLeavesBeforeTheTLSHandshake(t *testing.T) {
+	pki := newTLSTestPKI(t)
+	serverCert, _ := pki.issue(t, "server")
+
+	reported := &errorLog{}
+	rig := newWireRig(t, func(cfg *HostConfig) { cfg.OnError = reported.add })
+
+	clientSide, serverSide := net.Pipe()
+	closeQuietly(clientSide)
+
+	// Returns once the handshake has failed: the peer is already gone.
+	rig.server.ServeConn(tls.Server(serverSide, pki.serverConfig(serverCert)))
+
+	if reported.has(ErrTLSHandshake) {
+		t.Fatal("a peer that left without sending anything was reported")
+	}
+}

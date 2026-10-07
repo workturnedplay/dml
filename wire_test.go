@@ -426,6 +426,84 @@ func TestWireHandshakeRejectsWrongVersionAndMissingHello(t *testing.T) {
 	}
 }
 
+// TestWireHelloTimeoutIsAnsweredAndReported: a peer that connects and says
+// nothing is told it broke the protocol (it used to get a bare disconnect)
+// and the server reports it.
+func TestWireHelloTimeoutIsAnsweredAndReported(t *testing.T) {
+	original := wireHelloTimeout
+	wireHelloTimeout = 100 * time.Millisecond
+
+	// Registered first, so it runs after the rig's own cleanups.
+	t.Cleanup(func() { wireHelloTimeout = original })
+
+	reported := &errorLog{}
+	rig := newWireRig(t, func(cfg *HostConfig) { cfg.OnError = reported.add })
+
+	peer, reader := newRawWirePeer(t, rig.server)
+
+	if deadlineErr := peer.SetReadDeadline(time.Now().Add(10 * time.Second)); deadlineErr != nil {
+		t.Fatalf("SetReadDeadline(): %v", deadlineErr)
+	}
+
+	var resp wireResponse
+	if readErr := readWireFrame(reader, &resp); readErr != nil {
+		t.Fatalf("reading the answer to a silent peer: %v", readErr)
+	}
+
+	if resp.Error == nil || resp.Error.Code != "protocol" {
+		t.Fatalf("response = %+v, want a protocol error", resp)
+	}
+
+	var after wireResponse
+	if readErr := readWireFrame(reader, &after); !errors.Is(readErr, io.EOF) {
+		t.Fatalf("read after the timeout error = %v, want %v", readErr, io.EOF)
+	}
+
+	eventually(t, "the silent peer to be reported", func() bool { return reported.has(ErrWireProtocol) })
+}
+
+// TestWireHandshakeReportsAFailedSessionOpen: when the host cannot commit the
+// client's session, the client only learns a generic code, so the server
+// must report the real cause.
+func TestWireHandshakeReportsAFailedSessionOpen(t *testing.T) {
+	ctx := hostTestContext(t)
+	reported := &errorLog{}
+	rig := newWireRig(t, func(cfg *HostConfig) { cfg.OnError = reported.add })
+
+	// The store fails under the host: no session can be committed.
+	if closeErr := rig.host.store.Close(); closeErr != nil {
+		t.Fatalf("closing the store: %v", closeErr)
+	}
+
+	if _, err := NewWireClient(ctx, serveInMemory(t, rig.server)); err == nil {
+		t.Fatal("NewWireClient() succeeded although the host could not open a session")
+	}
+
+	if !reported.hasOp("wire: opening a session") {
+		t.Fatal("the failed session open was not reported")
+	}
+}
+
+// TestWireHandshakeDoesNotReportAHostThatIsClosing: ErrHostClosed is
+// shutdown, not a failure.
+func TestWireHandshakeDoesNotReportAHostThatIsClosing(t *testing.T) {
+	ctx := hostTestContext(t)
+	reported := &errorLog{}
+	rig := newWireRig(t, func(cfg *HostConfig) { cfg.OnError = reported.add })
+
+	if closeErr := rig.host.Close(); closeErr != nil {
+		t.Fatalf("Close(): %v", closeErr)
+	}
+
+	if _, err := NewWireClient(ctx, serveInMemory(t, rig.server)); !errors.Is(err, ErrHostClosed) {
+		t.Fatalf("NewWireClient() on a closed host error = %v, want %v", err, ErrHostClosed)
+	}
+
+	if reported.hasOp("wire: opening a session") {
+		t.Fatal("a host that is closing was reported as a failure")
+	}
+}
+
 func TestWireFrameRoundTripAndLimits(t *testing.T) {
 	var buf bytes.Buffer
 
