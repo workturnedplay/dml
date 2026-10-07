@@ -2232,6 +2232,49 @@ could be called directly.
  TestHostResourceCallEffectNeverReportsATimeoutForACallThatReturned (a
  probabilistic guard: many fast calls, none may time out).
 
+58. Handshake failures are reported server-side, and the hello timeout is a
+ real deadline (theorystate.md section 113). (a) WireServer.ServeConn now
+ completes the TLS handshake of a *tls.Conn itself (completeTLS, bounded by
+ wireHelloTimeout) instead of leaving it to the first read, so a failure is
+ known as a TLS failure: it is wrapped in the new ErrTLSHandshake together
+ with the peer's address and reported through HostConfig.OnError
+ (reportTLSFailure). Before, a client with an unknown or missing certificate,
+ or an HTTP request sent to the TLS port, was visible only on the client.
+ A peer that connects and leaves without a byte (io.EOF, such as a health
+ probe) and a handshake cut short by the server closing are not reported.
+ (b) The hello was read under a timer that closed the connection, so a peer
+ that sent nothing got a bare disconnect, and the "no hello within" protocol
+ error was reachable only in a race (readErr was checked first). readHello
+ now uses a read deadline: the timeout surfaces as a timeout error, is
+ answered with a protocol error frame and is reported like any other
+ protocol violation. wireHelloTimeout is a var so a test can shrink it.
+ (c) A failed Host.Connect during the handshake (the store could not commit
+ the session) is reported too, except ErrHostClosed, which is shutdown; the
+ client only ever saw a generic code. Covered by
+ TestWireHelloTimeoutIsAnsweredAndReported,
+ TestWireHandshakeReportsAFailedSessionOpen,
+ TestWireHandshakeDoesNotReportAHostThatIsClosing,
+ TestWireServerReportsAPeerThatDoesNotSpeakTLS,
+ TestWireServerDoesNotReportAPeerThatLeavesBeforeTheTLSHandshake (all over
+ net.Pipe) and, over loopback TCP, the unknown-CA assertion added to
+ TestFWNeededWireOverMutualTLSAuthorizesByCertificate. errorLog gained hasOp.
+
+59. The registry test suites run against every backend, closing the "no
+ harness" gap recorded in item 38 (theorystate.md section 97). The registry
+ fixtures build their graph with newTestGraph, which builds
+ activeTestBackend (the bare *Graph unless a driver changes it), and return a
+ testGraph (GraphAPI plus GraphStore: the test-only write methods every
+ backend has). TestRegistriesOnEveryBackend (registry_backends_test.go) runs
+ the tests in registryTestsOnEveryBackend, about 190 fixture-based ones, as
+ subtests under *Graph, stagedGraph and BoltGraph, after checking that the
+ fixtures really build that backend. No test body changed. The tests that
+ deliberately write corrupt data out-of-band (DetectsOutOfBand*, most
+ TestAdversarial*) stay *Graph-only: they rely on raw writes that bypass
+ Checkers, which on the other backends would decline the corrupting write
+ itself, and the on-read validation they test is above GraphReader. A test
+ that builds its own graph instead of using a fixture is not affected. A raw
+ write path per backend would let those run everywhere too (not done).
+
 Currently unaddressed yet:
 - Paged reads beyond a single node's own outgoing/incoming edges
   (theorystate.md section 105, items 43/46): FindRelationships and

@@ -3150,14 +3150,15 @@ no actual per-attempt read-set and detects no genuine conflict of its
 own — `forceConflict` is an externally-driven, deterministic stand-in for
 "a real CAS lost," not a conflict-detection mechanism in its own right
 (§94e's conflict-granularity analysis is not implemented anywhere yet).
-There is also no general harness re-running the *entire* existing
-registry test suite against both backends automatically; each
-portability test above was written by hand against `stagedGraph`
-specifically, rather than parametrizing every existing `*Graph`-based
-test over both backends. Building that harness, and giving `stagedGraph`
-a real (rather than externally forced) conflict-detection mechanism, are
-both left for whenever an actual networked backend makes either worth
-the cost.
+The registry test suites are now re-run against every backend by a
+harness (`TestRegistriesOnEveryBackend`: the fixtures build the active
+backend, and the driver runs the fixture-based tests under `*Graph`,
+`stagedGraph` and `BoltGraph`), so portability is tested across the whole
+registry surface, not only by the hand-written tests above. The tests that
+corrupt data out-of-band stay `*Graph`-only, since on a Checker-running
+backend the corrupting write is itself declined. Giving `stagedGraph` a
+real (rather than externally forced) conflict-detection mechanism is left
+for whenever an actual networked backend makes it worth the cost.
 
 ## 98. NameRegistry under a shared, multi-process backend (moot under §107's single-owner decision)
 
@@ -4235,11 +4236,11 @@ kept current as sections above resolve or split further.)*
 - Transports beyond named pipes and mutual TLS, with peer identity
   (§113), and how hosts on different machines coordinate (§107, §112,
   Part C). Production `Effect` implementations are not dml's (§112).
-- Whether to build a harness that automatically re-runs the existing
-  registry test suite against both *Graph and stagedGraph, versus
-  writing portability tests by hand as needed; and whether stagedGraph
-  should ever gain real (rather than externally forced) conflict
-  detection (§97).
+- Whether stagedGraph should ever gain real (rather than externally
+  forced) conflict detection (§97), and whether the out-of-band
+  corruption tests (which need a write that bypasses Checkers) should get
+  a raw-write path on every backend so the registry harness can run them
+  everywhere too.
 
 ### REJECTED FOR NOW
 - Giving primitive relationships their own NodeIDs.

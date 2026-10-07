@@ -2494,25 +2494,26 @@ func TestRootFindRelationshipsWithoutRootNodeEmitsNoVirtualRelationships(t *test
 	}
 }
 
-// newPointerTestFixture creates a fresh Graph and PointerRegistry with
-// AllPointers already bootstrapped, for use by PointerRegistry tests.
-func newPointerTestFixture(t *testing.T) (*Graph, *PointerRegistry) {
+// newPointerTestFixture creates a fresh graph (of the active test backend, see
+// newTestGraph) and a PointerRegistry with AllPointers already bootstrapped,
+// for use by PointerRegistry tests.
+func newPointerTestFixture(t *testing.T) (testGraph, *PointerRegistry) {
 	t.Helper()
 
-	var g Graph
-	names := NewNameRegistry(&g)
+	g := newTestGraph(t)
+	names := NewNameRegistry(g)
 
-	allPointers, err := names.EnsureNamedNode(&g, NameAllPointers)
+	allPointers, err := names.EnsureNamedNode(g, NameAllPointers)
 	if err != nil {
 		t.Fatalf("EnsureNamedNode(%q): %v", NameAllPointers, err)
 	}
 
-	pointers, err := NewPointerRegistry(&g, allPointers)
+	pointers, err := NewPointerRegistry(g, allPointers)
 	if err != nil {
 		t.Fatalf("NewPointerRegistry(): %v", err)
 	}
 
-	return &g, pointers
+	return g, pointers
 }
 
 func TestNewPointerRegistryRequiresExistingAllPointers(t *testing.T) {
@@ -3255,23 +3256,23 @@ func TestSubPointerReusesPointerRegistryUnderDifferentTag(t *testing.T) {
 	}
 }
 
-func newPointerMetadataTestFixture(t *testing.T) (*Graph, *PointerMetadataRegistry) {
+func newPointerMetadataTestFixture(t *testing.T) (testGraph, *PointerMetadataRegistry) {
 	t.Helper()
 
-	var g Graph
-	names := NewNameRegistry(&g)
+	g := newTestGraph(t)
+	names := NewNameRegistry(g)
 
-	ids, err := names.BootstrapNames(&g, FoundationalNames)
+	ids, err := names.BootstrapNames(g, FoundationalNames)
 	if err != nil {
 		t.Fatalf("BootstrapNames(): %v", err)
 	}
 
-	metadata, err := NewPointerMetadataRegistry(&g, ids[NameAllPointerMetadata], ids[NameAllPointerMetadataSubjectSlot])
+	metadata, err := NewPointerMetadataRegistry(g, ids[NameAllPointerMetadata], ids[NameAllPointerMetadataSubjectSlot])
 	if err != nil {
 		t.Fatalf("NewPointerMetadataRegistry(): %v", err)
 	}
 
-	return &g, metadata
+	return g, metadata
 }
 
 func TestNewPointerMetadataRegistryRequiresExistingTags(t *testing.T) {
@@ -3545,23 +3546,23 @@ func TestPointerMetadataRegistryDetectsOutOfBandInvariantViolation(t *testing.T)
 	}
 }
 
-func newPointerMetadataDTestFixture(t *testing.T) (*Graph, *PointerMetadataRegistryD) {
+func newPointerMetadataDTestFixture(t *testing.T) (testGraph, *PointerMetadataRegistryD) {
 	t.Helper()
 
-	var g Graph
-	names := NewNameRegistry(&g)
+	g := newTestGraph(t)
+	names := NewNameRegistry(g)
 
-	ids, err := names.BootstrapNames(&g, FoundationalNames)
+	ids, err := names.BootstrapNames(g, FoundationalNames)
 	if err != nil {
 		t.Fatalf("BootstrapNames(): %v", err)
 	}
 
-	metadata, err := NewPointerMetadataRegistryD(&g, ids[NameAllPointerMetadata], ids[NameAllPointerMetadataSubjectSlot], ids[NameAllPointerMetadataTargetSlot])
+	metadata, err := NewPointerMetadataRegistryD(g, ids[NameAllPointerMetadata], ids[NameAllPointerMetadataSubjectSlot], ids[NameAllPointerMetadataTargetSlot])
 	if err != nil {
 		t.Fatalf("NewPointerMetadataRegistryD(): %v", err)
 	}
 
-	return &g, metadata
+	return g, metadata
 }
 
 func TestFoundationalNamesIncludesAllPointerMetadataTargetSlot(t *testing.T) {
@@ -3900,19 +3901,19 @@ func TestPointerMetadataRegistryDAllowsUnrelatedMetadataChildren(t *testing.T) {
 	}
 }
 
-func newCapsuleTestFixture(t *testing.T) (*Graph, *CapsuleRegistry) {
+func newCapsuleTestFixture(t *testing.T) (testGraph, *CapsuleRegistry) {
 	t.Helper()
 
-	var g Graph
-	names := NewNameRegistry(&g)
+	g := newTestGraph(t)
+	names := NewNameRegistry(g)
 
-	ids, err := names.BootstrapNames(&g, FoundationalNames)
+	ids, err := names.BootstrapNames(g, FoundationalNames)
 	if err != nil {
 		t.Fatalf("BootstrapNames(): %v", err)
 	}
 
 	capsules, err := NewCapsuleRegistry(
-		&g,
+		g,
 		ids[NameAllElementCapsules],
 		ids[NameAllElementCapsulePrevSlot],
 		ids[NameAllElementCapsuleValueSlot],
@@ -3922,7 +3923,7 @@ func newCapsuleTestFixture(t *testing.T) (*Graph, *CapsuleRegistry) {
 		t.Fatalf("NewCapsuleRegistry(): %v", err)
 	}
 
-	return &g, capsules
+	return g, capsules
 }
 
 func TestFoundationalNamesIncludesElementCapsuleNames(t *testing.T) {
@@ -4652,19 +4653,19 @@ func TestCapsulesWithValuePagesAcrossMultipleFetches(t *testing.T) {
 	}
 }
 
-func newListTestFixture(t *testing.T) (*Graph, *CapsuleRegistry, *ListRegistry) {
+func newListTestFixture(t *testing.T) (testGraph, *CapsuleRegistry, *ListRegistry) {
 	t.Helper()
 
-	var g Graph
-	names := NewNameRegistry(&g)
+	g := newTestGraph(t)
+	names := NewNameRegistry(g)
 
-	ids, err := names.BootstrapNames(&g, FoundationalNames)
+	ids, err := names.BootstrapNames(g, FoundationalNames)
 	if err != nil {
 		t.Fatalf("BootstrapNames(): %v", err)
 	}
 
 	capsules, err := NewCapsuleRegistry(
-		&g,
+		g,
 		ids[NameAllElementCapsules],
 		ids[NameAllElementCapsulePrevSlot],
 		ids[NameAllElementCapsuleValueSlot],
@@ -4674,12 +4675,12 @@ func newListTestFixture(t *testing.T) (*Graph, *CapsuleRegistry, *ListRegistry) 
 		t.Fatalf("NewCapsuleRegistry(): %v", err)
 	}
 
-	lists, err := NewListRegistry(&g, capsules, ids[NameAllLists], ids[NameAllHeads], ids[NameAllTails])
+	lists, err := NewListRegistry(g, capsules, ids[NameAllLists], ids[NameAllHeads], ids[NameAllTails])
 	if err != nil {
 		t.Fatalf("NewListRegistry(): %v", err)
 	}
 
-	return &g, capsules, lists
+	return g, capsules, lists
 }
 
 func TestFoundationalNamesIncludesListNames(t *testing.T) {
@@ -6783,23 +6784,23 @@ func TestAdversarialEmptyListWithBoundaryTagIsInvalid(t *testing.T) {
 
 // newSetTestFixture creates a fresh Graph and SetRegistry with AllSets
 // already bootstrapped, for use by SetRegistry tests.
-func newSetTestFixture(t *testing.T) (*Graph, *SetRegistry) {
+func newSetTestFixture(t *testing.T) (testGraph, *SetRegistry) {
 	t.Helper()
 
-	var g Graph
-	names := NewNameRegistry(&g)
+	g := newTestGraph(t)
+	names := NewNameRegistry(g)
 
-	ids, err := names.BootstrapNames(&g, FoundationalNames)
+	ids, err := names.BootstrapNames(g, FoundationalNames)
 	if err != nil {
 		t.Fatalf("BootstrapNames(): %v", err)
 	}
 
-	sets, err := NewSetRegistry(&g, ids[NameAllSets], ids[NameAllCompositeSets], ids[NameAllCompositeSetLogs])
+	sets, err := NewSetRegistry(g, ids[NameAllSets], ids[NameAllCompositeSets], ids[NameAllCompositeSetLogs])
 	if err != nil {
 		t.Fatalf("NewSetRegistry(): %v", err)
 	}
 
-	return &g, sets
+	return g, sets
 }
 
 func TestFoundationalNamesIncludesAllSets(t *testing.T) {
@@ -7482,24 +7483,24 @@ func TestSetRegistryTagAsSetRejectsCompositeSetConflict(t *testing.T) {
 // newCompositeSetTestFixture creates a fresh Graph, SetRegistry, and
 // CompositeSetRegistry with every relevant name already bootstrapped, for
 // use by CompositeSetRegistry tests.
-func newCompositeSetTestFixture(t *testing.T) (*Graph, *SetRegistry, *CompositeSetRegistry) {
+func newCompositeSetTestFixture(t *testing.T) (testGraph, *SetRegistry, *CompositeSetRegistry) {
 	t.Helper()
 
-	var g Graph
-	names := NewNameRegistry(&g)
+	g := newTestGraph(t)
+	names := NewNameRegistry(g)
 
-	ids, err := names.BootstrapNames(&g, FoundationalNames)
+	ids, err := names.BootstrapNames(g, FoundationalNames)
 	if err != nil {
 		t.Fatalf("BootstrapNames(): %v", err)
 	}
 
-	sets, err := NewSetRegistry(&g, ids[NameAllSets], ids[NameAllCompositeSets], ids[NameAllCompositeSetLogs])
+	sets, err := NewSetRegistry(g, ids[NameAllSets], ids[NameAllCompositeSets], ids[NameAllCompositeSetLogs])
 	if err != nil {
 		t.Fatalf("NewSetRegistry(): %v", err)
 	}
 
 	composites, err := NewCompositeSetRegistry(
-		&g,
+		g,
 		sets,
 		ids[NameAllCompositeSets],
 		ids[NameAllAdditiveOp],
@@ -7511,7 +7512,7 @@ func newCompositeSetTestFixture(t *testing.T) (*Graph, *SetRegistry, *CompositeS
 		t.Fatalf("NewCompositeSetRegistry(): %v", err)
 	}
 
-	return &g, sets, composites
+	return g, sets, composites
 }
 
 func TestFoundationalNamesIncludesCompositeSetNames(t *testing.T) {
@@ -8138,24 +8139,24 @@ func TestCompositeSetContainsRequiresExistingValue(t *testing.T) {
 // needed to exercise CompositeSetLogRegistry, with full bidirectional
 // cross-representation dispatch already wired via
 // CompositeSetRegistry.SetLogs.
-func newCompositeSetLogTestFixture(t *testing.T) (*Graph, *SetRegistry, *CompositeSetRegistry, *CompositeSetLogRegistry) {
+func newCompositeSetLogTestFixture(t *testing.T) (testGraph, *SetRegistry, *CompositeSetRegistry, *CompositeSetLogRegistry) {
 	t.Helper()
 
-	var g Graph
-	names := NewNameRegistry(&g)
+	g := newTestGraph(t)
+	names := NewNameRegistry(g)
 
-	ids, err := names.BootstrapNames(&g, FoundationalNames)
+	ids, err := names.BootstrapNames(g, FoundationalNames)
 	if err != nil {
 		t.Fatalf("BootstrapNames(): %v", err)
 	}
 
-	sets, err := NewSetRegistry(&g, ids[NameAllSets], ids[NameAllCompositeSets], ids[NameAllCompositeSetLogs])
+	sets, err := NewSetRegistry(g, ids[NameAllSets], ids[NameAllCompositeSets], ids[NameAllCompositeSetLogs])
 	if err != nil {
 		t.Fatalf("NewSetRegistry(): %v", err)
 	}
 
 	composites, err := NewCompositeSetRegistry(
-		&g,
+		g,
 		sets,
 		ids[NameAllCompositeSets],
 		ids[NameAllAdditiveOp],
@@ -8168,7 +8169,7 @@ func newCompositeSetLogTestFixture(t *testing.T) (*Graph, *SetRegistry, *Composi
 	}
 
 	capsules, err := NewCapsuleRegistry(
-		&g,
+		g,
 		ids[NameAllElementCapsules],
 		ids[NameAllElementCapsulePrevSlot],
 		ids[NameAllElementCapsuleValueSlot],
@@ -8178,13 +8179,13 @@ func newCompositeSetLogTestFixture(t *testing.T) (*Graph, *SetRegistry, *Composi
 		t.Fatalf("NewCapsuleRegistry(): %v", err)
 	}
 
-	lists, err := NewListRegistry(&g, capsules, ids[NameAllLists], ids[NameAllHeads], ids[NameAllTails])
+	lists, err := NewListRegistry(g, capsules, ids[NameAllLists], ids[NameAllHeads], ids[NameAllTails])
 	if err != nil {
 		t.Fatalf("NewListRegistry(): %v", err)
 	}
 
 	logs, err := NewCompositeSetLogRegistry(
-		&g,
+		g,
 		lists,
 		composites,
 		ids[NameAllCompositeSetLogs],
@@ -8199,7 +8200,7 @@ func newCompositeSetLogTestFixture(t *testing.T) (*Graph, *SetRegistry, *Composi
 
 	composites.SetLogs(logs)
 
-	return &g, sets, composites, logs
+	return g, sets, composites, logs
 }
 
 func TestFoundationalNamesIncludesAllCompositeSetLogs(t *testing.T) {
@@ -9092,7 +9093,7 @@ func TestFoundationalNamesIncludesAllDomainSlot(t *testing.T) {
 // individual registries call sites need -- each is still just a field
 // access away.
 type domainPointerTestFixture struct {
-	graph      *Graph
+	graph      testGraph
 	names      *NameRegistry
 	sets       *SetRegistry
 	composites *CompositeSetRegistry
@@ -9115,21 +9116,21 @@ type domainPointerTestFixture struct {
 func newDomainPointerTestFixture(t *testing.T) *domainPointerTestFixture {
 	t.Helper()
 
-	var g Graph
-	names := NewNameRegistry(&g)
+	g := newTestGraph(t)
+	names := NewNameRegistry(g)
 
-	ids, err := names.BootstrapNames(&g, FoundationalNames)
+	ids, err := names.BootstrapNames(g, FoundationalNames)
 	if err != nil {
 		t.Fatalf("BootstrapNames(): %v", err)
 	}
 
-	sets, err := NewSetRegistry(&g, ids[NameAllSets], ids[NameAllCompositeSets], ids[NameAllCompositeSetLogs])
+	sets, err := NewSetRegistry(g, ids[NameAllSets], ids[NameAllCompositeSets], ids[NameAllCompositeSetLogs])
 	if err != nil {
 		t.Fatalf("NewSetRegistry(): %v", err)
 	}
 
 	composites, err := NewCompositeSetRegistry(
-		&g,
+		g,
 		sets,
 		ids[NameAllCompositeSets],
 		ids[NameAllAdditiveOp],
@@ -9142,7 +9143,7 @@ func newDomainPointerTestFixture(t *testing.T) *domainPointerTestFixture {
 	}
 
 	capsules, err := NewCapsuleRegistry(
-		&g,
+		g,
 		ids[NameAllElementCapsules],
 		ids[NameAllElementCapsulePrevSlot],
 		ids[NameAllElementCapsuleValueSlot],
@@ -9152,13 +9153,13 @@ func newDomainPointerTestFixture(t *testing.T) *domainPointerTestFixture {
 		t.Fatalf("NewCapsuleRegistry(): %v", err)
 	}
 
-	lists, err := NewListRegistry(&g, capsules, ids[NameAllLists], ids[NameAllHeads], ids[NameAllTails])
+	lists, err := NewListRegistry(g, capsules, ids[NameAllLists], ids[NameAllHeads], ids[NameAllTails])
 	if err != nil {
 		t.Fatalf("NewListRegistry(): %v", err)
 	}
 
 	logs, err := NewCompositeSetLogRegistry(
-		&g,
+		g,
 		lists,
 		composites,
 		ids[NameAllCompositeSetLogs],
@@ -9172,31 +9173,31 @@ func newDomainPointerTestFixture(t *testing.T) *domainPointerTestFixture {
 	}
 	composites.SetLogs(logs)
 
-	pointers, err := NewPointerRegistry(&g, ids[NameAllPointers])
+	pointers, err := NewPointerRegistry(g, ids[NameAllPointers])
 	if err != nil {
 		t.Fatalf("NewPointerRegistry(AllPointers): %v", err)
 	}
 
-	subPointers, err := NewPointerRegistry(&g, ids[NameAllSubPointers])
+	subPointers, err := NewPointerRegistry(g, ids[NameAllSubPointers])
 	if err != nil {
 		t.Fatalf("NewPointerRegistry(AllSubPointers): %v", err)
 	}
 
-	metadata, err := NewPointerMetadataRegistryD(&g, ids[NameAllPointerMetadata], ids[NameAllPointerMetadataSubjectSlot], ids[NameAllPointerMetadataTargetSlot])
+	metadata, err := NewPointerMetadataRegistryD(g, ids[NameAllPointerMetadata], ids[NameAllPointerMetadataSubjectSlot], ids[NameAllPointerMetadataTargetSlot])
 	if err != nil {
 		t.Fatalf("NewPointerMetadataRegistryD(): %v", err)
 	}
 
-	domainSlots, err := NewPointerRegistry(&g, ids[NameAllDomainSlot])
+	domainSlots, err := NewPointerRegistry(g, ids[NameAllDomainSlot])
 	if err != nil {
 		t.Fatalf("NewPointerRegistry(AllDomainSlot): %v", err)
 	}
 
-	domainB := NewDomainPointerRegistryB(&g, subPointers, domainSlots, sets, composites, logs)
-	domainD := NewDomainPointerRegistryD(&g, metadata, domainSlots, sets, composites, logs)
+	domainB := NewDomainPointerRegistryB(g, subPointers, domainSlots, sets, composites, logs)
+	domainD := NewDomainPointerRegistryD(g, metadata, domainSlots, sets, composites, logs)
 
 	return &domainPointerTestFixture{
-		graph:      &g,
+		graph:      g,
 		names:      names,
 		sets:       sets,
 		composites: composites,
@@ -10298,7 +10299,7 @@ func TestCrossRoleSetRegistryConflictCheckExercisedWhileSetIsDomainAndOperand(t 
 // strand a pointer outside its domain, for both Representation B and D.
 
 // newTestNode creates a fresh node in g, failing t on error.
-func newTestNode(t *testing.T, g *Graph) NodeID {
+func newTestNode(t *testing.T, g testGraph) NodeID {
 	t.Helper()
 
 	id, err := g.CreateNode()
@@ -13610,17 +13611,20 @@ func BenchmarkBoltGraphCommit(b *testing.B) {
 // sections 104, 110).
 
 // testBackend is one GraphAPI implementation to run a shared test against.
+// open returns a testGraph (the GraphAPI plus the test-only write methods),
+// which is what the registry fixtures need (see newTestGraph).
 type testBackend struct {
 	name string
-	open func(tb *testing.T) GraphAPI
+	open func(tb *testing.T) testGraph
 }
 
-// testBackends lists every GraphAPI implementation tests run against.
+// testBackends lists every GraphAPI implementation tests run against. The
+// first entry, the bare *Graph, is the default backend (activeTestBackend).
 func testBackends() []testBackend {
 	return []testBackend{
-		{name: "Graph", open: func(_ *testing.T) GraphAPI { return &Graph{} }},
-		{name: "stagedGraph", open: func(_ *testing.T) GraphAPI { return newStagedGraph() }},
-		{name: "BoltGraph", open: func(tb *testing.T) GraphAPI { return newBoltTestGraph(tb) }},
+		{name: "Graph", open: func(_ *testing.T) testGraph { return &Graph{} }},
+		{name: "stagedGraph", open: func(_ *testing.T) testGraph { return newStagedGraph() }},
+		{name: "BoltGraph", open: func(tb *testing.T) testGraph { return newBoltTestGraph(tb) }},
 	}
 }
 
@@ -17037,28 +17041,28 @@ func TestRootGraphInsideGraphActorPagesIncomingNatively(t *testing.T) {
 // ---------------------------------------------------------------------
 // LeaseRegistry: sessions and holds (theorystate.md section 111).
 
-func newLeaseTestFixture(t *testing.T) (*Graph, *SetRegistry, *LeaseRegistry) {
+func newLeaseTestFixture(t *testing.T) (testGraph, *SetRegistry, *LeaseRegistry) {
 	t.Helper()
 
-	var g Graph
-	names := NewNameRegistry(&g)
+	g := newTestGraph(t)
+	names := NewNameRegistry(g)
 
-	ids, err := names.BootstrapNames(&g, FoundationalNames)
+	ids, err := names.BootstrapNames(g, FoundationalNames)
 	if err != nil {
 		t.Fatalf("BootstrapNames(): %v", err)
 	}
 
-	sets, err := NewSetRegistry(&g, ids[NameAllSets], ids[NameAllCompositeSets], ids[NameAllCompositeSetLogs])
+	sets, err := NewSetRegistry(g, ids[NameAllSets], ids[NameAllCompositeSets], ids[NameAllCompositeSetLogs])
 	if err != nil {
 		t.Fatalf("NewSetRegistry(): %v", err)
 	}
 
-	leases, err := NewLeaseRegistry(&g, sets, ids[NameAllSessions])
+	leases, err := NewLeaseRegistry(g, sets, ids[NameAllSessions])
 	if err != nil {
 		t.Fatalf("NewLeaseRegistry(): %v", err)
 	}
 
-	return &g, sets, leases
+	return g, sets, leases
 }
 
 func mustNewSession(t *testing.T, api Transactor, leases *LeaseRegistry) NodeID {
