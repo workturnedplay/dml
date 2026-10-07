@@ -18468,3 +18468,18 @@ func TestHostConfigEffectTimeoutDefaultsAndDisable(t *testing.T) {
 		t.Fatalf("EffectTimeout = %v, want it kept at %v", got, time.Second)
 	}
 }
+
+// TestHostResourceCallEffectNeverReportsATimeoutForACallThatReturned makes
+// many fast calls under a generous deadline: none may be reported as timed
+// out. A regression guard for the order in which callEffect's goroutine
+// sends its result and cancels the call's context; the failure it guards
+// against is a race, so it is probabilistic (most likely to show under -race).
+func TestHostResourceCallEffectNeverReportsATimeoutForACallThatReturned(t *testing.T) {
+	r := newHostResource("example-resource", 0, &fakeEffect{}, time.Minute)
+
+	for i := range 20000 {
+		if _, err := r.checkPresent(context.Background()); err != nil {
+			t.Fatalf("call %d: checkPresent() error = %v, want nil", i, err)
+		}
+	}
+}

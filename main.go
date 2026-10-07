@@ -11397,10 +11397,16 @@ func (r *hostResource) callEffect(ctx context.Context, op string, fn func(ctx co
 	go func() {
 		callErr := fn(callCtx)
 
-		cancel()
+		// The result goes out before cancel: cancelling callCtx wakes the
+		// select below through callCtx.Done(), and if that could happen
+		// before the result is in done, a call that returned in time would
+		// be reported as timed out. done is buffered, so this never blocks,
+		// even when the caller has already abandoned the call.
 		r.busy.Store(false)
 
 		done <- callErr
+
+		cancel()
 	}()
 
 	select {

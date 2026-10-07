@@ -2219,6 +2219,19 @@ could be called directly.
  TestRunPrincipalPrintsTheFingerprint and TestRunHelpSucceeds. None needs a
  socket.
 
+57. Fixed a race in hostResource.callEffect (theorystate.md section 112,
+ item 52). The call's goroutine cancelled the call's context before it sent
+ the result, and the caller's select also waits on that context, so the
+ caller could wake on the cancellation while the result was not yet in the
+ channel, fall through to the abandoned-call path and report
+ ErrEffectTimeout for a call that had returned in time. The result is now
+ sent first (the channel is buffered) and the context cancelled after, so a
+ result is always visible by the time the cancellation can be seen. The cost
+ of the bug was a spurious failed pass, retried after RetryInterval, and an
+ ErrEffectTimeout in WaitApplied's last-error report. Covered by
+ TestHostResourceCallEffectNeverReportsATimeoutForACallThatReturned (a
+ probabilistic guard: many fast calls, none may time out).
+
 Currently unaddressed yet:
 - Paged reads beyond a single node's own outgoing/incoming edges
   (theorystate.md section 105, items 43/46): FindRelationships and
