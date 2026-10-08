@@ -2323,6 +2323,19 @@ could be called directly.
  TestCreatePrivateFileGrantsOnlyTheCurrentUserAndSystem (Windows only),
  TestIsSafeFileName and the new TestRunRejectsBadInput cases.
 
+62. Runnable examples and an embedding section (no behaviour change).
+ example_test.go (package dml_test, exported API only, so it also checks that
+ the public surface suffices for a consumer): ExampleHost (several clients,
+ one Apply, one Remove, the final shutdown pass), ExampleWireServer (a Host
+ served over net.Pipe with a peer identifier and a ResourcePolicy, showing
+ ErrNotAuthorized crossing the wire) and ExampleCertificateAuthority_Issue (a
+ certificate Principal in a ResourcePolicy). None opens a socket. No wire
+ example runs over TLS on net.Pipe: no test exercises that path, and closing a
+ tls.Conn whose peer is not reading can wait for its write deadline; the real
+ TLS setup is shown in the README instead. README.md gained "Embedding the
+ host" (host, pipe and TLS servers, client, and the one-connection-one-session
+ rule).
+
 Currently unaddressed yet:
 - Paged reads beyond a single node's own outgoing/incoming edges
   (theorystate.md section 105, items 43/46): FindRelationships and
