@@ -160,6 +160,14 @@ func ListenTLS(address string, cfg *tls.Config) (net.Listener, error) {
 		return nil, cfgErr
 	}
 
+	return listenTLS(address, serverCfg)
+}
+
+// listenTLS listens on the TCP address and wraps the listener in TLS with cfg,
+// which the caller has already validated. It is shared by ListenTLS (a fixed,
+// validated configuration) and ReloadingServerTLS.Listen (a configuration
+// that validates each per-connection configuration it hands out).
+func listenTLS(address string, cfg *tls.Config) (net.Listener, error) {
 	var lc net.ListenConfig
 
 	listener, listenErr := lc.Listen(context.Background(), "tcp", address)
@@ -167,7 +175,7 @@ func ListenTLS(address string, cfg *tls.Config) (net.Listener, error) {
 		return nil, fmt.Errorf("tls: listening on %s: %w", address, listenErr)
 	}
 
-	return tls.NewListener(listener, serverCfg), nil
+	return tls.NewListener(listener, cfg), nil
 }
 
 // DialTLS connects to a ListenTLS server at address, with cfg (which carries

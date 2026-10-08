@@ -2275,6 +2275,35 @@ could be called directly.
  that builds its own graph instead of using a fixture is not affected. A raw
  write path per backend would let those run everywhere too (not done).
 
+60. Certificate rotation without a host restart (theorystate.md section
+ 113). ReloadingServerTLS (wire_tls_files.go) keeps the server certificate,
+ key and client CA file in files and re-reads them when their modification
+ time or size changes, checked at each handshake (fileStamp, stampFiles);
+ Reload forces it. It serves through GetConfigForClient, which ListenTLS
+ refuses, so it has its own Listen (listenTLS was factored out of ListenTLS
+ and is shared): each per-connection configuration is built by
+ LoadServerTLS and validated by tlsServerConfig, and the base configuration
+ requires client certificates with no certificate or CA of its own, so it
+ fails closed. Unloadable files keep the previous configuration serving and
+ are reported once (a rebuild is not retried until the files change again;
+ a vanished file is reported once per distinct message); a bad first load is
+ an error. Session tickets are disabled so trust changes cannot be bypassed
+ by a resumed session. Established connections are unaffected by a
+ rotation. Clients need no reloader (LoadClientTLS before each dial). Test
+ support: tlsHandshakeBoth (tlsHandshakePair wraps it), mustKeyPair,
+ writeGeneration (sets an explicit modification time so a rewrite is always
+ seen as a change), errorLog.count. Covered by
+ TestReloadingServerTLSServesTheFilesAndAuthenticatesClients,
+ TestReloadingServerTLSPicksUpARotatedServerCertificate,
+ TestReloadingServerTLSPicksUpARotatedClientCAPool,
+ TestReloadingServerTLSKeepsServingTheOldFilesWhenTheNewOnesAreBad,
+ TestReloadingServerTLSReportsMissingFilesOnce,
+ TestNewReloadingServerTLSFailsLoudlyOnBadFiles (all over net.Pipe or without
+ a socket) and, over loopback TCP, the real rejection in
+ TestFWNeededReloadingServerTLSRotatesTheClientCAWithoutARestart. Not done:
+ CRL/OCSP, ending sessions admitted by a CA that was removed, watching the
+ files instead of checking them per handshake.
+
 Currently unaddressed yet:
 - Paged reads beyond a single node's own outgoing/incoming edges
   (theorystate.md section 105, items 43/46): FindRelationships and

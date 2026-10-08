@@ -22,6 +22,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"testing"
+	"time"
 )
 
 // This test opens a real TCP socket on 127.0.0.1, so like the one in
@@ -107,5 +108,80 @@ func TestFWNeededWireOverMutualTLSAuthorizesByCertificate(t *testing.T) {
 	sessions, sessionsErr := h.Registries().Leases.Sessions(h.Graph())
 	if sessionsErr != nil || len(sessions) != 2 {
 		t.Fatalf("Sessions() = (%v,%v), want exactly alice's and bob's sessions", sessions, sessionsErr)
+	}
+}
+
+// TestFWNeededReloadingServerTLSRotatesTheClientCAWithoutARestart serves a
+// ReloadingServerTLS over loopback TCP and replaces its file of client CAs
+// while it runs: a client of the old CA is admitted and one of the new CA is
+// not, then, after the rewrite, the other way round, with no restart.
+func TestFWNeededReloadingServerTLSRotatesTheClientCAWithoutARestart(t *testing.T) {
+	ctx := hostTestContext(t)
+	dir := t.TempDir()
+
+	serverCA := mustNewCA(t, time.Hour)
+	oldClientCA := mustNewCA(t, time.Hour)
+	newClientCA := mustNewCA(t, time.Hour)
+
+	server := mustIssue(t, serverCA, serverTestSpec())
+	alice := mustIssue(t, oldClientCA, clientTestSpec())
+	bob := mustIssue(t, newClientCA, clientTestSpec())
+
+	certFile := writeGeneration(t, dir, "srv.pem", server.CertPEM, 0)
+	keyFile := writeGeneration(t, dir, "srv-key.pem", server.KeyPEM, 0)
+	clientCAFile := writeGeneration(t, dir, "clients.pem", oldClientCA.CertPEM(), 0)
+
+	reported := &errorLog{}
+	h := openTestHost(t, boltTestPath(t), nil)
+
+	reloading, newErr := NewReloadingServerTLS(certFile, keyFile, clientCAFile, func(reloadErr error) { reported.add("reload", reloadErr) })
+	if newErr != nil {
+		t.Fatalf("NewReloadingServerTLS(): %v", newErr)
+	}
+
+	listener, listenErr := reloading.Listen("127.0.0.1:0")
+	if listenErr != nil {
+		t.Fatalf("Listen(): %v", listenErr)
+	}
+
+	serveListener(t, NewWireServer(h, WithPeerIdentifier(TLSPeerPrincipal)), listener)
+
+	address := listener.Addr().String()
+
+	dial := func(issued *IssuedCertificate) (*WireClient, error) {
+		return DialTLS(ctx, address, tlsClientConfig(mustKeyPair(t, issued), serverCA.Pool()))
+	}
+
+	admitted := func(who string, issued *IssuedCertificate) {
+		client, dialErr := dial(issued)
+		if dialErr != nil {
+			t.Fatalf("%s was refused: %v", who, dialErr)
+		}
+
+		t.Cleanup(func() {
+			if closeErr := client.Close(); closeErr != nil {
+				t.Errorf("%s: client Close(): %v", who, closeErr)
+			}
+		})
+	}
+
+	refused := func(who string, issued *IssuedCertificate) {
+		client, dialErr := dial(issued)
+		if dialErr == nil {
+			closeQuietly(client)
+			t.Fatalf("%s was admitted", who)
+		}
+	}
+
+	admitted("alice, before the rotation", alice)
+	refused("bob, before the rotation", bob)
+
+	writeGeneration(t, dir, "clients.pem", newClientCA.CertPEM(), 1)
+
+	admitted("bob, after the rotation", bob)
+	refused("alice, after the rotation", alice)
+
+	if got := reported.count(); got != 0 {
+		t.Fatalf("%d reload problems reported, want none", got)
 	}
 }

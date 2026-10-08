@@ -3914,7 +3914,31 @@ fingerprints trusts the listed certificates rather than the CA's naming.
 The cost is that rotating a client certificate means updating the policy.
 Which resource a client may use is still the `Authorizer`, fail-closed
 (a peer without a verified certificate is the empty principal). Revocation
-is not handled by dml; it is whatever the `tls.Config` does.
+lists (CRL, OCSP) are not handled by dml: trust is withdrawn by removing a
+fingerprint from the policy or a CA from the client CA file.
+
+**Rotation without a restart (DECIDED, implemented).** `ReloadingServerTLS`
+keeps the server's certificate, private key and client CA file in files and
+re-reads them when their modification time or size changes (checked at each
+handshake: a stat of three files); `Reload` forces it. It needs
+`GetConfigForClient`, which `ListenTLS` refuses, so it has its own `Listen`,
+safe by construction: every connection is served with a per-connection
+configuration built by `LoadServerTLS` and validated by the very check
+`ListenTLS` applies, and the base configuration requires client certificates
+and holds neither a certificate nor a CA, so a handshake that did not get a
+validated configuration cannot succeed. Files that cannot be loaded
+(half-written, a key that does not match, a file that vanished while being
+replaced) never take the host down: the previous configuration keeps serving
+and the problem is reported once through an error callback (a bad first load
+is an error at startup). Session tickets are disabled so that a changed
+certificate or CA applies to every new connection and cannot be bypassed by a
+resumed session; a connection here is one long-lived session, so the cost is
+one full handshake each. Already-established connections are not affected: a
+CA removed from the file does not end sessions it admitted. Clients need no
+reloader: one connection is one session and `DialTLS` takes a configuration
+per dial, so a client reloads its files with `LoadClientTLS` before each dial.
+Its Principal is its fingerprint, so rotating a client certificate still
+means updating the policy first.
 
 **Plain TCP is refused (DECIDED, implemented).** The server serves a TCP
 connection only if it is TLS. The threat on loopback is not sniffing (reading
@@ -3938,9 +3962,10 @@ certificates that cannot outlive the CA, and a tool that never overwrites a
 file and prints each client's Principal so the policy can be written from its
 output. The CA's private key is the root of trust: whoever has it can make a
 certificate every peer accepts, so it should live where the host does not
-(the host needs only `ca.pem`). Revocation and rotation are not handled: a
-lost client key is dealt with by removing its fingerprint from the policy,
-which is exactly why the Principal is a fingerprint.
+(the host needs only `ca.pem`). Revocation lists and renewal tooling are not
+handled: a lost client key is dealt with by removing its fingerprint from the
+policy, which is exactly why the Principal is a fingerprint; rotating
+certificates or the client CA file is covered by `ReloadingServerTLS` above.
 
 **OPEN.** Transports beyond named pipes and mutual TLS, and a way to
 identify peers on them, and how an error crosses when §89c's transaction

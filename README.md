@@ -51,6 +51,14 @@ go run ./cmd/dmlcert client -dir certs -name alice
 In code: `LoadServerTLS` + `ListenTLS` on the host, `LoadClientTLS` + `DialTLS`
 on the client. Keep every `*-key.pem` secret (they are git-ignored).
 
+To rotate the server's certificate, or the file of client CAs, without
+restarting the host, use `NewReloadingServerTLS` + its `Listen` instead:
+replace the files and the next connection is served with the new ones (a bad
+replacement is reported and ignored). Connections already open are not
+affected. A client rotates by calling `LoadClientTLS` before each `DialTLS`;
+since its Principal is its certificate's fingerprint, update the
+`ResourcePolicy` first.
+
 ## License
 
 This project and all of its contents (including source code and documentation) are 

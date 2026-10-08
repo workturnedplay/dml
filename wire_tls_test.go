@@ -67,12 +67,7 @@ func (p *tlsTestPKI) issue(t *testing.T, name string) (tls.Certificate, *x509.Ce
 		t.Fatalf("issuing the certificate of %q: %v", name, issueErr)
 	}
 
-	cert, pairErr := tls.X509KeyPair(issued.CertPEM, issued.KeyPEM)
-	if pairErr != nil {
-		t.Fatalf("loading the certificate of %q: %v", name, pairErr)
-	}
-
-	return cert, issued.Certificate
+	return mustKeyPair(t, issued), issued.Certificate
 }
 
 // serverConfig is a valid ListenTLS configuration trusting this CA's clients.
@@ -99,11 +94,12 @@ func tlsClientConfig(cert tls.Certificate, roots *x509.CertPool) *tls.Config {
 	}
 }
 
-// tlsHandshakePair runs a TLS handshake between a server and a client over
-// net.Pipe and returns the server side. Both pipe ends are closed directly
-// when the test ends: closing a tls.Conn would try to write a close_notify
-// that nobody reads.
-func tlsHandshakePair(t *testing.T, serverCfg, clientCfg *tls.Config) *tls.Conn {
+// tlsHandshakeBoth runs a TLS handshake between a server and a client over
+// net.Pipe and returns both sides. Both pipe ends are closed directly when
+// the test ends: closing a tls.Conn would try to write a close_notify that
+// nobody reads. It only fits handshakes that succeed: over the unbuffered
+// pipe a rejecting server would block writing its alert.
+func tlsHandshakeBoth(t *testing.T, serverCfg, clientCfg *tls.Config) (serverConn, clientConn *tls.Conn) {
 	t.Helper()
 
 	clientPipe, serverPipe := net.Pipe()
@@ -113,8 +109,8 @@ func tlsHandshakePair(t *testing.T, serverCfg, clientCfg *tls.Config) *tls.Conn 
 		closeQuietly(serverPipe)
 	})
 
-	serverConn := tls.Server(serverPipe, serverCfg)
-	clientConn := tls.Client(clientPipe, clientCfg)
+	serverConn = tls.Server(serverPipe, serverCfg)
+	clientConn = tls.Client(clientPipe, clientCfg)
 
 	serverDone := make(chan error, 1)
 
@@ -127,6 +123,15 @@ func tlsHandshakePair(t *testing.T, serverCfg, clientCfg *tls.Config) *tls.Conn 
 	if serverErr := <-serverDone; serverErr != nil {
 		t.Fatalf("server handshake: %v", serverErr)
 	}
+
+	return serverConn, clientConn
+}
+
+// tlsHandshakePair is tlsHandshakeBoth returning only the server side.
+func tlsHandshakePair(t *testing.T, serverCfg, clientCfg *tls.Config) *tls.Conn {
+	t.Helper()
+
+	serverConn, _ := tlsHandshakeBoth(t, serverCfg, clientCfg)
 
 	return serverConn
 }

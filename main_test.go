@@ -18365,6 +18365,14 @@ func (l *errorLog) hasOp(op string) bool {
 	return slices.Contains(l.ops, op)
 }
 
+// count is how many errors were reported in all.
+func (l *errorLog) count() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	return len(l.errs)
+}
+
 func (l *errorLog) has(target error) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
