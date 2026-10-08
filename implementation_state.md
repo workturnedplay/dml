@@ -2304,6 +2304,25 @@ could be called directly.
  CRL/OCSP, ending sessions admitted by a CA that was removed, watching the
  files instead of checking them per handshake.
 
+61. dmlcert hardening (theorystate.md section 113). (a) Key files were
+ documented as "mode 0600", which on Windows only toggles the read-only
+ attribute: a key inherited its directory's ACL. New exported
+ CreatePrivateFile (private_file.go, private_file_other.go,
+ private_file_windows.go) creates a file exclusively and private from the
+ first instant: O_EXCL with 0600 elsewhere; on Windows CreateFile(CREATE_NEW)
+ with a protected DACL (current user and SYSTEM only) attached at creation, so
+ there is no window between creating a file and restricting it.
+ currentUserSID is now shared by DefaultPipeSecurity and the file code.
+ (b) isSafeFileName also rejects the characters Windows forbids in file
+ names (<>"|?*), control characters and the reserved device names (CON, PRN,
+ AUX, NUL, COM1-9, LPT1-9, with any extension), on every platform, since the
+ files get copied between machines. (c) A failed write no longer leaves a
+ partial file, and a failed certificate write removes the key written a
+ moment earlier, so a retry is not refused for files nothing uses. Covered by
+ TestCreatePrivateFileCreatesAWritableFileAndNeverOverwrites,
+ TestCreatePrivateFileGrantsOnlyTheCurrentUserAndSystem (Windows only),
+ TestIsSafeFileName and the new TestRunRejectsBadInput cases.
+
 Currently unaddressed yet:
 - Paged reads beyond a single node's own outgoing/incoming edges
   (theorystate.md section 105, items 43/46): FindRelationships and

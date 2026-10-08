@@ -49,7 +49,9 @@ go run ./cmd/dmlcert client -dir certs -name alice
 ```
 
 In code: `LoadServerTLS` + `ListenTLS` on the host, `LoadClientTLS` + `DialTLS`
-on the client. Keep every `*-key.pem` secret (they are git-ignored).
+on the client. Keep every `*-key.pem` secret (they are git-ignored). `dmlcert`
+creates every file readable only by you: mode 0600, and on Windows, where mode
+bits mean nothing, an ACL granting only you and SYSTEM.
 
 To rotate the server's certificate, or the file of client CAs, without
 restarting the host, use `NewReloadingServerTLS` + its `Listen` instead:

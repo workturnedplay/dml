@@ -139,6 +139,9 @@ func TestRunRejectsBadInput(t *testing.T) {
 		{name: "client without a name", args: []string{"client", "-dir", dir}},
 		{name: "client name with a directory", args: []string{"client", "-dir", dir, "-name", "../evil"}},
 		{name: "client name with a backslash", args: []string{"client", "-dir", dir, "-name", `..\evil`}},
+		{name: "client name that is a Windows device", args: []string{"client", "-dir", dir, "-name", "con"}},
+		{name: "client name that is a Windows device with an extension", args: []string{"client", "-dir", dir, "-name", "NUL.txt"}},
+		{name: "client name with a character Windows forbids", args: []string{"client", "-dir", dir, "-name", "a|b"}},
 		{name: "server without a CA", args: []string{"server", "-dir", filepath.Join(dir, "no-ca")}},
 		{name: "server without hosts", args: []string{"server", "-dir", dir, "-hosts", " , "}},
 		{name: "principal without files", args: []string{"principal"}},
@@ -149,6 +152,52 @@ func TestRunRejectsBadInput(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if _, _, err := runCommand(tc.args...); err == nil {
 				t.Fatalf("run(%v) succeeded, want an error", tc.args)
+			}
+		})
+	}
+}
+
+func TestIsSafeFileName(t *testing.T) {
+	cases := []struct {
+		name string
+		want bool
+	}{
+		{name: "alice", want: true},
+		{name: "host-1", want: true},
+		{name: "my cert", want: true},
+		{name: "a.b", want: true},
+		{name: "console", want: true},
+		{name: "com1x", want: true},
+		{name: "com10", want: true},
+		{name: "com0", want: true},
+		{name: "", want: false},
+		{name: ".", want: false},
+		{name: "..", want: false},
+		{name: "a/b", want: false},
+		{name: `a\b`, want: false},
+		{name: "c:x", want: false},
+		{name: "a<b", want: false},
+		{name: "a>b", want: false},
+		{name: `a"b`, want: false},
+		{name: "a|b", want: false},
+		{name: "a?b", want: false},
+		{name: "a*b", want: false},
+		{name: "a\x00b", want: false},
+		{name: "a\tb", want: false},
+		{name: "con", want: false},
+		{name: "CON", want: false},
+		{name: "con ", want: false},
+		{name: "Nul.txt", want: false},
+		{name: "aux", want: false},
+		{name: "prn", want: false},
+		{name: "com1", want: false},
+		{name: "LPT9", want: false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isSafeFileName(tc.name); got != tc.want {
+				t.Fatalf("isSafeFileName(%q) = %v, want %v", tc.name, got, tc.want)
 			}
 		})
 	}

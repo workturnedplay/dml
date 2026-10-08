@@ -3962,7 +3962,10 @@ certificates that cannot outlive the CA, and a tool that never overwrites a
 file and prints each client's Principal so the policy can be written from its
 output. The CA's private key is the root of trust: whoever has it can make a
 certificate every peer accepts, so it should live where the host does not
-(the host needs only `ca.pem`). Revocation lists and renewal tooling are not
+(the host needs only `ca.pem`). Every file dmlcert writes is private to its
+owner: mode 0600, and on Windows, where mode bits mean nothing, a protected
+ACL granting only the current user and SYSTEM (`CreatePrivateFile`).
+Revocation lists and renewal tooling are not
 handled: a lost client key is dealt with by removing its fingerprint from the
 policy, which is exactly why the Principal is a fingerprint; rotating
 certificates or the client CA file is covered by `ReloadingServerTLS` above.

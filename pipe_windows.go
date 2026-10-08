@@ -49,12 +49,12 @@ func PipePath(name string) string {
 // over SMB, even as the same account), then allows only the current user and
 // SYSTEM.
 func DefaultPipeSecurity() (string, error) {
-	user, userErr := windows.GetCurrentProcessToken().GetTokenUser()
-	if userErr != nil {
-		return "", fmt.Errorf("pipe: reading the current user's SID: %w", userErr)
+	sid, sidErr := currentUserSID()
+	if sidErr != nil {
+		return "", fmt.Errorf("pipe: %w", sidErr)
 	}
 
-	return fmt.Sprintf("D:P(D;;GA;;;NU)(A;;GA;;;%s)(A;;GA;;;SY)", user.User.Sid.String()), nil
+	return fmt.Sprintf("D:P(D;;GA;;;NU)(A;;GA;;;%s)(A;;GA;;;SY)", sid), nil
 }
 
 // ListenPipe listens on the named pipe path (see PipePath) with the given SDDL

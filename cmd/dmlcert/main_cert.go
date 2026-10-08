@@ -28,8 +28,10 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
+	"unicode"
 
 	"dml"
 )
@@ -49,7 +51,8 @@ usage:
       print the Principal of each certificate file
 
 DIR defaults to the current directory. server and client read the CA from DIR.
-Every file is written with mode 0600 and nothing is ever overwritten.
+Every file is created readable only by you (mode 0600; on Windows an ACL
+granting only you and SYSTEM) and nothing is ever overwritten.
 `
 
 const (
@@ -58,8 +61,7 @@ const (
 	defaultLeafDays = 365
 	maxDays         = 36500
 
-	privateFileMode os.FileMode = 0o600
-	privateDirMode  os.FileMode = 0o700
+	privateDirMode os.FileMode = 0o700
 )
 
 var errNoCommand = errors.New("no command given")
@@ -152,11 +154,34 @@ func splitList(list string) []string {
 	return items
 }
 
-// isSafeFileName reports whether name is a plain file name: no directory, no
-// separator, nothing that names another place.
+// isSafeFileName reports whether name is a plain file name on every platform
+// the files may be copied to: no directory, no separator, nothing that names
+// another place, none of the characters Windows forbids in a file name, no
+// control characters and not one of the device names Windows reserves (writing
+// to "con.pem" there does not make a file).
 func isSafeFileName(name string) bool {
 	return name != "" && name != "." && name != ".." &&
-		name == filepath.Base(name) && !strings.ContainsAny(name, `/\:`)
+		name == filepath.Base(name) &&
+		!strings.ContainsAny(name, `/\:<>"|?*`) &&
+		strings.IndexFunc(name, unicode.IsControl) < 0 &&
+		!isWindowsReservedName(name)
+}
+
+// isWindowsReservedName reports whether name, up to its first dot and
+// ignoring case and trailing spaces, is a device name Windows reserves: CON,
+// PRN, AUX, NUL, COM1 to COM9 and LPT1 to LPT9. Windows treats such a name
+// as the device whatever extension follows it.
+func isWindowsReservedName(name string) bool {
+	base, _, _ := strings.Cut(name, ".")
+	base = strings.ToUpper(strings.TrimRight(base, " "))
+
+	if slices.Contains([]string{"CON", "PRN", "AUX", "NUL"}, base) {
+		return true
+	}
+
+	return len(base) == 4 &&
+		(strings.HasPrefix(base, "COM") || strings.HasPrefix(base, "LPT")) &&
+		base[3] >= '1' && base[3] <= '9'
 }
 
 // pairPaths returns the certificate and key file paths for base in dir.
@@ -180,9 +205,13 @@ func requireAbsent(paths ...string) error {
 	return nil
 }
 
-// writeNewFile creates path, which must not exist, with data in it.
+// writeNewFile creates path, which must not exist, with data in it. The file
+// is private to its owner from the moment it exists (dml.CreatePrivateFile).
+// If writing it fails, the partial file is removed again: this call created
+// it exclusively, and leaving it would make a retry refuse to overwrite a file
+// that holds nothing useful.
 func writeNewFile(path string, data []byte) error {
-	file, openErr := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, privateFileMode)
+	file, openErr := dml.CreatePrivateFile(path)
 	if openErr != nil {
 		return fmt.Errorf("creating %s: %w", path, openErr)
 	}
@@ -191,7 +220,7 @@ func writeNewFile(path string, data []byte) error {
 	closeErr := file.Close()
 
 	if joined := errors.Join(writeErr, closeErr); joined != nil {
-		return fmt.Errorf("writing %s: %w", path, joined)
+		return fmt.Errorf("writing %s: %w", path, errors.Join(joined, os.Remove(path)))
 	}
 
 	return nil
@@ -217,6 +246,13 @@ func writePair(dir, base string, certPEM, keyPEM []byte) (string, string, error)
 	}
 
 	if certErr := writeNewFile(certPath, certPEM); certErr != nil {
+		// The pair is useless without its certificate, and this call created
+		// the key exclusively a moment ago, so take it back: a retry would
+		// otherwise be refused for a key that nothing uses.
+		if removeErr := os.Remove(keyPath); removeErr != nil {
+			return "", "", fmt.Errorf("%w (and removing %s failed: %w)", certErr, keyPath, removeErr)
+		}
+
 		return "", "", certErr
 	}
 
