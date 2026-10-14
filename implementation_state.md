@@ -2350,7 +2350,21 @@ could be called directly.
  (O(n) instead of the O(n squared) of repeated Append); Append is now a
  one-value AppendMany. DRY: requireExists is the shared "and the
  value/member exists" half of requireListValue and requireSetMember.
- Measurements are not recorded yet. Covered by
+ Measured (i7-8700K, Windows, no -race, -benchtime 30x, ms per commit; the
+empty commit is the baseline of about 2.7 ms):
+   n         empty   tail-scan   checker-only   append
+   1,000      2.6       7.7          46.7         48.9
+   10,000     2.9      20.8         596.8        622.7
+   100,000    2.8     190.5       6,359.0      6,475.4
+ Net of the baseline the Checker costs about 44, 59 and 64 microseconds per
+ element (about 410 to 550 allocations and 17 to 30 KB per element), and the
+ tail scan about 5, 1.8 and 1.9. The Checker is 94 to 97 percent of an
+ Append, about 30 times the tail scan, and linear per commit, so adding
+ elements one at a time is quadratic: an estimated 30 s for 1,000 elements,
+ 50 minutes for 10,000 and several days for 100,000. AppendMany pays one
+ check per transaction. Every commit that touches the list, and every read
+ through Elements, pays the same cost.
+ Covered by
  TestListAppendManyAppendsInOrderAndReturnsTheCapsules,
  TestListAppendManyOnAnEmptyListSetsHeadAndTail,
  TestListAppendManyIsAtomicWhenAValueIsMissing and
@@ -2360,7 +2374,9 @@ could be called directly.
 Currently unaddressed yet:
 - ListRegistry.Append finds the tail by reading the list's whole child set
   (O(n)) and the list Checker validates the whole list on every commit that
-  touches it (O(n)); see item 63 for the benchmark that separates them.
+  touches it (O(n)); item 63 measures them: the Checker costs about 30 times
+  the tail scan, so it is addressed first (a neighbourhood-only Checker is
+  proposed there).
 - Paged reads beyond a single node's own outgoing/incoming edges
   (theorystate.md section 105, items 43/46): FindRelationships and
   rootReader.FindRelationships are still O(graph) on BoltGraph, as
