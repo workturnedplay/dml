@@ -2336,7 +2336,31 @@ could be called directly.
  host" (host, pipe and TLS servers, client, and the one-connection-one-session
  rule).
 
+63. Measuring the cost of commit-time Checkers on a long list
+ (theorystate.md section 105). ListRegistry's Checker runs
+ validateStructure over the whole list on every commit touching it, and
+ ListRegistry.Append reads every child of the list to find the tail, so
+ both are O(n) per commit. Added BenchmarkListCommitCost (main_test.go,
+ run via measure.bat): per list size (1k, 10k, 100k, over the production
+ stack from OpenHost) it times an empty commit, Append's tail scan alone, a
+ commit that only makes the Checker validate the list, and a real Append, so
+ the two O(n) costs can be told apart before a local check is designed.
+ Building the large lists needed a bulk operation: ListRegistry.AppendMany
+ appends many values in one transaction, looking up the tail once
+ (O(n) instead of the O(n squared) of repeated Append); Append is now a
+ one-value AppendMany. DRY: requireExists is the shared "and the
+ value/member exists" half of requireListValue and requireSetMember.
+ Measurements are not recorded yet. Covered by
+ TestListAppendManyAppendsInOrderAndReturnsTheCapsules,
+ TestListAppendManyOnAnEmptyListSetsHeadAndTail,
+ TestListAppendManyIsAtomicWhenAValueIsMissing and
+ TestListAppendManyOfNothingStillChecksTheList (all four also run on every
+ backend).
+
 Currently unaddressed yet:
+- ListRegistry.Append finds the tail by reading the list's whole child set
+  (O(n)) and the list Checker validates the whole list on every commit that
+  touches it (O(n)); see item 63 for the benchmark that separates them.
 - Paged reads beyond a single node's own outgoing/incoming edges
   (theorystate.md section 105, items 43/46): FindRelationships and
   rootReader.FindRelationships are still O(graph) on BoltGraph, as

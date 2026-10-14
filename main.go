@@ -5439,6 +5439,22 @@ func requireTagged(graph GraphReader, id, tag NodeID, notTaggedErr error) error 
 	return nil
 }
 
+// requireExists checks that id exists, returning ErrNodeNotFound
+// otherwise. It is the shared "and the value/member exists" half of
+// ListRegistry.requireListValue, SetRegistry.requireSetMember and
+// ListRegistry.AppendMany.
+func requireExists(graph GraphReader, id NodeID) error {
+	exists, err := graph.NodeExists(id)
+	if err != nil {
+		return wrapInterfaceErr(err)
+	}
+	if !exists {
+		return ErrNodeNotFound
+	}
+
+	return nil
+}
+
 // PointerRegistry enforces the Pointer invariant -- "at most one target"
 // -- for nodes tagged Pointer-kind via a caller-supplied tag relationship
 // (tag, P).
@@ -7295,15 +7311,7 @@ func (l *ListRegistry) requireListValue(graph GraphReader, list, value NodeID) e
 		return requireErr
 	}
 
-	exists, err := graph.NodeExists(value)
-	if err != nil {
-		return wrapInterfaceErr(err)
-	}
-	if !exists {
-		return ErrNodeNotFound
-	}
-
-	return nil
+	return requireExists(graph, value)
 }
 
 // NewList creates a fresh NodeID and tags it (AllLists, id). The new list
@@ -7371,46 +7379,82 @@ func (l *ListRegistry) Tail(graph GraphReader, list NodeID) (tail NodeID, hasTai
 // exist. Both are checked against tx itself, so a caller composing this
 // into a larger transaction cannot act on a stale pre-check.
 func (l *ListRegistry) Append(graph Transactor, list, value NodeID) (NodeID, error) {
-	return transactValue(graph, func(tx Tx) (NodeID, error) {
-		if requireErr := l.requireListValue(tx, list, value); requireErr != nil {
-			return 0, requireErr
+	capsules, err := l.AppendMany(graph, list, []NodeID{value})
+	if err != nil {
+		return 0, err
+	}
+
+	return capsules[0], nil
+}
+
+// AppendMany appends one fresh capsule per value, in order, as the new
+// tail of list, entirely inside one transaction (nested if graph is a Tx),
+// and returns the capsules in the same order. The result is exactly what
+// calling Append once per value would produce, but the current tail is
+// looked up once, not once per value: Append's tail lookup reads every
+// child of the list, so n separate Appends cost O(n squared) reads and one
+// AppendMany costs O(n). A bulk load should use this.
+//
+// It is all-or-nothing: if any value is missing (ErrNodeNotFound) or any
+// step fails, nothing is appended. With no values it only checks that list
+// is a list and returns an empty result.
+//
+// list must already be tagged (AllLists, list) and every value must
+// already exist. Both are checked against tx itself, so a caller composing
+// this into a larger transaction cannot act on a stale pre-check.
+func (l *ListRegistry) AppendMany(graph Transactor, list NodeID, values []NodeID) ([]NodeID, error) {
+	return transactValue(graph, func(tx Tx) ([]NodeID, error) {
+		if requireErr := l.requireList(tx, list); requireErr != nil {
+			return nil, requireErr
 		}
 
-		oldTail, hasTail, err := findUniqueTaggedChild(tx, list, l.allTails)
+		tail, hasTail, err := findUniqueTaggedChild(tx, list, l.allTails)
 		if err != nil {
-			return 0, err
+			return nil, err
 		}
 
-		capsule, err := l.capsules.NewCapsule(tx, value)
-		if err != nil {
-			return 0, err
-		}
+		// Built fresh on every run of the closure (it may be re-run).
+		capsules := make([]NodeID, 0, len(values))
 
-		if linkErr := addRelationshipTx(tx, list, capsule); linkErr != nil {
-			return 0, linkErr
-		}
-
-		if hasTail {
-			if prevErr := l.capsules.SetPrev(tx, capsule, oldTail); prevErr != nil {
-				return 0, prevErr
+		for _, value := range values {
+			if requireErr := requireExists(tx, value); requireErr != nil {
+				return nil, requireErr
 			}
-			if nextErr := l.capsules.SetNext(tx, oldTail, capsule); nextErr != nil {
-				return 0, nextErr
+
+			capsule, newErr := l.capsules.NewCapsule(tx, value)
+			if newErr != nil {
+				return nil, newErr
 			}
-			if untagErr := removeRelationshipTx(tx, l.allTails, oldTail); untagErr != nil {
-				return 0, untagErr
+
+			if linkErr := addRelationshipTx(tx, list, capsule); linkErr != nil {
+				return nil, linkErr
 			}
-		} else {
-			if headErr := addRelationshipTx(tx, l.allHeads, capsule); headErr != nil {
-				return 0, headErr
+
+			if hasTail {
+				if prevErr := l.capsules.SetPrev(tx, capsule, tail); prevErr != nil {
+					return nil, prevErr
+				}
+				if nextErr := l.capsules.SetNext(tx, tail, capsule); nextErr != nil {
+					return nil, nextErr
+				}
+				if untagErr := removeRelationshipTx(tx, l.allTails, tail); untagErr != nil {
+					return nil, untagErr
+				}
+			} else {
+				if headErr := addRelationshipTx(tx, l.allHeads, capsule); headErr != nil {
+					return nil, headErr
+				}
 			}
+
+			if tailErr := addRelationshipTx(tx, l.allTails, capsule); tailErr != nil {
+				return nil, tailErr
+			}
+
+			tail, hasTail = capsule, true
+			capsules = append(capsules, capsule)
 		}
 
-		if tailErr := addRelationshipTx(tx, l.allTails, capsule); tailErr != nil {
-			return 0, tailErr
-		}
-
-		return capsule, nil
+		return capsules, nil
 	})
 }
 
@@ -8117,15 +8161,7 @@ func (s *SetRegistry) requireSetMember(graph GraphReader, set, member NodeID) er
 		return requireErr
 	}
 
-	exists, err := graph.NodeExists(member)
-	if err != nil {
-		return wrapInterfaceErr(err)
-	}
-	if !exists {
-		return ErrNodeNotFound
-	}
-
-	return nil
+	return requireExists(graph, member)
 }
 
 // NewSet creates a fresh NodeID and tags it (AllSets, id). The new set

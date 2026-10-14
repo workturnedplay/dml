@@ -19,6 +19,7 @@ package dml
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -4848,6 +4849,139 @@ func TestListAppendMultipleMaintainsOrder(t *testing.T) {
 	}
 	if !hasTail || lastValue != values[len(values)-1] {
 		t.Fatalf("tail capsule's value = %d, want %d", lastValue, values[len(values)-1])
+	}
+}
+
+func TestListAppendManyAppendsInOrderAndReturnsTheCapsules(t *testing.T) {
+	g, _, lists := newListTestFixture(t)
+
+	list, err := lists.NewList(g)
+	if err != nil {
+		t.Fatalf("NewList(): %v", err)
+	}
+
+	first := newTestNode(t, g)
+	a := newTestNode(t, g)
+	b := newTestNode(t, g)
+	c := newTestNode(t, g)
+
+	// A non-empty list first, so the tail being extended is a real one.
+	if _, appendErr := lists.Append(g, list, first); appendErr != nil {
+		t.Fatalf("Append(first): %v", appendErr)
+	}
+
+	capsules, err := lists.AppendMany(g, list, []NodeID{a, b, c})
+	if err != nil {
+		t.Fatalf("AppendMany(): %v", err)
+	}
+	if len(capsules) != 3 {
+		t.Fatalf("AppendMany() returned %d capsules, want 3", len(capsules))
+	}
+
+	requireListElements(t, lists, g, list, []NodeID{first, a, b, c})
+
+	for i, want := range []NodeID{a, b, c} {
+		value, hasValue, valueErr := lists.capsules.Value(g, capsules[i])
+		if valueErr != nil {
+			t.Fatalf("Value(capsules[%d]): %v", i, valueErr)
+		}
+		if !hasValue || value != want {
+			t.Fatalf("Value(capsules[%d]) = (%d,%v), want (%d,true)", i, value, hasValue, want)
+		}
+	}
+
+	tail, hasTail, tailErr := lists.Tail(g, list)
+	if tailErr != nil {
+		t.Fatalf("Tail(): %v", tailErr)
+	}
+	if !hasTail || tail != capsules[2] {
+		t.Fatalf("Tail() = (%d,%v), want (%d,true)", tail, hasTail, capsules[2])
+	}
+}
+
+func TestListAppendManyOnAnEmptyListSetsHeadAndTail(t *testing.T) {
+	g, _, lists := newListTestFixture(t)
+
+	list, err := lists.NewList(g)
+	if err != nil {
+		t.Fatalf("NewList(): %v", err)
+	}
+
+	a := newTestNode(t, g)
+	b := newTestNode(t, g)
+
+	capsules, err := lists.AppendMany(g, list, []NodeID{a, b})
+	if err != nil {
+		t.Fatalf("AppendMany(): %v", err)
+	}
+
+	requireListElements(t, lists, g, list, []NodeID{a, b})
+
+	head, hasHead, headErr := lists.Head(g, list)
+	if headErr != nil {
+		t.Fatalf("Head(): %v", headErr)
+	}
+	if !hasHead || head != capsules[0] {
+		t.Fatalf("Head() = (%d,%v), want (%d,true)", head, hasHead, capsules[0])
+	}
+
+	tail, hasTail, tailErr := lists.Tail(g, list)
+	if tailErr != nil {
+		t.Fatalf("Tail(): %v", tailErr)
+	}
+	if !hasTail || tail != capsules[1] {
+		t.Fatalf("Tail() = (%d,%v), want (%d,true)", tail, hasTail, capsules[1])
+	}
+}
+
+// TestListAppendManyIsAtomicWhenAValueIsMissing: the first value is fine and
+// is wired in before the second one fails, so only a rollback of the whole
+// call leaves the list as it was.
+func TestListAppendManyIsAtomicWhenAValueIsMissing(t *testing.T) {
+	g, _, lists := newListTestFixture(t)
+
+	list, err := lists.NewList(g)
+	if err != nil {
+		t.Fatalf("NewList(): %v", err)
+	}
+
+	existing := newTestNode(t, g)
+	a := newTestNode(t, g)
+
+	if _, appendErr := lists.Append(g, list, existing); appendErr != nil {
+		t.Fatalf("Append(existing): %v", appendErr)
+	}
+
+	const nonexistent NodeID = 999999
+
+	if _, manyErr := lists.AppendMany(g, list, []NodeID{a, nonexistent}); !errors.Is(manyErr, ErrNodeNotFound) {
+		t.Fatalf("AppendMany() error = %v, want %v", manyErr, ErrNodeNotFound)
+	}
+
+	// Elements validates head/tail, links and reachability, so this also
+	// proves the first value's capsule and the tail move were undone.
+	requireListElements(t, lists, g, list, []NodeID{existing})
+}
+
+func TestListAppendManyOfNothingStillChecksTheList(t *testing.T) {
+	g, _, lists := newListTestFixture(t)
+
+	list, err := lists.NewList(g)
+	if err != nil {
+		t.Fatalf("NewList(): %v", err)
+	}
+
+	capsules, err := lists.AppendMany(g, list, nil)
+	if err != nil || len(capsules) != 0 {
+		t.Fatalf("AppendMany(nothing) = (%v,%v), want (none,nil)", capsules, err)
+	}
+
+	requireListElements(t, lists, g, list, nil)
+
+	notAList := newTestNode(t, g)
+
+	if _, manyErr := lists.AppendMany(g, notAList, nil); !errors.Is(manyErr, ErrNotList) {
+		t.Fatalf("AppendMany(not a list) error = %v, want %v", manyErr, ErrNotList)
 	}
 }
 
@@ -13603,6 +13737,177 @@ func BenchmarkBoltGraphCommit(b *testing.B) {
 
 	if info, statErr := os.Stat(path); statErr == nil {
 		b.ReportMetric(float64(info.Size()), "file-bytes")
+	}
+}
+
+// ---------------------------------------------------------------------
+// Cost of the commit-time Checkers on a long list (theorystate.md section
+// 105). ListRegistry's Checker runs validateStructure over the whole list
+// on every commit that touches it, and Append reads every child of the list
+// to find the tail, so both are expected to grow with the list. This
+// measures how much, on the production stack (GraphActor over RootGraph
+// over BoltGraph, every registry and Checker), before any local check is
+// designed. Run without -race:
+//
+//	go test -run "^$" -bench ListCommitCost -benchtime 30x -timeout 60m
+//
+// Add -short to skip the largest list. Per size, the sub-benchmarks are:
+//   - empty-commit: a commit that touches nothing relevant (the baseline);
+//   - tail-scan: only Append's own tail lookup, read-only (no Checker runs);
+//   - checker-only: a commit that only touches the list, so the Checker
+//     validates it and nothing else happens;
+//   - append: the real operation, run last because it lengthens the list
+//     (so the list is n+30 long at the end, which does not matter at 30x).
+//
+// append minus checker-only is about the tail scan; checker-only minus
+// empty-commit is about the Checker.
+
+// listBenchSizes are the list lengths BenchmarkListCommitCost measures.
+var listBenchSizes = []int{1_000, 10_000, 100_000}
+
+const (
+	// listBenchChunk is how many elements one transaction appends while a
+	// benchmark list is built. Every commit validates the whole list so
+	// far, so a larger chunk means fewer validations, and a smaller one a
+	// smaller bolt transaction.
+	listBenchChunk = 20_000
+
+	// listBenchShortLimit is the largest list built under -short.
+	listBenchShortLimit = 10_000
+)
+
+// openListBenchHost opens a Host over a fresh store and closes it when b
+// ends.
+func openListBenchHost(b *testing.B) *Host {
+	b.Helper()
+
+	h, err := OpenHost(HostConfig{
+		Path:         filepath.Join(b.TempDir(), "list-bench.db"),
+		KeepaliveTTL: -1,
+		OnError:      func(string, error) {},
+	})
+	if err != nil {
+		b.Fatalf("OpenHost(): %v", err)
+	}
+
+	b.Cleanup(func() {
+		if closeErr := h.Close(); closeErr != nil {
+			b.Errorf("Close(): %v", closeErr)
+		}
+	})
+
+	return h
+}
+
+// buildBenchList makes a list of size elements with AppendMany, one chunk
+// per transaction (appending one at a time would itself be quadratic).
+func buildBenchList(b *testing.B, h *Host, size int) NodeID {
+	b.Helper()
+
+	lists := h.Registries().Lists
+
+	list, err := lists.NewList(h.Graph())
+	if err != nil {
+		b.Fatalf("NewList(): %v", err)
+	}
+
+	for built := 0; built < size; {
+		count := min(listBenchChunk, size-built)
+
+		txErr := h.Graph().Transact(func(tx Tx) error {
+			values := make([]NodeID, 0, count)
+
+			for range count {
+				value, createErr := createNodeTx(tx)
+				if createErr != nil {
+					return createErr
+				}
+
+				values = append(values, value)
+			}
+
+			_, appendErr := lists.AppendMany(tx, list, values)
+
+			return appendErr
+		})
+		if txErr != nil {
+			b.Fatalf("building the list (%d of %d built): %v", built, size, txErr)
+		}
+
+		built += count
+	}
+
+	return list
+}
+
+func BenchmarkListCommitCost(b *testing.B) {
+	for _, size := range listBenchSizes {
+		b.Run(fmt.Sprintf("n=%d", size), func(b *testing.B) {
+			if testing.Short() && size > listBenchShortLimit {
+				b.Skipf("building a list of %d elements takes a long time; skipped under -short", size)
+			}
+
+			h := openListBenchHost(b)
+			graph := h.Graph()
+			lists := h.Registries().Lists
+
+			start := time.Now()
+			list := buildBenchList(b, h, size)
+			b.Logf("built a list of %d elements in %v", size, time.Since(start))
+
+			bystander, err := createNodeVia(graph)
+			if err != nil {
+				b.Fatalf("CreateNode() for the bystander: %v", err)
+			}
+
+			value, err := createNodeVia(graph)
+			if err != nil {
+				b.Fatalf("CreateNode() for the value: %v", err)
+			}
+
+			commit := func(b *testing.B, step func(tx Tx) error) {
+				b.Helper()
+				b.ReportAllocs()
+
+				for b.Loop() {
+					if txErr := graph.Transact(step); txErr != nil {
+						b.Fatalf("Transact(): %v", txErr)
+					}
+				}
+			}
+
+			b.Run("empty-commit", func(b *testing.B) {
+				commit(b, func(tx Tx) error {
+					tx.Touch(bystander)
+
+					return nil
+				})
+			})
+
+			b.Run("tail-scan", func(b *testing.B) {
+				commit(b, func(tx Tx) error {
+					_, _, scanErr := findUniqueTaggedChild(tx, list, lists.allTails)
+
+					return scanErr
+				})
+			})
+
+			b.Run("checker-only", func(b *testing.B) {
+				commit(b, func(tx Tx) error {
+					tx.Touch(list)
+
+					return nil
+				})
+			})
+
+			b.Run("append", func(b *testing.B) {
+				commit(b, func(tx Tx) error {
+					_, appendErr := lists.Append(tx, list, value)
+
+					return appendErr
+				})
+			})
+		})
 	}
 }
 
