@@ -2394,7 +2394,29 @@ empty commit is the baseline of about 2.7 ms):
  full-validation fallback. Covered by
  TestListCheckerDeclinesEachLocalViolationAtCommitTime (also on every
  backend) and TestListCheckerLeavesGlobalStructureToReadsAndVerifyStructures.
- Measurements after this change are not recorded yet.
+ Measured after the change (same machine and settings, ms per commit):
+   n         local-check   checker-only   append (was)
+   1,000          3.6          44.6        6.1 (48.9)
+   10,000         3.6         593.4       22.7 (622.7)
+   100,000        2.6       6,142.3      193.1 (6,475.4)
+ The local check costs about the empty commit and does not grow with the
+ list; an Append is now about its own tail scan (the remaining O(n)), 34 times
+ cheaper at 100,000 elements. checker-only, the full-validation fallback, is
+ unchanged, as intended.
+
+65. requireExists everywhere (no behaviour change). requireAllExist is
+ requireExists over a list, and every "node exists, else ErrNodeNotFound"
+ block in main.go now uses one of them: the constructors' tag checks
+ (NewPointerRegistry, NewPointerMetadataRegistry(D), NewCapsuleRegistry,
+ NewListRegistry, NewSetRegistry, NewCompositeSetRegistry,
+ NewCompositeSetLogRegistry, NewLeaseRegistry, NewRootGraph), the mutators'
+ target checks, and CompositeSetRegistry.Contains and
+ CompositeSetLogRegistry.Contains (which now use requireCompositeSet and
+ requireLog like the other Contains methods). rootReader.requireExist
+ delegates to requireAllExist. Not converted because they are a different
+ check: affectedAnchors (skips a missing node), lookupLive and VerifyBindings
+ (ErrNameBoundToDeletedNode), and the paired checks in the bolt and staged
+ backends. A shadowed err in boltTxn.DeleteNode went away with it.
 
 Currently unaddressed yet:
 - ListRegistry.Append still finds the tail by reading the list's whole child
