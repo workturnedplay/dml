@@ -5214,6 +5214,210 @@ func TestListRegistryCheckerCatchesInvalidStructureAtCommitTime(t *testing.T) {
 	}
 }
 
+// listCorruptionRig is the list [a, b, c] (capsules[0..2], values[0..2]) plus
+// one capsule, foreign, that is the sole element of another list.
+type listCorruptionRig struct {
+	graph    testGraph
+	lists    *ListRegistry
+	list     NodeID
+	values   [3]NodeID
+	capsules [3]NodeID
+	foreign  NodeID
+}
+
+func newListCorruptionRig(t *testing.T) *listCorruptionRig {
+	t.Helper()
+
+	g, _, lists := newListTestFixture(t)
+
+	list, err := lists.NewList(g)
+	if err != nil {
+		t.Fatalf("NewList(): %v", err)
+	}
+
+	rig := &listCorruptionRig{graph: g, lists: lists, list: list}
+
+	for i := range rig.values {
+		rig.values[i] = newTestNode(t, g)
+
+		capsule, appendErr := lists.Append(g, list, rig.values[i])
+		if appendErr != nil {
+			t.Fatalf("Append(%d): %v", i, appendErr)
+		}
+
+		rig.capsules[i] = capsule
+	}
+
+	otherList, err := lists.NewList(g)
+	if err != nil {
+		t.Fatalf("NewList() for the other list: %v", err)
+	}
+
+	foreign, err := lists.Append(g, otherList, newTestNode(t, g))
+	if err != nil {
+		t.Fatalf("Append() to the other list: %v", err)
+	}
+
+	rig.foreign = foreign
+
+	return rig
+}
+
+// newLooseCapsuleTx makes a capsule, with a fresh value, that is linked into
+// no list.
+func newLooseCapsuleTx(tx Tx, lists *ListRegistry) (NodeID, error) {
+	value, createErr := createNodeTx(tx)
+	if createErr != nil {
+		return 0, createErr
+	}
+
+	return lists.capsules.NewCapsule(tx, value)
+}
+
+// TestListCheckerDeclinesEachLocalViolationAtCommitTime corrupts a list in
+// one transaction per case, through paths that touch only the capsules (or
+// only the list) involved, and checks that the commit is declined and the
+// list is left exactly as it was.
+func TestListCheckerDeclinesEachLocalViolationAtCommitTime(t *testing.T) {
+	cases := []struct {
+		name    string
+		corrupt func(tx Tx, r *listCorruptionRig) error
+	}{
+		{
+			name: "a back link is missing",
+			corrupt: func(tx Tx, r *listCorruptionRig) error {
+				_, err := r.lists.capsules.RemovePrev(tx, r.capsules[2])
+				return err
+			},
+		},
+		{
+			name: "a forward link skips a member",
+			corrupt: func(tx Tx, r *listCorruptionRig) error {
+				return r.lists.capsules.SetNext(tx, r.capsules[0], r.capsules[2])
+			},
+		},
+		{
+			name: "a second capsule is tagged head",
+			corrupt: func(tx Tx, r *listCorruptionRig) error {
+				return addRelationshipTx(tx, r.lists.allHeads, r.capsules[1])
+			},
+		},
+		{
+			name: "the tail loses its tag",
+			corrupt: func(tx Tx, r *listCorruptionRig) error {
+				return removeRelationshipTx(tx, r.lists.allTails, r.capsules[2])
+			},
+		},
+		{
+			name: "a capsule of another list is linked in from outside",
+			corrupt: func(tx Tx, r *listCorruptionRig) error {
+				return r.lists.capsules.SetNext(tx, r.capsules[2], r.foreign)
+			},
+		},
+		{
+			name: "a member is never wired into the chain",
+			corrupt: func(tx Tx, r *listCorruptionRig) error {
+				capsule, err := newLooseCapsuleTx(tx, r.lists)
+				if err != nil {
+					return err
+				}
+
+				return addRelationshipTx(tx, r.list, capsule)
+			},
+		},
+		{
+			name: "a member is unlinked without relinking its neighbours",
+			corrupt: func(tx Tx, r *listCorruptionRig) error {
+				return removeRelationshipTx(tx, r.list, r.capsules[1])
+			},
+		},
+		{
+			name: "a capsule outside every list is tagged tail",
+			corrupt: func(tx Tx, r *listCorruptionRig) error {
+				capsule, err := newLooseCapsuleTx(tx, r.lists)
+				if err != nil {
+					return err
+				}
+
+				return addRelationshipTx(tx, r.lists.allTails, capsule)
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rig := newListCorruptionRig(t)
+
+			err := rig.graph.Transact(func(tx Tx) error {
+				return tc.corrupt(tx, rig)
+			})
+			if !errors.Is(err, ErrInvalidListStructure) {
+				t.Fatalf("Transact() error = %v, want %v", err, ErrInvalidListStructure)
+			}
+
+			// Elements validates the whole list, so this also proves the
+			// declined commit was rolled back.
+			requireListElements(t, rig.lists, rig.graph, rig.list, rig.values[:])
+		})
+	}
+}
+
+// TestListCheckerLeavesGlobalStructureToReadsAndVerifyStructures pins down
+// what the local Checker deliberately does not see: a second chain, locally
+// consistent, with its own head and tail. The commit is accepted; Elements
+// and VerifyStructures find the two heads.
+func TestListCheckerLeavesGlobalStructureToReadsAndVerifyStructures(t *testing.T) {
+	rig := newListCorruptionRig(t)
+
+	if verifyErr := rig.lists.VerifyStructures(rig.graph); verifyErr != nil {
+		t.Fatalf("VerifyStructures() on valid lists: %v", verifyErr)
+	}
+
+	err := rig.graph.Transact(func(tx Tx) error {
+		first, firstErr := newLooseCapsuleTx(tx, rig.lists)
+		if firstErr != nil {
+			return firstErr
+		}
+
+		second, secondErr := newLooseCapsuleTx(tx, rig.lists)
+		if secondErr != nil {
+			return secondErr
+		}
+
+		for _, capsule := range []NodeID{first, second} {
+			if linkErr := addRelationshipTx(tx, rig.list, capsule); linkErr != nil {
+				return linkErr
+			}
+		}
+
+		if nextErr := rig.lists.capsules.SetNext(tx, first, second); nextErr != nil {
+			return nextErr
+		}
+
+		if prevErr := rig.lists.capsules.SetPrev(tx, second, first); prevErr != nil {
+			return prevErr
+		}
+
+		if headErr := addRelationshipTx(tx, rig.lists.allHeads, first); headErr != nil {
+			return headErr
+		}
+
+		return addRelationshipTx(tx, rig.lists.allTails, second)
+	})
+	if err != nil {
+		t.Fatalf("Transact() error = %v, want the locally consistent second chain accepted", err)
+	}
+
+	if _, elementsErr := rig.lists.Elements(rig.graph, rig.list); !errors.Is(elementsErr, ErrAmbiguousPointerMetadata) {
+		t.Fatalf("Elements() error = %v, want %v (two heads)", elementsErr, ErrAmbiguousPointerMetadata)
+	}
+
+	verifyErr := rig.lists.VerifyStructures(rig.graph)
+	if !errors.Is(verifyErr, ErrLoadVerification) || !errors.Is(verifyErr, ErrAmbiguousPointerMetadata) {
+		t.Fatalf("VerifyStructures() error = %v, want %v wrapping %v", verifyErr, ErrLoadVerification, ErrAmbiguousPointerMetadata)
+	}
+}
+
 func TestListOperationsRequireListTag(t *testing.T) {
 	g, _, lists := newListTestFixture(t)
 
@@ -13754,13 +13958,16 @@ func BenchmarkBoltGraphCommit(b *testing.B) {
 // Add -short to skip the largest list. Per size, the sub-benchmarks are:
 //   - empty-commit: a commit that touches nothing relevant (the baseline);
 //   - tail-scan: only Append's own tail lookup, read-only (no Checker runs);
-//   - checker-only: a commit that only touches the list, so the Checker
-//     validates it and nothing else happens;
+//   - local-check: a commit that only touches the tail capsule, so the
+//     local Checker validates that capsule and nothing else happens;
+//   - checker-only: a commit that only touches the list node, which has no
+//     touched member capsule, so the Checker falls back to validating the
+//     whole list (the cost of a sweep, and of the old Checker on every
+//     commit);
 //   - append: the real operation, run last because it lengthens the list
 //     (so the list is n+30 long at the end, which does not matter at 30x).
 //
-// append minus checker-only is about the tail scan; checker-only minus
-// empty-commit is about the Checker.
+// append minus local-check is about the tail scan.
 
 // listBenchSizes are the list lengths BenchmarkListCommitCost measures.
 var listBenchSizes = []int{1_000, 10_000, 100_000}
@@ -13889,6 +14096,19 @@ func BenchmarkListCommitCost(b *testing.B) {
 					_, _, scanErr := findUniqueTaggedChild(tx, list, lists.allTails)
 
 					return scanErr
+				})
+			})
+
+			b.Run("local-check", func(b *testing.B) {
+				tail, hasTail, tailErr := lists.Tail(graph, list)
+				if tailErr != nil || !hasTail {
+					b.Fatalf("Tail() = (%v,%v)", hasTail, tailErr)
+				}
+
+				commit(b, func(tx Tx) error {
+					tx.Touch(tail)
+
+					return nil
 				})
 			})
 

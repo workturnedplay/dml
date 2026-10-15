@@ -7243,21 +7243,20 @@ func NewListRegistry(graph GraphAPI, capsules *CapsuleRegistry, allLists, allHea
 		allTails: allTails,
 	}
 
-	// Registered against l itself so this Checker's Check closure can
-	// call l.validateStructure -- the exact same structural check
-	// Elements() already runs lazily on read (see that method and
-	// validateStructure's own doc comment), now additionally run eagerly
-	// at commit time for any touched node currently tagged (allLists,
-	// node).
+	// The Checker is local: it validates what the transaction touched
+	// (checkTouched has the rules, and says what it deliberately leaves to
+	// Elements and VerifyStructures) instead of every list the transaction
+	// touched. Validating a whole list on every commit made adding the n-th
+	// element cost O(n) (theorystate.md section 105, item 63 and 64 of
+	// implementation_state.md).
 	//
-	// This Checker only ever runs for mutations made through
-	// Graph.Transact (see the Checker doc comment). Every legitimate
-	// ListRegistry mutation already touches the list node itself within
-	// that same transaction (Append/Prepend/InsertAfter/
-	// RemoveWithoutDeletingCapsule each add or remove a (list,capsule)
-	// relationship), so Tags: []NodeID{allLists} is sufficient for every
-	// call path this registry itself exposes -- it is not a narrower
-	// version of some broader relevance rule this Checker is missing.
+	// Tags: a list, a capsule, or a head/tail-tagged node being touched is
+	// what can change a list's structure. Every legitimate ListRegistry
+	// mutation touches the capsules it changes (a link change touches the
+	// slot's target, a membership or boundary-tag change touches the
+	// capsule), which is what makes a touched capsule a sufficient trigger.
+	// This Checker only ever runs for mutations made through Transact (see
+	// the Checker doc comment).
 	// A raw, direct Graph.AddRelationship/RemoveRelationship call
 	// bypassing Transact entirely -- exactly what every existing
 	// out-of-band adversarial test in this file already does -- still
@@ -7266,25 +7265,9 @@ func NewListRegistry(graph GraphAPI, capsules *CapsuleRegistry, allLists, allHea
 	// Elements) remains the backstop for that case, unaffected by this
 	// addition.
 	graph.RegisterChecker(Checker{
-		Name: fmt.Sprintf("ListRegistry(tag=%d)", allLists),
-		Tags: []NodeID{allLists},
-		Check: func(g GraphReader, touched map[NodeID]struct{}) error {
-			for node := range touched {
-				tagged, taggedErr := g.HasRelationship(allLists, node)
-				if taggedErr != nil {
-					return wrapInterfaceErr(taggedErr)
-				}
-				if !tagged {
-					continue
-				}
-
-				if err := l.validateStructure(g, node); err != nil {
-					return err
-				}
-			}
-
-			return nil
-		},
+		Name:  fmt.Sprintf("ListRegistry(tag=%d)", allLists),
+		Tags:  []NodeID{allLists, capsules.allElementCapsules, allHeads, allTails},
+		Check: l.checkTouched,
 	})
 
 	return l, nil
@@ -7717,6 +7700,279 @@ func (l *ListRegistry) validateStructure(graph GraphReader, list NodeID) error {
 	if len(visited) != len(members) {
 		return ErrInvalidListStructure
 	}
+	return nil
+}
+
+// capsuleLinks is a capsule's own prev and next links, read once by
+// checkCapsule.
+type capsuleLinks struct {
+	prev, next       NodeID
+	hasPrev, hasNext bool
+}
+
+// rejectBoundaryTags returns ErrInvalidListStructure if node is tagged as a
+// list's head or tail. It is asked about a node that is not a member capsule
+// of any list (a non-capsule, or a capsule linked into no list), which has
+// no business carrying a boundary tag.
+func (l *ListRegistry) rejectBoundaryTags(g GraphReader, node NodeID) error {
+	for _, tag := range []NodeID{l.allHeads, l.allTails} {
+		tagged, err := g.HasRelationship(tag, node)
+		if err != nil {
+			return wrapInterfaceErr(err)
+		}
+		if tagged {
+			return ErrInvalidListStructure
+		}
+	}
+
+	return nil
+}
+
+// requireNeighbour checks that neighbour is a capsule of list whose link in
+// the opposite direction (backLink: Next for a previous neighbour, Prev for
+// a next one) points back at capsule.
+func (l *ListRegistry) requireNeighbour(g GraphReader, list, neighbour, capsule NodeID, backLink func(GraphReader, NodeID) (NodeID, bool, error)) error {
+	isCapsule, capsuleErr := l.capsules.IsCapsule(g, neighbour)
+	if capsuleErr != nil {
+		return capsuleErr
+	}
+
+	inList, inListErr := g.HasRelationship(list, neighbour)
+	if inListErr != nil {
+		return wrapInterfaceErr(inListErr)
+	}
+
+	if !isCapsule || !inList {
+		return ErrInvalidListStructure
+	}
+
+	back, hasBack, backErr := backLink(g, neighbour)
+	if backErr != nil {
+		return wrapInterfaceErr(backErr)
+	}
+
+	if !hasBack || back != capsule {
+		return ErrInvalidListStructure
+	}
+
+	return nil
+}
+
+// checkStaleLink rejects a node that points at the capsule through a role
+// slot the capsule does not agree with: a next-slot pointing at it must
+// belong to the capsule's own prev, and a prev-slot to its next. This is
+// what catches a stale pointer left by a neighbour the transaction did not
+// touch.
+func (l *ListRegistry) checkStaleLink(g GraphReader, source NodeID, links capsuleLinks) error {
+	roles := [...]struct {
+		slots *PointerRegistry
+		other NodeID
+		has   bool
+	}{
+		{slots: l.capsules.nextSlots, other: links.prev, has: links.hasPrev},
+		{slots: l.capsules.prevSlots, other: links.next, has: links.hasNext},
+	}
+
+	for _, role := range roles {
+		isSlot, slotErr := role.slots.IsPointer(g, source)
+		if slotErr != nil {
+			return slotErr
+		}
+		if !isSlot {
+			continue
+		}
+
+		owner, found, ownerErr := findUniqueTaggedParent(g, source, l.capsules.allElementCapsules)
+		if ownerErr != nil {
+			return ownerErr
+		}
+
+		if found && (!role.has || owner != role.other) {
+			return ErrInvalidListStructure
+		}
+	}
+
+	return nil
+}
+
+// checkCapsule validates one capsule in the neighbourhood of its own links
+// (see checkTouched) and records in verified every list it is a member of.
+// A capsule that is a member of no list is only checked for boundary tags.
+func (l *ListRegistry) checkCapsule(g GraphReader, capsule NodeID, verified map[NodeID]struct{}) error {
+	incoming, err := g.FindIncoming(capsule)
+	if err != nil {
+		return wrapInterfaceErr(err)
+	}
+
+	lists := make([]NodeID, 0, 1)
+
+	for _, rel := range incoming {
+		isList, listErr := l.IsList(g, rel.From)
+		if listErr != nil {
+			return listErr
+		}
+		if isList {
+			lists = append(lists, rel.From)
+		}
+	}
+
+	if len(lists) == 0 {
+		return l.rejectBoundaryTags(g, capsule)
+	}
+
+	var (
+		links   capsuleLinks
+		linkErr error
+	)
+
+	links.prev, links.hasPrev, linkErr = l.capsules.Prev(g, capsule)
+	if linkErr != nil {
+		return linkErr
+	}
+
+	links.next, links.hasNext, linkErr = l.capsules.Next(g, capsule)
+	if linkErr != nil {
+		return linkErr
+	}
+
+	_, hasValue, valueErr := l.capsules.Value(g, capsule)
+	if valueErr != nil {
+		return valueErr
+	}
+	if !hasValue {
+		return ErrInvalidListStructure
+	}
+
+	isHead, headErr := g.HasRelationship(l.allHeads, capsule)
+	if headErr != nil {
+		return wrapInterfaceErr(headErr)
+	}
+
+	isTail, tailErr := g.HasRelationship(l.allTails, capsule)
+	if tailErr != nil {
+		return wrapInterfaceErr(tailErr)
+	}
+
+	// A capsule is the head exactly when it has no previous one, and the
+	// tail exactly when it has no next one.
+	if isHead == links.hasPrev || isTail == links.hasNext {
+		return ErrInvalidListStructure
+	}
+
+	for _, list := range lists {
+		verified[list] = struct{}{}
+
+		if links.hasPrev {
+			if prevErr := l.requireNeighbour(g, list, links.prev, capsule, l.capsules.Next); prevErr != nil {
+				return prevErr
+			}
+		}
+
+		if links.hasNext {
+			if nextErr := l.requireNeighbour(g, list, links.next, capsule, l.capsules.Prev); nextErr != nil {
+				return nextErr
+			}
+		}
+	}
+
+	for _, rel := range incoming {
+		if staleErr := l.checkStaleLink(g, rel.From, links); staleErr != nil {
+			return staleErr
+		}
+	}
+
+	return nil
+}
+
+// checkTouched is the commit-time Checker of ListRegistry. It costs time
+// proportional to what the transaction touched, not to the length of the
+// lists involved (validateStructure, which it replaced here, reads a whole
+// list, so adding the n-th element cost O(n); see item 63 of
+// implementation_state.md for the measurements).
+//
+//   - Every touched capsule that is a member of a list is checked locally
+//     (checkCapsule): its value, head/tail tags against its links, its
+//     neighbours' back links, and stale pointers at it.
+//   - A touched node that is not a member capsule must not carry a head or
+//     tail tag.
+//   - A touched list none of whose member capsules was touched is validated
+//     in full (validateStructure): nothing local says what changed.
+//
+// What this does not check at commit time, because it cannot be checked
+// without reading the whole list: that the list has a single head and a
+// single tail, that no second chain is unreachable from the head, and that
+// there is no cycle apart from the head. A history of valid operations
+// cannot produce these; a hand-written transaction or foreign data could.
+// Elements checks them on every read and VerifyStructures at startup.
+func (l *ListRegistry) checkTouched(g GraphReader, touched map[NodeID]struct{}) error {
+	var capsules, lists []NodeID
+
+	for node := range touched {
+		isCapsule, capsuleErr := l.capsules.IsCapsule(g, node)
+		if capsuleErr != nil {
+			return capsuleErr
+		}
+
+		if isCapsule {
+			capsules = append(capsules, node)
+		} else if tagErr := l.rejectBoundaryTags(g, node); tagErr != nil {
+			return tagErr
+		}
+
+		isList, listErr := l.IsList(g, node)
+		if listErr != nil {
+			return listErr
+		}
+		if isList {
+			lists = append(lists, node)
+		}
+	}
+
+	verified := make(map[NodeID]struct{})
+
+	for _, capsule := range capsules {
+		if capsuleCheckErr := l.checkCapsule(g, capsule, verified); capsuleCheckErr != nil {
+			return capsuleCheckErr
+		}
+	}
+
+	for _, list := range lists {
+		if _, done := verified[list]; done {
+			continue
+		}
+
+		if structureErr := l.validateStructure(g, list); structureErr != nil {
+			return structureErr
+		}
+	}
+
+	return nil
+}
+
+// VerifyStructures validates every list in full (validateStructure), the
+// startup counterpart of the local commit-time Checker: it also checks what
+// that cannot (a single head and tail, nothing unreachable from the head, no
+// cycle). It is fail-closed: the first list that fails is returned, wrapped
+// in ErrLoadVerification, and nothing is repaired. Each list is read in one
+// transaction, so it is consistent, and the cost is linear in the size of
+// the lists. A CompositeSetLog is a list too, so it is covered.
+func (l *ListRegistry) VerifyStructures(graph GraphAPI) error {
+	lists, err := graph.FindOutgoing(l.allLists)
+	if err != nil {
+		return wrapInterfaceErr(err)
+	}
+
+	for _, rel := range lists {
+		list := rel.To
+
+		verifyErr := graph.Transact(func(tx Tx) error {
+			return l.validateStructure(tx, list)
+		})
+		if verifyErr != nil {
+			return fmt.Errorf("%w: list %d: %w", ErrLoadVerification, list, verifyErr)
+		}
+	}
+
 	return nil
 }
 
@@ -11567,7 +11823,8 @@ type Host struct {
 //     the Checkers);
 //  6. CloseAllSessions: sessions are ephemeral, every client died with the
 //     previous process;
-//  7. VerifyAll and NameRegistry.VerifyBindings, both fail-closed.
+//  7. VerifyAll, ListRegistry.VerifyStructures and NameRegistry.VerifyBindings,
+//     all fail-closed.
 //
 // Any failure closes whatever was opened and returns the error.
 func OpenHost(cfg HostConfig) (*Host, error) {
@@ -11644,6 +11901,10 @@ func finishHostStart(cfg HostConfig, store *BoltGraph, actor *GraphActor, names 
 
 	if verifyErr := VerifyAll(actor, cfg.VerifyPageSize); verifyErr != nil {
 		return nil, fmt.Errorf("host startup: %w", verifyErr)
+	}
+
+	if listsErr := reg.Lists.VerifyStructures(actor); listsErr != nil {
+		return nil, fmt.Errorf("host startup: %w", listsErr)
 	}
 
 	if bindErr := names.VerifyBindings(actor); bindErr != nil {

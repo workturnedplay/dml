@@ -183,6 +183,7 @@ var registryTestsOnEveryBackend = []func(*testing.T){
 	TestListInsertAfterTailUpdatesTail,
 	TestListInsertAfterRequiresCapsuleInList,
 	TestListRegistryCheckerCatchesInvalidStructureAtCommitTime,
+	TestListCheckerDeclinesEachLocalViolationAtCommitTime,
 	TestListOperationsRequireListTag,
 	TestListContainsFindsValue,
 	TestListContainsFalseForAbsentValue,

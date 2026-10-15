@@ -2371,12 +2371,36 @@ empty commit is the baseline of about 2.7 ms):
  TestListAppendManyOfNothingStillChecksTheList (all four also run on every
  backend).
 
+64. Local list Checker (theorystate.md section 105), acting on item 63's
+ measurements. ListRegistry's Checker no longer runs validateStructure over
+ every list a commit touches. checkTouched validates what was touched:
+ every touched member capsule is checked in its neighbourhood (checkCapsule:
+ it has a value; head iff no prev, tail iff no next; its neighbours are
+ capsules of the same list whose back links point at it; no next-slot or
+ prev-slot elsewhere points at it unless its own prev/next agree, which
+ catches a stale pointer left by an untouched neighbour); a touched node that
+ is not a member capsule must carry no head or tail tag; a touched list with
+ no touched member capsule is still validated in full. Relevance Tags are now
+ AllLists, AllElementCapsules, AllHeads and AllTails. Not checked at commit
+ any more (they need the whole list): a single head and tail, a locally
+ consistent second chain unreachable from the head, a cycle apart from the
+ head; Elements still checks them on every read. ListRegistry.
+ VerifyStructures validates every list in full and OpenHost runs it after
+ VerifyAll, because VerifyAll's pages touch capsules and so would now only
+ check lists locally. A slot pointed at a node that is not a capsule, with
+ nothing else touched, is not seen at commit time (the same as before for an
+ untouched list). BenchmarkListCommitCost gained local-check, and
+ checker-only (a touched list with no touched capsule) now measures the
+ full-validation fallback. Covered by
+ TestListCheckerDeclinesEachLocalViolationAtCommitTime (also on every
+ backend) and TestListCheckerLeavesGlobalStructureToReadsAndVerifyStructures.
+ Measurements after this change are not recorded yet.
+
 Currently unaddressed yet:
-- ListRegistry.Append finds the tail by reading the list's whole child set
-  (O(n)) and the list Checker validates the whole list on every commit that
-  touches it (O(n)); item 63 measures them: the Checker costs about 30 times
-  the tail scan, so it is addressed first (a neighbourhood-only Checker is
-  proposed there).
+- ListRegistry.Append still finds the tail by reading the list's whole child
+  set (O(n), about 0.19 s at 100,000 elements, item 63); finding a tagged
+  child of a list cannot be O(1) without a structural change (a head/tail
+  pointer on the list), which is a separate design.
 - Paged reads beyond a single node's own outgoing/incoming edges
   (theorystate.md section 105, items 43/46): FindRelationships and
   rootReader.FindRelationships are still O(graph) on BoltGraph, as

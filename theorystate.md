@@ -3480,7 +3480,8 @@ APIs (`Members`, `Elements`, `Evaluate`, `Operands`), and two internal
 full-child-set reads not previously named here:
 `ListRegistry.validateStructure`'s `FindOutgoing(list)` (every list's
 elements are the list node's own direct children, read in full on every
-`Elements` call and on every commit touching the list, via its Checker) and
+`Elements` call; the commit-time Checker no longer reads it for a commit that
+touches member capsules, `implementation_state.md` item 64) and
 `CompositeSetRegistry.Operands`/`evaluate`'s `FindOutgoing(set)` (every
 operand descriptor, similarly). Paging either would not reduce total work --
 both need the complete child set for their own correctness checks (stray
@@ -3499,6 +3500,22 @@ its own short transaction; the view can shift between pages, which is
 acceptable for verification (later changes are checked by commit-time
 Checkers) and not for an exact point-in-time result. The exported interface
 shape, if any of this is ever promoted to one, is still not fixed.
+
+**Local list Checker (implemented; the weakening is deliberate).** Measured
+(`implementation_state.md` item 63), validating a whole list on every commit
+that touches it cost about 64 microseconds per element per commit, so adding
+elements one at a time was quadratic. The list Checker now validates only what a
+commit touched (item 64): each touched member capsule against its neighbours
+(links reciprocal in both directions, head iff no prev, tail iff no next, a
+value, no stale pointer at it), and a touched list with no touched member in
+full. Three whole-list properties are therefore no longer commit-time
+invariants: a single head, a single tail, and no second chain or cycle
+unreachable from the head. A history of valid operations preserves them, since
+every operation keeps the local rules; they can only break through a
+hand-written transaction or foreign data, and are checked on every `Elements`
+read and by `ListRegistry.VerifyStructures` at startup. This is a choice of
+what a commit proves, not a mechanism gap: they cannot be checked locally,
+because finding a list's tagged child reads all its children.
 
 ## 106. Explored and not adopted
 
