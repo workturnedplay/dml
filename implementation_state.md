@@ -18,6 +18,14 @@
 
 Project Implementation State
 
+Scope of this file: the numbered changelog below records what was built and
+why, item by item, and the "Currently unaddressed yet" list holds only
+implementation-level leftovers. Everything that is a theory-level open
+question (cross-graph identity, concurrency mechanisms, transports beyond
+the pipe and mutual TLS, in-graph transaction descriptors, nested
+transactions on a CAS backend, domain-pointer residuals, ...) lives in one
+place only: theorystate.md Part D. It is deliberately not repeated here.
+
 Current implementation:
 - Go 1.27 implementation. This is the foundation the project builds on,
   not a prototype (theorystate.md section 7b).
@@ -135,7 +143,11 @@ Important constraints:
 - Keep alternative representations open where theory has not decided them.
 
 Editing convention:
-- Keep implementation consolidated in main.go and main_test.go.
+- The graph engine, registries and Host are consolidated in main.go and
+  main_test.go. The wire transport has its own files (wire.go, wire_auth.go,
+  wire_tls.go, wire_tls_files.go, wire_tls_pki.go, pipe_windows.go,
+  private_file*.go, cmd/dmlcert) with their tests, because of build tags and
+  because they are a separate layer.
 - For changes, give exact:
   Find this text:
   ...
@@ -2418,6 +2430,29 @@ empty commit is the baseline of about 2.7 ms):
  (ErrNameBoundToDeletedNode), and the paired checks in the bolt and staged
  backends. A shadowed err in boltTxn.DeleteNode went away with it.
 
+66. Named-pipe peers are identified by impersonation, not by process ID
+ (theorystate.md section 113). PipePeerPrincipal (pipe_windows.go) now
+ impersonates the pipe's client (ImpersonateNamedPipeClient, through a lazy
+ proc since x/sys/windows has no wrapper), reads the thread's token
+ (OpenThreadToken with openAsSelf, GetTokenUser) and reverts, on a goroutine
+ of its own locked to its OS thread (clientUserSID). The thread is unlocked
+ only if RevertToSelf succeeded; otherwise the goroutine ends locked and the
+ runtime terminates the thread. Removed: pipeClientProcessID,
+ processUserSID, the GetNamedPipeClientProcessId proc and the unsafe import.
+ This closes the PID-reuse window and the non-elevated-host-versus-SYSTEM-
+ client limit item 53 recorded. DialPipe now connects through dialPipeConn
+ with DialPipeAccessImpLevel at the Identification level (go-winio v0.6.2
+ or newer; check vendor/modules.txt), because a plain DialPipeContext
+ connects anonymously. An anonymous client, or a server that has read
+ nothing yet, is unidentified (ErrPeerUnidentified, the empty Principal, denied by the
+ Authorizer). Tests: acceptPipePeer/pipeDialer/dialPipeAnonymously helpers
+ (the client writes a byte and the server reads it first, since Windows
+ impersonates the last message read). Covered by
+ TestPipePeerPrincipalIsTheClientUser (20 repeated calls),
+ TestPipePeerPrincipalRefusesAnAnonymousClient,
+ TestPipeAuthorizationDeniesAnAnonymousClient and the unchanged
+ TestPipePeerPrincipalRefusesAConnectionThatHidesItsHandle.
+
 Currently unaddressed yet:
 - ListRegistry.Append still finds the tail by reading the list's whole child
   set (O(n), about 0.19 s at 100,000 elements, item 63); finding a tagged
@@ -2429,37 +2464,16 @@ Currently unaddressed yet:
   are ListRegistry.validateStructure's and CompositeSetRegistry's own
   full-child-set reads. (The GraphReader methods that lacked error
   results now have them; see ErrGraphStoreUnavailable.)
-- Transports other than the named pipe (item 49) and mutual TLS over TCP (item 54), and peer identity on
-  them (theorystate.md sections 107, 112, 113). Production Effect
-  implementations are deliberately not dml's (theorystate.md section 112).
+- Theory-level open questions (other transports and peer identity on them,
+  Part C, concurrency mechanisms, ...) are in theorystate.md Part D only.
+  Production Effect implementations are deliberately not dml's
+  (theorystate.md section 112).
 - An abandoned effect call (theorystate.md section 112, item 52) cannot be
   killed if the effect ignores its context; at most one lingers per
   resource.
-- Nested transactions as a production-backend feature are also realized
-  on BoltGraph (item 40), via the same shared txLog (undo log, commit
-  and rollback hooks, savepoints) mechanism Txn already uses -- not a
-  separate, backend-specific mechanism, since bbolt's own writes are
-  visible to the same update transaction immediately, which tolerates
-  the identical undo-log approach the in-memory backend uses. The
-  test-only stagedGraph's nested transactions (item 38) are likewise
-  undo-log-style, over its own local per-attempt buffer, not the "child
-  write buffer merged into its parent" shape theorystate.md section 45 /
-  89a describes as the eventual approach for a true CAS-based backend
-  (theorystate.md sections 93-97): no backend in this codebase actually
-  needs that shape yet, because none of them keep writes invisible to
-  their own in-flight transaction the way a real networked CAS store
-  would. That specific savepoint mechanism therefore remains
-  unimplemented and OPEN, not merely "for a non-memory backend" in
-  general. Txn.DeleteNode is supported -- see item 15.
-- Domain-pointer staleness residuals (theorystate.md section 86): raw
-  non-Transact mutations, Set-kind tag removal inside a Transact (by
-  design, it fails loudly on read), and O(pointers-per-domain)
-  validation cost per commit (unmemoized) remain accepted.
-- A bare *Graph is not safe for concurrent use. concurrentAccessGuard
-  panics on detected overlap instead of corrupting state (theorystate.md
-  section 89b); it cannot catch a non-overlapping handoff with no
-  happens-before edge, which `go test -race` covers. GraphActor (item 25,
-  section 89c) is the supported way to share a graph between goroutines.
+- (Nested transactions on a CAS-style backend, the domain-pointer residuals
+  and the bare-*Graph guard are covered in theorystate.md sections 45, 86,
+  89b and Part D; nothing implementation-only is left of them.)
 
 Explored and declined (implementation-level; the theory-level
 counterpart of this list is theorystate.md's own DECIDED/TENTATIVE/OPEN/

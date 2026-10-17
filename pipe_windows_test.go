@@ -19,8 +19,10 @@
 package dml
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"strings"
 	"testing"
@@ -117,7 +119,28 @@ func TestPipeEndToEnd(t *testing.T) {
 	})
 }
 
-func TestPipePeerPrincipalIsTheClientUser(t *testing.T) {
+// pipeDialer connects a client to the pipe at path.
+type pipeDialer func(ctx context.Context, path string) (net.Conn, error)
+
+// dialPipeAnonymously connects like winio.DialPipeContext, which lets the
+// server impersonate the client only at the Anonymous level: the server
+// cannot learn who it is.
+func dialPipeAnonymously(ctx context.Context, path string) (net.Conn, error) {
+	nc, err := winio.DialPipeContext(ctx, path)
+	if err != nil {
+		return nil, fmt.Errorf("dialing %s anonymously: %w", path, err)
+	}
+
+	return nc, nil
+}
+
+// acceptPipePeer connects a client made by dial to a fresh pipe, has the
+// client send one byte and the server read it (Windows impersonates the last
+// message read, so identifying a peer needs one), and returns the server's
+// side of the connection.
+func acceptPipePeer(t *testing.T, dial pipeDialer) net.Conn {
+	t.Helper()
+
 	ctx := hostTestContext(t)
 	path := PipePath(fmt.Sprintf("dml-test-peer-%d", time.Now().UnixNano()))
 
@@ -140,9 +163,9 @@ func TestPipePeerPrincipalIsTheClientUser(t *testing.T) {
 		accepted <- acceptResult{conn: nc, err: acceptErr}
 	}()
 
-	clientConn, dialErr := winio.DialPipeContext(ctx, path)
+	clientConn, dialErr := dial(ctx, path)
 	if dialErr != nil {
-		t.Fatalf("DialPipeContext(): %v", dialErr)
+		t.Fatalf("dialing the pipe: %v", dialErr)
 	}
 
 	t.Cleanup(func() { closeQuietly(clientConn) })
@@ -161,13 +184,97 @@ func TestPipePeerPrincipalIsTheClientUser(t *testing.T) {
 
 	t.Cleanup(func() { closeQuietly(got.conn) })
 
-	principal, principalErr := PipePeerPrincipal(got.conn)
-	if principalErr != nil {
-		t.Fatalf("PipePeerPrincipal(): %v", principalErr)
+	if _, writeErr := clientConn.Write([]byte{1}); writeErr != nil {
+		t.Fatalf("the client writing a byte: %v", writeErr)
+	}
+
+	if deadlineErr := got.conn.SetReadDeadline(time.Now().Add(10 * time.Second)); deadlineErr != nil {
+		t.Fatalf("SetReadDeadline(): %v", deadlineErr)
+	}
+
+	var first [1]byte
+
+	if _, readErr := io.ReadFull(got.conn, first[:]); readErr != nil {
+		t.Fatalf("the server reading the client's byte: %v", readErr)
+	}
+
+	return got.conn
+}
+
+func TestPipePeerPrincipalIsTheClientUser(t *testing.T) {
+	peer := acceptPipePeer(t, dialPipeConn)
+	want := currentUserPrincipal(t)
+
+	// Every identification impersonates on a thread of its own and reverts,
+	// so any number of them must keep working.
+	for i := range 20 {
+		principal, err := PipePeerPrincipal(peer)
+		if err != nil {
+			t.Fatalf("PipePeerPrincipal() call %d: %v", i, err)
+		}
+
+		if principal != want {
+			t.Fatalf("PipePeerPrincipal() call %d = %q, want the current user %q", i, principal, want)
+		}
+	}
+}
+
+// TestPipePeerPrincipalRefusesAnAnonymousClient: a client that lets the server
+// see no identity is unidentified (the safe outcome: the empty Principal),
+// and failing to identify it leaves nothing behind that breaks the next one.
+func TestPipePeerPrincipalRefusesAnAnonymousClient(t *testing.T) {
+	anonymous := acceptPipePeer(t, dialPipeAnonymously)
+
+	for i := range 3 {
+		if _, err := PipePeerPrincipal(anonymous); !errors.Is(err, ErrPeerUnidentified) {
+			t.Fatalf("PipePeerPrincipal(anonymous) call %d error = %v, want %v", i, err, ErrPeerUnidentified)
+		}
+	}
+
+	identified := acceptPipePeer(t, dialPipeConn)
+
+	principal, err := PipePeerPrincipal(identified)
+	if err != nil {
+		t.Fatalf("PipePeerPrincipal() after refusing an anonymous client: %v", err)
 	}
 
 	if want := currentUserPrincipal(t); principal != want {
 		t.Fatalf("PipePeerPrincipal() = %q, want the current user %q", principal, want)
+	}
+}
+
+// TestPipeAuthorizationDeniesAnAnonymousClient: through a server, a client
+// that dialed anonymously is the empty Principal and is denied, even though
+// the policy lists the very user running it.
+func TestPipeAuthorizationDeniesAnAnonymousClient(t *testing.T) {
+	ctx := hostTestContext(t)
+	h := openTestHost(t, boltTestPath(t), nil)
+	registerTestResource(t, h, "mine", nil)
+
+	policy := NewResourcePolicy(map[string][]Principal{
+		"mine": {currentUserPrincipal(t)},
+	})
+
+	path := servePipe(t, NewWireServer(h, WithPeerIdentifier(PipePeerPrincipal), WithAuthorizer(policy)))
+
+	nc, dialErr := dialPipeAnonymously(ctx, path)
+	if dialErr != nil {
+		t.Fatalf("dialPipeAnonymously(): %v", dialErr)
+	}
+
+	client, clientErr := NewWireClient(ctx, nc)
+	if clientErr != nil {
+		t.Fatalf("NewWireClient(): %v", clientErr)
+	}
+
+	t.Cleanup(func() {
+		if closeErr := client.Close(); closeErr != nil {
+			t.Errorf("client Close(): %v", closeErr)
+		}
+	})
+
+	if _, acquireErr := client.Acquire(ctx, "mine"); !errors.Is(acquireErr, ErrNotAuthorized) {
+		t.Fatalf("Acquire(mine) by an anonymous client error = %v, want %v", acquireErr, ErrNotAuthorized)
 	}
 }
 

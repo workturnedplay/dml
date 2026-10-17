@@ -3160,7 +3160,14 @@ backend the corrupting write is itself declined. Giving `stagedGraph` a
 real (rather than externally forced) conflict-detection mechanism is left
 for whenever an actual networked backend makes it worth the cost.
 
-## 98. NameRegistry under a shared, multi-process backend (moot under §107's single-owner decision)
+## 98. NameRegistry under a shared, multi-process backend (MOOT, condensed)
+
+**Moot under §107's single-owner decision; kept so references to §98
+resolve.** One host owns the store, so there is a single writer of name
+bindings and §103's same-transaction name records need no cross-process
+arbitration. The alternative this section weighed, representing bindings as
+graph structure so a shared backend's own CAS or a Checker could arbitrate,
+was not adopted (§103). The original analysis follows, as history only.
 
 A gap surfaced by §94's premise (multiple processes genuinely sharing one
 persistent backend) that no existing section addresses: `NameRegistry`'s
@@ -3193,7 +3200,13 @@ that redesign is worth the churn versus simply documenting single-writer-
 for-bootstrap as an accepted constraint (mirroring how §38 accepted
 permanent global-discovery limits rather than solving them).
 
-## 99. Load-time reconciliation is backend-relative (answered by §104 and §110; the etcd framing is moot under §107)
+## 99. Load-time reconciliation is backend-relative (ANSWERED, condensed)
+
+**Answered by §104 and §110; the etcd framing is moot (§100, §107).** The
+startup order of §110 (`CheckStore`, `VerifyAll`, `VerifyStructures`,
+`VerifyBindings`) is the "verify what is already stored" pass this section
+asked for; it runs in the host's startup order (§112). The original
+discussion follows, as history only.
 
 `implementation_state.md`'s own "Currently unaddressed yet" list already
 anticipates, for the in-memory backend specifically, that restoring a
@@ -3909,15 +3922,35 @@ and §112 fixed the `Client` shape. This is its first transport.
   a resource with no entry. The in-process `Conn` is trusted and not subject
   to it, and policy is not stored in the graph. With the default pipe
   security only the current user and SYSTEM can connect, so a SID tells just
-  those two apart (and a SYSTEM client cannot be opened by a non-elevated
-  host, so it is unknown); the layer matters once `ListenPipe` is given a
-  wider security descriptor.
+  those two apart; the layer matters once `ListenPipe` is given a wider
+  security descriptor.
 - A server limits its connections (`WithMaxConns`, default 256, negative:
   unlimited), because every admitted connection opens a session, which is a
   durable commit. A connection over the limit is told why (`too_many_conns`,
   after its hello is read, within 2 s) and closed without a session. The
   heartbeat proves the process is alive, not that its logic is making
   progress.
+
+**Pipe peers are identified by impersonation, not by process ID (DECIDED,
+implemented).** `PipePeerPrincipal` calls `ImpersonateNamedPipeClient` on the
+accepted connection and reads the token of the impersonating thread
+(`OpenThreadToken` as the process, then `GetTokenUser`), then reverts. The
+earlier way, `GetNamedPipeClientProcessId` followed by opening that process,
+had a window in which the process ID could be reused, and a non-elevated host
+could not open a SYSTEM client's process at all. Impersonation at the
+Identification level is always allowed (below `SecurityImpersonation`), so
+neither problem remains. It gives the host no rights: the client chooses to
+let the server see its identity, nothing more. Two requirements follow, both
+fail-closed. Windows impersonates "the last message read", so the server must
+have read from the connection first (the wire server identifies a peer after
+its hello). And the client must connect at the Identification level or higher:
+`DialPipe` does (`DialPipeAccessImpLevel`, go-winio v0.6.2 or newer), while a
+plain `winio.DialPipeContext` connects anonymously, cannot be identified, and
+is the empty Principal, which a `ResourcePolicy` denies. Impersonation changes
+the identity of an OS thread, so it runs on a goroutine of its own locked to its
+thread; the thread is unlocked again only if the revert succeeded, otherwise
+the goroutine ends while locked and the Go runtime terminates the thread, so a
+thread that is still impersonating is never reused.
 
 **Mutual TLS over TCP (DECIDED, implemented).** The TCP counterpart of the
 pipe's DACL is the TLS handshake: a server built with `ListenTLS` refuses to
@@ -4172,6 +4205,10 @@ kept current as sections above resolve or split further.)*
   transport's `Principal`, fail-closed and before the resource is looked up,
   and a server limits its connections without opening sessions for the
   refused ones (§113).
+- A named-pipe peer is identified by impersonating the client at the
+  Identification level, never by its process ID; clients must dial at that
+  level or higher (`DialPipe` does), and an anonymous client is the empty
+  Principal and is denied (§113).
 
 ### TENTATIVE
 - bbolt as the first persistent-backend spike, with the layout and

@@ -101,6 +101,11 @@ _, err = client.Release(ctx, "my-rule")
 
 Things worth knowing:
 
+- Over a named pipe the host names a client by its Windows user (by
+  impersonating it at the Identification level, which grants the host no
+  rights). `dml.DialPipe` connects that way; a client that dials the pipe
+  with plain `winio.DialPipeContext` is anonymous, so with an `Authorizer` it
+  is denied.
 - One connection is one session, and any disconnect releases it: there is no
   resume. A client that loses its connection must connect and acquire again.
 - The host is the only owner of the store (a second host on the same file
