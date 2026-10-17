@@ -728,6 +728,152 @@ func TestWireMaxConnsFreesTheSlotWhenAConnectionEnds(t *testing.T) {
 	})
 }
 
+// scriptedListener is a net.Listener whose Accept fails with each of errs in
+// turn, then hands out the connections sent on conns, and returns
+// net.ErrClosed once it is closed.
+type scriptedListener struct {
+	mu     sync.Mutex
+	errs   []error
+	conns  chan net.Conn
+	closed chan struct{}
+	once   sync.Once
+}
+
+func newScriptedListener(errs ...error) *scriptedListener {
+	return &scriptedListener{
+		errs:   errs,
+		conns:  make(chan net.Conn, 4),
+		closed: make(chan struct{}),
+	}
+}
+
+func (l *scriptedListener) Accept() (net.Conn, error) {
+	l.mu.Lock()
+
+	if len(l.errs) > 0 {
+		failure := l.errs[0]
+		l.errs = l.errs[1:]
+
+		l.mu.Unlock()
+
+		return nil, failure
+	}
+
+	l.mu.Unlock()
+
+	select {
+	case nc := <-l.conns:
+		return nc, nil
+	case <-l.closed:
+		return nil, net.ErrClosed
+	}
+}
+
+func (l *scriptedListener) Close() error {
+	l.once.Do(func() { close(l.closed) })
+
+	return nil
+}
+
+func (l *scriptedListener) Addr() net.Addr { return testTCPAddr }
+
+// shrinkAcceptRetry shortens the accept loop's first pause and sets how many
+// failures in a row it tolerates, until the test ends.
+func shrinkAcceptRetry(t *testing.T, backoff time.Duration, maxFailures int) {
+	t.Helper()
+
+	originalBackoff, originalMax := wireAcceptBackoffStart, wireAcceptMaxFailures
+	wireAcceptBackoffStart, wireAcceptMaxFailures = backoff, maxFailures
+
+	t.Cleanup(func() { wireAcceptBackoffStart, wireAcceptMaxFailures = originalBackoff, originalMax })
+}
+
+// serveScripted runs server.Serve over listener in the background and returns
+// its result. Both are closed when the test ends, before the rig's own cleanup.
+func serveScripted(t *testing.T, server *WireServer, listener *scriptedListener) <-chan error {
+	t.Helper()
+
+	served := make(chan error, 1)
+
+	go func() { served <- server.Serve(listener) }()
+
+	t.Cleanup(func() {
+		closeQuietly(listener)
+
+		if closeErr := server.Close(); closeErr != nil {
+			t.Errorf("server Close(): %v", closeErr)
+		}
+	})
+
+	return served
+}
+
+func TestWireServeRetriesFailingAcceptsAndKeepsServing(t *testing.T) {
+	shrinkAcceptRetry(t, time.Millisecond, 50)
+
+	errAccept := errors.New("accept: too many open files")
+	reported := &errorLog{}
+	rig := newWireRig(t, func(cfg *HostConfig) { cfg.OnError = reported.add })
+
+	listener := newScriptedListener(errAccept, errAccept)
+	serveScripted(t, rig.server, listener)
+
+	clientSide, serverSide := net.Pipe()
+	listener.conns <- serverSide
+
+	client := startWireClient(t, clientSide)
+
+	if keepErr := client.Keepalive(hostTestContext(t)); keepErr != nil {
+		t.Fatalf("Keepalive() over a connection accepted after failed accepts: %v", keepErr)
+	}
+
+	if got := reported.count(); got != 2 || !reported.has(errAccept) {
+		t.Fatalf("%d accept failures reported (has the cause: %v), want exactly the 2 that happened", got, reported.has(errAccept))
+	}
+}
+
+func TestWireServeGivesUpAfterTooManyFailingAcceptsInARow(t *testing.T) {
+	shrinkAcceptRetry(t, time.Millisecond, 3)
+
+	errAccept := errors.New("accept: broken listener")
+	rig := newWireRig(t, nil)
+
+	served := serveScripted(t, rig.server, newScriptedListener(errAccept, errAccept, errAccept, errAccept))
+
+	select {
+	case serveErr := <-served:
+		if !errors.Is(serveErr, errAccept) {
+			t.Fatalf("Serve() error = %v, want it to wrap %v", serveErr, errAccept)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Serve() did not give up after repeated accept failures")
+	}
+}
+
+func TestWireCloseInterruptsTheWaitBetweenAcceptRetries(t *testing.T) {
+	shrinkAcceptRetry(t, time.Hour, 50)
+
+	reported := &errorLog{}
+	rig := newWireRig(t, func(cfg *HostConfig) { cfg.OnError = reported.add })
+
+	served := serveScripted(t, rig.server, newScriptedListener(errors.New("accept: boom")))
+
+	eventually(t, "the failed accept to be reported", func() bool { return reported.count() == 1 })
+
+	if closeErr := rig.server.Close(); closeErr != nil {
+		t.Fatalf("Close(): %v", closeErr)
+	}
+
+	select {
+	case serveErr := <-served:
+		if serveErr != nil {
+			t.Fatalf("Serve() error = %v, want nil after Close", serveErr)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Serve() kept waiting after Close")
+	}
+}
+
 // newAuthRig serves a host with two registered resources to peers that are
 // all identified as principal, under authorizer.
 func newAuthRig(t *testing.T, principal Principal, authorizer Authorizer) *wireRig {

@@ -2453,6 +2453,23 @@ empty commit is the baseline of about 2.7 ms):
  TestPipeAuthorizationDeniesAnAnonymousClient and the unchanged
  TestPipePeerPrincipalRefusesAConnectionThatHidesItsHandle.
 
+67. WireServer.Serve survives failing Accept calls (theorystate.md section
+ 113). It used to return on the first Accept error, so a transient one (out of
+ file descriptors, a connection reset before it was accepted) left a host that
+ was up but accepted nobody, visible only in a return value that
+ `go server.Serve(l)` discards. A failing Accept is now reported through
+ HostConfig.OnError and retried after a pause that starts at
+ wireAcceptBackoffStart (5 ms) and doubles up to wireAcceptBackoffMax (1 s),
+ reset by a successful accept; only wireAcceptMaxFailures (50) failures in a
+ row end Serve, with an error wrapping the last one. A closed listener
+ (net.ErrClosed) or a closed server ends it as before (nil when the server
+ was closed), and Close wakes a pause through the new stop channel. The
+ deprecated net.Error.Temporary is deliberately not used. Covered by
+ TestWireServeRetriesFailingAcceptsAndKeepsServing,
+ TestWireServeGivesUpAfterTooManyFailingAcceptsInARow and
+ TestWireCloseInterruptsTheWaitBetweenAcceptRetries (scriptedListener, no
+ sockets).
+
 Currently unaddressed yet:
 - ListRegistry.Append still finds the tail by reading the list's whole child
   set (O(n), about 0.19 s at 100,000 elements, item 63); finding a tagged

@@ -86,6 +86,18 @@ var (
 // completeTLS). A var, not a const, so tests can shrink it.
 var wireHelloTimeout = 10 * time.Second
 
+// Serve survives failing Accept calls (running out of file descriptors, a
+// connection reset before it was accepted): it waits, starting at
+// wireAcceptBackoffStart and doubling up to wireAcceptBackoffMax, and tries
+// again, giving up only after wireAcceptMaxFailures failures in a row. The
+// first two are vars, not consts, so tests can shrink them.
+var (
+	wireAcceptBackoffStart = 5 * time.Millisecond
+	wireAcceptMaxFailures  = 50
+)
+
+const wireAcceptBackoffMax = time.Second
+
 const (
 	wireVersion      = 1
 	wireHeaderSize   = 4
@@ -323,6 +335,9 @@ type WireServer struct {
 	conns     map[net.Conn]struct{}
 	admitted  int // connections counted against maxConns
 
+	// stop is closed by Close, to wake a Serve that is waiting to retry.
+	stop chan struct{}
+
 	wg sync.WaitGroup
 }
 
@@ -373,6 +388,7 @@ func NewWireServer(host *Host, opts ...WireOption) *WireServer {
 		maxConns:  wireDefaultMaxConns,
 		listeners: make(map[net.Listener]struct{}),
 		conns:     make(map[net.Conn]struct{}),
+		stop:      make(chan struct{}),
 	}
 
 	for _, opt := range opts {
@@ -423,9 +439,13 @@ func (s *WireServer) acceptFailure(acceptErr error) error {
 	return fmt.Errorf("wire: accepting a connection: %w", acceptErr)
 }
 
-// Serve accepts connections from l, one goroutine each, until l fails or the
-// server is closed (then it returns nil). It takes ownership of l: Close
-// closes it.
+// Serve accepts connections from l, one goroutine each, until l is closed or
+// the server is closed (then it returns nil), or Accept keeps failing. A
+// failing Accept (out of file descriptors, say) is reported to the host's
+// error hook and retried after a growing pause; only wireAcceptMaxFailures
+// failures in a row end Serve with an error, so a passing resource shortage
+// does not leave a host that is up but accepting nobody. It takes ownership of
+// l: Close closes it.
 func (s *WireServer) Serve(l net.Listener) error {
 	if !s.track(func() { s.listeners[l] = struct{}{} }) {
 		closeQuietly(l)
@@ -435,13 +455,52 @@ func (s *WireServer) Serve(l net.Listener) error {
 
 	defer s.untrack(func() { delete(s.listeners, l) })
 
+	failures := 0
+	backoff := wireAcceptBackoffStart
+
 	for {
 		nc, acceptErr := l.Accept()
-		if acceptErr != nil {
+		if acceptErr == nil {
+			failures = 0
+			backoff = wireAcceptBackoffStart
+
+			go s.ServeConn(nc)
+
+			continue
+		}
+
+		// A closed listener is not coming back, whoever closed it.
+		if errors.Is(acceptErr, net.ErrClosed) || s.isClosed() {
 			return s.acceptFailure(acceptErr)
 		}
 
-		go s.ServeConn(nc)
+		failures++
+
+		if failures >= wireAcceptMaxFailures {
+			return fmt.Errorf("wire: accepting a connection: giving up after %d failures in a row: %w", failures, acceptErr)
+		}
+
+		s.host.report("wire: accepting a connection", acceptErr)
+
+		// The server was closed while waiting: a clean end, like above.
+		if !s.pause(backoff) {
+			return s.acceptFailure(acceptErr)
+		}
+
+		backoff = min(backoff*2, wireAcceptBackoffMax)
+	}
+}
+
+// pause waits for d and reports false if the server was closed meanwhile.
+func (s *WireServer) pause(d time.Duration) bool {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+
+	select {
+	case <-s.stop:
+		return false
+	case <-timer.C:
+		return true
 	}
 }
 
@@ -449,7 +508,11 @@ func (s *WireServer) Serve(l net.Listener) error {
 // Every session that was open is released by then.
 func (s *WireServer) Close() error {
 	s.mu.Lock()
-	s.closed = true
+
+	if !s.closed {
+		s.closed = true
+		close(s.stop)
+	}
 	listeners := slices.Collect(maps.Keys(s.listeners))
 	conns := slices.Collect(maps.Keys(s.conns))
 	s.mu.Unlock()
