@@ -2506,6 +2506,27 @@ empty commit is the baseline of about 2.7 ms):
  Queued next: the "a member capsule has exactly one list parent" invariant,
  in checkCapsule and validateStructure.
 
+69. Follow-ups to item 68. (a) setReverseLookup (composites and logs) is a
+ standalone type holding transitiveSetContainers, setOperandContainers and
+ descriptorOwners, moved off domainConstraint (reverseLookup()); the log
+ registry's mentionCandidates uses its own instead of a throwaway
+ domainConstraint. (b) CompositeSetLogRegistry.contains validates the shape
+ of every operation its backward walk passes (value, one operand, one tag per
+ axis), candidate or not, so a malformed one fails loudly instead of being
+ skipped (TestCrossRoleCorruptedLoggedOperandDoesNotCorruptSiblingStructures
+ caught this). A value nothing mentions is still answered without reading the
+ log. (c) New invariant: a member capsule is a child of exactly one list.
+ ListRegistry.ListsOf (the lists a capsule is in; other code should use it,
+ not the raw edge), listsAmong and requireSoleList; checkCapsule declines a
+ capsule with more than one list parent at commit, and validateStructure
+ (so Elements and VerifyStructures) rejects it with ErrInvalidListStructure.
+ TestAdversarialSameCapsuleMayBeReferencedByTwoListsOnlyIfTopologyAllowsIt,
+ which pinned the old tolerance, is now
+ TestAdversarialCapsuleInTwoListsIsInvalid. Covered also by
+ TestListCheckerDeclinesACapsuleLinkedIntoASecondList. Pending decisions for
+ the new list type: its own capsule tags, and whether Representation C gets
+ its own tags and a place in Registries.
+
 Currently unaddressed yet:
 - ListRegistry.Append still finds the tail by reading the list's whole child
   set (O(n), about 0.19 s at 100,000 elements, item 63); finding a tagged

@@ -629,6 +629,13 @@ its unique `AllElementCapsules`-tagged owner. Arbitrary unrelated parents of
 a role slot remain permitted because role slots are ordinary graph nodes; two
 distinct capsule owners are ambiguous and are rejected rather than guessed.
 
+A member capsule is a child of exactly one list (`ListRegistry.ListsOf`
+returns one): its `Prev`/`Next` links are a position in one chain, so a second
+list would share, and silently change, that position. A list that must appear
+in two places holds a pointer to it, or is the value of a capsule (which is
+not sharing). Checked at commit for a touched capsule and in full by
+`validateStructure`.
+
 These rules are implementation-level validation for the currently explored
 representation, not a claim that the primitive Graph should enforce them or
 that they define the final semantics of Lists. They follow §7a's separation

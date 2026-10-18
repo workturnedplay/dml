@@ -7700,6 +7700,10 @@ func (l *ListRegistry) validateStructure(graph GraphReader, list NodeID) error {
 			return memberErr
 		}
 		if isMember {
+			if soleErr := l.requireSoleList(graph, rel.To); soleErr != nil {
+				return soleErr
+			}
+
 			members[rel.To] = struct{}{}
 		}
 	}
@@ -7809,6 +7813,54 @@ func (l *ListRegistry) validateStructure(graph GraphReader, list NodeID) error {
 	return nil
 }
 
+// ListsOf returns every list that capsule is a direct child of, ascending. A
+// member capsule belongs to exactly one (see requireSoleList); more than one
+// can only come from a hand-written transaction or foreign data. Code that
+// needs to know which list a capsule is in should use this, not the raw edge.
+func (l *ListRegistry) ListsOf(graph GraphReader, capsule NodeID) ([]NodeID, error) {
+	incoming, err := graph.FindIncoming(capsule)
+	if err != nil {
+		return nil, wrapInterfaceErr(err)
+	}
+
+	return l.listsAmong(graph, incoming)
+}
+
+// listsAmong returns the sources of incoming that are lists.
+func (l *ListRegistry) listsAmong(graph GraphReader, incoming []Relationship) ([]NodeID, error) {
+	lists := make([]NodeID, 0, 1)
+
+	for _, rel := range incoming {
+		isList, listErr := l.IsList(graph, rel.From)
+		if listErr != nil {
+			return nil, listErr
+		}
+		if isList {
+			lists = append(lists, rel.From)
+		}
+	}
+
+	return lists, nil
+}
+
+// requireSoleList returns ErrInvalidListStructure unless capsule is a child of
+// exactly one list: its Prev and Next links describe a position in one chain,
+// so a second list would share, and so silently change, that position. (A
+// list that must appear in two places holds a pointer to it, or is the value
+// of a capsule, which is not sharing.)
+func (l *ListRegistry) requireSoleList(graph GraphReader, capsule NodeID) error {
+	owners, err := l.ListsOf(graph, capsule)
+	if err != nil {
+		return err
+	}
+
+	if len(owners) != 1 {
+		return ErrInvalidListStructure
+	}
+
+	return nil
+}
+
 // capsuleLinks is a capsule's own prev and next links, read once by
 // checkCapsule.
 type capsuleLinks struct {
@@ -7910,20 +7962,18 @@ func (l *ListRegistry) checkCapsule(g GraphReader, capsule NodeID, verified map[
 		return wrapInterfaceErr(err)
 	}
 
-	lists := make([]NodeID, 0, 1)
-
-	for _, rel := range incoming {
-		isList, listErr := l.IsList(g, rel.From)
-		if listErr != nil {
-			return listErr
-		}
-		if isList {
-			lists = append(lists, rel.From)
-		}
+	lists, listsErr := l.listsAmong(g, incoming)
+	if listsErr != nil {
+		return listsErr
 	}
 
 	if len(lists) == 0 {
 		return l.rejectBoundaryTags(g, capsule)
+	}
+
+	// A member capsule belongs to exactly one list (see requireSoleList).
+	if len(lists) > 1 {
+		return ErrInvalidListStructure
 	}
 
 	var (
@@ -9984,13 +10034,11 @@ func (c *CompositeSetLogRegistry) Contains(graph GraphReader, log, value NodeID)
 	return c.contains(graph, log, value, map[NodeID]struct{}{log: {}})
 }
 
-// containerWalker returns a domainConstraint used only for its reverse
-// lookups over operand descriptors (descriptorOwners, transitiveSetContainers),
-// which need nothing but the registries. Its logs is c itself, so a log that
-// expands another log is found even if composites was never told about logs
-// (CompositeSetRegistry.SetLogs).
-func (c *CompositeSetLogRegistry) containerWalker() *domainConstraint {
-	return &domainConstraint{sets: c.sets, composites: c.composites, logs: c}
+// reverseLookup returns the reverse lookups over operand descriptors. Its logs
+// is c itself, so a log that expands another log is found even if composites
+// was never told about logs (CompositeSetRegistry.SetLogs).
+func (c *CompositeSetLogRegistry) reverseLookup() setReverseLookup {
+	return setReverseLookup{composites: c.composites, logs: c}
 }
 
 // mentionCandidates returns the capsules of log whose operation might mention
@@ -10007,7 +10055,7 @@ func (c *CompositeSetLogRegistry) containerWalker() *domainConstraint {
 // is a capsule of log whose descriptor is a scalar one naming value or a set
 // one expanding a holder.
 func (c *CompositeSetLogRegistry) mentionCandidates(graph GraphReader, log, value NodeID) (map[NodeID]struct{}, error) {
-	walker := c.containerWalker()
+	walker := c.reverseLookup()
 	holders := make(map[NodeID]struct{})
 	scalars := make([]NodeID, 0)
 
@@ -10144,31 +10192,39 @@ func (c *CompositeSetLogRegistry) contains(graph GraphReader, log, value NodeID,
 
 		seen[current] = struct{}{}
 
+		// Every operation the walk passes is checked for shape (a value, one
+		// operand, one tag per axis), candidate or not, so a malformed one
+		// fails loudly instead of being skipped.
+		u, hasValue, valueErr := c.lists.capsules.Value(graph, current)
+		if valueErr != nil {
+			return false, valueErr
+		}
+		if !hasValue {
+			return false, ErrInvalidOperandDescriptor
+		}
+
+		operand, operandErr := operandTargetGeneric(graph, u)
+		if operandErr != nil {
+			return false, operandErr
+		}
+
+		expand, expandErr := exactlyOneTag(graph, u, c.allSetOperand, c.allScalarOperand)
+		if expandErr != nil {
+			return false, expandErr
+		}
+
+		additive, additiveErr := exactlyOneTag(graph, u, c.allAdditiveOp, c.allSubtractiveOp)
+		if additiveErr != nil {
+			return false, additiveErr
+		}
+
 		if _, candidate := candidates[current]; candidate {
-			u, hasValue, valueErr := c.lists.capsules.Value(graph, current)
-			if valueErr != nil {
-				return false, valueErr
-			}
-			if !hasValue {
-				return false, ErrInvalidOperandDescriptor
-			}
-
-			operand, operandErr := operandTargetGeneric(graph, u)
-			if operandErr != nil {
-				return false, operandErr
-			}
-
-			expand, expandErr := exactlyOneTag(graph, u, c.allSetOperand, c.allScalarOperand)
-			if expandErr != nil {
-				return false, expandErr
-			}
-
 			mentions, mentionErr := c.operandMentions(graph, operand, expand, value, visited)
 			if mentionErr != nil {
 				return false, mentionErr
 			}
 			if mentions {
-				return exactlyOneTag(graph, u, c.allAdditiveOp, c.allSubtractiveOp)
+				return additive, nil
 			}
 		}
 
@@ -10555,7 +10611,7 @@ func (d *domainConstraint) affectedAnchors(g GraphReader, targetTag NodeID, touc
 			continue
 		}
 
-		owners, ownersErr := d.descriptorOwners(g, node)
+		owners, ownersErr := d.reverseLookup().descriptorOwners(g, node)
 		if ownersErr != nil {
 			return nil, ownersErr
 		}
@@ -10575,7 +10631,7 @@ func (d *domainConstraint) affectedAnchors(g GraphReader, targetTag NodeID, touc
 // every pointer whose domain could have changed membership because node's
 // own definition or membership changed.
 func (d *domainConstraint) addAnchorsExpanding(g GraphReader, targetTag, node NodeID, anchors map[NodeID]struct{}) error {
-	containers, err := d.transitiveSetContainers(g, node)
+	containers, err := d.reverseLookup().transitiveSetContainers(g, node)
 	if err != nil {
 		return err
 	}
@@ -10654,6 +10710,23 @@ func (d *domainConstraint) addSlotOwners(g GraphReader, slot, targetTag NodeID, 
 	return nil
 }
 
+// setReverseLookup holds the reverse lookups over operand descriptors that
+// need nothing but the composite and log registries: from a descriptor to the
+// composite or log owning it, and from a node to every composite or log that
+// expands it. domainConstraint uses them to find the pointers a mutation
+// could strand, CompositeSetLogRegistry to find the operations that might
+// mention a value. logs may be nil (no log registry exists yet), as for
+// domainConstraint.
+type setReverseLookup struct {
+	composites *CompositeSetRegistry
+	logs       *CompositeSetLogRegistry
+}
+
+// reverseLookup returns d's reverse lookups over composites and logs.
+func (d *domainConstraint) reverseLookup() setReverseLookup {
+	return setReverseLookup{composites: d.composites, logs: d.logs}
+}
+
 // domainSlotsOf returns every domain slot whose target is domain: a
 // reverse lookup over FindIncoming(domain), filtered by the AllDomainSlot
 // tag.
@@ -10683,7 +10756,7 @@ func (d *domainConstraint) domainSlotsOf(g GraphReader, domain NodeID) ([]NodeID
 // setOperandContainers with a visited set, so shared sub-expressions
 // (diamonds) are visited once and cycles -- legal in a corrupted graph --
 // terminate.
-func (d *domainConstraint) transitiveSetContainers(g GraphReader, node NodeID) ([]NodeID, error) {
+func (r setReverseLookup) transitiveSetContainers(g GraphReader, node NodeID) ([]NodeID, error) {
 	visited := map[NodeID]struct{}{node: {}}
 	queue := []NodeID{node}
 	var containers []NodeID
@@ -10692,7 +10765,7 @@ func (d *domainConstraint) transitiveSetContainers(g GraphReader, node NodeID) (
 		current := queue[0]
 		queue = queue[1:]
 
-		direct, err := d.setOperandContainers(g, current)
+		direct, err := r.setOperandContainers(g, current)
 		if err != nil {
 			return nil, err
 		}
@@ -10716,7 +10789,7 @@ func (d *domainConstraint) transitiveSetContainers(g GraphReader, node NodeID) (
 // node as a scalar operand is deliberately ignored: a scalar operand
 // contributes node itself, not node's membership, so a change to node's
 // members cannot change the container's membership.
-func (d *domainConstraint) setOperandContainers(g GraphReader, node NodeID) ([]NodeID, error) {
+func (r setReverseLookup) setOperandContainers(g GraphReader, node NodeID) ([]NodeID, error) {
 	incoming, err := g.FindIncoming(node)
 	if err != nil {
 		return nil, wrapInterfaceErr(err)
@@ -10724,7 +10797,7 @@ func (d *domainConstraint) setOperandContainers(g GraphReader, node NodeID) ([]N
 
 	containers := make([]NodeID, 0, len(incoming))
 	for _, rel := range incoming {
-		isSetOperand, hasErr := g.HasRelationship(d.composites.allSetOperand, rel.From)
+		isSetOperand, hasErr := g.HasRelationship(r.composites.allSetOperand, rel.From)
 		if hasErr != nil {
 			return nil, wrapInterfaceErr(hasErr)
 		}
@@ -10732,7 +10805,7 @@ func (d *domainConstraint) setOperandContainers(g GraphReader, node NodeID) ([]N
 			continue
 		}
 
-		owners, ownersErr := d.descriptorOwners(g, rel.From)
+		owners, ownersErr := r.descriptorOwners(g, rel.From)
 		if ownersErr != nil {
 			return nil, ownersErr
 		}
@@ -10749,7 +10822,7 @@ func (d *domainConstraint) setOperandContainers(g GraphReader, node NodeID) ([]N
 // an operand descriptor is attached (theorystate.md section 80/82). The
 // log hop reuses CapsuleRegistry.CapsulesWithValue rather than any new
 // index.
-func (d *domainConstraint) descriptorOwners(g GraphReader, u NodeID) ([]NodeID, error) {
+func (r setReverseLookup) descriptorOwners(g GraphReader, u NodeID) ([]NodeID, error) {
 	incoming, err := g.FindIncoming(u)
 	if err != nil {
 		return nil, wrapInterfaceErr(err)
@@ -10757,7 +10830,7 @@ func (d *domainConstraint) descriptorOwners(g GraphReader, u NodeID) ([]NodeID, 
 
 	owners := make([]NodeID, 0, len(incoming))
 	for _, rel := range incoming {
-		isComposite, isCompositeErr := d.composites.IsCompositeSet(g, rel.From)
+		isComposite, isCompositeErr := r.composites.IsCompositeSet(g, rel.From)
 		if isCompositeErr != nil {
 			return nil, isCompositeErr
 		}
@@ -10766,11 +10839,11 @@ func (d *domainConstraint) descriptorOwners(g GraphReader, u NodeID) ([]NodeID, 
 		}
 	}
 
-	if d.logs == nil {
+	if r.logs == nil {
 		return owners, nil
 	}
 
-	capsules, err := d.logs.lists.capsules.CapsulesWithValue(g, u)
+	capsules, err := r.logs.lists.capsules.CapsulesWithValue(g, u)
 	if err != nil {
 		return nil, err
 	}
@@ -10782,7 +10855,7 @@ func (d *domainConstraint) descriptorOwners(g GraphReader, u NodeID) ([]NodeID, 
 		}
 
 		for _, rel := range capsuleIncoming {
-			isLog, isLogErr := d.logs.IsCompositeSetLog(g, rel.From)
+			isLog, isLogErr := r.logs.IsCompositeSetLog(g, rel.From)
 			if isLogErr != nil {
 				return nil, isLogErr
 			}

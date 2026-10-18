@@ -5418,6 +5418,32 @@ func TestListCheckerLeavesGlobalStructureToReadsAndVerifyStructures(t *testing.T
 	}
 }
 
+// TestListCheckerDeclinesACapsuleLinkedIntoASecondList: a member capsule
+// belongs to exactly one list, so linking one into a second is declined at
+// commit and rolled back.
+func TestListCheckerDeclinesACapsuleLinkedIntoASecondList(t *testing.T) {
+	rig := newListCorruptionRig(t)
+
+	owners, err := rig.lists.ListsOf(rig.graph, rig.capsules[1])
+	if err != nil || !reflect.DeepEqual(owners, []NodeID{rig.list}) {
+		t.Fatalf("ListsOf() = (%v,%v), want ([%d],nil)", owners, err, rig.list)
+	}
+
+	other, err := rig.lists.NewList(rig.graph)
+	if err != nil {
+		t.Fatalf("NewList(): %v", err)
+	}
+
+	err = rig.graph.Transact(func(tx Tx) error {
+		return addRelationshipTx(tx, other, rig.capsules[1])
+	})
+	if !errors.Is(err, ErrInvalidListStructure) {
+		t.Fatalf("Transact() error = %v, want %v", err, ErrInvalidListStructure)
+	}
+
+	requireListElements(t, rig.lists, rig.graph, rig.list, rig.values[:])
+}
+
 func TestListOperationsRequireListTag(t *testing.T) {
 	g, _, lists := newListTestFixture(t)
 
@@ -6986,7 +7012,9 @@ func TestAdversarialSelfReferentialCapsuleValueIsAllowed(t *testing.T) {
 	}
 }
 
-func TestAdversarialSameCapsuleMayBeReferencedByTwoListsOnlyIfTopologyAllowsIt(t *testing.T) {
+// A capsule linked into two lists would share one position in two chains, so
+// every read of either list rejects it.
+func TestAdversarialCapsuleInTwoListsIsInvalid(t *testing.T) {
 	g, capsules, lists := newListTestFixture(t)
 	listA, err := lists.NewList(g)
 	if err != nil {
@@ -7017,11 +7045,14 @@ func TestAdversarialSameCapsuleMayBeReferencedByTwoListsOnlyIfTopologyAllowsIt(t
 		t.Fatal(err)
 	}
 
-	if _, err := lists.Elements(g, listA); !errors.Is(err, nil) {
-		t.Fatalf("Elements(listA) error = %v, want nil", err)
+	if _, err := lists.Elements(g, listA); !errors.Is(err, ErrInvalidListStructure) {
+		t.Fatalf("Elements(listA) error = %v, want %v", err, ErrInvalidListStructure)
 	}
-	if _, err := lists.Elements(g, listB); !errors.Is(err, nil) {
-		t.Fatalf("Elements(listB) error = %v, want nil", err)
+	if _, err := lists.Elements(g, listB); !errors.Is(err, ErrInvalidListStructure) {
+		t.Fatalf("Elements(listB) error = %v, want %v", err, ErrInvalidListStructure)
+	}
+	if verifyErr := lists.VerifyStructures(g); !errors.Is(verifyErr, ErrLoadVerification) || !errors.Is(verifyErr, ErrInvalidListStructure) {
+		t.Fatalf("VerifyStructures() error = %v, want %v wrapping %v", verifyErr, ErrLoadVerification, ErrInvalidListStructure)
 	}
 }
 
