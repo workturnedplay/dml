@@ -408,6 +408,51 @@ func (g *Graph) findIncomingCore(to NodeID) ([]Relationship, error) {
 	return relationships, nil
 }
 
+// findCommonChildren is the guarded form of findCommonChildrenCore (see
+// commonChildrenFinder).
+func (g *Graph) findCommonChildren(a, b NodeID, limit int) ([]NodeID, error) {
+	release := g.guard.acquire()
+	defer release()
+
+	return g.findCommonChildrenCore(a, b, limit)
+}
+
+// findCommonChildrenCore is findCommonChildren's unguarded implementation;
+// see createNodeCore's doc comment for why this split exists. It walks the
+// smaller of the two children maps and probes the other.
+func (g *Graph) findCommonChildrenCore(a, b NodeID, limit int) ([]NodeID, error) {
+	if !g.nodeExists(a) {
+		return nil, ErrNodeNotFound
+	}
+
+	if limit <= 0 {
+		return nil, nil
+	}
+
+	small, large := g.outgoing[a], g.outgoing[b]
+	if len(small) > len(large) {
+		small, large = large, small
+	}
+
+	common := make([]NodeID, 0, min(limit, len(small)))
+
+	for to := range small {
+		if _, shared := large[to]; !shared {
+			continue
+		}
+
+		common = append(common, to)
+
+		if len(common) == limit {
+			break
+		}
+	}
+
+	slices.Sort(common)
+
+	return common, nil
+}
+
 // FindRelationships returns every primitive relationship in the graph.
 //
 // The returned relationships are sorted by From, then To. This ordering
@@ -1223,6 +1268,12 @@ func (tx *Txn) FindNodes() ([]NodeID, error) {
 	return tx.graph.findNodesCore(), nil
 }
 
+// findCommonChildren delegates to the real, concrete *Graph's unguarded
+// core (see commonChildrenFinder and the NodeExists doc comment above).
+func (tx *Txn) findCommonChildren(a, b NodeID, limit int) ([]NodeID, error) {
+	return tx.graph.findCommonChildrenCore(a, b, limit)
+}
+
 // Compile-time assertion that *Txn satisfies GraphReader, exactly
 // mirroring the existing assertions for *Graph and *GraphActor against
 // GraphAPI.
@@ -1391,6 +1442,12 @@ func (r graphCoreReader) FindNodes() ([]NodeID, error) {
 	return r.graph.findNodesCore(), nil
 }
 
+// findCommonChildren delegates to graph's unguarded core. See the
+// graphCoreReader doc comment.
+func (r graphCoreReader) findCommonChildren(a, b NodeID, limit int) ([]NodeID, error) {
+	return r.graph.findCommonChildrenCore(a, b, limit)
+}
+
 // Compile-time assertion that graphCoreReader satisfies GraphReader,
 // mirroring the existing assertions for *Graph, *Txn, and *GraphActor.
 var _ GraphReader = graphCoreReader{}
@@ -1510,6 +1567,36 @@ func nodesAfter(reader GraphReader, after NodeID, hasAfter bool, limit int) ([]N
 
 	return pageNodeIDs(ids, after, hasAfter, limit), nil
 }
+
+// commonChildrenFinder is implemented by a GraphReader that can find the
+// children two nodes have in common without reading either node's whole
+// child set (*Graph, BoltGraph's boltView and, through forwarding, the ROOT
+// overlay and GraphActor). It makes "the child of this node that carries
+// this tag" cost about the smaller of the two child sets instead of the
+// node's own: a list node has one child per element and a tag hub one child
+// per tagged node, so the hub is usually the smaller. a must exist
+// (ErrNodeNotFound); a missing b has no children, so nothing is in common.
+// At most limit nodes are returned, sorted ascending; if more than limit are
+// common, which of them is unspecified. A non-positive limit returns
+// nothing. An implementation that cannot answer a request natively returns
+// errPagingUnsupported (a signal, not a failure) and the caller scans one
+// child set instead (scanTaggedChild).
+type commonChildrenFinder interface {
+	findCommonChildren(a, b NodeID, limit int) ([]NodeID, error)
+}
+
+// Compile-time assertions that every reader with a native common-children
+// lookup provides it.
+var (
+	_ commonChildrenFinder = (*Graph)(nil)
+	_ commonChildrenFinder = (*Txn)(nil)
+	_ commonChildrenFinder = graphCoreReader{}
+	_ commonChildrenFinder = boltView{}
+	_ commonChildrenFinder = (*boltTxn)(nil)
+	_ commonChildrenFinder = (*BoltGraph)(nil)
+	_ commonChildrenFinder = rootReader{}
+	_ commonChildrenFinder = (*GraphActor)(nil)
+)
 
 // outgoingPager is implemented by a GraphReader that can list a bounded
 // page of one node's own outgoing relationships without materializing
@@ -2138,6 +2225,21 @@ func (ga *GraphActor) findIncomingAfter(to, after NodeID, hasAfter bool, limit i
 	})
 }
 
+// findCommonChildren forwards the lookup to the backend as one short job. If
+// the backend has none, errPagingUnsupported tells the caller to scan.
+func (ga *GraphActor) findCommonChildren(a, b NodeID, limit int) ([]NodeID, error) {
+	return actorPage(ga, func(g GraphAPI) ([]NodeID, error) {
+		finder, ok := g.(commonChildrenFinder)
+		if !ok {
+			return nil, errPagingUnsupported
+		}
+
+		common, err := finder.findCommonChildren(a, b, limit)
+
+		return common, wrapInterfaceErr(err)
+	})
+}
+
 // Compile-time assertions that GraphActor forwards paging.
 var (
 	_ outgoingPager = (*GraphActor)(nil)
@@ -2511,6 +2613,44 @@ func (v boltView) findIncomingAfter(to, after NodeID, hasAfter bool, limit int) 
 	}
 
 	return relationships, nil
+}
+
+// findCommonChildren returns up to limit nodes that are children of both a
+// and b, ascending (see commonChildrenFinder). It is a leapfrog join over the
+// two sorted runs of the out bucket: the run that is behind seeks straight to
+// the other's current child, so the cost is about the smaller run, not the
+// larger. boltTxn picks this up through embedding boltView.
+func (v boltView) findCommonChildren(a, b NodeID, limit int) ([]NodeID, error) {
+	exists, err := v.NodeExists(a)
+	if err != nil {
+		return nil, err
+	}
+	if !exists {
+		return nil, ErrNodeNotFound
+	}
+
+	common := []NodeID{}
+	prefixA, prefixB := boltKey8(a), boltKey8(b)
+	cursorA, cursorB := v.out.Cursor(), v.out.Cursor()
+	keyA, _ := cursorA.Seek(prefixA)
+	keyB, _ := cursorB.Seek(prefixB)
+
+	for len(common) < limit && bytes.HasPrefix(keyA, prefixA) && bytes.HasPrefix(keyB, prefixB) {
+		childA, childB := boltID(keyA[boltIDSize:]), boltID(keyB[boltIDSize:])
+
+		switch {
+		case childA == childB:
+			common = append(common, childA)
+			keyA, _ = cursorA.Next()
+			keyB, _ = cursorB.Next()
+		case childA < childB:
+			keyA, _ = cursorA.Seek(boltKey16(a, childB))
+		default:
+			keyB, _ = cursorB.Seek(boltKey16(b, childA))
+		}
+	}
+
+	return common, nil
 }
 
 // Compile-time assertions that boltView pages nodes and relationships.
@@ -3336,6 +3476,14 @@ func (g *BoltGraph) findIncomingAfter(to, after NodeID, hasAfter bool, limit int
 	return boltRead(g, func(v boltView) ([]Relationship, error) {
 		return v.findIncomingAfter(to, after, hasAfter, limit)
 	})
+}
+
+// findCommonChildren is one short read transaction (see commonChildrenFinder).
+func (g *BoltGraph) findCommonChildren(a, b NodeID, limit int) ([]NodeID, error) {
+	release := g.guard.acquire()
+	defer release()
+
+	return boltRead(g, func(v boltView) ([]NodeID, error) { return v.findCommonChildren(a, b, limit) })
 }
 
 // Compile-time assertions that BoltGraph pages.
@@ -4471,6 +4619,26 @@ func (v rootReader) findOutgoingAfter(from, after NodeID, hasAfter bool, limit i
 	}
 
 	return relationships, nil
+}
+
+// findCommonChildren forwards to the underlying reader for any two nodes
+// other than ROOT: their stored children are their children in the ROOT view
+// (only ROOT's own outgoing set is virtual, section 12a). ROOT's children, or
+// an underlying reader with no native lookup, are reported as
+// errPagingUnsupported, and the caller scans.
+func (v rootReader) findCommonChildren(a, b NodeID, limit int) ([]NodeID, error) {
+	if a == v.root || b == v.root {
+		return nil, errPagingUnsupported
+	}
+
+	finder, ok := v.inner.(commonChildrenFinder)
+	if !ok {
+		return nil, errPagingUnsupported
+	}
+
+	common, err := finder.findCommonChildren(a, b, limit)
+
+	return common, wrapInterfaceErr(err)
 }
 
 // Compile-time assertions that the ROOT overlay pages outgoing and
@@ -5803,6 +5971,41 @@ func findUniqueTaggedParent(g GraphReader, node, tag NodeID) (parent NodeID, fou
 // out-of-band Graph mutation -- ErrAmbiguousPointerMetadata is returned
 // instead of arbitrarily picking one.
 func findUniqueTaggedChild(g GraphReader, node, tag NodeID) (child NodeID, found bool, err error) {
+	// A reader that can intersect two child sets natively answers in time
+	// bounded by the smaller of them (see commonChildrenFinder). Asking for
+	// two is enough to tell none, one and more than one apart, so the
+	// ambiguity check is kept.
+	if finder, native := g.(commonChildrenFinder); native {
+		common, findErr := finder.findCommonChildren(node, tag, 2)
+
+		switch {
+		case findErr == nil:
+			return uniqueNode(common)
+		case !errors.Is(findErr, errPagingUnsupported):
+			return 0, false, wrapInterfaceErr(findErr)
+		}
+	}
+
+	return scanTaggedChild(g, node, tag)
+}
+
+// uniqueNode turns the (at most two) nodes of a common-children lookup into
+// findUniqueTaggedChild's answer.
+func uniqueNode(nodes []NodeID) (NodeID, bool, error) {
+	switch len(nodes) {
+	case 0:
+		return 0, false, nil
+	case 1:
+		return nodes[0], true, nil
+	default:
+		return 0, false, ErrAmbiguousPointerMetadata
+	}
+}
+
+// scanTaggedChild is findUniqueTaggedChild for a reader with no native
+// common-children lookup: it reads all of node's children and probes each for
+// the tag, so it costs the fan-out of node.
+func scanTaggedChild(g GraphReader, node, tag NodeID) (child NodeID, found bool, err error) {
 	outgoing, err := g.FindOutgoing(node)
 	if err != nil {
 		return 0, false, wrapInterfaceErr(err)
@@ -6849,40 +7052,32 @@ func (c *CapsuleRegistry) SetValue(graph Transactor, capsule, value NodeID) erro
 func (c *CapsuleRegistry) CapsulesWithValue(graph GraphReader, value NodeID) ([]NodeID, error) {
 	var capsules []NodeID
 
-	pages := incomingPages(graph, value, capsulesWithValuePageSize)
+	walkErr := forEachIncoming(graph, value, func(rel Relationship) error {
+		slot := rel.From
 
-	for {
-		page, err := pages.next()
-		if err != nil {
-			return nil, err
+		isValueSlot, isSlotErr := c.valueSlots.IsPointer(graph, slot)
+		if isSlotErr != nil {
+			return isSlotErr
+		}
+		if !isValueSlot {
+			return nil
 		}
 
-		if len(page) == 0 {
-			return capsules, nil
+		capsule, found, findErr := findUniqueTaggedParent(graph, slot, c.allElementCapsules)
+		if findErr != nil {
+			return findErr
 		}
-
-		for _, rel := range page {
-			slot := rel.From
-
-			isValueSlot, isSlotErr := c.valueSlots.IsPointer(graph, slot)
-			if isSlotErr != nil {
-				return nil, isSlotErr
-			}
-			if !isValueSlot {
-				continue
-			}
-
-			capsule, found, findErr := findUniqueTaggedParent(graph, slot, c.allElementCapsules)
-			if findErr != nil {
-				return nil, findErr
-			}
-			if !found {
-				continue
-			}
-
+		if found {
 			capsules = append(capsules, capsule)
 		}
+
+		return nil
+	})
+	if walkErr != nil {
+		return nil, walkErr
 	}
+
+	return capsules, nil
 }
 
 // capsulesWithValuePageSize bounds each internal page CapsulesWithValue
@@ -6890,6 +7085,30 @@ func (c *CapsuleRegistry) CapsulesWithValue(graph GraphReader, value NodeID) ([]
 // section 105). A var, not a const, specifically so tests can shrink it to
 // exercise the multi-page loop without needing thousands of capsules.
 var capsulesWithValuePageSize = 1000
+
+// forEachIncoming calls visit for every relationship whose target is to, in
+// ascending source order, reading them capsulesWithValuePageSize at a time
+// (see incomingPages), and stops at the first error visit returns.
+func forEachIncoming(graph GraphReader, to NodeID, visit func(rel Relationship) error) error {
+	pages := incomingPages(graph, to, capsulesWithValuePageSize)
+
+	for {
+		page, err := pages.next()
+		if err != nil {
+			return err
+		}
+
+		if len(page) == 0 {
+			return nil
+		}
+
+		for _, rel := range page {
+			if visitErr := visit(rel); visitErr != nil {
+				return wrapInterfaceErr(visitErr)
+			}
+		}
+	}
+}
 
 // Prev returns capsule's previous-capsule link, if any. hasPrev is false
 // for a capsule currently at the head of its list.
@@ -7911,6 +8130,36 @@ func (l *ListRegistry) Elements(graph GraphReader, list NodeID) ([]NodeID, error
 	}
 
 	return values, nil
+}
+
+// stepBack returns the capsule before capsule in list, checking only what one
+// step needs: capsule is a member of list, and its previous capsule's next
+// link points back at it. A walk from the tail with stepBack therefore costs
+// per step, not per list; the whole-list properties are left to Elements and
+// VerifyStructures. hasPrev is false for the head.
+func (l *ListRegistry) stepBack(graph GraphReader, list, capsule NodeID) (NodeID, bool, error) {
+	inList, inListErr := graph.HasRelationship(list, capsule)
+	if inListErr != nil {
+		return 0, false, wrapInterfaceErr(inListErr)
+	}
+	if !inList {
+		return 0, false, ErrInvalidListStructure
+	}
+
+	prev, hasPrev, prevErr := l.capsules.Prev(graph, capsule)
+	if prevErr != nil || !hasPrev {
+		return 0, false, prevErr
+	}
+
+	back, hasBack, backErr := l.capsules.Next(graph, prev)
+	if backErr != nil {
+		return 0, false, backErr
+	}
+	if !hasBack || back != capsule {
+		return 0, false, ErrInvalidListStructure
+	}
+
+	return prev, true, nil
 }
 
 // OccurrencesOf returns every capsule within list whose value equals
@@ -9735,37 +9984,198 @@ func (c *CompositeSetLogRegistry) Contains(graph GraphReader, log, value NodeID)
 	return c.contains(graph, log, value, map[NodeID]struct{}{log: {}})
 }
 
+// containerWalker returns a domainConstraint used only for its reverse
+// lookups over operand descriptors (descriptorOwners, transitiveSetContainers),
+// which need nothing but the registries. Its logs is c itself, so a log that
+// expands another log is found even if composites was never told about logs
+// (CompositeSetRegistry.SetLogs).
+func (c *CompositeSetLogRegistry) containerWalker() *domainConstraint {
+	return &domainConstraint{sets: c.sets, composites: c.composites, logs: c}
+}
+
+// mentionCandidates returns the capsules of log whose operation might mention
+// value, found by reverse lookup from value without reading the log. A
+// superset of the capsules that really mention it: contains confirms each
+// with operandMentions, so a composite that subtracts the value again is
+// merely a candidate that fails the check.
+//
+// Value can be mentioned by a scalar descriptor naming it, or by a set
+// descriptor whose operand contains it. So the holders are the nodes whose
+// membership might contain value (the plain Sets that list it as a member,
+// the composites and logs owning a scalar descriptor that names it, and every
+// composite or log that expands any of those, transitively), and a candidate
+// is a capsule of log whose descriptor is a scalar one naming value or a set
+// one expanding a holder.
+func (c *CompositeSetLogRegistry) mentionCandidates(graph GraphReader, log, value NodeID) (map[NodeID]struct{}, error) {
+	walker := c.containerWalker()
+	holders := make(map[NodeID]struct{})
+	scalars := make([]NodeID, 0)
+
+	incomingErr := forEachIncoming(graph, value, func(rel Relationship) error {
+		isSet, setErr := c.sets.IsSet(graph, rel.From)
+		if setErr != nil {
+			return setErr
+		}
+		if isSet {
+			holders[rel.From] = struct{}{}
+
+			return nil
+		}
+
+		isScalar, scalarErr := graph.HasRelationship(c.allScalarOperand, rel.From)
+		if scalarErr != nil {
+			return wrapInterfaceErr(scalarErr)
+		}
+		if !isScalar {
+			return nil
+		}
+
+		scalars = append(scalars, rel.From)
+
+		owners, ownersErr := walker.descriptorOwners(graph, rel.From)
+		if ownersErr != nil {
+			return ownersErr
+		}
+
+		for _, owner := range owners {
+			// This log's own descriptors are handled through scalars.
+			if owner != log {
+				holders[owner] = struct{}{}
+			}
+		}
+
+		return nil
+	})
+	if incomingErr != nil {
+		return nil, incomingErr
+	}
+
+	for _, holder := range slices.Collect(maps.Keys(holders)) {
+		containers, containersErr := walker.transitiveSetContainers(graph, holder)
+		if containersErr != nil {
+			return nil, containersErr
+		}
+
+		for _, container := range containers {
+			holders[container] = struct{}{}
+		}
+	}
+
+	candidates := make(map[NodeID]struct{})
+
+	addCapsulesOf := func(descriptor NodeID) error {
+		capsules, capsulesErr := c.lists.capsules.CapsulesWithValue(graph, descriptor)
+		if capsulesErr != nil {
+			return capsulesErr
+		}
+
+		for _, capsule := range capsules {
+			inLog, inLogErr := graph.HasRelationship(log, capsule)
+			if inLogErr != nil {
+				return wrapInterfaceErr(inLogErr)
+			}
+			if inLog {
+				candidates[capsule] = struct{}{}
+			}
+		}
+
+		return nil
+	}
+
+	for _, descriptor := range scalars {
+		if addErr := addCapsulesOf(descriptor); addErr != nil {
+			return nil, addErr
+		}
+	}
+
+	for holder := range holders {
+		holderErr := forEachIncoming(graph, holder, func(rel Relationship) error {
+			isSetOperand, tagErr := graph.HasRelationship(c.allSetOperand, rel.From)
+			if tagErr != nil {
+				return wrapInterfaceErr(tagErr)
+			}
+			if !isSetOperand {
+				return nil
+			}
+
+			return addCapsulesOf(rel.From)
+		})
+		if holderErr != nil {
+			return nil, holderErr
+		}
+	}
+
+	return candidates, nil
+}
+
 // contains is Contains's recursive core, assuming log and value have
 // already been confirmed to exist, log to be tagged CompositeSetLog-kind,
 // and log to already be recorded in visited.
+//
+// It does not read the log to find where value is mentioned: the candidate
+// capsules come from a reverse lookup (mentionCandidates), so a value nothing
+// mentions is answered without touching the log, and otherwise the log is
+// walked backward from its tail, one validated step at a time (stepBack), only
+// until the most recent operation that really mentions value. Unlike Elements
+// it does not validate the whole list on every call: a value the log mentions
+// early still costs the distance to it, and the global properties are left to
+// VerifyStructures.
 func (c *CompositeSetLogRegistry) contains(graph GraphReader, log, value NodeID, visited map[NodeID]struct{}) (bool, error) {
-	operations, err := c.lists.Elements(graph, log)
+	candidates, err := c.mentionCandidates(graph, log, value)
 	if err != nil {
 		return false, err
 	}
 
-	for i := len(operations) - 1; i >= 0; i-- {
-		u := operations[i]
+	if len(candidates) == 0 {
+		return false, nil
+	}
 
-		operand, err := operandTargetGeneric(graph, u)
+	current, hasCurrent, err := c.lists.Tail(graph, log)
+	if err != nil {
+		return false, err
+	}
+
+	seen := make(map[NodeID]struct{})
+
+	for hasCurrent {
+		if _, repeated := seen[current]; repeated {
+			return false, ErrListCycle
+		}
+
+		seen[current] = struct{}{}
+
+		if _, candidate := candidates[current]; candidate {
+			u, hasValue, valueErr := c.lists.capsules.Value(graph, current)
+			if valueErr != nil {
+				return false, valueErr
+			}
+			if !hasValue {
+				return false, ErrInvalidOperandDescriptor
+			}
+
+			operand, operandErr := operandTargetGeneric(graph, u)
+			if operandErr != nil {
+				return false, operandErr
+			}
+
+			expand, expandErr := exactlyOneTag(graph, u, c.allSetOperand, c.allScalarOperand)
+			if expandErr != nil {
+				return false, expandErr
+			}
+
+			mentions, mentionErr := c.operandMentions(graph, operand, expand, value, visited)
+			if mentionErr != nil {
+				return false, mentionErr
+			}
+			if mentions {
+				return exactlyOneTag(graph, u, c.allAdditiveOp, c.allSubtractiveOp)
+			}
+		}
+
+		current, hasCurrent, err = c.lists.stepBack(graph, log, current)
 		if err != nil {
 			return false, err
 		}
-
-		expand, err := exactlyOneTag(graph, u, c.allSetOperand, c.allScalarOperand)
-		if err != nil {
-			return false, err
-		}
-
-		mentions, err := c.operandMentions(graph, operand, expand, value, visited)
-		if err != nil {
-			return false, err
-		}
-		if !mentions {
-			continue
-		}
-
-		return exactlyOneTag(graph, u, c.allAdditiveOp, c.allSubtractiveOp)
 	}
 
 	return false, nil

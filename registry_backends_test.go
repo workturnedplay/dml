@@ -275,6 +275,7 @@ var registryTestsOnEveryBackend = []func(*testing.T){
 	TestCompositeSetLogEvaluateDetectsCycle,
 	TestCompositeSetLogEvaluateDetectsCrossRepresentationCycle,
 	TestCompositeSetLogContainsMatchesEvaluate,
+	TestCompositeSetLogContainsAgreesWithEvaluateForEveryNode,
 	TestCompositeSetLogContainsRequiresExistingValue,
 	TestCompositeSetLogRemoveOperationDeletesDescriptorAndCapsule,
 	TestCompositeSetLogRemoveOperationRequiresOperationInLog,

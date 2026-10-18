@@ -9117,6 +9117,145 @@ func TestCompositeSetLogContainsMatchesEvaluate(t *testing.T) {
 	}
 }
 
+// outgoingReadCounter counts FindOutgoing calls for one watched node.
+// Embedding the GraphReader interface hides any optional pager or
+// common-children lookup the wrapped value has.
+type outgoingReadCounter struct {
+	GraphReader
+	watched NodeID
+	calls   int
+}
+
+func (r *outgoingReadCounter) FindOutgoing(from NodeID) ([]Relationship, error) {
+	if from == r.watched {
+		r.calls++
+	}
+
+	relationships, err := r.GraphReader.FindOutgoing(from)
+
+	return relationships, wrapInterfaceErr(err)
+}
+
+// TestCompositeSetLogContainsAgreesWithEvaluateForEveryNode mixes scalar and
+// set operands, a composite, subtractions and a re-add, and checks Contains
+// against Evaluate for every node.
+func TestCompositeSetLogContainsAgreesWithEvaluateForEveryNode(t *testing.T) {
+	g, sets, composites, logs := newCompositeSetLogTestFixture(t)
+
+	a := newTestNode(t, g)
+	b := newTestNode(t, g)
+	c := newTestNode(t, g)
+	d := newTestNode(t, g)
+	e := newTestNode(t, g)
+	f := newTestNode(t, g)
+
+	set, err := sets.NewSet(g)
+	if err != nil {
+		t.Fatalf("NewSet(): %v", err)
+	}
+
+	for _, member := range []NodeID{b, d} {
+		if _, addErr := sets.Add(g, set, member); addErr != nil {
+			t.Fatalf("Add(set, %d): %v", member, addErr)
+		}
+	}
+
+	// composite = {e} minus {d} = {e}
+	composite, err := composites.NewCompositeSet(g)
+	if err != nil {
+		t.Fatalf("NewCompositeSet(): %v", err)
+	}
+
+	if _, operandErr := composites.AddOperand(g, composite, e, true, false); operandErr != nil {
+		t.Fatalf("AddOperand(e): %v", operandErr)
+	}
+
+	if _, operandErr := composites.AddOperand(g, composite, d, false, false); operandErr != nil {
+		t.Fatalf("AddOperand(d, subtractive): %v", operandErr)
+	}
+
+	log, err := logs.NewCompositeSetLog(g)
+	if err != nil {
+		t.Fatalf("NewCompositeSetLog(): %v", err)
+	}
+
+	// {a} -> {a,b,d} -> {a,d} -> {a,d,e} -> {a,e} -> {a,b,e}
+	for _, op := range []struct {
+		operand          NodeID
+		additive, expand bool
+	}{
+		{operand: a, additive: true},
+		{operand: set, additive: true, expand: true},
+		{operand: b},
+		{operand: composite, additive: true, expand: true},
+		{operand: set, expand: true},
+		{operand: b, additive: true},
+	} {
+		if _, _, appendErr := logs.AppendOperation(g, log, op.operand, op.additive, op.expand); appendErr != nil {
+			t.Fatalf("AppendOperation(%d): %v", op.operand, appendErr)
+		}
+	}
+
+	evaluated, err := logs.Evaluate(g, log)
+	if err != nil {
+		t.Fatalf("Evaluate(): %v", err)
+	}
+
+	if want := sortedNodeIDs([]NodeID{a, b, e}); !reflect.DeepEqual(sortedNodeIDs(evaluated), want) {
+		t.Fatalf("Evaluate() = %v, want %v", evaluated, want)
+	}
+
+	for _, node := range []NodeID{a, b, c, d, e, f} {
+		got, containsErr := logs.Contains(g, log, node)
+		if containsErr != nil {
+			t.Fatalf("Contains(%d): %v", node, containsErr)
+		}
+
+		if want := slices.Contains(evaluated, node); got != want {
+			t.Fatalf("Contains(%d) = %v, want %v (Evaluate() = %v)", node, got, want, evaluated)
+		}
+	}
+}
+
+// TestCompositeSetLogContainsOfAnUnmentionedValueDoesNotReadTheLog: the
+// candidates come from a reverse lookup from the value, so a value nothing
+// mentions never makes Contains read the log's own children (Elements, which
+// it used to call, does).
+func TestCompositeSetLogContainsOfAnUnmentionedValueDoesNotReadTheLog(t *testing.T) {
+	g, _, _, logs := newCompositeSetLogTestFixture(t)
+
+	log, err := logs.NewCompositeSetLog(g)
+	if err != nil {
+		t.Fatalf("NewCompositeSetLog(): %v", err)
+	}
+
+	a := newTestNode(t, g)
+	b := newTestNode(t, g)
+	unmentioned := newTestNode(t, g)
+
+	for _, operand := range []NodeID{a, b} {
+		if _, _, appendErr := logs.AppendOperation(g, log, operand, true, false); appendErr != nil {
+			t.Fatalf("AppendOperation(%d): %v", operand, appendErr)
+		}
+	}
+
+	reads := &outgoingReadCounter{GraphReader: g, watched: log}
+
+	got, err := logs.Contains(reads, log, unmentioned)
+	if err != nil || got {
+		t.Fatalf("Contains(unmentioned) = (%v,%v), want (false,nil)", got, err)
+	}
+
+	if reads.calls != 0 {
+		t.Fatalf("Contains(unmentioned) read the children of the log %d times, want 0", reads.calls)
+	}
+
+	got, err = logs.Contains(reads, log, b)
+	if err != nil || !got {
+		t.Fatalf("Contains(b) = (%v,%v), want (true,nil)", got, err)
+	}
+}
+
 func TestCompositeSetLogContainsRequiresExistingValue(t *testing.T) {
 	g, _, _, logs := newCompositeSetLogTestFixture(t)
 
@@ -14484,6 +14623,231 @@ func TestPageIteratorsMatchFullReadsOnEveryBackendAndThroughGraphActor(t *testin
 				}
 			})
 		}
+	}
+}
+
+// forEachBackendAndActor runs body once per GraphAPI implementation, directly
+// and behind a GraphActor.
+func forEachBackendAndActor(t *testing.T, body func(t *testing.T, graph testGraph)) {
+	t.Helper()
+
+	for _, backend := range testBackends() {
+		for _, viaActor := range []bool{false, true} {
+			name := backend.name
+			if viaActor {
+				name += "/GraphActor"
+			}
+
+			t.Run(name, func(t *testing.T) {
+				graph := backend.open(t)
+
+				if viaActor {
+					actor := NewGraphActor(graph)
+					t.Cleanup(actor.Close)
+
+					graph = actor
+				}
+
+				body(t, graph)
+			})
+		}
+	}
+}
+
+func TestFindCommonChildrenMatchesTheIntersectionOnEveryBackend(t *testing.T) {
+	const nonexistent NodeID = 999999
+
+	forEachBackendAndActor(t, func(t *testing.T, graph testGraph) {
+		finder, ok := graph.(commonChildrenFinder)
+		if !ok {
+			t.Skip("no native common-children lookup")
+		}
+
+		left := mustCreateNode(t, graph)
+		right := mustCreateNode(t, graph)
+		loner := mustCreateNode(t, graph)
+
+		kids := make([]NodeID, 0, 20)
+		for range 20 {
+			kids = append(kids, mustCreateNode(t, graph))
+		}
+
+		for _, kid := range kids {
+			if _, linkErr := addRelationshipVia(graph, left, kid); linkErr != nil {
+				t.Fatalf("AddRelationship(left, %d): %v", kid, linkErr)
+			}
+		}
+
+		// Spread out, so a leapfrog has to skip.
+		shared := []NodeID{kids[3], kids[10], kids[19]}
+
+		for _, kid := range shared {
+			if _, linkErr := addRelationshipVia(graph, right, kid); linkErr != nil {
+				t.Fatalf("AddRelationship(right, %d): %v", kid, linkErr)
+			}
+		}
+
+		if _, probeErr := finder.findCommonChildren(left, right, 1); errors.Is(probeErr, errPagingUnsupported) {
+			t.Skip("the backend underneath has no native common-children lookup")
+		}
+
+		cases := []struct {
+			name  string
+			a, b  NodeID
+			limit int
+			want  []NodeID
+			err   error
+		}{
+			{name: "left and right", a: left, b: right, limit: 100, want: shared},
+			{name: "right and left", a: right, b: left, limit: 100, want: shared},
+			{name: "a node with itself", a: left, b: left, limit: 100, want: kids},
+			{name: "disjoint", a: left, b: loner, limit: 100},
+			{name: "zero limit", a: left, b: right, limit: 0},
+			{name: "negative limit", a: left, b: right, limit: -1},
+			{name: "missing first node", a: nonexistent, b: right, limit: 100, err: ErrNodeNotFound},
+			{name: "missing second node", a: left, b: nonexistent, limit: 100},
+		}
+
+		for _, tc := range cases {
+			got, err := finder.findCommonChildren(tc.a, tc.b, tc.limit)
+			if !errors.Is(err, tc.err) {
+				t.Fatalf("%s: error = %v, want %v", tc.name, err, tc.err)
+			}
+
+			if len(got) != len(tc.want) || (len(got) > 0 && !reflect.DeepEqual(got, tc.want)) {
+				t.Fatalf("%s: findCommonChildren() = %v, want %v", tc.name, got, tc.want)
+			}
+		}
+
+		capped, cappedErr := finder.findCommonChildren(left, right, 2)
+		if cappedErr != nil || len(capped) != 2 {
+			t.Fatalf("findCommonChildren(limit 2) = (%v,%v), want two nodes", capped, cappedErr)
+		}
+
+		for _, kid := range capped {
+			if !slices.Contains(shared, kid) {
+				t.Fatalf("findCommonChildren(limit 2) returned %d, which is not a common child", kid)
+			}
+		}
+	})
+}
+
+func TestFindUniqueTaggedChildAgreesWithAScanOnEveryBackend(t *testing.T) {
+	const nonexistent NodeID = 999999
+
+	finders := []struct {
+		name string
+		find func(GraphReader, NodeID, NodeID) (NodeID, bool, error)
+	}{
+		{name: "findUniqueTaggedChild", find: findUniqueTaggedChild},
+		{name: "scanTaggedChild", find: scanTaggedChild},
+	}
+
+	forEachBackendAndActor(t, func(t *testing.T, graph testGraph) {
+		node := mustCreateNode(t, graph)
+		tag := mustCreateNode(t, graph)
+		outsider := mustCreateNode(t, graph)
+
+		// The tag has a child that is not a child of node: an intersection,
+		// not a union.
+		if _, linkErr := addRelationshipVia(graph, tag, outsider); linkErr != nil {
+			t.Fatalf("AddRelationship(tag, outsider): %v", linkErr)
+		}
+
+		kids := make([]NodeID, 0, 6)
+
+		for range 6 {
+			kid := mustCreateNode(t, graph)
+
+			if _, linkErr := addRelationshipVia(graph, node, kid); linkErr != nil {
+				t.Fatalf("AddRelationship(node, %d): %v", kid, linkErr)
+			}
+
+			kids = append(kids, kid)
+		}
+
+		check := func(label string, from, wantChild NodeID, wantFound bool, wantErr error) {
+			t.Helper()
+
+			for _, impl := range finders {
+				child, found, err := impl.find(graph, from, tag)
+				if !errors.Is(err, wantErr) || found != wantFound || child != wantChild {
+					t.Fatalf("%s: %s = (%d,%v,%v), want (%d,%v,%v)", label, impl.name, child, found, err, wantChild, wantFound, wantErr)
+				}
+			}
+		}
+
+		tagKid := func(kid NodeID) {
+			t.Helper()
+
+			if _, linkErr := addRelationshipVia(graph, tag, kid); linkErr != nil {
+				t.Fatalf("AddRelationship(tag, %d): %v", kid, linkErr)
+			}
+		}
+
+		check("nothing tagged", node, 0, false, nil)
+
+		tagKid(kids[2])
+		check("one tagged", node, kids[2], true, nil)
+
+		tagKid(kids[4])
+		check("two tagged", node, 0, false, ErrAmbiguousPointerMetadata)
+
+		check("missing node", nonexistent, 0, false, ErrNodeNotFound)
+	})
+}
+
+// TestRootReaderFindCommonChildrenForwardsOrReportsUnsupported: for ordinary
+// nodes the overlay forwards to a backend that has the lookup and reports
+// errPagingUnsupported over one that has not, and for ROOT (whose children are
+// virtual) it always does; findUniqueTaggedChild gives the same answer either
+// way.
+func TestRootReaderFindCommonChildrenForwardsOrReportsUnsupported(t *testing.T) {
+	scenarios := []struct {
+		name   string
+		api    testGraph
+		native bool
+	}{
+		{name: "BoltGraph", api: newBoltTestGraph(t), native: true},
+		{name: "stagedGraph", api: newStagedGraph(), native: false},
+	}
+
+	for _, sc := range scenarios {
+		t.Run(sc.name, func(t *testing.T) {
+			root := mustCreateNode(t, sc.api)
+			left := mustCreateNode(t, sc.api)
+			right := mustCreateNode(t, sc.api)
+			kid := mustCreateNode(t, sc.api)
+
+			for _, parent := range []NodeID{left, right} {
+				if _, linkErr := addRelationshipVia(sc.api, parent, kid); linkErr != nil {
+					t.Fatalf("AddRelationship(%d, kid): %v", parent, linkErr)
+				}
+			}
+
+			r, err := NewRootGraph(sc.api, root)
+			if err != nil {
+				t.Fatalf("NewRootGraph(): %v", err)
+			}
+
+			common, findErr := r.findCommonChildren(left, right, 2)
+
+			switch {
+			case sc.native && (findErr != nil || !reflect.DeepEqual(common, []NodeID{kid})):
+				t.Fatalf("findCommonChildren() = (%v,%v), want ([%d],nil)", common, findErr, kid)
+			case !sc.native && !errors.Is(findErr, errPagingUnsupported):
+				t.Fatalf("findCommonChildren() error = %v, want %v", findErr, errPagingUnsupported)
+			}
+
+			if _, rootErr := r.findCommonChildren(root, left, 2); !errors.Is(rootErr, errPagingUnsupported) {
+				t.Fatalf("findCommonChildren(ROOT, ...) error = %v, want %v", rootErr, errPagingUnsupported)
+			}
+
+			child, found, uniqueErr := findUniqueTaggedChild(r, left, right)
+			if uniqueErr != nil || !found || child != kid {
+				t.Fatalf("findUniqueTaggedChild() = (%d,%v,%v), want (%d,true,nil)", child, found, uniqueErr, kid)
+			}
+		})
 	}
 }
 

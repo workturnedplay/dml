@@ -2470,6 +2470,42 @@ empty commit is the baseline of about 2.7 ms):
  TestWireCloseInterruptsTheWaitBetweenAcceptRetries (scriptedListener, no
  sockets).
 
+68. Common-children lookup, and a lazy CompositeSetLogRegistry.Contains
+ (theorystate.md section 105). (a) New optional reader interface
+ commonChildrenFinder (findCommonChildren(a, b, limit)), the children two
+ nodes share, at most limit, ascending, without reading either child set in
+ full. *Graph (and so Txn and graphCoreReader) walks the smaller children
+ map and probes the other; boltView (and so boltTxn and BoltGraph) does a
+ leapfrog join over the two sorted runs of the out bucket; rootReader
+ forwards for any two nodes other than ROOT and GraphActor forwards to its
+ backend. A reader that cannot answer returns errPagingUnsupported and the
+ caller scans (stagedGraph and the test wrapper readers take this path, so
+ both are tested). findUniqueTaggedChild now asks for two hits (so the
+ ambiguity check is kept) and falls back to scanTaggedChild, the old scan.
+ This is what makes ListRegistry's tail and head lookup cost about the
+ smaller of the list's children and the AllTails/AllHeads hub's, instead of
+ the list's. findUniqueTaggedParent is not changed (it would need the same
+ over the in bucket). (b) CompositeSetLogRegistry.contains no longer calls
+ Elements. mentionCandidates finds the capsules of the log whose operation
+ might mention the value by reverse lookup (plain Sets listing it, owners of
+ scalar descriptors naming it, their transitive containers, then the log's
+ capsules whose descriptor names it or expands one of them; the walk reuses
+ domainConstraint's descriptorOwners/transitiveSetContainers through
+ containerWalker); with no candidate the answer is false without reading the
+ log, otherwise the log is walked backward from its tail with
+ ListRegistry.stepBack (membership and reciprocal links per step, a visited
+ set for cycles) until the latest operation that operandMentions confirms.
+ Whole-list validation is left to VerifyStructures (a policy change: Contains
+ used to validate the whole list on every call). DRY: forEachIncoming (the
+ paged walk CapsulesWithValue used inline). Covered by
+ TestFindCommonChildrenMatchesTheIntersectionOnEveryBackend,
+ TestFindUniqueTaggedChildAgreesWithAScanOnEveryBackend,
+ TestRootReaderFindCommonChildrenForwardsOrReportsUnsupported,
+ TestCompositeSetLogContainsAgreesWithEvaluateForEveryNode (also on every
+ backend) and TestCompositeSetLogContainsOfAnUnmentionedValueDoesNotReadTheLog.
+ Queued next: the "a member capsule has exactly one list parent" invariant,
+ in checkCapsule and validateStructure.
+
 Currently unaddressed yet:
 - ListRegistry.Append still finds the tail by reading the list's whole child
   set (O(n), about 0.19 s at 100,000 elements, item 63); finding a tagged
