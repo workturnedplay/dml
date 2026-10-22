@@ -16836,7 +16836,7 @@ func TestGraphActorConcurrentListAppendKeepsListValid(t *testing.T) {
 // cannot be deleted (something else references its value slot), the
 // operation must stay in the log completely intact instead of ending up
 // unlinked from the log but still holding its descriptor.
-func requireListElements(t *testing.T, lists *ListRegistry, graph GraphReader, list NodeID, want []NodeID) {
+func requireListElements(t *testing.T, lists OrderedList, graph GraphReader, list NodeID, want []NodeID) {
 	t.Helper()
 
 	got, err := lists.Elements(graph, list)

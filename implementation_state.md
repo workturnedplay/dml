@@ -2537,6 +2537,24 @@ empty commit is the baseline of about 2.7 ms):
  Checkers apart; Registries carries both list types, and moving
  CompositeSetLogRegistry onto the new one is a follow-up.
 
+71. Shared ordered-list contract (part 1 of the new list type, item 70).
+ OrderedList is the interface a list implementation offers (the operations
+ the composite Set log and the tests use, plus Capsules() and the
+ package-private stepBack), with the contract written on it; ListRegistry
+ implements it (compile-time assertion, new Capsules() accessor).
+ ordered_list_test.go holds the behaviour every implementation must have,
+ run against every implementation in orderedListImpls on every backend
+ (forEachOrderedList); requireListElements takes the interface. Tests that
+ corrupt one implementation's own structure stay with that implementation.
+ Nothing in production code uses the interface yet: part 2 adds
+ SlottedListRegistry (own capsule tags, head/tail slots, a members node),
+ and moving CompositeSetLogRegistry onto the interface is the follow-up.
+ Covered by TestOrderedList* (starts empty, append/prepend/insert-after/
+ append-many, remove with and without deleting the capsule, contains and
+ occurrences, one list per capsule, delete-only-if-empty, operations require
+ a list, capsules that are not elements, composition and rollback, stepBack,
+ a mixed workload with VerifyStructures).
+
 Currently unaddressed yet:
 - ListRegistry.Append still finds the tail by reading the list's whole child
   set (O(n), about 0.19 s at 100,000 elements, item 63); finding a tagged
