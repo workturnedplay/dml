@@ -6246,6 +6246,16 @@ func (b *subjectMetadataBase) HasMetadata(graph GraphReader, subject NodeID) (bo
 // representation for testing how higher-level code should react when a
 // lower layer refuses something Representation D would allow
 // (theorystate.md section 73).
+//
+// It is deliberately NOT part of Registries, and not meant for use: any extra
+// child of M breaks target discovery, so M can carry nothing else (no domain
+// slot, section 10c). It has a Checker like every other registry, keyed on
+// allPointerMetadata, and it shares that tag and the subject-slot tag with
+// PointerMetadataRegistryD. Constructing both over the same tag nodes in one
+// graph is therefore a mistake: this Checker would fire on D's metadata nodes
+// and decline valid commits, since a D node with a target slot and a domain
+// slot has two non-subject-slot children. The tests construct it only in its
+// own fixtures.
 type PointerMetadataRegistry struct {
 	subjectMetadataBase
 }

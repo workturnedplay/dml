@@ -2527,6 +2527,16 @@ empty commit is the baseline of about 2.7 ms):
  the new list type: its own capsule tags, and whether Representation C gets
  its own tags and a place in Registries.
 
+70. Decided, recorded without code. (a) Representation C
+ (PointerMetadataRegistry) stays test-only, outside Registries, with its
+ existing tags: it breaks on any extra child of M, and its Checker would fire
+ on Representation D's metadata nodes if both were constructed over the same
+ tag nodes in one graph (documented on its type). It does not get tags of its
+ own. (b) The new ordered list type gets its own capsule tag set (a second
+ CapsuleRegistry instance), so the relevance filter keeps the two list types'
+ Checkers apart; Registries carries both list types, and moving
+ CompositeSetLogRegistry onto the new one is a follow-up.
+
 Currently unaddressed yet:
 - ListRegistry.Append still finds the tail by reading the list's whole child
   set (O(n), about 0.19 s at 100,000 elements, item 63); finding a tagged
