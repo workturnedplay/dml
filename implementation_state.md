@@ -2555,6 +2555,33 @@ empty commit is the baseline of about 2.7 ms):
  a list, capsules that are not elements, composition and rollback, stepBack,
  a mixed workload with VerifyStructures).
 
+72. SlottedListRegistry, the second ordered list type (theorystate.md section
+ 105a), in slotted_list.go. Structure: (AllSlottedLists, list); list -> M
+ (AllSlottedListMembers) -> every capsule; list -> HS and list -> TS, each a
+ PointerRegistry slot (AllSlottedListHeadSlot/TailSlot) -> the head/tail
+ capsule. Its capsules are a second CapsuleRegistry with its own tags
+ (AllSlottedCapsules and the three role slots), so ListRegistry's Checker
+ never fires for them and the other way round. Eight new foundational names.
+ Head, Tail, Append, Prepend, InsertAfter, Remove and Contains no longer read
+ a node whose child count grows with the list (the list node has three
+ children; membership is one relationship from M; a capsule's list comes
+ from its few parents). The commit-time Checker is local like ListRegistry's:
+ a touched member capsule against its neighbours (head iff no prev, tail iff
+ no next, with head/tail read from the slots), a touched list/M/slot has its
+ head and tail checked, a capsule in no list must not be pointed at by a slot
+ or a next/prev link, and a capsule is a member of one list only; whole-list
+ properties are left to Elements and VerifyStructures. DRY: the checks and
+ walks both list types share are free functions now (findOwnedSlot, which
+ CapsuleRegistry.slotFor also uses, checkCapsuleInChain, requireNeighbour,
+ checkStaleLink, validateChain, stepBackWithin, verifyLists).
+ Registries carries both (Lists, SlottedLists, SlottedCapsules) and OpenHost
+ verifies both. The shared behaviour suite (ordered_list_test.go) runs against
+ it on every backend; slotted_list_test.go has the corruption tests,
+ TestSlottedListLookupsDoNotReadTheMembersNode and BenchmarkSlottedListCommitCost
+ (buildBenchList takes an OrderedList). Not done yet (follow-up):
+ CompositeSetLogRegistry still uses ListRegistry; moving it onto OrderedList
+ is next.
+
 Currently unaddressed yet:
 - ListRegistry.Append still finds the tail by reading the list's whole child
   set (O(n), about 0.19 s at 100,000 elements, item 63); finding a tagged

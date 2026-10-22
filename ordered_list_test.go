@@ -41,6 +41,13 @@ type orderedListImpl struct {
 // orderedListImpls lists every implementation under test.
 var orderedListImpls = []orderedListImpl{
 	{name: "ListRegistry", build: buildListRegistry},
+	{name: "SlottedListRegistry", build: buildSlottedListRegistry},
+}
+
+func buildSlottedListRegistry(t *testing.T, graph testGraph) OrderedList {
+	t.Helper()
+
+	return buildSlottedList(t, graph)
 }
 
 func buildListRegistry(t *testing.T, graph testGraph) OrderedList {
@@ -273,8 +280,8 @@ func TestOrderedListInsertAfterMiddleAndTail(t *testing.T) {
 			t.Fatalf("InsertAfter(a, b): %v", err)
 		}
 
-		values = []NodeID{values[0], b, values[1]}
-		capsules = []NodeID{capsules[0], capsuleB, capsules[1]}
+		values = slices.Insert(values, 1, b)
+		capsules = slices.Insert(capsules, 1, capsuleB)
 		requireListState(t, lists, g, list, values, capsules)
 
 		d := mustCreateNode(t, g)

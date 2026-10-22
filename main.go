@@ -4405,6 +4405,22 @@ const (
 	// Set. Sessions are ephemeral. See LeaseRegistry.
 	NameAllSessions = "AllSessions"
 
+	// NameAllSlottedLists tags a node as a slotted list, and the next three
+	// tag its members node and its head and tail slots (see
+	// SlottedListRegistry). NameAllSlottedCapsules and the three role-slot
+	// names after it are the capsule tag set of slotted lists: a separate
+	// set from ListRegistry's, so the relevance filter keeps the two list
+	// types' Checkers apart.
+	NameAllSlottedLists        = "AllSlottedLists"
+	NameAllSlottedListMembers  = "AllSlottedListMembers"
+	NameAllSlottedListHeadSlot = "AllSlottedListHeadSlot"
+	NameAllSlottedListTailSlot = "AllSlottedListTailSlot"
+
+	NameAllSlottedCapsules         = "AllSlottedCapsules"
+	NameAllSlottedCapsulePrevSlot  = "AllSlottedCapsulePrevSlot"
+	NameAllSlottedCapsuleValueSlot = "AllSlottedCapsuleValueSlot"
+	NameAllSlottedCapsuleNextSlot  = "AllSlottedCapsuleNextSlot"
+
 	// NameRoot is the name of the ROOT node (theorystate.md section 12).
 	// It is deliberately NOT in FoundationalNames: RootGraph needs ROOT to
 	// exist before the graph stack is built, so Host ensures it directly on
@@ -4439,6 +4455,14 @@ var FoundationalNames = []string{
 	NameAllCompositeSetLogs,
 	NameAllDomainSlot,
 	NameAllSessions,
+	NameAllSlottedLists,
+	NameAllSlottedListMembers,
+	NameAllSlottedListHeadSlot,
+	NameAllSlottedListTailSlot,
+	NameAllSlottedCapsules,
+	NameAllSlottedCapsulePrevSlot,
+	NameAllSlottedCapsuleValueSlot,
+	NameAllSlottedCapsuleNextSlot,
 }
 
 // ErrCannotDeleteRoot is returned when deletion of ROOT is attempted
@@ -6771,20 +6795,7 @@ func (c *CapsuleRegistry) requireCapsule(graph GraphReader, id NodeID) error {
 // two distinct capsule-tagged parents produce ErrAmbiguousPointerMetadata.
 // capsule's existence is checked implicitly by the underlying lookups.
 func (c *CapsuleRegistry) slotFor(graph GraphReader, capsule, tag NodeID) (slot NodeID, found bool, err error) {
-	slot, found, err = findUniqueTaggedChild(graph, capsule, tag)
-	if err != nil || !found {
-		return slot, found, err
-	}
-
-	owner, foundOwner, err := findUniqueTaggedParent(graph, slot, c.allElementCapsules)
-	if err != nil {
-		return 0, false, err
-	}
-	if !foundOwner || owner != capsule {
-		return 0, false, ErrAmbiguousPointerMetadata
-	}
-
-	return slot, true, nil
+	return findOwnedSlot(graph, capsule, c.allElementCapsules, tag)
 }
 
 // wellFormed reports whether capsule currently has exactly the fixed
@@ -7774,102 +7785,7 @@ func (l *ListRegistry) validateStructure(graph GraphReader, list NodeID) error {
 		return nil
 	}
 
-	headIsCapsule, err := l.capsules.IsCapsule(graph, head)
-	if err != nil {
-		return err
-	}
-	tailIsCapsule, err := l.capsules.IsCapsule(graph, tail)
-	if err != nil {
-		return err
-	}
-	if !headIsCapsule || !tailIsCapsule {
-		return ErrInvalidListStructure
-	}
-	if _, ok := members[head]; !ok {
-		return ErrInvalidListStructure
-	}
-	if _, ok := members[tail]; !ok {
-		return ErrInvalidListStructure
-	}
-
-	visited := make(map[NodeID]struct{}, len(members))
-	current := head
-	for {
-		if _, seen := visited[current]; seen {
-			return ErrListCycle
-		}
-		visited[current] = struct{}{}
-
-		currentIsCapsule, currentIsCapsuleErr := l.capsules.IsCapsule(graph, current)
-		if currentIsCapsuleErr != nil {
-			return currentIsCapsuleErr
-		}
-		if !currentIsCapsule {
-			return ErrInvalidListStructure
-		}
-
-		currentInList, currentInListErr := graph.HasRelationship(list, current)
-		if currentInListErr != nil {
-			return wrapInterfaceErr(currentInListErr)
-		}
-		if !currentInList {
-			return ErrInvalidListStructure
-		}
-
-		_, hasValue, valueErr := l.capsules.Value(graph, current)
-		if valueErr != nil {
-			return valueErr
-		}
-		if !hasValue {
-			return ErrInvalidListStructure
-		}
-
-		next, hasNext, nextErr := l.capsules.Next(graph, current)
-		if nextErr != nil {
-			return nextErr
-		}
-		if !hasNext {
-			if current != tail {
-				return ErrInvalidListStructure
-			}
-			break
-		}
-
-		nextIsCapsule, nextIsCapsuleErr := l.capsules.IsCapsule(graph, next)
-		if nextIsCapsuleErr != nil {
-			return nextIsCapsuleErr
-		}
-		nextInList, nextInListErr := graph.HasRelationship(list, next)
-		if nextInListErr != nil {
-			return wrapInterfaceErr(nextInListErr)
-		}
-		if !nextIsCapsule || !nextInList {
-			return ErrInvalidListStructure
-		}
-
-		prev, hasPrev, prevErr := l.capsules.Prev(graph, next)
-		if prevErr != nil {
-			return prevErr
-		}
-		if !hasPrev || prev != current {
-			return ErrInvalidListStructure
-		}
-
-		current = next
-	}
-
-	_, headHasPrev, err := l.capsules.Prev(graph, head)
-	if err != nil {
-		return err
-	}
-	if headHasPrev {
-		return ErrInvalidListStructure
-	}
-
-	if len(visited) != len(members) {
-		return ErrInvalidListStructure
-	}
-	return nil
+	return validateChain(graph, l.capsules, list, head, tail, members)
 }
 
 // ListsOf returns every list that capsule is a direct child of, ascending. A
@@ -7948,13 +7864,13 @@ func (l *ListRegistry) rejectBoundaryTags(g GraphReader, node NodeID) error {
 // requireNeighbour checks that neighbour is a capsule of list whose link in
 // the opposite direction (backLink: Next for a previous neighbour, Prev for
 // a next one) points back at capsule.
-func (l *ListRegistry) requireNeighbour(g GraphReader, list, neighbour, capsule NodeID, backLink func(GraphReader, NodeID) (NodeID, bool, error)) error {
-	isCapsule, capsuleErr := l.capsules.IsCapsule(g, neighbour)
+func requireNeighbour(g GraphReader, capsules *CapsuleRegistry, container, neighbour, capsule NodeID, backLink func(GraphReader, NodeID) (NodeID, bool, error)) error {
+	isCapsule, capsuleErr := capsules.IsCapsule(g, neighbour)
 	if capsuleErr != nil {
 		return capsuleErr
 	}
 
-	inList, inListErr := g.HasRelationship(list, neighbour)
+	inList, inListErr := g.HasRelationship(container, neighbour)
 	if inListErr != nil {
 		return wrapInterfaceErr(inListErr)
 	}
@@ -7980,14 +7896,14 @@ func (l *ListRegistry) requireNeighbour(g GraphReader, list, neighbour, capsule 
 // belong to the capsule's own prev, and a prev-slot to its next. This is
 // what catches a stale pointer left by a neighbour the transaction did not
 // touch.
-func (l *ListRegistry) checkStaleLink(g GraphReader, source NodeID, links capsuleLinks) error {
+func checkStaleLink(g GraphReader, capsules *CapsuleRegistry, source NodeID, links capsuleLinks) error {
 	roles := [...]struct {
 		slots *PointerRegistry
 		other NodeID
 		has   bool
 	}{
-		{slots: l.capsules.nextSlots, other: links.prev, has: links.hasPrev},
-		{slots: l.capsules.prevSlots, other: links.next, has: links.hasNext},
+		{slots: capsules.nextSlots, other: links.prev, has: links.hasPrev},
+		{slots: capsules.prevSlots, other: links.next, has: links.hasNext},
 	}
 
 	for _, role := range roles {
@@ -7999,7 +7915,7 @@ func (l *ListRegistry) checkStaleLink(g GraphReader, source NodeID, links capsul
 			continue
 		}
 
-		owner, found, ownerErr := findUniqueTaggedParent(g, source, l.capsules.allElementCapsules)
+		owner, found, ownerErr := findUniqueTaggedParent(g, source, capsules.allElementCapsules)
 		if ownerErr != nil {
 			return ownerErr
 		}
@@ -8035,28 +7951,8 @@ func (l *ListRegistry) checkCapsule(g GraphReader, capsule NodeID, verified map[
 		return ErrInvalidListStructure
 	}
 
-	var (
-		links   capsuleLinks
-		linkErr error
-	)
-
-	links.prev, links.hasPrev, linkErr = l.capsules.Prev(g, capsule)
-	if linkErr != nil {
-		return linkErr
-	}
-
-	links.next, links.hasNext, linkErr = l.capsules.Next(g, capsule)
-	if linkErr != nil {
-		return linkErr
-	}
-
-	_, hasValue, valueErr := l.capsules.Value(g, capsule)
-	if valueErr != nil {
-		return valueErr
-	}
-	if !hasValue {
-		return ErrInvalidListStructure
-	}
+	list := lists[0]
+	verified[list] = struct{}{}
 
 	isHead, headErr := g.HasRelationship(l.allHeads, capsule)
 	if headErr != nil {
@@ -8068,35 +7964,7 @@ func (l *ListRegistry) checkCapsule(g GraphReader, capsule NodeID, verified map[
 		return wrapInterfaceErr(tailErr)
 	}
 
-	// A capsule is the head exactly when it has no previous one, and the
-	// tail exactly when it has no next one.
-	if isHead == links.hasPrev || isTail == links.hasNext {
-		return ErrInvalidListStructure
-	}
-
-	for _, list := range lists {
-		verified[list] = struct{}{}
-
-		if links.hasPrev {
-			if prevErr := l.requireNeighbour(g, list, links.prev, capsule, l.capsules.Next); prevErr != nil {
-				return prevErr
-			}
-		}
-
-		if links.hasNext {
-			if nextErr := l.requireNeighbour(g, list, links.next, capsule, l.capsules.Prev); nextErr != nil {
-				return nextErr
-			}
-		}
-	}
-
-	for _, rel := range incoming {
-		if staleErr := l.checkStaleLink(g, rel.From, links); staleErr != nil {
-			return staleErr
-		}
-	}
-
-	return nil
+	return checkCapsuleInChain(g, l.capsules, list, capsule, isHead, isTail, incoming)
 }
 
 // checkTouched is the commit-time Checker of ListRegistry. It costs time
@@ -8172,23 +8040,7 @@ func (l *ListRegistry) checkTouched(g GraphReader, touched map[NodeID]struct{}) 
 // transaction, so it is consistent, and the cost is linear in the size of
 // the lists. A CompositeSetLog is a list too, so it is covered.
 func (l *ListRegistry) VerifyStructures(graph GraphAPI) error {
-	lists, err := graph.FindOutgoing(l.allLists)
-	if err != nil {
-		return wrapInterfaceErr(err)
-	}
-
-	for _, rel := range lists {
-		list := rel.To
-
-		verifyErr := graph.Transact(func(tx Tx) error {
-			return l.validateStructure(tx, list)
-		})
-		if verifyErr != nil {
-			return fmt.Errorf("%w: list %d: %w", ErrLoadVerification, list, verifyErr)
-		}
-	}
-
-	return nil
+	return verifyLists(graph, l.allLists, l.validateStructure)
 }
 
 // Elements returns list's current values, in head-to-tail order, by
@@ -8247,28 +8099,7 @@ func (l *ListRegistry) Elements(graph GraphReader, list NodeID) ([]NodeID, error
 // per step, not per list; the whole-list properties are left to Elements and
 // VerifyStructures. hasPrev is false for the head.
 func (l *ListRegistry) stepBack(graph GraphReader, list, capsule NodeID) (NodeID, bool, error) {
-	inList, inListErr := graph.HasRelationship(list, capsule)
-	if inListErr != nil {
-		return 0, false, wrapInterfaceErr(inListErr)
-	}
-	if !inList {
-		return 0, false, ErrInvalidListStructure
-	}
-
-	prev, hasPrev, prevErr := l.capsules.Prev(graph, capsule)
-	if prevErr != nil || !hasPrev {
-		return 0, false, prevErr
-	}
-
-	back, hasBack, backErr := l.capsules.Next(graph, prev)
-	if backErr != nil {
-		return 0, false, backErr
-	}
-	if !hasBack || back != capsule {
-		return 0, false, ErrInvalidListStructure
-	}
-
-	return prev, true, nil
+	return stepBackWithin(graph, l.capsules, list, capsule)
 }
 
 // OccurrencesOf returns every capsule within list whose value equals
@@ -11669,6 +11500,11 @@ type Registries struct {
 	DomainB     *DomainPointerRegistryB
 	DomainD     *DomainPointerRegistryD
 	Leases      *LeaseRegistry
+
+	// SlottedCapsules and SlottedLists are the second ordered list type
+	// (head, tail and members in slots), with a capsule tag set of its own.
+	SlottedCapsules *CapsuleRegistry
+	SlottedLists    *SlottedListRegistry
 }
 
 // NewRegistries constructs every registry over graph. ids must hold an
@@ -11703,6 +11539,29 @@ func NewRegistries(graph GraphAPI, ids map[string]NodeID) (*Registries, error) {
 	}
 
 	lists, err := NewListRegistry(graph, capsules, ids[NameAllLists], ids[NameAllHeads], ids[NameAllTails])
+	if err != nil {
+		return nil, err
+	}
+
+	slottedCapsules, err := NewCapsuleRegistry(
+		graph,
+		ids[NameAllSlottedCapsules],
+		ids[NameAllSlottedCapsulePrevSlot],
+		ids[NameAllSlottedCapsuleValueSlot],
+		ids[NameAllSlottedCapsuleNextSlot],
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	slottedLists, err := NewSlottedListRegistry(
+		graph,
+		slottedCapsules,
+		ids[NameAllSlottedLists],
+		ids[NameAllSlottedListMembers],
+		ids[NameAllSlottedListHeadSlot],
+		ids[NameAllSlottedListTailSlot],
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -11747,6 +11606,9 @@ func NewRegistries(graph GraphAPI, ids map[string]NodeID) (*Registries, error) {
 		DomainB:     NewDomainPointerRegistryB(graph, subPointers, domainSlots, sets, composites, logs),
 		DomainD:     NewDomainPointerRegistryD(graph, metadata, domainSlots, sets, composites, logs),
 		Leases:      leases,
+
+		SlottedCapsules: slottedCapsules,
+		SlottedLists:    slottedLists,
 	}, nil
 }
 
@@ -12238,8 +12100,10 @@ func finishHostStart(cfg HostConfig, store *BoltGraph, actor *GraphActor, names 
 		return nil, fmt.Errorf("host startup: %w", verifyErr)
 	}
 
-	if listsErr := reg.Lists.VerifyStructures(actor); listsErr != nil {
-		return nil, fmt.Errorf("host startup: %w", listsErr)
+	for _, lists := range []OrderedList{reg.Lists, reg.SlottedLists} {
+		if listsErr := lists.VerifyStructures(actor); listsErr != nil {
+			return nil, fmt.Errorf("host startup: %w", listsErr)
+		}
 	}
 
 	if bindErr := names.VerifyBindings(actor); bindErr != nil {

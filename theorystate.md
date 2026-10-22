@@ -3537,6 +3537,36 @@ read and by `ListRegistry.VerifyStructures` at startup. This is a choice of
 what a commit proves, not a mechanism gap: they cannot be checked locally,
 because finding a list's tagged child reads all its children.
 
+## 105a. The slotted list: bounded fan-out for every lookup (TENTATIVE, implemented)
+
+Finding the tail of a `ListRegistry` list means finding the one child of the
+list that carries `AllTails`; the list has one child per element, so that
+costs the length of the list (§105, measured). `SlottedListRegistry` moves
+the fan-out off the node the lookups run on:
+
+```text
+(AllSlottedLists, list)
+list -> M    (AllSlottedListMembers, M)   M  -> every capsule of the list
+list -> HS   (AllSlottedListHeadSlot, HS) HS -> the head capsule
+list -> TS   (AllSlottedListTailSlot, TS) TS -> the tail capsule
+```
+
+Every slot is explicitly tagged and discovered by its tag, never by position
+or exclusion (§10a). Head and tail are the at-most-one targets of two pointer
+slots (§76: the same `PointerRegistry` type under two more tags), so "is this
+capsule the head" is derived from the capsule's own incoming edges and cannot
+drift from a tag kept in step by hand. A capsule's list is found from the
+capsule's few parents. The list type has its own capsule tags, so the commit
+Checker of each list type is selected by the existing relevance filter
+(§77): a capsule of one type never wakes the other's.
+
+The invariants are those of §11b, including that a member capsule belongs to
+exactly one list. Commit-time checking is local, as for `ListRegistry`;
+global properties stay with `Elements` and `VerifyStructures`. Both list types
+implement one `OrderedList` contract and run the same behaviour suite.
+`ListRegistry` is kept: it is the simpler structure, and the reference for how
+it costs (an O(n) tail lookup) when the fan-out is on the list node.
+
 ## 106. Explored and not adopted
 
 - **Whole-image snapshot/export of `*Graph`** (JSON or binary, checksum,

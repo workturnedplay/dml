@@ -329,4 +329,11 @@ var registryTestsOnEveryBackend = []func(*testing.T){
 	TestLeaseCloseSessionRollsBackIfSessionIsReferencedElsewhere,
 	TestLeaseCloseAllSessionsIsTheStartupSweep,
 	TestLeaseAcquireComposesAndRollsBackWithEnclosingTransaction,
+
+	// SlottedListRegistry.
+	TestSlottedListCheckerDeclinesEachLocalViolationAtCommitTime,
+	TestSlottedListSlotsHoldAtMostOneTarget,
+	TestSlottedListLeavesGlobalStructureToReadsAndVerifyStructures,
+	TestSlottedListLookupsDoNotReadTheMembersNode,
+	TestSlottedListDeleteListRemovesEveryNodeItMade,
 }

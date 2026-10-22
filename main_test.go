@@ -14178,10 +14178,8 @@ func openListBenchHost(b *testing.B) *Host {
 
 // buildBenchList makes a list of size elements with AppendMany, one chunk
 // per transaction (appending one at a time would itself be quadratic).
-func buildBenchList(b *testing.B, h *Host, size int) NodeID {
+func buildBenchList(b *testing.B, h *Host, lists OrderedList, size int) NodeID {
 	b.Helper()
-
-	lists := h.Registries().Lists
 
 	list, err := lists.NewList(h.Graph())
 	if err != nil {
@@ -14229,7 +14227,7 @@ func BenchmarkListCommitCost(b *testing.B) {
 			lists := h.Registries().Lists
 
 			start := time.Now()
-			list := buildBenchList(b, h, size)
+			list := buildBenchList(b, h, lists, size)
 			b.Logf("built a list of %d elements in %v", size, time.Since(start))
 
 			bystander, err := createNodeVia(graph)
