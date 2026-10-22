@@ -3571,6 +3571,16 @@ implement one `OrderedList` contract and run the same behaviour suite.
 `ListRegistry` is kept: it is the simpler structure, with a tail lookup whose
 cost depends on how many lists exist, and the reference for comparison.
 
+A composite Set log (§82) keeps its operations in whichever `OrderedList` its
+registry was given (the host uses the slotted one); the log's node is then
+tagged `AllCompositeSetLogs` and that list type's own list tag, in place of
+`AllLists`. A log reaches its list only through the interface (`IsMember`,
+`ListsOf`, never a raw edge). A slotted list's mutations do not change the
+list node, so the log registry marks the log as touched when it changes: the
+domain-pointer Checker (§86) finds the pointers a log is the domain of
+through that. One registry has one list type; a log of the other type is
+accepted as an operand by tag and fails with `ErrNotList` when read.
+
 ## 106. Explored and not adopted
 
 - **Whole-image snapshot/export of `*Graph`** (JSON or binary, checksum,

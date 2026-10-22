@@ -238,7 +238,7 @@ func mustIsCapsule(t *testing.T, c *CapsuleRegistry, g GraphReader, id NodeID) b
 	return is
 }
 
-func mustIsList(t *testing.T, l *ListRegistry, g GraphReader, id NodeID) bool {
+func mustIsList(t *testing.T, l OrderedList, g GraphReader, id NodeID) bool {
 	t.Helper()
 
 	is, err := l.IsList(g, id)
@@ -9493,11 +9493,16 @@ func TestCompositeSetLogRegistrySharesListStructureChecker(t *testing.T) {
 		t.Fatalf("CreateNode() for bogus: %v", err)
 	}
 
+	listRegistry, isListRegistry := logs.lists.(*ListRegistry)
+	if !isListRegistry {
+		t.Fatalf("the fixture's log lists are a %T, want a *ListRegistry", logs.lists)
+	}
+
 	err = g.Transact(func(tx Tx) error {
 		if err2 := addRelationshipTx(tx, log, bogus); err2 != nil {
 			return err2
 		}
-		return addRelationshipTx(tx, logs.lists.allHeads, bogus)
+		return addRelationshipTx(tx, listRegistry.allHeads, bogus)
 	})
 
 	if !errors.Is(err, ErrInvalidListStructure) {
@@ -17422,7 +17427,7 @@ func TestCompositeSetLogNestedRemoveOperationFailureLeavesLogIntactAndOuterConti
 			return appendErr
 		}
 
-		capsules := logs.lists.capsules
+		capsules := logs.lists.Capsules()
 
 		valueSlot, found, slotErr := capsules.slotFor(tx, capsule, capsules.valueSlots.allPointers)
 		if slotErr != nil {
@@ -17559,7 +17564,7 @@ func TestCompositeSetLogRemoveOperationIsAtomicWhenCapsuleCannotBeDeleted(t *tes
 		t.Fatalf("AppendOperation(): %v", err)
 	}
 
-	capsules := logs.lists.capsules
+	capsules := logs.lists.Capsules()
 
 	valueSlot, found, err := capsules.slotFor(g, capsule, capsules.valueSlots.allPointers)
 	if err != nil || !found {

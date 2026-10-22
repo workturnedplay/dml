@@ -665,12 +665,43 @@ func (s *SlottedListRegistry) ListsOf(graph GraphReader, capsule NodeID) ([]Node
 
 // stepBack implements OrderedList.
 func (s *SlottedListRegistry) stepBack(graph GraphReader, list, capsule NodeID) (NodeID, bool, error) {
-	slots, err := s.slotsOf(graph, list)
+	members, err := s.membersOf(graph, list)
 	if err != nil {
 		return 0, false, err
 	}
 
-	return stepBackWithin(graph, s.capsules, slots.members, capsule)
+	return stepBackWithin(graph, s.capsules, members, capsule)
+}
+
+// membersOf returns list's members node: one lookup, where slotsOf makes
+// three, for the operations that need nothing else.
+func (s *SlottedListRegistry) membersOf(graph GraphReader, list NodeID) (NodeID, error) {
+	if requireErr := s.requireList(graph, list); requireErr != nil {
+		return 0, requireErr
+	}
+
+	members, found, err := findOwnedSlot(graph, list, s.allLists, s.allMembers)
+	if err != nil {
+		return 0, err
+	}
+	if !found {
+		return 0, ErrInvalidListStructure
+	}
+
+	return members, nil
+}
+
+// IsMember implements OrderedList: capsule is an element of list when it is a
+// child of list's members node.
+func (s *SlottedListRegistry) IsMember(graph GraphReader, list, capsule NodeID) (bool, error) {
+	members, err := s.membersOf(graph, list)
+	if err != nil {
+		return false, err
+	}
+
+	has, hasErr := graph.HasRelationship(members, capsule)
+
+	return has, wrapInterfaceErr(hasErr)
 }
 
 // VerifyStructures validates every list in full, fail-closed.

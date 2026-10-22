@@ -31,37 +31,7 @@ import (
 func buildSlottedList(t *testing.T, graph testGraph) *SlottedListRegistry {
 	t.Helper()
 
-	names := NewNameRegistry(graph)
-
-	ids, err := names.BootstrapNames(graph, FoundationalNames)
-	if err != nil {
-		t.Fatalf("BootstrapNames(): %v", err)
-	}
-
-	capsules, err := NewCapsuleRegistry(
-		graph,
-		ids[NameAllSlottedCapsules],
-		ids[NameAllSlottedCapsulePrevSlot],
-		ids[NameAllSlottedCapsuleValueSlot],
-		ids[NameAllSlottedCapsuleNextSlot],
-	)
-	if err != nil {
-		t.Fatalf("NewCapsuleRegistry(): %v", err)
-	}
-
-	lists, err := NewSlottedListRegistry(
-		graph,
-		capsules,
-		ids[NameAllSlottedLists],
-		ids[NameAllSlottedListMembers],
-		ids[NameAllSlottedListHeadSlot],
-		ids[NameAllSlottedListTailSlot],
-	)
-	if err != nil {
-		t.Fatalf("NewSlottedListRegistry(): %v", err)
-	}
-
-	return lists
+	return slottedListFromIDs(t, graph, bootstrapTestNames(t, graph))
 }
 
 // slottedListRig is the list [a, b, c] (capsules[0..2]) plus a capsule,

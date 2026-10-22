@@ -2595,6 +2595,35 @@ empty commit is the baseline of about 2.7 ms):
  100,000, unchanged). Not measured yet: a graph with many lists, and a commit
  touching a list node on the slotted type.
 
+74. CompositeSetLogRegistry runs on OrderedList (item 72's follow-up, theorystate.md
+ section 105a). It takes any OrderedList and reaches its list only through the
+ interface, so the choice is the caller's; NewRegistries gives it the slotted
+ lists (change one argument for ListRegistry). OrderedList gained
+ IsMember(list, capsule) (ListRegistry: the (list, capsule) edge after
+ requireList; slotted: one lookup of the members node, membersOf, which
+ stepBack now uses instead of the three-slot slotsOf). The log no longer
+ uses raw membership edges: RemoveOperation and mentionCandidates use
+ IsMember, descriptorOwners (the domain Checker's reverse lookup) finds the
+ log of a capsule with ListsOf, and DeleteCompositeSetLog removes its own
+ tag and lets DeleteList delete the list and whatever the type made for it.
+ Bug found and fixed on the way: a slotted list's mutations do not touch the
+ list node, and the domain Checker finds the pointers a log is the domain of
+ through the log being touched, so a RemoveOperation that stranded a pointer
+ would have been accepted; AppendOperation and RemoveOperation now call
+ tx.Touch(log). A log of the other list type is accepted as an operand (the tag
+ is the same) and fails with ErrNotList when read. Test helpers shared by the
+ list and log tests: bootstrapTestNames, listRegistryFromIDs,
+ slottedListFromIDs, setsAndCompositesFromIDs, logsOver. Covered by
+ TestOrderedListIsMemberIsScopedToTheList and, in
+ composite_set_log_lists_test.go (every backend, both list types),
+ TestCompositeSetLogOnEveryListTypeContainsAgreesWithEvaluate,
+ ...RemovesOperations, ...DeleteOnlyWhenEmptyAndLeavesNothing,
+ ...ResolvesNestedLogsAndDetectsCycles, ...DomainStaleness,
+ TestCompositeSetLogOfTheOtherListTypeFailsLoudly and
+ TestHostLogsKeepTheirOperationsInSlottedLists. Mixing both types in one log
+ registry (a type per log, found by asking each list type IsList) was
+ considered and not built.
+
 Currently unaddressed yet:
 - ListRegistry.Append finds the tail as the child its list shares with the
   AllTails hub (item 68), so it costs about the smaller of the two child sets:

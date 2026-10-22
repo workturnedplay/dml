@@ -7411,6 +7411,10 @@ func NewListRegistry(graph GraphAPI, capsules *CapsuleRegistry, allLists, allHea
 //     InsertAfter, Remove and RemoveWithoutDeletingCapsule;
 //   - Elements of an empty list is nil;
 //   - a member capsule belongs to exactly one list (ListsOf);
+//   - IsMember(list, capsule) reports whether capsule is an element of list,
+//     after the same list check (ErrNodeNotFound, then ErrNotList): code
+//     that needs membership uses it, never the raw edge, which differs
+//     between implementations;
 //   - every mutator takes a Transactor, so it composes and nests.
 //
 // stepBack is unexported on purpose: it is only for code in this package, so
@@ -7431,6 +7435,7 @@ type OrderedList interface {
 	OccurrencesOf(graph GraphReader, list, value NodeID) ([]NodeID, error)
 	Contains(graph GraphReader, list, value NodeID) (capsule NodeID, found bool, err error)
 	ListsOf(graph GraphReader, capsule NodeID) ([]NodeID, error)
+	IsMember(graph GraphReader, list, capsule NodeID) (bool, error)
 	VerifyStructures(graph GraphAPI) error
 
 	// Capsules is the CapsuleRegistry the list's capsules are made by.
@@ -7447,6 +7452,18 @@ var _ OrderedList = (*ListRegistry)(nil)
 // Capsules returns the CapsuleRegistry l makes its capsules with.
 func (l *ListRegistry) Capsules() *CapsuleRegistry {
 	return l.capsules
+}
+
+// IsMember implements OrderedList: capsule is an element of list when
+// (list, capsule) exists.
+func (l *ListRegistry) IsMember(graph GraphReader, list, capsule NodeID) (bool, error) {
+	if requireErr := l.requireList(graph, list); requireErr != nil {
+		return false, requireErr
+	}
+
+	has, err := graph.HasRelationship(list, capsule)
+
+	return has, wrapInterfaceErr(err)
 }
 
 // IsList reports whether id is currently tagged (AllLists, id).
@@ -9595,7 +9612,7 @@ func (c *CompositeSetRegistry) DeleteCompositeSet(graph Transactor, set NodeID) 
 // step. See CompositeSetRegistry.SetLogs's doc comment for the required
 // construction order.
 type CompositeSetLogRegistry struct {
-	lists               *ListRegistry
+	lists               OrderedList
 	sets                *SetRegistry
 	composites          *CompositeSetRegistry
 	allCompositeSetLogs NodeID
@@ -9615,7 +9632,13 @@ type CompositeSetLogRegistry struct {
 // constructed, since both required arguments below must already exist.
 //
 // lists is used to store and traverse the log itself (each logged
-// operation is one list element, in append order); composites is used
+// operation is one list element, in append order). It is any OrderedList
+// (ListRegistry or SlottedListRegistry): the log reaches its list only
+// through that interface, so which one a registry uses is the caller's
+// choice, and every log the registry makes is a list of that type. A log
+// made by a registry over the other type is tagged AllCompositeSetLogs
+// too, so it passes the checks of an operand, and fails with ErrNotList as
+// soon as it is read. composites is used
 // both to resolve set-expansion operands that turn out to be
 // CompositeSets (theorystate.md section 83's dispatcher) and as the
 // source of the SetRegistry used to resolve plain-Set operands (via
@@ -9636,7 +9659,7 @@ type CompositeSetLogRegistry struct {
 // (including recursive self-reference) until composites is told about it
 // via composites.SetLogs(this registry) -- see that method's doc comment
 // for why this second wiring step is required.
-func NewCompositeSetLogRegistry(graph GraphAPI, lists *ListRegistry, composites *CompositeSetRegistry, allCompositeSetLogs, allAdditiveOp, allSubtractiveOp, allScalarOperand, allSetOperand NodeID) (*CompositeSetLogRegistry, error) {
+func NewCompositeSetLogRegistry(graph GraphAPI, lists OrderedList, composites *CompositeSetRegistry, allCompositeSetLogs, allAdditiveOp, allSubtractiveOp, allScalarOperand, allSetOperand NodeID) (*CompositeSetLogRegistry, error) {
 	if existsErr := requireAllExist(graph, allCompositeSetLogs, allAdditiveOp, allSubtractiveOp, allScalarOperand, allSetOperand); existsErr != nil {
 		return nil, existsErr
 	}
@@ -9679,7 +9702,7 @@ func (c *CompositeSetLogRegistry) NewCompositeSetLog(graph Transactor) (NodeID, 
 	return transactValue(graph, func(tx Tx) (NodeID, error) {
 		id, err := c.lists.NewList(tx)
 		if err != nil {
-			return 0, err
+			return 0, wrapInterfaceErr(err)
 		}
 
 		if tagErr := tagNodeTx(tx, c.allCompositeSetLogs, id); tagErr != nil {
@@ -9723,8 +9746,13 @@ func (c *CompositeSetLogRegistry) AppendOperation(graph Transactor, log, operand
 			return err2
 		}
 
+		// A slotted list's mutations do not touch the list node itself, and
+		// the domain Checker finds the pointers a log is the domain of
+		// through the log being touched, so say it changed.
+		tx.Touch(log)
+
 		capsule, err2 = c.lists.Append(tx, log, u)
-		return err2
+		return wrapInterfaceErr(err2)
 	})
 	if err != nil {
 		return 0, 0, wrapInterfaceErr(err)
@@ -9760,7 +9788,10 @@ func (c *CompositeSetLogRegistry) RemoveOperation(graph Transactor, log, capsule
 			return requireErr
 		}
 
-		inLog, err := tx.HasRelationship(log, capsule)
+		// See AppendOperation: the log changes, so it is touched.
+		tx.Touch(log)
+
+		inLog, err := c.lists.IsMember(tx, log, capsule)
 		if err != nil {
 			return wrapInterfaceErr(err)
 		}
@@ -9768,7 +9799,7 @@ func (c *CompositeSetLogRegistry) RemoveOperation(graph Transactor, log, capsule
 			return ErrCapsuleNotInList
 		}
 
-		u, hasValue, err := c.lists.capsules.Value(tx, capsule)
+		u, hasValue, err := c.lists.Capsules().Value(tx, capsule)
 		if err != nil {
 			return err
 		}
@@ -9782,10 +9813,10 @@ func (c *CompositeSetLogRegistry) RemoveOperation(graph Transactor, log, capsule
 		}
 
 		if unlinkErr := c.lists.RemoveWithoutDeletingCapsule(tx, log, capsule); unlinkErr != nil {
-			return unlinkErr
+			return wrapInterfaceErr(unlinkErr)
 		}
 
-		if deleteErr := c.lists.capsules.DeleteCapsule(tx, capsule); deleteErr != nil {
+		if deleteErr := c.lists.Capsules().DeleteCapsule(tx, capsule); deleteErr != nil {
 			return deleteErr
 		}
 
@@ -9804,7 +9835,9 @@ func (c *CompositeSetLogRegistry) Operations(graph GraphReader, log NodeID) ([]N
 		return nil, requireErr
 	}
 
-	return c.lists.Elements(graph, log)
+	values, err := c.lists.Elements(graph, log)
+
+	return values, wrapInterfaceErr(err)
 }
 
 // OperandTarget returns descriptor u's operand, i.e. u's single outgoing
@@ -9855,7 +9888,7 @@ func (c *CompositeSetLogRegistry) Evaluate(graph GraphReader, log NodeID) ([]Nod
 func (c *CompositeSetLogRegistry) evaluate(graph GraphReader, log NodeID, visited map[NodeID]struct{}) ([]NodeID, error) {
 	operations, err := c.lists.Elements(graph, log)
 	if err != nil {
-		return nil, err
+		return nil, wrapInterfaceErr(err)
 	}
 
 	result := make(map[NodeID]struct{})
@@ -10002,13 +10035,13 @@ func (c *CompositeSetLogRegistry) mentionCandidates(graph GraphReader, log, valu
 	candidates := make(map[NodeID]struct{})
 
 	addCapsulesOf := func(descriptor NodeID) error {
-		capsules, capsulesErr := c.lists.capsules.CapsulesWithValue(graph, descriptor)
+		capsules, capsulesErr := c.lists.Capsules().CapsulesWithValue(graph, descriptor)
 		if capsulesErr != nil {
 			return capsulesErr
 		}
 
 		for _, capsule := range capsules {
-			inLog, inLogErr := graph.HasRelationship(log, capsule)
+			inLog, inLogErr := c.lists.IsMember(graph, log, capsule)
 			if inLogErr != nil {
 				return wrapInterfaceErr(inLogErr)
 			}
@@ -10070,7 +10103,7 @@ func (c *CompositeSetLogRegistry) contains(graph GraphReader, log, value NodeID,
 
 	current, hasCurrent, err := c.lists.Tail(graph, log)
 	if err != nil {
-		return false, err
+		return false, wrapInterfaceErr(err)
 	}
 
 	seen := make(map[NodeID]struct{})
@@ -10085,7 +10118,7 @@ func (c *CompositeSetLogRegistry) contains(graph GraphReader, log, value NodeID,
 		// Every operation the walk passes is checked for shape (a value, one
 		// operand, one tag per axis), candidate or not, so a malformed one
 		// fails loudly instead of being skipped.
-		u, hasValue, valueErr := c.lists.capsules.Value(graph, current)
+		u, hasValue, valueErr := c.lists.Capsules().Value(graph, current)
 		if valueErr != nil {
 			return false, valueErr
 		}
@@ -10120,7 +10153,7 @@ func (c *CompositeSetLogRegistry) contains(graph GraphReader, log, value NodeID,
 
 		current, hasCurrent, err = c.lists.stepBack(graph, log, current)
 		if err != nil {
-			return false, err
+			return false, wrapInterfaceErr(err)
 		}
 	}
 
@@ -10209,7 +10242,15 @@ func (c *CompositeSetLogRegistry) DeleteCompositeSetLog(graph Transactor, log No
 		if requireErr := c.requireLog(tx, log); requireErr != nil {
 			return requireErr
 		}
-		return untagAndDeleteNodeTx(tx, log, c.allCompositeSetLogs, c.lists.allLists)
+		// The log's own tag goes first; the list type then deletes the list
+		// and whatever it made for it (a slotted list has a members node and
+		// two slots). If that refuses (ErrNodeNotEmpty), the whole
+		// transaction rolls back and the tag is restored.
+		if untagErr := removeRelationshipTx(tx, c.allCompositeSetLogs, log); untagErr != nil {
+			return untagErr
+		}
+
+		return wrapInterfaceErr(c.lists.DeleteList(tx, log))
 	}))
 }
 
@@ -10733,24 +10774,24 @@ func (r setReverseLookup) descriptorOwners(g GraphReader, u NodeID) ([]NodeID, e
 		return owners, nil
 	}
 
-	capsules, err := r.logs.lists.capsules.CapsulesWithValue(g, u)
+	capsules, err := r.logs.lists.Capsules().CapsulesWithValue(g, u)
 	if err != nil {
 		return nil, err
 	}
 
 	for _, capsule := range capsules {
-		capsuleIncoming, capsuleErr := g.FindIncoming(capsule)
-		if capsuleErr != nil {
-			return nil, wrapInterfaceErr(capsuleErr)
+		lists, listsErr := r.logs.lists.ListsOf(g, capsule)
+		if listsErr != nil {
+			return nil, wrapInterfaceErr(listsErr)
 		}
 
-		for _, rel := range capsuleIncoming {
-			isLog, isLogErr := r.logs.IsCompositeSetLog(g, rel.From)
+		for _, list := range lists {
+			isLog, isLogErr := r.logs.IsCompositeSetLog(g, list)
 			if isLogErr != nil {
 				return nil, isLogErr
 			}
 			if isLog {
-				owners = append(owners, rel.From)
+				owners = append(owners, list)
 			}
 		}
 	}
@@ -11576,7 +11617,9 @@ func NewRegistries(graph GraphAPI, ids map[string]NodeID) (*Registries, error) {
 		return nil, err
 	}
 
-	logs, err := NewCompositeSetLogRegistry(graph, lists, composites, ids[NameAllCompositeSetLogs], ids[NameAllAdditiveOp], ids[NameAllSubtractiveOp], ids[NameAllScalarOperand], ids[NameAllSetOperand])
+	// The log's operations are kept in slotted lists; passing lists instead
+	// is the only change needed to keep them in ListRegistry lists.
+	logs, err := NewCompositeSetLogRegistry(graph, slottedLists, composites, ids[NameAllCompositeSetLogs], ids[NameAllAdditiveOp], ids[NameAllSubtractiveOp], ids[NameAllScalarOperand], ids[NameAllSetOperand])
 	if err != nil {
 		return nil, err
 	}

@@ -53,30 +53,7 @@ func buildSlottedListRegistry(t *testing.T, graph testGraph) OrderedList {
 func buildListRegistry(t *testing.T, graph testGraph) OrderedList {
 	t.Helper()
 
-	names := NewNameRegistry(graph)
-
-	ids, err := names.BootstrapNames(graph, FoundationalNames)
-	if err != nil {
-		t.Fatalf("BootstrapNames(): %v", err)
-	}
-
-	capsules, err := NewCapsuleRegistry(
-		graph,
-		ids[NameAllElementCapsules],
-		ids[NameAllElementCapsulePrevSlot],
-		ids[NameAllElementCapsuleValueSlot],
-		ids[NameAllElementCapsuleNextSlot],
-	)
-	if err != nil {
-		t.Fatalf("NewCapsuleRegistry(): %v", err)
-	}
-
-	lists, err := NewListRegistry(graph, capsules, ids[NameAllLists], ids[NameAllHeads], ids[NameAllTails])
-	if err != nil {
-		t.Fatalf("NewListRegistry(): %v", err)
-	}
-
-	return lists
+	return listRegistryFromIDs(t, graph, bootstrapTestNames(t, graph))
 }
 
 // forEachOrderedList runs body once per backend and implementation, each on a
@@ -440,6 +417,53 @@ func TestOrderedListEveryCapsuleBelongsToExactlyOneList(t *testing.T) {
 			if err != nil || !reflect.DeepEqual(owners, []NodeID{tc.list}) {
 				t.Fatalf("ListsOf(%d) = (%v,%v), want ([%d],nil)", tc.capsule, owners, err, tc.list)
 			}
+		}
+	})
+}
+
+func TestOrderedListIsMemberIsScopedToTheList(t *testing.T) {
+	const nonexistent NodeID = 999999
+
+	forEachOrderedList(t, func(t *testing.T, g testGraph, lists OrderedList) {
+		list := mustNewOrderedList(t, lists, g)
+		other := mustNewOrderedList(t, lists, g)
+		_, capsules := mustAppendValues(t, lists, g, list, 2)
+		_, otherCapsules := mustAppendValues(t, lists, g, other, 1)
+
+		cases := []struct {
+			name    string
+			list    NodeID
+			capsule NodeID
+			want    bool
+		}{
+			{name: "head", list: list, capsule: capsules[0], want: true},
+			{name: "tail", list: list, capsule: capsules[1], want: true},
+			{name: "capsule of another list", list: list, capsule: otherCapsules[0]},
+			{name: "plain node", list: list, capsule: mustCreateNode(t, g)},
+			{name: "nonexistent node", list: list, capsule: nonexistent},
+		}
+
+		for _, tc := range cases {
+			got, err := lists.IsMember(g, tc.list, tc.capsule)
+			if err != nil || got != tc.want {
+				t.Fatalf("%s: IsMember() = (%v,%v), want (%v,nil)", tc.name, got, err, tc.want)
+			}
+		}
+
+		if removeErr := lists.RemoveWithoutDeletingCapsule(g, list, capsules[0]); removeErr != nil {
+			t.Fatalf("RemoveWithoutDeletingCapsule(): %v", removeErr)
+		}
+
+		if got, err := lists.IsMember(g, list, capsules[0]); err != nil || got {
+			t.Fatalf("IsMember() after removal = (%v,%v), want (false,nil)", got, err)
+		}
+
+		if _, err := lists.IsMember(g, mustCreateNode(t, g), capsules[1]); !errors.Is(err, ErrNotList) {
+			t.Fatalf("IsMember(not a list) error = %v, want %v", err, ErrNotList)
+		}
+
+		if _, err := lists.IsMember(g, nonexistent, capsules[1]); !errors.Is(err, ErrNodeNotFound) {
+			t.Fatalf("IsMember(nonexistent list) error = %v, want %v", err, ErrNodeNotFound)
 		}
 	})
 }
