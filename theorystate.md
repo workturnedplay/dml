@@ -3540,9 +3540,13 @@ because finding a list's tagged child reads all its children.
 ## 105a. The slotted list: bounded fan-out for every lookup (TENTATIVE, implemented)
 
 Finding the tail of a `ListRegistry` list means finding the one child of the
-list that carries `AllTails`; the list has one child per element, so that
-costs the length of the list (§105, measured). `SlottedListRegistry` moves
-the fan-out off the node the lookups run on:
+list that carries `AllTails`. The list has one child per element, so scanning
+it costs the length of the list (§105, measured); with the common-children
+lookup (`implementation_state.md` item 68) it costs about the smaller of the
+list's children and the `AllTails` hub's, which is the number of non-empty
+lists. That is cheap with few lists and linear with many. `SlottedListRegistry`
+moves the fan-out off the node the lookups run on, so the cost does not depend
+on either:
 
 ```text
 (AllSlottedLists, list)
@@ -3564,8 +3568,8 @@ The invariants are those of §11b, including that a member capsule belongs to
 exactly one list. Commit-time checking is local, as for `ListRegistry`;
 global properties stay with `Elements` and `VerifyStructures`. Both list types
 implement one `OrderedList` contract and run the same behaviour suite.
-`ListRegistry` is kept: it is the simpler structure, and the reference for how
-it costs (an O(n) tail lookup) when the fan-out is on the list node.
+`ListRegistry` is kept: it is the simpler structure, with a tail lookup whose
+cost depends on how many lists exist, and the reference for comparison.
 
 ## 106. Explored and not adopted
 

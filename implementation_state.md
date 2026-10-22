@@ -2582,11 +2582,24 @@ empty commit is the baseline of about 2.7 ms):
  CompositeSetLogRegistry still uses ListRegistry; moving it onto OrderedList
  is next.
 
+73. Measurements after items 68 and 72 (i7-8700K, Windows, no -race,
+ -benchtime 30x, ms per commit; empty commit about 2.7 to 3.9, so differences
+ under about 1 ms are noise). ListRegistry append: 4.9, 7.8, 6.2 for n =
+ 1,000, 10,000, 100,000 (was 6.1, 22.7, 193.1 before item 68), its tail scan
+ at 100,000 went from 190.5 to 3.2. SlottedListRegistry append: 5.4, 5.6, 6.7,
+ flat; tail lookup 4.4, 3.1, 2.9. Slotted allocates about 18% more per append
+ (11.3k against 9.6k at 100,000). The graph has few lists, so the common-children
+ lookup is at its best for ListRegistry; slotted's remaining advantages are a
+ cost that does not depend on the number of lists and a touched list node that
+ is checked locally (ListRegistry falls back to full validation, 5.6 s at
+ 100,000, unchanged). Not measured yet: a graph with many lists, and a commit
+ touching a list node on the slotted type.
+
 Currently unaddressed yet:
-- ListRegistry.Append still finds the tail by reading the list's whole child
-  set (O(n), about 0.19 s at 100,000 elements, item 63); finding a tagged
-  child of a list cannot be O(1) without a structural change (a head/tail
-  pointer on the list), which is a separate design.
+- ListRegistry.Append finds the tail as the child its list shares with the
+  AllTails hub (item 68), so it costs about the smaller of the two child sets:
+  fine with few lists, linear in the number of non-empty lists when there are
+  many (item 73). SlottedListRegistry (item 72) does not have that dependence.
 - Paged reads beyond a single node's own outgoing/incoming edges
   (theorystate.md section 105, items 43/46): FindRelationships and
   rootReader.FindRelationships are still O(graph) on BoltGraph, as

@@ -14203,7 +14203,7 @@ func buildBenchList(b *testing.B, h *Host, lists OrderedList, size int) NodeID {
 
 			_, appendErr := lists.AppendMany(tx, list, values)
 
-			return appendErr
+			return wrapInterfaceErr(appendErr)
 		})
 		if txErr != nil {
 			b.Fatalf("building the list (%d of %d built): %v", built, size, txErr)
