@@ -1,0 +1,97 @@
+// Suffix-extending string trie ("cons cells with shared tails"), design only.
+// Every arrow goes from a PARENT to a CHILD. Nothing points back.
+digraph strings {
+  rankdir=TB;
+  graph [fontname="Segoe UI", labelloc=t, fontsize=13, nodesep=0.45, ranksep=0.7,
+         label="Every arrow is parent -> child (a node's parents are just the arrows coming INTO it).\nblack  = P -> Q : Q is the string P with ONE CHAR PUT IN FRONT of it\ncolored (one color per char) = char -> Q : Q STARTS with that char\ngray = AllStrings -> every string   yellow = AllChars -> every char   green = AllWords -> strings that are also words\nText in the boxes is only for the reader. The graph stores no text on string nodes.\n"];
+  node  [fontname="Segoe UI"];
+  edge  [fontname="Segoe UI"];
+
+  // ---- tag nodes
+  node [shape=box, style="filled", penwidth=1.5, color="#555555"];
+  h_strings [label="AllStrings\n(tag node)",         fillcolor="#d9d9d9"];
+  h_chars   [label="AllChars\n(tag node)",           fillcolor="#ffe699"];
+  h_words   [label="AllWords\n(tag node, optional)", fillcolor="#b6e3b6"];
+  { rank=source; h_strings; h_chars; h_words; }
+
+  // ---- the name that identifies the root (kept outside the graph)
+  n_name [shape=note, style=dotted, label="the NAME \"EmptyString\"\n(NameRegistry, outside the graph;\nnot an edge of the graph)"];
+
+  // ---- string nodes: pale = only a stepping stone, dark = a word
+  node [shape=box, style="rounded,filled", fillcolor="#e8eef7", color="#7a8ca8", penwidth=1.5];
+  s_root [label="\"\"  (empty string)\nthe root", fillcolor="#f2f2f2"];
+  s_t    [label="\"t\""];
+  s_r    [label="\"r\""];
+  s_ar   [label="\"ar\""];
+
+  node [fillcolor="#9ec1f0", color="#2f5fa8", penwidth=2];
+  s_at   [label="\"at\""];
+  s_cat  [label="\"cat\""];
+  s_hat  [label="\"hat\""];
+  s_car  [label="\"car\""];
+  s_bar  [label="\"bar\""];
+
+  // ---- char nodes: one per character, shared by every string
+  node [shape=circle, style=filled, fillcolor="#fff2cc", penwidth=2, fixedsize=true, width=0.5];
+  ch_c [label="c", color="#d62728"];
+  ch_h [label="h", color="#ff7f0e"];
+  ch_a [label="a", color="#2ca02c"];
+  ch_t [label="t", color="#1f77b4"];
+  ch_r [label="r", color="#9467bd"];
+  ch_b [label="b", color="#8c564b"];
+  { rank=sink; ch_c; ch_h; ch_a; ch_t; ch_r; ch_b; }
+
+  edge [constraint=false, penwidth=1, arrowsize=0.6];
+  n_name -> s_root [style=dotted, arrowhead=none];
+
+  // ---- tag edges: AllStrings -> every string node (9)
+  edge [color="#7f7f7f", style=solid];
+  h_strings -> s_root;
+  h_strings -> s_t;
+  h_strings -> s_r;
+  h_strings -> s_at;
+  h_strings -> s_ar;
+  h_strings -> s_cat;
+  h_strings -> s_hat;
+  h_strings -> s_car;
+  h_strings -> s_bar;
+
+  // ---- tag edges: AllChars -> every char node (6)
+  edge [color="#bf9000"];
+  h_chars -> ch_c;
+  h_chars -> ch_h;
+  h_chars -> ch_a;
+  h_chars -> ch_t;
+  h_chars -> ch_r;
+  h_chars -> ch_b;
+
+  // ---- tag edges: AllWords -> every string that is also a word (5)
+  edge [color="#2e8b2e"];
+  h_words -> s_at;
+  h_words -> s_cat;
+  h_words -> s_hat;
+  h_words -> s_car;
+  h_words -> s_bar;
+
+  // ---- "Q is P with one char in front": the shape of the trie (8)
+  edge [color=black, penwidth=1.6, arrowsize=0.9, constraint=true];
+  s_root -> s_t;
+  s_root -> s_r;
+  s_t    -> s_at;
+  s_at   -> s_cat;
+  s_at   -> s_hat;
+  s_r    -> s_ar;
+  s_ar   -> s_car;
+  s_ar   -> s_bar;
+
+  // ---- "Q starts with this char" (8), parent = the char, child = the string
+  edge [style=solid, penwidth=1.3, arrowsize=0.8, constraint=false];
+  ch_c -> s_cat [color="#d62728"];
+  ch_c -> s_car [color="#d62728"];
+  ch_h -> s_hat [color="#ff7f0e"];
+  ch_a -> s_at  [color="#2ca02c"];
+  ch_a -> s_ar  [color="#2ca02c"];
+  ch_t -> s_t   [color="#1f77b4"];
+  ch_r -> s_r   [color="#9467bd"];
+  ch_b -> s_bar [color="#8c564b"];
+}

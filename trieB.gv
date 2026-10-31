@@ -1,0 +1,162 @@
+// Design B: one canonical node per string + a prefix index over indexed strings.
+// EVERY arrow goes from a PARENT to a CHILD. Nothing points back.
+digraph B {
+  rankdir=TB;
+  graph [fontname="Segoe UI", labelloc=t, fontsize=12, nodesep=0.35, ranksep=0.8,
+    label="Design B for the indexed strings \"at\", \"cat\", \"car\"   (every arrow: parent -> child; 79 edges; text in boxes is for the reader only)\n\nblack = canonical trie: P -> Q means Q is the string P with ONE CHAR PUT IN FRONT.     colored (per char) = char -> slot, StartsWith slot -> strings whose first char it is, IndexStep slot -> index nodes reached by that char.\nteal = index tree (X -> X : one more char at the END of the prefix).   brown = index node -> entry slot -> the canonical string.\nthin gray/green/etc. from the top = tag edges (kind tag -> every node of that kind).   dotted magenta = AllFoundational -> foundational nodes.\n"];
+  node  [fontname="Segoe UI"];
+  edge  [fontname="Segoe UI"];
+
+  // ---------------- tag nodes (kinds) ----------------
+  node [shape=box, style=filled, penwidth=1.5, color="#555555"];
+  t_strings [label="AllStrings",          fillcolor="#d9d9d9"];
+  t_chars   [label="AllChars",            fillcolor="#ffe699"];
+  t_indexed [label="AllIndexedStrings",   fillcolor="#b6e3b6"];
+  t_idxn    [label="AllIndexNodes",       fillcolor="#b3e0e0"];
+  t_entries [label="AllIndexEntries",     fillcolor="#e6cfa8"];
+  t_sw      [label="AllStartsWithSlots",  fillcolor="#d5d0f5"];
+  t_is      [label="AllIndexStepSlots",   fillcolor="#f5c6e0"];
+  t_found   [label="AllFoundational",     fillcolor="#f4c7f4", peripheries=2];
+  { rank=source; t_found; t_strings; t_chars; t_indexed; t_idxn; t_entries; t_sw; t_is; }
+
+  // names kept in NameRegistry (outside the graph, NOT edges)
+  n_empty [shape=note, style=dotted, label="NAME \"EmptyString\"\n(outside the graph)"];
+  n_xroot [shape=note, style=dotted, label="NAME \"IndexRoot\"\n(outside the graph)"];
+
+  // ---------------- canonical strings ----------------
+  node [shape=box, style="rounded,filled", fillcolor="#e8eef7", color="#7a8ca8", penwidth=1.5];
+  s_root [label="\"\"  (empty)\nthe root string", fillcolor="#f2f2f2"];
+  s_t    [label="\"t\""];
+  s_r    [label="\"r\""];
+  s_ar   [label="\"ar\""];
+  node [fillcolor="#9ec1f0", color="#2f5fa8", penwidth=2];
+  s_at   [label="\"at\"\n(indexed)"];
+  s_cat  [label="\"cat\"\n(indexed)"];
+  s_car  [label="\"car\"\n(indexed)"];
+
+  // ---------------- char nodes ----------------
+  node [shape=circle, style=filled, fillcolor="#fff2cc", penwidth=2, fixedsize=true, width=0.5];
+  ch_c [label="c", color="#d62728"];
+  ch_a [label="a", color="#2ca02c"];
+  ch_t [label="t", color="#1f77b4"];
+  ch_r [label="r", color="#9467bd"];
+
+  // ---------------- per-char slots ----------------
+  node [shape=hexagon, style=filled, fixedsize=false, penwidth=2, fillcolor="#e4e0fa"];
+  sw_c [label="c.StartsWith", color="#d62728"];
+  sw_a [label="a.StartsWith", color="#2ca02c"];
+  sw_t [label="t.StartsWith", color="#1f77b4"];
+  sw_r [label="r.StartsWith", color="#9467bd"];
+  node [fillcolor="#fadcec"];
+  is_c [label="c.IndexStep", color="#d62728"];
+  is_a [label="a.IndexStep", color="#2ca02c"];
+  is_t [label="t.IndexStep", color="#1f77b4"];
+  is_r [label="r.IndexStep", color="#9467bd"];
+
+  // ---------------- prefix index nodes ----------------
+  node [shape=ellipse, style=filled, fillcolor="#c9ecec", color="#008b8b", penwidth=1.5];
+  x_root [label="index root\n(prefix \"\")"];
+  x_c    [label="prefix \"c\""];
+  x_a    [label="prefix \"a\""];
+  x_ca   [label="prefix \"ca\""];
+  x_cat  [label="prefix \"cat\""];
+  x_car  [label="prefix \"car\""];
+  x_at   [label="prefix \"at\""];
+
+  // ---------------- entry slots ----------------
+  node [shape=tab, style=filled, fillcolor="#f0e0c0", color="#8b4513", penwidth=1.5];
+  e_cat [label="entry"];
+  e_car [label="entry"];
+  e_at  [label="entry"];
+
+  n_empty -> s_root [style=dotted, arrowhead=none, constraint=false];
+  n_xroot -> x_root [style=dotted, arrowhead=none, constraint=false];
+
+  // ===== tag edges (constraint=false so they do not bend the layout) =====
+  edge [constraint=false, penwidth=0.9, arrowsize=0.6, style=solid];
+
+  // AllStrings -> every string (7)
+  edge [color="#7f7f7f"];
+  t_strings -> s_root; t_strings -> s_t;  t_strings -> s_r;   t_strings -> s_at;
+  t_strings -> s_ar;   t_strings -> s_cat; t_strings -> s_car;
+
+  // AllChars -> every char (4)
+  edge [color="#bf9000"];
+  t_chars -> ch_c; t_chars -> ch_a; t_chars -> ch_t; t_chars -> ch_r;
+
+  // AllIndexedStrings -> the strings someone asked to index (3)
+  edge [color="#2e8b2e"];
+  t_indexed -> s_at; t_indexed -> s_cat; t_indexed -> s_car;
+
+  // AllIndexNodes -> every index node (7)
+  edge [color="#008b8b"];
+  t_idxn -> x_root; t_idxn -> x_c;  t_idxn -> x_a;   t_idxn -> x_ca;
+  t_idxn -> x_cat;  t_idxn -> x_car; t_idxn -> x_at;
+
+  // AllIndexEntries -> every entry slot (3)
+  edge [color="#8b4513"];
+  t_entries -> e_cat; t_entries -> e_car; t_entries -> e_at;
+
+  // AllStartsWithSlots -> every StartsWith slot (4)
+  edge [color="#6a5acd"];
+  t_sw -> sw_c; t_sw -> sw_a; t_sw -> sw_t; t_sw -> sw_r;
+
+  // AllIndexStepSlots -> every IndexStep slot (4)
+  edge [color="#c71585"];
+  t_is -> is_c; t_is -> is_a; t_is -> is_t; t_is -> is_r;
+
+  // AllFoundational -> the 7 kind tags + the two roots (9)
+  edge [color="#cc00cc", style=dotted];
+  t_found -> t_strings; t_found -> t_chars; t_found -> t_indexed; t_found -> t_idxn;
+  t_found -> t_entries; t_found -> t_sw;    t_found -> t_is;
+  t_found -> s_root;    t_found -> x_root;
+
+  // ===== char -> its two slots (8), colored per char =====
+  edge [style=solid, penwidth=1.3, arrowsize=0.8, constraint=true];
+  ch_c -> sw_c [color="#d62728"]; ch_c -> is_c [color="#d62728"];
+  ch_a -> sw_a [color="#2ca02c"]; ch_a -> is_a [color="#2ca02c"];
+  ch_t -> sw_t [color="#1f77b4"]; ch_t -> is_t [color="#1f77b4"];
+  ch_r -> sw_r [color="#9467bd"]; ch_r -> is_r [color="#9467bd"];
+
+  // ===== canonical trie: tail -> string with one char in front (6) =====
+  edge [color=black, penwidth=1.8, arrowsize=0.9, constraint=true];
+  s_root -> s_t;    // "t"   = t + ""
+  s_root -> s_r;    // "r"   = r + ""
+  s_t    -> s_at;   // "at"  = a + "t"
+  s_r    -> s_ar;   // "ar"  = a + "r"
+  s_at   -> s_cat;  // "cat" = c + "at"
+  s_ar   -> s_car;  // "car" = c + "ar"
+
+  // ===== StartsWith slot -> strings whose FIRST char it is (6) =====
+  edge [penwidth=1.3, arrowsize=0.8, constraint=false];
+  sw_t -> s_t   [color="#1f77b4"];
+  sw_r -> s_r   [color="#9467bd"];
+  sw_a -> s_at  [color="#2ca02c"];
+  sw_a -> s_ar  [color="#2ca02c"];
+  sw_c -> s_cat [color="#d62728"];
+  sw_c -> s_car [color="#d62728"];
+
+  // ===== index tree: prefix -> prefix with one more char at the END (6) =====
+  edge [color="#008b8b", penwidth=1.8, arrowsize=0.9, constraint=true];
+  x_root -> x_c;    // step c
+  x_root -> x_a;    // step a
+  x_c    -> x_ca;   // step a
+  x_ca   -> x_cat;  // step t
+  x_ca   -> x_car;  // step r
+  x_a    -> x_at;   // step t
+
+  // ===== IndexStep slot -> index nodes reached by that char (6) =====
+  edge [penwidth=1.3, arrowsize=0.8, constraint=false];
+  is_c -> x_c   [color="#d62728"];
+  is_a -> x_ca  [color="#2ca02c"];
+  is_a -> x_a   [color="#2ca02c"];
+  is_t -> x_cat [color="#1f77b4"];
+  is_t -> x_at  [color="#1f77b4"];
+  is_r -> x_car [color="#9467bd"];
+
+  // ===== index node -> entry slot (3), entry slot -> canonical string (3) =====
+  edge [color="#8b4513", penwidth=1.5, arrowsize=0.8, constraint=true];
+  x_cat -> e_cat; x_car -> e_car; x_at -> e_at;
+  edge [constraint=false];
+  e_cat -> s_cat; e_car -> s_car; e_at -> s_at;
+}

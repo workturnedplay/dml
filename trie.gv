@@ -1,0 +1,63 @@
+// Example of the interned-string trie (design only, nothing in dml yet).
+// Boxes are string nodes, circles are char nodes. Labels on string nodes are
+// for the human reader: the graph itself stores no text there.
+digraph strings {
+  rankdir=TB;
+  graph [fontname="Segoe UI", labelloc=t, fontsize=14,
+         label="String trie: solid black = \"extended by one char\", dashed colored = \"ends in this char\"\n(the AllStrings and AllChars tag edges are left out to keep it readable)"];
+  node  [fontname="Segoe UI"];
+  edge  [fontname="Segoe UI"];
+
+  // ---- string nodes: pale = just a prefix, dark = a string the program asked for
+  node [shape=box, style="rounded,filled", fillcolor="#e8eef7", color="#7a8ca8"];
+  s_root [label="(empty string)\nthe root", fillcolor="#f2f2f2"];
+  s_c    [label="c"];
+  s_ca   [label="ca"];
+  s_car  [label="car"];
+  s_d    [label="d"];
+  s_do   [label="do"];
+  s_a    [label="a"];
+
+  node [fillcolor="#9ec1f0", color="#2f5fa8", penwidth=2];
+  s_cat  [label="cat"];
+  s_cart [label="cart"];
+  s_dog  [label="dog"];
+  s_at   [label="at"];
+
+  // ---- char nodes: one per character, shared by every string
+  node [shape=circle, style=filled, fillcolor="#fff2cc", penwidth=2, fixedsize=true, width=0.5];
+  ch_c [label="c", color="#d62728"];
+  ch_a [label="a", color="#2ca02c"];
+  ch_t [label="t", color="#1f77b4"];
+  ch_r [label="r", color="#9467bd"];
+  ch_d [label="d", color="#ff7f0e"];
+  ch_o [label="o", color="#8c564b"];
+  ch_g [label="g", color="#e377c2"];
+  { rank=sink; ch_c; ch_a; ch_t; ch_r; ch_d; ch_o; ch_g; }
+
+  // ---- "Q is P extended by one char": the shape of the trie
+  edge [color=black, penwidth=1.4, style=solid];
+  s_root -> s_c;
+  s_root -> s_d;
+  s_root -> s_a;
+  s_c    -> s_ca;
+  s_ca   -> s_cat;
+  s_ca   -> s_car;
+  s_car  -> s_cart;
+  s_d    -> s_do;
+  s_do   -> s_dog;
+  s_a    -> s_at;
+
+  // ---- "Q ends in this char" (constraint=false so they don't bend the layout)
+  edge [style=dashed, penwidth=1.2, constraint=false];
+  ch_c -> s_c    [color="#d62728"];
+  ch_a -> s_ca   [color="#2ca02c"];
+  ch_a -> s_a    [color="#2ca02c"];
+  ch_t -> s_cat  [color="#1f77b4"];
+  ch_t -> s_cart [color="#1f77b4"];
+  ch_t -> s_at   [color="#1f77b4"];
+  ch_r -> s_car  [color="#9467bd"];
+  ch_d -> s_d    [color="#ff7f0e"];
+  ch_o -> s_do   [color="#8c564b"];
+  ch_g -> s_dog  [color="#e377c2"];
+}
