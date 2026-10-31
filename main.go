@@ -4463,6 +4463,54 @@ var FoundationalNames = []string{
 	NameAllSlottedCapsulePrevSlot,
 	NameAllSlottedCapsuleValueSlot,
 	NameAllSlottedCapsuleNextSlot,
+	NameAllFoundational,
+	NameAllStrings,
+	NameAllChars,
+	NameAllIndexedStrings,
+	NameAllIndexNodes,
+	NameAllIndexEntries,
+	NameAllStartsWithSlots,
+	NameAllIndexStepSlots,
+	NameEmptyString,
+	NameIndexRoot,
+}
+
+// TagFoundational tags every foundational name with (AllFoundational, id),
+// plus every node in extra (the host passes ROOT), in one idempotent
+// transaction. It lets a browser list the foundational nodes among the
+// parents of any node with one HasRelationship each, instead of comparing
+// every parent against every known foundational node. AllFoundational does
+// not tag itself. ids must hold every name in FoundationalNames.
+func TagFoundational(graph Transactor, ids map[string]NodeID, extra ...NodeID) error {
+	tag, ok := ids[NameAllFoundational]
+	if !ok {
+		return fmt.Errorf("%w: %q", ErrNameNotFound, NameAllFoundational)
+	}
+
+	nodes := make([]NodeID, 0, len(FoundationalNames)+len(extra))
+
+	for _, name := range FoundationalNames {
+		id, present := ids[name]
+		if !present {
+			return fmt.Errorf("%w: %q", ErrNameNotFound, name)
+		}
+
+		if id != tag {
+			nodes = append(nodes, id)
+		}
+	}
+
+	nodes = append(nodes, extra...)
+
+	return wrapInterfaceErr(graph.Transact(func(tx Tx) error {
+		for _, node := range nodes {
+			if tagErr := tagNodeTx(tx, tag, node); tagErr != nil {
+				return tagErr
+			}
+		}
+
+		return nil
+	}))
 }
 
 // ErrCannotDeleteRoot is returned when deletion of ROOT is attempted
@@ -11546,13 +11594,17 @@ type Registries struct {
 	// (head, tail and members in slots), with a capsule tag set of its own.
 	SlottedCapsules *CapsuleRegistry
 	SlottedLists    *SlottedListRegistry
+
+	// Text is the interned-string layer (theorystate.md section 114).
+	Text *TextRegistry
 }
 
 // NewRegistries constructs every registry over graph. ids must hold an
 // entry for every name in FoundationalNames (as returned by
 // NameRegistry.BootstrapNames); a missing one is ErrNameNotFound, never a
-// silent NodeID 0.
-func NewRegistries(graph GraphAPI, ids map[string]NodeID) (*Registries, error) {
+// silent NodeID 0. names is the registry those names were bootstrapped
+// through: the text layer names its chars in it.
+func NewRegistries(graph GraphAPI, names *NameRegistry, ids map[string]NodeID) (*Registries, error) {
 	for _, name := range FoundationalNames {
 		if _, ok := ids[name]; !ok {
 			return nil, fmt.Errorf("%w: %q", ErrNameNotFound, name)
@@ -11636,6 +11688,11 @@ func NewRegistries(graph GraphAPI, ids map[string]NodeID) (*Registries, error) {
 		return nil, err
 	}
 
+	text, err := NewTextRegistry(graph, names, ids)
+	if err != nil {
+		return nil, err
+	}
+
 	return &Registries{
 		Pointers:    pointers,
 		SubPointers: subPointers,
@@ -11652,6 +11709,7 @@ func NewRegistries(graph GraphAPI, ids map[string]NodeID) (*Registries, error) {
 
 		SlottedCapsules: slottedCapsules,
 		SlottedLists:    slottedLists,
+		Text:            text,
 	}, nil
 }
 
@@ -12130,7 +12188,11 @@ func finishHostStart(cfg HostConfig, store *BoltGraph, actor *GraphActor, names 
 		return nil, fmt.Errorf("host startup: bootstrapping names: %w", idsErr)
 	}
 
-	reg, regErr := NewRegistries(actor, ids)
+	if tagErr := TagFoundational(actor, ids, root); tagErr != nil {
+		return nil, fmt.Errorf("host startup: tagging foundational names: %w", tagErr)
+	}
+
+	reg, regErr := NewRegistries(actor, names, ids)
 	if regErr != nil {
 		return nil, fmt.Errorf("host startup: constructing registries: %w", regErr)
 	}

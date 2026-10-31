@@ -2624,6 +2624,28 @@ empty commit is the baseline of about 2.7 ms):
  registry (a type per log, found by asking each list type IsList) was
  considered and not built.
 
+75. Interned strings (theorystate.md section 114), in text.go. TextRegistry
+ gives every piece of text one canonical node: a non-empty string is its tail
+ with one char put in FRONT, so the strings ending with S are the descendants
+ of S. Chars are seeded through NameRegistry ("char/U+0061", lazily, inside
+ the intern transaction) and have two slots (StartsWith, IndexStep). Lookup of
+ "char + tail" is findUniqueTaggedChild(tail, StartsWith): no stored text, no
+ index per string. A separate prefix index (index nodes, entry slots,
+ AllIndexedStrings) covers only the strings marked with MarkIndexed.
+ Operations: Intern, InternIndexed, Lookup, Text, MarkIndexed, UnmarkIndexed
+ (prunes unused index nodes through nested savepoints), IndexedWithPrefix,
+ EndingWith. A local Checker (keyed on the new tags) enforces one tail, one
+ first char and one string per (tail, char), a rootless-parent root, chars
+ that are not strings, and one entry per indexed string. Also:
+ AllFoundational and TagFoundational, run at host startup for every
+ foundational name and ROOT; NewRegistries now takes the NameRegistry; ten new
+ foundational names. Limits: 4096 runes, case-sensitive, no normalization,
+ invalid UTF-8 rejected; no DeleteString yet. Cycles longer than a self-loop in
+ the string chain are found by Text and the startup sweep, not at commit.
+ Covered by the TestText* tests (every backend), TestNewTextRegistryRequiresEveryName,
+ TestTagFoundationalRequiresTheNames and
+ TestHostTagsFoundationalNamesAndKeepsTextAcrossARestart.
+
 Currently unaddressed yet:
 - ListRegistry.Append finds the tail as the child its list shares with the
   AllTails hub (item 68), so it costs about the smaller of the two child sets:

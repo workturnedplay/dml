@@ -4077,6 +4077,43 @@ descriptors exist.
 
 ---
 
+## 114. Interned strings: a suffix trie with a prefix index (TENTATIVE, implemented)
+
+Text is represented once, as graph structure, with no stored characters on
+string nodes.
+
+- A **char** node exists per code point, named in NameRegistry
+  (`char/U+0061`), tagged AllChars, with two slots: StartsWith and IndexStep.
+  Chars are case-sensitive; there is no normalization.
+- A **string** node (AllStrings) is its **tail with one char put in front**:
+  `tail -> Q` and `char.StartsWith -> Q`. The root is the empty string
+  (named EmptyString). The strings that end with S are exactly the
+  descendants of S, so suffix search is a walk down; nothing is reversed.
+- **Lookup** of "c + tail" is the one child tail and c.StartsWith share (the
+  leapfrog join of section 105). Its cost does not depend on how many strings
+  exist. **Reading** a string walks up: the StartsWith parent gives the first
+  char, the AllStrings parent the rest. Interning "cat" therefore creates
+  "t", "at" and "cat": the suffixes it needs, and no more.
+- **Prefix search** needs the other direction, which a node cannot serve
+  without every substring existing as a node. Instead a separate index over
+  the strings marked with MarkIndexed (AllIndexedStrings, "asked for on
+  purpose"; the text may contain spaces): index nodes extend a prefix by one
+  char at the END (char.IndexStep -> node), and an entry slot ends a path at
+  the canonical string. It costs one node per prefix per indexed string,
+  shared; only Intern and MarkIndexed/UnmarkIndexed write it.
+- **Rule:** lists and anything that refers to text use string nodes, never
+  char nodes. A sentence is an ordered list of string nodes; each use of a
+  word is its own capsule pointing at the one word node.
+- **Rejected:** a list of chars per word (no interning, 4 nodes per char);
+  one node in both tries (needs every substring to exist, quadratic, and a
+  tiny length cap); reversing the stored text.
+- **AllFoundational** tags every foundational name and ROOT, so a browser can
+  tell foundational parents of any node apart with one lookup each.
+
+Limits: 4096 runes per text, invalid UTF-8 is rejected, no string deletion yet.
+
+---
+
 ## PART D — STATUS SUMMARY (consolidated)
 
 *(This part supersedes the early informal "explicitly not decided" list

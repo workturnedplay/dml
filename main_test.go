@@ -18752,7 +18752,7 @@ func requireEffectCounts(t *testing.T, fw *fakeEffect, wantApplies, wantRemoves 
 }
 
 func TestNewRegistriesRejectsMissingNames(t *testing.T) {
-	if _, err := NewRegistries(&Graph{}, map[string]NodeID{}); !errors.Is(err, ErrNameNotFound) {
+	if _, err := NewRegistries(&Graph{}, NewNameRegistry(nil), map[string]NodeID{}); !errors.Is(err, ErrNameNotFound) {
 		t.Fatalf("NewRegistries() error = %v, want %v", err, ErrNameNotFound)
 	}
 }
