@@ -461,7 +461,7 @@ func TestTextCheckerDeclinesEachViolationAtCommitTime(t *testing.T) {
 		{
 			name: "a string with no first char",
 			want: ErrInvalidTextStructure,
-			corrupt: func(t *testing.T, tx Tx, rig *textRig, _ NodeID) error {
+			corrupt: func(_ *testing.T, tx Tx, rig *textRig, _ NodeID) error {
 				orphan, createErr := createTaggedNodeTx(tx, rig.text.allStrings)
 				if createErr != nil {
 					return createErr
@@ -480,21 +480,21 @@ func TestTextCheckerDeclinesEachViolationAtCommitTime(t *testing.T) {
 		{
 			name: "the empty string gets a tail",
 			want: ErrInvalidTextStructure,
-			corrupt: func(t *testing.T, tx Tx, rig *textRig, cat NodeID) error {
+			corrupt: func(_ *testing.T, tx Tx, rig *textRig, cat NodeID) error {
 				return addRelationshipTx(tx, cat, rig.text.emptyString)
 			},
 		},
 		{
 			name: "indexed with no entry",
 			want: ErrInvalidTextStructure,
-			corrupt: func(t *testing.T, tx Tx, rig *textRig, cat NodeID) error {
+			corrupt: func(_ *testing.T, tx Tx, rig *textRig, cat NodeID) error {
 				return addRelationshipTx(tx, rig.text.allIndexedStrings, cat)
 			},
 		},
 		{
 			name: "an index node with no step slot",
 			want: ErrInvalidTextStructure,
-			corrupt: func(t *testing.T, tx Tx, rig *textRig, _ NodeID) error {
+			corrupt: func(_ *testing.T, tx Tx, rig *textRig, _ NodeID) error {
 				stray, createErr := createTaggedNodeTx(tx, rig.text.allIndexNodes)
 				if createErr != nil {
 					return createErr
@@ -509,7 +509,7 @@ func TestTextCheckerDeclinesEachViolationAtCommitTime(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			forEachTextRig(t, func(t *testing.T, rig *textRig) {
 				cat := rig.intern(t, "cat")
-				rig.checkSlotsGraph = rig.graph
+				//rig.checkSlotsGraph = rig.graph
 
 				err := rig.graph.Transact(func(tx Tx) error {
 					return tc.corrupt(t, tx, rig, cat)
