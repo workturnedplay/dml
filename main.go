@@ -12857,9 +12857,10 @@ func (c *Conn) Keepalive(ctx context.Context) error {
 	return nil
 }
 
-// enterResource validates the request and enters the host; on success the
-// caller must call host.leave.
-func (c *Conn) enterResource(ctx context.Context, name string) (*hostResource, error) {
+// enterResourceQuietly validates the request and enters the host, without
+// counting it as a sign of life of the client (for work the host itself
+// starts); on success the caller must call host.leave.
+func (c *Conn) enterResourceQuietly(ctx context.Context, name string) (*hostResource, error) {
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return nil, fmt.Errorf("resource %q: %w", name, ctxErr)
 	}
@@ -12875,6 +12876,17 @@ func (c *Conn) enterResource(ctx context.Context, name string) (*hostResource, e
 
 	if !c.host.enter() {
 		return nil, ErrHostClosed
+	}
+
+	return res, nil
+}
+
+// enterResource is enterResourceQuietly for a request of the client, which is
+// a sign of life; on success the caller must call host.leave.
+func (c *Conn) enterResource(ctx context.Context, name string) (*hostResource, error) {
+	res, err := c.enterResourceQuietly(ctx, name)
+	if err != nil {
+		return nil, err
 	}
 
 	c.touch()
@@ -12913,6 +12925,19 @@ func (c *Conn) Acquire(ctx context.Context, resource string) (AcquireResult, err
 	return AcquireResult{First: first, Mark: mark}, nil
 }
 
+// release removes the session from res's holder Set and wakes the reconciler.
+// The caller has entered the host.
+func (c *Conn) release(res *hostResource, resource string) (bool, error) {
+	last, err := c.host.reg.Leases.Release(c.host.actor, res.node, c.session)
+	if err != nil {
+		return false, c.opErr("release", resource, err)
+	}
+
+	c.host.markDirty(res)
+
+	return last, nil
+}
+
 // Release implements Client: one Transact removing the session from the
 // resource's holder Set. The effect itself is removed by the reconciler,
 // after the teardown grace.
@@ -12923,14 +12948,72 @@ func (c *Conn) Release(ctx context.Context, resource string) (bool, error) {
 	}
 	defer c.host.leave()
 
-	last, releaseErr := c.host.reg.Leases.Release(c.host.actor, res.node, c.session)
-	if releaseErr != nil {
-		return false, c.opErr("release", resource, releaseErr)
+	return c.release(res, resource)
+}
+
+// isHolder reports whether this connection's session holds res.
+func (c *Conn) isHolder(res *hostResource) (bool, error) {
+	return c.host.reg.Sets.Contains(c.host.actor, res.node, c.session)
+}
+
+// holds reports whether this connection's session holds the named resource.
+// It is for the wire server's authorization, not a request of the client.
+func (c *Conn) holds(ctx context.Context, resource string) (bool, error) {
+	res, err := c.enterResourceQuietly(ctx, resource)
+	if err != nil {
+		return false, err
+	}
+	defer c.host.leave()
+
+	holder, holdErr := c.isHolder(res)
+	if holdErr != nil {
+		return false, c.opErr("check the hold of", resource, holdErr)
 	}
 
-	c.host.markDirty(res)
+	return holder, nil
+}
 
-	return last, nil
+// heldResources returns the names of the registered resources this
+// connection's session holds, for WireServer.Revalidate.
+func (c *Conn) heldResources() ([]string, error) {
+	if c.isDone() {
+		return nil, ErrConnClosed
+	}
+
+	if !c.host.enter() {
+		return nil, ErrHostClosed
+	}
+	defer c.host.leave()
+
+	var held []string
+
+	for _, res := range c.host.resourceSnapshot() {
+		holder, err := c.isHolder(res)
+		if err != nil {
+			return nil, c.opErr("list the holds of", res.name, err)
+		}
+
+		if holder {
+			held = append(held, res.name)
+		}
+	}
+
+	return held, nil
+}
+
+// revoke releases the session's hold of the named resource on the host's own
+// initiative (WireServer.Revalidate): unlike Release it is not a sign of life
+// of the client.
+func (c *Conn) revoke(ctx context.Context, resource string) error {
+	res, err := c.enterResourceQuietly(ctx, resource)
+	if err != nil {
+		return err
+	}
+	defer c.host.leave()
+
+	_, releaseErr := c.release(res, resource)
+
+	return releaseErr
 }
 
 // waitErr builds WaitApplied's context-ended error, carrying the last
@@ -12954,7 +13037,7 @@ func (c *Conn) WaitApplied(ctx context.Context, resource string, mark uint64) er
 	defer c.host.leave()
 
 	for {
-		holder, holdErr := c.host.reg.Sets.Contains(c.host.actor, res.node, c.session)
+		holder, holdErr := c.isHolder(res)
 		if holdErr != nil {
 			return c.opErr("wait for", resource, holdErr)
 		}

@@ -199,9 +199,13 @@ func ExampleCertificateAuthority_Issue() {
 	})
 
 	fmt.Println(strings.HasPrefix(string(alice.Principal()), "tls-sha256:"))
-	fmt.Println(policy.Authorize(alice.Principal(), "example-resource"))
-	fmt.Println(errors.Is(policy.Authorize("tls-sha256:someone-else", "example-resource"), dml.ErrNotAuthorized))
-	fmt.Println(errors.Is(policy.Authorize(alice.Principal(), "unlisted-resource"), dml.ErrNotAuthorized))
+	request := func(resource string) dml.AuthRequest {
+		return dml.AuthRequest{Operation: dml.OpAcquire, Resource: resource}
+	}
+
+	fmt.Println(policy.Authorize(alice.Principal(), request("example-resource")))
+	fmt.Println(errors.Is(policy.Authorize("tls-sha256:someone-else", request("example-resource")), dml.ErrNotAuthorized))
+	fmt.Println(errors.Is(policy.Authorize(alice.Principal(), request("unlisted-resource")), dml.ErrNotAuthorized))
 
 	// Output:
 	// true

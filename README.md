@@ -113,6 +113,10 @@ Things worth knowing:
   in the background (failed effects, rejected TLS handshakes, ...).
 - `dml.Conn` from `host.Connect` is the in-process client: the same `Client`
   interface, no transport.
+- A `ResourcePolicy` is fixed. To change who may use what while the host runs,
+  give `WithAuthorizer` a `MutablePolicy`, call its `Replace`, then call
+  `server.Revalidate(ctx)` to release the holds the new policy no longer
+  allows. A client may always release what it holds.
 - `example_test.go` has runnable versions of these, which use in-memory pipes
   and need no sockets.
 

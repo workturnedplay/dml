@@ -4028,6 +4028,20 @@ Which resource a client may use is still the `Authorizer`, fail-closed
 lists (CRL, OCSP) are not handled by dml: trust is withdrawn by removing a
 fingerprint from the policy or a CA from the client CA file.
 
+**Changing the policy while the host runs (DECIDED, implemented).**
+`ResourcePolicy` is immutable; `MutablePolicy` is the same table behind an
+atomic pointer, replaced with `Replace`. A replacement governs every request
+that starts after it, but a hold a principal already has is not undone by it:
+`WireServer.Revalidate` releases the holds of live connections that the
+authorizer no longer allows, and a per-connection lock makes authorizing an
+acquire and taking the hold one step with respect to it. The client is not
+told; its next call for that resource is refused, and a wait in flight ends
+with `ErrHoldLost`. Whatever the policy says, a principal may release a hold
+its own session has: refusing would only keep the effect alive until the
+connection ends. The authorizer is asked what the client wants to do
+(`AuthRequest`), not only which resource, so a policy can later distinguish
+operations.
+
 **Rotation without a restart (DECIDED, implemented).** `ReloadingServerTLS`
 keeps the server's certificate, private key and client CA file in files and
 re-reads them when their modification time or size changes (checked at each
@@ -4302,7 +4316,9 @@ kept current as sections above resolve or split further.)*
 - Wire clients are authorized per resource by an `Authorizer` over the
   transport's `Principal`, fail-closed and before the resource is looked up,
   and a server limits its connections without opening sessions for the
-  refused ones (§113).
+  refused ones (§113). The policy can be replaced at run time and the holds it
+  no longer allows dropped (`MutablePolicy`, `WireServer.Revalidate`); a holder
+  may always release what it holds.
 - A named-pipe peer is identified by impersonating the client at the
   Identification level, never by its process ID; clients must dial at that
   level or higher (`DialPipe` does), and an anonymous client is the empty
@@ -4345,6 +4361,12 @@ kept current as sections above resolve or split further.)*
   `singleChildTarget`-governed node, small-fixed-candidate-set for
   `exactlyOneTag`-shaped checks — rather than one uniform per-node rule
   (§89c).
+
+- Slotted ordered list (§105a) and interned strings as a suffix trie with a
+  prefix index (§114): implemented. Whether the trie is the right
+  representation (against lists of chars, which allow substring search and are
+  easier to browse, but have no canonical form) depends on which queries are
+  needed; the layer's API does not expose the representation.
 
 ### OPEN
 - Exact Set/Pointer/List definitions; exact primitive storage; whether a

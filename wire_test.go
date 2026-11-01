@@ -949,14 +949,15 @@ type recordingAuthorizer struct {
 
 type recordedAuthorization struct {
 	principal Principal
+	operation WireOperation
 	resource  string
 }
 
-func (r *recordingAuthorizer) Authorize(principal Principal, resource string) error {
+func (r *recordingAuthorizer) Authorize(principal Principal, request AuthRequest) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	r.calls = append(r.calls, recordedAuthorization{principal: principal, resource: resource})
+	r.calls = append(r.calls, recordedAuthorization{principal: principal, operation: request.Operation, resource: request.Resource})
 
 	return ErrNotAuthorized
 }
@@ -997,7 +998,7 @@ func TestWireAuthorizerSeesAnUnknownPrincipalWhenThePeerCannotBeIdentified(t *te
 				t.Fatalf("Acquire() error = %v, want %v", acquireErr, ErrNotAuthorized)
 			}
 
-			want := []recordedAuthorization{{principal: "", resource: "example-resource"}}
+			want := []recordedAuthorization{{principal: "", operation: OpAcquire, resource: "example-resource"}}
 			if got := recorder.recorded(); !reflect.DeepEqual(got, want) {
 				t.Fatalf("the authorizer was asked %+v, want %+v (an unidentified peer is the empty principal)", got, want)
 			}
@@ -1007,7 +1008,7 @@ func TestWireAuthorizerSeesAnUnknownPrincipalWhenThePeerCannotBeIdentified(t *te
 
 func TestWireAuthorizerThatFailsDenies(t *testing.T) {
 	ctx := hostTestContext(t)
-	authorizer := AuthorizerFunc(func(Principal, string) error { return errors.New("policy store unavailable") })
+	authorizer := AuthorizerFunc(func(Principal, AuthRequest) error { return errors.New("policy store unavailable") })
 	rig := newAuthRig(t, "S-1-5-test-alice", authorizer)
 	client := rig.dial(t)
 
@@ -1061,7 +1062,7 @@ func TestResourcePolicyAuthorize(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := policy.Authorize(tc.principal, tc.resource)
+			err := policy.Authorize(tc.principal, AuthRequest{Operation: OpAcquire, Resource: tc.resource})
 
 			switch {
 			case tc.allowed && err != nil:

@@ -335,6 +335,10 @@ type WireServer struct {
 	conns     map[net.Conn]struct{}
 	admitted  int // connections counted against maxConns
 
+	// live holds the connections that completed their handshake, so
+	// Revalidate can reach them.
+	live map[*wireServerConn]struct{}
+
 	// stop is closed by Close, to wake a Serve that is waiting to retry.
 	stop chan struct{}
 
@@ -362,6 +366,11 @@ func WithMaxConns(n int) WireOption {
 // wait_applied. Without one every connection may use every resource. Peers
 // are named by WithPeerIdentifier; without one they are all the empty
 // Principal.
+//
+// One exception: whatever a says, a principal may release a hold its own
+// session has (refusing would only keep the effect alive until the
+// connection ends). A release of anything else is asked like the rest. Holds
+// a changed policy no longer allows are dropped by WireServer.Revalidate.
 func WithAuthorizer(a Authorizer) WireOption {
 	return func(s *WireServer) { s.authorizer = a }
 }
@@ -388,6 +397,7 @@ func NewWireServer(host *Host, opts ...WireOption) *WireServer {
 		maxConns:  wireDefaultMaxConns,
 		listeners: make(map[net.Listener]struct{}),
 		conns:     make(map[net.Conn]struct{}),
+		live:      make(map[*wireServerConn]struct{}),
 		stop:      make(chan struct{}),
 	}
 
@@ -568,6 +578,52 @@ func (s *WireServer) unregister(nc net.Conn, admitted bool) {
 	})
 }
 
+// addLive records sc as past its handshake, so Revalidate can reach it.
+func (s *WireServer) addLive(sc *wireServerConn) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.live[sc] = struct{}{}
+}
+
+// removeLive undoes addLive.
+func (s *WireServer) removeLive(sc *wireServerConn) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	delete(s.live, sc)
+}
+
+// Revalidate releases every hold of every live connection whose principal the
+// authorizer no longer allows to acquire that resource (an authorizer that
+// fails counts as saying no), and returns how many it released. Call it after
+// replacing the policy (MutablePolicy.Replace). The client is not told: its
+// next call for that resource is refused (ErrNotAuthorized), and a
+// WaitApplied already in flight ends with ErrHoldLost. A request that began
+// before the policy changed has finished by the time a connection is
+// scanned, so no hold it took is missed. Without an authorizer there is
+// nothing to revalidate.
+func (s *WireServer) Revalidate(ctx context.Context) (int, error) {
+	s.mu.Lock()
+	live := slices.Collect(maps.Keys(s.live))
+	s.mu.Unlock()
+
+	total := 0
+	errs := make([]error, 0, len(live))
+
+	for _, sc := range live {
+		released, revalidateErr := sc.revalidate(ctx)
+		total += released
+
+		// A connection that ended meanwhile released its holds by ending.
+		if revalidateErr != nil && !errors.Is(revalidateErr, ErrConnClosed) {
+			errs = append(errs, revalidateErr)
+		}
+	}
+
+	return total, joinErrors(errs...)
+}
+
 // refuse answers the first request of a connection the server will not serve
 // with cause, so the client's handshake fails with the reason. It never
 // opens a session, and a peer that is slow to talk or to listen is cut off
@@ -668,6 +724,9 @@ func (s *WireServer) ServeConn(nc net.Conn) {
 	sc.authorizer = s.authorizer
 	sc.principal = s.identify(nc)
 
+	s.addLive(sc)
+	defer s.removeLive(sc)
+
 	// A connection the host ends (keepalive expiry, shutdown) must also end
 	// the transport, so the client finds out.
 	sc.wg.Go(func() {
@@ -698,6 +757,13 @@ type wireServerConn struct {
 	// allows everything.
 	authorizer Authorizer
 	principal  Principal
+
+	// grantMu makes "authorize an acquire and take the hold" one step with
+	// respect to Revalidate: acquires hold it for reading, Revalidate for
+	// writing. A policy replaced before Revalidate starts is therefore seen
+	// by every acquire that begins after it, and every acquire that began
+	// before has finished (its hold is listed) by the time Revalidate scans.
+	grantMu sync.RWMutex
 
 	writeMu sync.Mutex
 
@@ -906,15 +972,15 @@ func (sc *wireServerConn) cancelInflight(id uint64) {
 // authorizing.
 var wireResourceOps = []string{wireOpAcquire, wireOpRelease, wireOpWaitApplied}
 
-// authorize reports whether the connection's principal may use resource. It
+// authorize reports whether the connection's principal may do request. It
 // fails closed: an authorizer that fails for any reason other than saying no
 // denies too.
-func (sc *wireServerConn) authorize(resource string) error {
+func (sc *wireServerConn) authorize(request AuthRequest) error {
 	if sc.authorizer == nil {
 		return nil
 	}
 
-	authErr := sc.authorizer.Authorize(sc.principal, resource)
+	authErr := sc.authorizer.Authorize(sc.principal, request)
 
 	switch {
 	case authErr == nil:
@@ -922,16 +988,79 @@ func (sc *wireServerConn) authorize(resource string) error {
 	case errors.Is(authErr, ErrNotAuthorized):
 		return wrapInterfaceErr(authErr)
 	default:
-		return fmt.Errorf("%w: authorizing resource %q failed: %w", ErrNotAuthorized, resource, authErr)
+		return fmt.Errorf("%w: authorizing %s of resource %q failed: %w", ErrNotAuthorized, request.Operation, request.Resource, authErr)
 	}
+}
+
+// authorizeRequest is authorize for one wire request, with one exception: a
+// principal may always let go of a hold its own session has, whatever the
+// policy now says. Whether the session holds the resource is only asked after
+// the policy said no, and any failure to find out leaves the refusal, so a
+// resource that does not exist or is not held reveals nothing.
+func (sc *wireServerConn) authorizeRequest(ctx context.Context, req wireRequest) error {
+	authErr := sc.authorize(AuthRequest{Operation: WireOperation(req.Op), Resource: req.Resource})
+	if authErr == nil {
+		return nil
+	}
+
+	if req.Op == wireOpRelease {
+		if holder, holdErr := sc.conn.holds(ctx, req.Resource); holdErr == nil && holder {
+			return nil
+		}
+	}
+
+	return authErr
+}
+
+// revalidate releases the holds of this connection's session that the
+// authorizer no longer allows (see WireServer.Revalidate) and returns how
+// many it released.
+func (sc *wireServerConn) revalidate(ctx context.Context) (int, error) {
+	if sc.authorizer == nil {
+		return 0, nil
+	}
+
+	sc.grantMu.Lock()
+	defer sc.grantMu.Unlock()
+
+	held, heldErr := sc.conn.heldResources()
+	if heldErr != nil {
+		return 0, heldErr
+	}
+
+	released := 0
+	errs := make([]error, 0, len(held))
+
+	for _, resource := range held {
+		if sc.authorize(AuthRequest{Operation: OpAcquire, Resource: resource}) == nil {
+			continue
+		}
+
+		if revokeErr := sc.conn.revoke(ctx, resource); revokeErr != nil {
+			errs = append(errs, revokeErr)
+
+			continue
+		}
+
+		released++
+	}
+
+	return released, joinErrors(errs...)
 }
 
 // execute runs one operation on the session and builds its response.
 func (sc *wireServerConn) execute(ctx context.Context, req wireRequest) wireResponse {
+	if req.Op == wireOpAcquire {
+		// Authorizing and taking the hold are one step with respect to
+		// Revalidate (see grantMu).
+		sc.grantMu.RLock()
+		defer sc.grantMu.RUnlock()
+	}
+
 	// Before the host looks the resource up, so an unregistered name is
 	// refused exactly like a forbidden one and nothing is revealed.
 	if slices.Contains(wireResourceOps, req.Op) {
-		if authErr := sc.authorize(req.Resource); authErr != nil {
+		if authErr := sc.authorizeRequest(ctx, req); authErr != nil {
 			return wireErrorResponse(authErr)
 		}
 	}

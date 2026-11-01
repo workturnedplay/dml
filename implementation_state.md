@@ -2667,6 +2667,30 @@ empty commit is the baseline of about 2.7 ms):
  TestHostGraphWritesToUnrelatedNodesDoNotWakeTheReconciler and
  TestHostGraphNamesPersistAcrossARestart.
 
+77. Mutable authorization (theorystate.md section 113). (a) Authorizer now
+ takes an AuthRequest{Operation, Resource} (WireOperation: OpAcquire,
+ OpRelease, OpWaitApplied, typed from the wire op constants) instead of a bare
+ resource name, so a policy can decide by operation; ResourcePolicy ignores
+ the operation. (b) MutablePolicy is an Authorizer over an
+ atomic.Pointer[ResourcePolicy] with Replace; its zero value denies everyone.
+ (c) A principal may always release a hold its own session has, however the
+ policy changed (wireServerConn.authorizeRequest asks Conn.holds only after
+ the policy said no, and any failure leaves the refusal, so unknown or
+ not-held resources reveal nothing). (d) WireServer.Revalidate releases the
+ holds of every live connection (WireServer.live, registered after the
+ handshake) that the authorizer no longer allows to acquire, through
+ Conn.heldResources and Conn.revoke (not a sign of life of the client). A
+ per-connection RWMutex (grantMu) makes "authorize an acquire and take the
+ hold" one step with respect to Revalidate, so an acquire authorized under the
+ old policy cannot land after the scan. DRY: Conn.release, isHolder and
+ enterResourceQuietly are shared by the client's operations and the host's own.
+ Covered by TestMutablePolicyReplaceChangesDecisionsAndZeroValueDeniesAll,
+ TestWireHolderMayAlwaysReleaseWhatItHolds,
+ TestWireRevalidateReleasesOnlyHoldsThePolicyNoLongerAllows and
+ TestWireRevalidateWithoutAnAuthorizerChangesNothing. Not done: a push to the
+ client that its hold was revoked (it learns on its next call), the policy in
+ the graph (backlog item 4).
+
 Currently unaddressed yet:
 - ListRegistry.Append finds the tail as the child its list shares with the
   AllTails hub (item 68), so it costs about the smaller of the two child sets:

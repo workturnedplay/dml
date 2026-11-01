@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sync/atomic"
 )
 
 // Per-resource authorization for the wire transport (theorystate.md section
@@ -51,21 +52,39 @@ const AnyPrincipal Principal = "*"
 // the empty Principal (and is reported), never an allowed one.
 type PeerIdentifier func(nc net.Conn) (Principal, error)
 
+// WireOperation names what a wire client asks to do with a resource.
+type WireOperation string
+
+// The operations a wire client can ask to do with a named resource.
+const (
+	OpAcquire     WireOperation = wireOpAcquire
+	OpRelease     WireOperation = wireOpRelease
+	OpWaitApplied WireOperation = wireOpWaitApplied
+)
+
+// AuthRequest is what an Authorizer is asked: may the principal do Operation
+// to Resource. WireServer.Revalidate asks about OpAcquire (may it hold the
+// resource at all).
+type AuthRequest struct {
+	Operation WireOperation
+	Resource  string
+}
+
 // Authorizer decides which principals may use which resources over the wire.
 type Authorizer interface {
-	// Authorize returns nil if principal may acquire, release or wait on
-	// resource, and an error wrapping ErrNotAuthorized otherwise. Any other
-	// error also denies. It is called for names that are not registered
+	// Authorize returns nil if principal may do request.Operation to
+	// request.Resource, and an error wrapping ErrNotAuthorized otherwise. Any
+	// other error also denies. It is called for names that are not registered
 	// resources too, and must not touch the graph.
-	Authorize(principal Principal, resource string) error
+	Authorize(principal Principal, request AuthRequest) error
 }
 
 // AuthorizerFunc adapts a function to Authorizer.
-type AuthorizerFunc func(principal Principal, resource string) error
+type AuthorizerFunc func(principal Principal, request AuthRequest) error
 
 // Authorize calls f.
-func (f AuthorizerFunc) Authorize(principal Principal, resource string) error {
-	return wrapInterfaceErr(f(principal, resource))
+func (f AuthorizerFunc) Authorize(principal Principal, request AuthRequest) error {
+	return wrapInterfaceErr(f(principal, request))
 }
 
 // ResourcePolicy is an Authorizer from a fixed table: for each resource
@@ -96,9 +115,10 @@ func NewResourcePolicy(rules map[string][]Principal) *ResourcePolicy {
 	return &ResourcePolicy{allowed: allowed}
 }
 
-// Authorize implements Authorizer.
-func (p *ResourcePolicy) Authorize(principal Principal, resource string) error {
-	set := p.allowed[resource] // a missing entry is a nil map: nothing listed
+// Authorize implements Authorizer. It decides by resource alone: the
+// operation is ignored.
+func (p *ResourcePolicy) Authorize(principal Principal, request AuthRequest) error {
+	set := p.allowed[request.Resource] // a missing entry is a nil map: nothing listed
 
 	if _, listed := set[principal]; listed {
 		return nil
@@ -108,5 +128,42 @@ func (p *ResourcePolicy) Authorize(principal Principal, resource string) error {
 		return nil
 	}
 
-	return fmt.Errorf("%w: resource %q", ErrNotAuthorized, resource)
+	return fmt.Errorf("%w: resource %q", ErrNotAuthorized, request.Resource)
+}
+
+// MutablePolicy is an Authorizer whose table can be replaced while the host
+// runs, which ResourcePolicy (immutable) cannot. Replace takes effect for
+// every request that starts after it returns. Holds a principal already has
+// are not touched by it: WireServer.Revalidate releases the ones the new
+// table no longer allows. The zero value has no table and denies everyone.
+// It is safe for concurrent use.
+type MutablePolicy struct {
+	current atomic.Pointer[ResourcePolicy]
+}
+
+// Compile-time assertion that *MutablePolicy satisfies Authorizer.
+var _ Authorizer = (*MutablePolicy)(nil)
+
+// NewMutablePolicy returns a MutablePolicy holding NewResourcePolicy(rules).
+func NewMutablePolicy(rules map[string][]Principal) *MutablePolicy {
+	p := &MutablePolicy{}
+	p.Replace(rules)
+
+	return p
+}
+
+// Replace makes NewResourcePolicy(rules) the table in force. rules is copied;
+// nil means no resource is allowed to anyone.
+func (p *MutablePolicy) Replace(rules map[string][]Principal) {
+	p.current.Store(NewResourcePolicy(rules))
+}
+
+// Authorize implements Authorizer against the table in force.
+func (p *MutablePolicy) Authorize(principal Principal, request AuthRequest) error {
+	policy := p.current.Load()
+	if policy == nil {
+		return fmt.Errorf("%w: resource %q (no policy set)", ErrNotAuthorized, request.Resource)
+	}
+
+	return policy.Authorize(principal, request)
 }
