@@ -3936,6 +3936,16 @@ direct and `Close` can wait for an effect that ignores its context.
 **Still OPEN.** How hosts on different machines coordinate (Part C). The
 wire transport and the keepalive helper are §113.
 
+**The owner's graph handle is guarded (DECIDED, implemented).**
+`Host.Graph()` is not the raw `GraphActor`: it goes through the same
+enter/leave gate every `Conn` operation uses, so after `Close` it fails with
+`ErrHostClosed` and `Close` waits for it, and its transactions mark the
+resources whose holder set they changed dirty after commit, so the
+reconciler is woken exactly as for a `Conn` write. Registries called
+directly are ordered by the same actor as wire requests; what a direct user
+still skips is authorization and session cleanup, which exist only on the
+wire path.
+
 ---
 
 ## 113. The wire transport of the Client interface (TENTATIVE, implemented)

@@ -12246,9 +12246,14 @@ func (h *Host) Registries() *Registries {
 	return h.reg
 }
 
-// Graph returns the actor-fronted graph, for the owner process's own use.
-func (h *Host) Graph() *GraphActor {
-	return h.actor
+// Graph returns the graph handle for the owner process's own use. It is
+// guarded (see hostGraph): after Close every call returns ErrHostClosed
+// instead of panicking, Close waits for calls still running, and a write that
+// changes a resource's holder set wakes the reconciler. Pass it to registry
+// methods as usual; never use it from inside a Transact closure (use the tx
+// the closure was given), exactly as with a GraphActor.
+func (h *Host) Graph() GraphAPI {
+	return hostGraph{host: h}
 }
 
 // monoNow is the host's monotonic clock: time since the host started.

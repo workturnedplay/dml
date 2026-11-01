@@ -2646,6 +2646,27 @@ empty commit is the baseline of about 2.7 ms):
  TestTagFoundationalRequiresTheNames and
  TestHostTagsFoundationalNamesAndKeepsTextAcrossARestart.
 
+76. Guarded Host.Graph() (theorystate.md section 112), in host_graph.go.
+ Host.Graph() returned the raw GraphActor, so a direct user skipped what Conn
+ guarantees: after Close it panicked (send on the closed actor channel), and
+ writes to holder sets did not wake the reconciler until the next resync. It
+ now returns a GraphAPI (hostGraph): every read, Transact and RegisterChecker
+ goes through enter/leave, so after Close it returns ErrHostClosed (a
+ RegisterChecker does nothing) and Close waits for calls in flight. The Tx its
+ Transact hands the closure (hostTx) records every node that is the source of
+ an added or removed relationship, or is deleted, and one OnCommit hook marks
+ the registered resources among them dirty; nested transactions share the set.
+ hostTx forwards nameRecords and the four optional reader interfaces
+ (findCommonChildren, findOutgoingAfter, findIncomingAfter, findNodesAfter),
+ without which names would not persist and findUniqueTaggedChild would scan
+ inside every transaction. Host internals still use h.actor directly. The
+ return type changed from *GraphActor to GraphAPI; nothing used the concrete
+ type. Covered by TestHostGraphFailsWithErrHostClosedAfterClose,
+ TestHostGraphCloseWaitsForATransactionInFlight,
+ TestHostGraphWritesWakeTheReconciler,
+ TestHostGraphWritesToUnrelatedNodesDoNotWakeTheReconciler and
+ TestHostGraphNamesPersistAcrossARestart.
+
 Currently unaddressed yet:
 - ListRegistry.Append finds the tail as the child its list shares with the
   AllTails hub (item 68), so it costs about the smaller of the two child sets:
