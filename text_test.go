@@ -431,16 +431,18 @@ func TestTextUnmarkIndexedPrunesWhatNothingElseNeeds(t *testing.T) {
 
 // TestTextCheckerDeclinesEachViolationAtCommitTime corrupts the structure in
 // one transaction per case and checks the commit is declined and rolled back.
+// The closures read only through tx: the char slots are looked up before the
+// transaction, since a bare *Graph panics on a guarded read from inside one.
 func TestTextCheckerDeclinesEachViolationAtCommitTime(t *testing.T) {
 	cases := []struct {
 		name    string
 		want    error
-		corrupt func(t *testing.T, tx Tx, rig *textRig, cat NodeID) error
+		corrupt func(tx Tx, rig *textRig, cat NodeID, c charSlots) error
 	}{
 		{
 			name: "two strings for the same tail and char",
 			want: ErrAmbiguousPointerMetadata,
-			corrupt: func(t *testing.T, tx Tx, rig *textRig, _ NodeID) error {
+			corrupt: func(tx Tx, rig *textRig, _ NodeID, c charSlots) error {
 				at, found, err := rig.text.Lookup(tx, "at")
 				if err != nil || !found {
 					return ErrInvalidTextStructure
@@ -455,13 +457,13 @@ func TestTextCheckerDeclinesEachViolationAtCommitTime(t *testing.T) {
 					return linkErr
 				}
 
-				return addRelationshipTx(tx, rig.charSlots(t, 'c').startsWith, duplicate)
+				return addRelationshipTx(tx, c.startsWith, duplicate)
 			},
 		},
 		{
 			name: "a string with no first char",
 			want: ErrInvalidTextStructure,
-			corrupt: func(_ *testing.T, tx Tx, rig *textRig, _ NodeID) error {
+			corrupt: func(tx Tx, rig *textRig, _ NodeID, _ charSlots) error {
 				orphan, createErr := createTaggedNodeTx(tx, rig.text.allStrings)
 				if createErr != nil {
 					return createErr
@@ -473,28 +475,28 @@ func TestTextCheckerDeclinesEachViolationAtCommitTime(t *testing.T) {
 		{
 			name: "a char that is also a string",
 			want: ErrInvalidTextStructure,
-			corrupt: func(t *testing.T, tx Tx, rig *textRig, _ NodeID) error {
-				return addRelationshipTx(tx, rig.text.allStrings, rig.charSlots(t, 'c').node)
+			corrupt: func(tx Tx, rig *textRig, _ NodeID, c charSlots) error {
+				return addRelationshipTx(tx, rig.text.allStrings, c.node)
 			},
 		},
 		{
 			name: "the empty string gets a tail",
 			want: ErrInvalidTextStructure,
-			corrupt: func(_ *testing.T, tx Tx, rig *textRig, cat NodeID) error {
+			corrupt: func(tx Tx, rig *textRig, cat NodeID, _ charSlots) error {
 				return addRelationshipTx(tx, cat, rig.text.emptyString)
 			},
 		},
 		{
 			name: "indexed with no entry",
 			want: ErrInvalidTextStructure,
-			corrupt: func(_ *testing.T, tx Tx, rig *textRig, cat NodeID) error {
+			corrupt: func(tx Tx, rig *textRig, cat NodeID, _ charSlots) error {
 				return addRelationshipTx(tx, rig.text.allIndexedStrings, cat)
 			},
 		},
 		{
 			name: "an index node with no step slot",
 			want: ErrInvalidTextStructure,
-			corrupt: func(_ *testing.T, tx Tx, rig *textRig, _ NodeID) error {
+			corrupt: func(tx Tx, rig *textRig, _ NodeID, _ charSlots) error {
 				stray, createErr := createTaggedNodeTx(tx, rig.text.allIndexNodes)
 				if createErr != nil {
 					return createErr
@@ -509,10 +511,10 @@ func TestTextCheckerDeclinesEachViolationAtCommitTime(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			forEachTextRig(t, func(t *testing.T, rig *textRig) {
 				cat := rig.intern(t, "cat")
-				//rig.checkSlotsGraph = rig.graph
+				c := rig.charSlots(t, 'c')
 
 				err := rig.graph.Transact(func(tx Tx) error {
-					return tc.corrupt(t, tx, rig, cat)
+					return tc.corrupt(tx, rig, cat, c)
 				})
 				if !errors.Is(err, tc.want) {
 					t.Fatalf("Transact() error = %v, want %v", err, tc.want)
