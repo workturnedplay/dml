@@ -612,6 +612,17 @@ func (t *TextRegistry) EndingWith(graph GraphReader, suffix string, limit int, i
 			}
 
 			visited[rel.To] = struct{}{}
+
+			// A trie node can also have a form slot as a child
+			// (text_forms.go): only strings are part of the trie.
+			isString, stringErr := t.IsString(graph, rel.To)
+			if stringErr != nil {
+				return nil, stringErr
+			}
+			if !isString {
+				continue
+			}
+
 			queue = append(queue, rel.To)
 		}
 	}

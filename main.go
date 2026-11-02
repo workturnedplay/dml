@@ -4473,6 +4473,8 @@ var FoundationalNames = []string{
 	NameAllIndexStepSlots,
 	NameEmptyString,
 	NameIndexRoot,
+	NameAllTextLists,
+	NameAllTextFormSlots,
 }
 
 // TagFoundational tags every foundational name with (AllFoundational, id),
@@ -11597,6 +11599,10 @@ type Registries struct {
 
 	// Text is the interned-string layer (theorystate.md section 114).
 	Text *TextRegistry
+
+	// TextForms keeps text lists and the forms (alternative spellings) of
+	// texts, over the slotted lists.
+	TextForms *TextFormRegistry
 }
 
 // NewRegistries constructs every registry over graph. ids must hold an
@@ -11693,6 +11699,11 @@ func NewRegistries(graph GraphAPI, names *NameRegistry, ids map[string]NodeID) (
 		return nil, err
 	}
 
+	forms, err := NewTextFormRegistry(graph, text, slottedLists, ids)
+	if err != nil {
+		return nil, err
+	}
+
 	return &Registries{
 		Pointers:    pointers,
 		SubPointers: subPointers,
@@ -11710,6 +11721,7 @@ func NewRegistries(graph GraphAPI, names *NameRegistry, ids map[string]NodeID) (
 		SlottedCapsules: slottedCapsules,
 		SlottedLists:    slottedLists,
 		Text:            text,
+		TextForms:       forms,
 	}, nil
 }
 

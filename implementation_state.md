@@ -2691,13 +2691,45 @@ empty commit is the baseline of about 2.7 ms):
  client that its hold was revoked (it learns on its next call), the policy in
  the graph (backlog item 4).
 
+78. Text lists and text forms (theorystate.md section 114), in text_forms.go.
+ TextFormRegistry keeps text lists (ordered lists, over any OrderedList, whose
+ elements must be non-empty string nodes, tag AllTextLists) and forms: each
+ trie node may have ONE slot (AllTextFormSlots) whose children are text lists
+ that spell the node's text with other string nodes (T -> R -> form). Two new
+ foundational names; Registries.TextForms over the slotted lists.
+ EnsureForm is idempotent (find the form with the same elements, else create
+ slot, list and elements in one transaction) and refuses elements that do not
+ concatenate to the text; the empty string has no forms. NewTextList,
+ AppendMany, Parts, Text, Forms, TextOf and DeleteForm (removes the elements
+ and the slot with the last form). The Checker (keyed on AllTextLists,
+ AllTextFormSlots and the list capsule tag) validates the touched text lists
+ in full (bounded by the text length for a form) and the touched slots: a
+ non-string or empty element, a form that does not spell its text, a slot with
+ no text or on a text that has another slot, a slot child that is not a text
+ list are declined. A form emptied by hand without touching anything else is
+ found only by VerifyAll. Bug fixed on the way: TextRegistry.EndingWith walked
+ every child of a trie node and would have returned the slot; it skips
+ non-strings. Covered by TestTextFormsAreEnsuredReadBackAndIdempotent,
+ TestTextFormsRejectWhatDoesNotSpellTheText,
+ TestTextFormCheckerDeclinesEachHandMadeViolation,
+ TestTextFormsAreNotAppendedTo,
+ TestTextFormsDeleteFormLeavesNothingAndKeepsStrings,
+ TestTextListIsGenericAndChecksItsElements,
+ TestTextEndingWithIgnoresFormSlots and TestHostRegistriesCarryTextForms.
+ Not done: "contains" search, DeleteString.
+
 Currently unaddressed yet:
-- Interned text (item 75) is a suffix trie plus a prefix index and stays as the
-  identity of text. Next (not built): TextList (an ordered slotted list whose
-  values must be string nodes, checked) and text forms, one slot per trie node
-  whose children are such lists, each required to spell the node's text
-  (theorystate.md section 114). EndingWith must then filter by AllStrings.
-  "Contains" search is a paged scan for now.
+- Interned text (items 75, 78): "contains" (substring) search is not built (a
+  paged scan first, an optional positional index later), and there is no
+  DeleteString (only when nothing extends it, nothing refers to it and it has
+  no forms; interacts with the prefix index and lists).
+- Planned next, in this order: (1) randomized differential tests of both list
+  types against a slice model, and of CompositeSetLog.Contains against
+  Evaluate; (2) a design round for plan-as-data remote operations with
+  operations and allow-lists defined in the graph; (3) notes on nodes;
+  (4) measuring a graph with many lists and a commit touching a slotted list
+  node; (5) out-of-band corruption tests on every backend; (6) docs drift
+  (Part D status lists).
 - ListRegistry.Append finds the tail as the child its list shares with the
   AllTails hub (item 68), so it costs about the smaller of the two child sets:
   fine with few lists, linear in the number of non-empty lists when there are

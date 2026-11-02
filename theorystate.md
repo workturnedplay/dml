@@ -4179,7 +4179,8 @@ node. A representation aimed at browsing rather than speed:
 Earlier text of this section implied "one string, one path"; that held only
 within the trie.
 
-**Decision (TENTATIVE; not built): the trie stays, forms hang off its nodes.**
+**Decision (TENTATIVE; forms and text lists implemented, see
+implementation_state.md item 78): the trie stays, forms hang off its nodes.**
 - The trie node is the identity of a text: one per text, enforced at commit by
   the trie's own Checker (a hand-made duplicate is declined), found in time
   proportional to the length. Everything that refers to text links to it. No
@@ -4433,8 +4434,8 @@ kept current as sections above resolve or split further.)*
 
 - Slotted ordered list (§105a) and interned strings as a suffix trie with a
   prefix index (§114): implemented. The trie stays as the identity and lookup
-  of text; alternative spellings are to be added as forms (ordered lists of
-  string nodes) behind one slot per trie node (§114, TENTATIVE, not built).
+  of text; alternative spellings are forms (ordered lists of string nodes)
+  behind one slot per trie node (§114, TENTATIVE, implemented).
 
 ### OPEN
 - Exact Set/Pointer/List definitions; exact primitive storage; whether a
