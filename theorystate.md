@@ -4153,8 +4153,19 @@ node. A representation aimed at browsing rather than speed:
   children; from raw text, reverse-look-up the first char's capsules, climb
   while the capsule is a head element (list, group, the group's own head
   position, ...) and verify each candidate by flattening it against the text.
-  Cost is the number of occurrences of that char. Segmenting text into known
-  words is the only part that needs backtracking.
+  The climb is transitive, so the candidates are every text that starts with
+  that char (a large part of the corpus for a common char), not just the
+  occurrences of the char: without an index, create-or-find is
+  corpus-proportional and a commit-time duplicate check is unaffordable (a
+  startup sweep would find duplicates instead). Segmenting text into known
+  words is the part that needs backtracking.
+- Therefore the trie is still needed as the text-to-group index (one canonical
+  node per text, found in time proportional to the length), either beside the
+  groups or as the group itself (the trie node gains representation lists as
+  extra tagged children). The groups add browsability and substring search; the
+  trie keeps identity and lookup. Decide when the needed queries are known:
+  exact lookup needs an index, suffix and prefix are served by the trie and its
+  prefix index, only "contains" needs the char-list model.
 - Risk: fragmentation. Two groups spelling the same text make equality no
   longer node identity. Creating a group must search first, in the same
   transaction; a merge operation (move representations under one group,
