@@ -4136,6 +4136,38 @@ string nodes.
 
 Limits: 4096 runes per text, invalid UTF-8 is rejected, no string deletion yet.
 
+**Alternative under consideration (OPEN; not built; may replace the trie).**
+The suffix trie gives one canonical node per text only among trie nodes: an
+ordered list of one-char string nodes spelling the same text is a different
+node. A representation aimed at browsing rather than speed:
+- A *text group* node `(AllTexts, T)` stands for one spelling. Its children are
+  its *representations*, each an ordered list whose elements are chars or other
+  text groups (so "The cat sat on the mat." can be a list of words and spaces,
+  or of fragments, or of chars only). Chars are the leaves.
+- Everything that refers to text links to the group (a sentence is an ordered
+  list of groups), never to a representation. Words are separated by spaces;
+  the space is its own group. Case differs means a different group.
+- Invariant (Checker): every representation of a group flattens to the same
+  text. Adding a representation is adding a child.
+- Finding is a search, not a table: from a group its representations are its
+  children; from raw text, reverse-look-up the first char's capsules, climb
+  while the capsule is a head element (list, group, the group's own head
+  position, ...) and verify each candidate by flattening it against the text.
+  Cost is the number of occurrences of that char. Segmenting text into known
+  words is the only part that needs backtracking.
+- Risk: fragmentation. Two groups spelling the same text make equality no
+  longer node identity. Creating a group must search first, in the same
+  transaction; a merge operation (move representations under one group,
+  re-point referrers held in capsule value slots or note edges) is the repair
+  and is the hard part.
+- Substring search ("contains") comes with this model and does not exist in the
+  trie. The trie would at most remain an optional text-to-group index.
+- Cost: a word is a group node, a list (4 nodes) and 4 nodes per char, and char
+  nodes become hubs. Accepted for accessibility. TextRegistry's API (Intern,
+  Lookup, Text) does not expose the representation, so a switch is possible.
+Earlier text of this section implied "one string, one path"; that held only
+within the trie.
+
 ---
 
 ## PART D — STATUS SUMMARY (consolidated)
