@@ -2692,11 +2692,12 @@ empty commit is the baseline of about 2.7 ms):
  the graph (backlog item 4).
 
 Currently unaddressed yet:
-- Interned text (item 75) is a suffix trie plus a prefix index. An alternative
-  built for browsing is recorded in theorystate.md section 114 (text groups
-  with several representations as ordered lists of chars and sub-groups,
-  found by search, no canonical table). Not built; decide before TextList
-  (backlog item 1), since a TextList of groups would replace one of strings.
+- Interned text (item 75) is a suffix trie plus a prefix index and stays as the
+  identity of text. Next (not built): TextList (an ordered slotted list whose
+  values must be string nodes, checked) and text forms, one slot per trie node
+  whose children are such lists, each required to spell the node's text
+  (theorystate.md section 114). EndingWith must then filter by AllStrings.
+  "Contains" search is a paged scan for now.
 - ListRegistry.Append finds the tail as the child its list shares with the
   AllTails hub (item 68), so it costs about the smaller of the two child sets:
   fine with few lists, linear in the number of non-empty lists when there are

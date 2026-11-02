@@ -4136,7 +4136,7 @@ string nodes.
 
 Limits: 4096 runes per text, invalid UTF-8 is rejected, no string deletion yet.
 
-**Alternative under consideration (OPEN; not built; may replace the trie).**
+**Alternative considered (superseded by the decision below).**
 The suffix trie gives one canonical node per text only among trie nodes: an
 ordered list of one-char string nodes spelling the same text is a different
 node. A representation aimed at browsing rather than speed:
@@ -4178,6 +4178,32 @@ node. A representation aimed at browsing rather than speed:
   Lookup, Text) does not expose the representation, so a switch is possible.
 Earlier text of this section implied "one string, one path"; that held only
 within the trie.
+
+**Decision (TENTATIVE; not built): the trie stays, forms hang off its nodes.**
+- The trie node is the identity of a text: one per text, enforced at commit by
+  the trie's own Checker (a hand-made duplicate is declined), found in time
+  proportional to the length. Everything that refers to text links to it. No
+  separate group node: it would be redundant.
+- Alternative spellings are *forms*: each trie node may have ONE extra tagged
+  child, a slot (AllTextForms), whose children are ordered lists of string
+  nodes (a form). Elements are string nodes only (a "char" in a form is the
+  1-char string); the raw char nodes stay inside the trie. The slot keeps the
+  node's own fan-out (its one-char extensions) uncrowded. Forms are not hung
+  on index entries, which exist only for marked strings and are pruned with
+  the prefix index.
+- Invariant (Checker): a form hangs under exactly one text, and its elements'
+  texts concatenate to that text. An element's text comes from its own trie
+  position, never from its forms, so the check is bounded by the text length
+  and cannot recurse. A manually added form is fine; a wrong one is declined.
+- The form list is the TextList of the backlog: an ordered slotted list whose
+  values must be string nodes.
+- Queries: exact lookup and suffix search are served by the trie, prefix search
+  by the index for marked strings, "contains" by a paged scan for now (an
+  optional positional index later). Walks over a trie node's children
+  (EndingWith) must filter by the AllStrings tag once the slot exists.
+- Rejected: separate group nodes (redundant), forms as direct children of the
+  trie node (crowds it), forms on index entries (wrong lifetime), a scan as the
+  only lookup (corpus-proportional, and uniqueness could only be swept).
 
 ---
 
@@ -4406,10 +4432,9 @@ kept current as sections above resolve or split further.)*
   (§89c).
 
 - Slotted ordered list (§105a) and interned strings as a suffix trie with a
-  prefix index (§114): implemented. Whether the trie is the right
-  representation (against lists of chars, which allow substring search and are
-  easier to browse, but have no canonical form) depends on which queries are
-  needed; the layer's API does not expose the representation.
+  prefix index (§114): implemented. The trie stays as the identity and lookup
+  of text; alternative spellings are to be added as forms (ordered lists of
+  string nodes) behind one slot per trie node (§114, TENTATIVE, not built).
 
 ### OPEN
 - Exact Set/Pointer/List definitions; exact primitive storage; whether a
