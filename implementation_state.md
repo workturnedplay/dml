@@ -2718,17 +2718,32 @@ empty commit is the baseline of about 2.7 ms):
  TestTextEndingWithIgnoresFormSlots and TestHostRegistriesCarryTextForms.
  Not done: "contains" search, DeleteString.
 
+79. Randomized differential tests (list_differential_test.go, no production
+ change). A fixed-seed random sequence of operations is applied to the real
+ structure and to a plain model, and everything is compared after every step.
+ Lists: three lists of one implementation share a pool of eight values;
+ Append, Prepend, InsertAfter, Remove, RemoveWithoutDeletingCapsule and
+ AppendMany, about one in six rolled back inside a failing transaction; after
+ each step Elements, Head, Tail, IsMember, ListsOf, stepBack from every
+ element, Contains, OccurrencesOf and VerifyStructures must agree with a slice,
+ removed capsules must be gone or loose. Logs: sets, composites and logs
+ that expand each other without cycles, changed at random (set Add/Remove,
+ AddOperand/RemoveOperand, AppendOperation/RemoveOperation); after each step
+ Contains must agree with Evaluate for every node, log and composite.
+ Both run on every backend and list type. Covered by
+ TestOrderedListsMatchASliceModelUnderRandomOperations and
+ TestCompositeSetLogContainsMatchesEvaluateUnderRandomOperations. Under -short
+ the step counts are divided by four.
+
 Currently unaddressed yet:
 - Interned text (items 75, 78): "contains" (substring) search is not built (a
   paged scan first, an optional positional index later), and there is no
   DeleteString (only when nothing extends it, nothing refers to it and it has
   no forms; interacts with the prefix index and lists).
-- Planned next, in this order: (1) randomized differential tests of both list
-  types against a slice model, and of CompositeSetLog.Contains against
-  Evaluate; (2) a design round for plan-as-data remote operations with
-  operations and allow-lists defined in the graph; (3) notes on nodes;
-  (4) measuring a graph with many lists and a commit touching a slotted list
-  node; (5) out-of-band corruption tests on every backend; (6) docs drift
+- Planned next, in this order: (1) a design round for plan-as-data remote
+  operations with operations and allow-lists defined in the graph; (2) notes on
+  nodes; (3) measuring a graph with many lists and a commit touching a slotted
+  list node; (4) out-of-band corruption tests on every backend; (5) docs drift
   (Part D status lists).
 - ListRegistry.Append finds the tail as the child its list shares with the
   AllTails hub (item 68), so it costs about the smaller of the two child sets:
