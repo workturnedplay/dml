@@ -11523,8 +11523,10 @@ var (
 	// twice.
 	ErrResourceRegistered = errors.New("resource is already registered")
 
-	// ErrResourceName is returned for an empty resource name.
-	ErrResourceName = errors.New("resource name must not be empty")
+	// ErrResourceName is returned for an empty resource name, and for
+	// PlanResource, the name a wire Authorizer is asked about for a plan,
+	// which must never be a real resource.
+	ErrResourceName = errors.New("resource name must not be empty or reserved")
 
 	// ErrHoldLost is returned by WaitApplied when the session no longer
 	// holds the resource it is waiting for.
@@ -12432,7 +12434,7 @@ func (h *Host) shutdownConns() []error {
 // compares it with reality at once and removes a rule left behind by a
 // previous run.
 func (h *Host) RegisterResource(name string, effect Effect) error {
-	if name == "" {
+	if name == "" || name == PlanResource {
 		return ErrResourceName
 	}
 

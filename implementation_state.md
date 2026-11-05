@@ -2735,15 +2735,46 @@ empty commit is the baseline of about 2.7 ms):
  TestCompositeSetLogContainsMatchesEvaluateUnderRandomOperations. Under -short
  the step counts are divided by four.
 
+80. Plan-as-data remote operations, stage 1 (theorystate.md section 115), in
+ plan.go and the wire transport. A plan is a complete, straight-line list of
+ steps sent in one frame: create, ensure_named, intern, add, remove, delete,
+ assert_has, assert_lacks, assert_exists. Steps name nodes by a label an
+ earlier step bound, by NodeID (a pointer, so node 0 is told from "not set"),
+ or by registered name. Host.RunPlan validates it without touching the graph
+ (ErrPlanInvalid: unknown operation, missing or extra fields, a label that is
+ unbound or bound twice, a reserved name prefix, bad text, too many steps) and
+ runs it as ONE transaction through the guarded Host.Graph(), so Checkers run
+ and holder-set changes wake the reconciler; a failure that depends on the
+ graph (a failed assert, a missing node or name, a node that cannot be
+ deleted) is ErrPlanConflict naming the step, and nothing is changed. The wire
+ side: WithPlans(maxSteps) turns plans on (off by default), they fail closed
+ without an Authorizer, and the authorizer is asked AuthRequest{OpPlan,
+ PlanResource} before anything about the plan is looked at;
+ WireClient.RunPlan returns the bound labels; plan_invalid and plan_conflict
+ are new wire codes. RegisterResource refuses PlanResource. Also: the server
+ now bounds a half-sent frame (readWireFrameBounded: once a header has arrived
+ the payload must follow within wireFrameTimeout, else a protocol violation,
+ reported); and a bug fixed in WireClient.send: a request too large for a frame
+ killed the whole connection and session, it now fails with
+ ErrWireFrameTooLarge and leaves the connection alone. Covered by the TestPlan*
+ tests (plan_test.go), TestRegisterResourceRefusesThePlanResourceName and, in
+ wire_plan_test.go, TestWirePlanRunsAndReturnsTheBoundLabels,
+ TestWirePlanErrorsKeepTheirIdentity, TestWirePlanIsRefusedUnlessEnabledAndAuthorized,
+ TestWirePlanFollowsTheCurrentPolicy, TestWirePlanStepLimitComesFromWithPlans,
+ TestWireOversizedPlanIsRefusedAndTheConnectionSurvives and
+ TestWireSlowFrameIsDroppedAfterTheFrameDeadline. Not done (stage 2): operations
+ and allow-lists defined in the graph, so a principal can be allowed some plans
+ and not others.
+
 Currently unaddressed yet:
 - Interned text (items 75, 78): "contains" (substring) search is not built (a
   paged scan first, an optional positional index later), and there is no
   DeleteString (only when nothing extends it, nothing refers to it and it has
   no forms; interacts with the prefix index and lists).
-- Planned next, in this order: (1) a design round for plan-as-data remote
-  operations with operations and allow-lists defined in the graph; (2) notes on
-  nodes; (3) measuring a graph with many lists and a commit touching a slotted
-  list node; (4) out-of-band corruption tests on every backend; (5) docs drift
+- Planned next, in this order: (1) stage 2 of plan-as-data, operations and
+  allow-lists defined in the graph (stage 1 is item 80); (2) notes on nodes;
+  (3) measuring a graph with many lists and a commit touching a slotted list
+  node; (4) out-of-band corruption tests on every backend; (5) docs drift
   (Part D status lists).
 - ListRegistry.Append finds the tail as the child its list shares with the
   AllTails hub (item 68), so it costs about the smaller of the two child sets:

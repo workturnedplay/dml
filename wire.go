@@ -86,6 +86,12 @@ var (
 // completeTLS). A var, not a const, so tests can shrink it.
 var wireHelloTimeout = 10 * time.Second
 
+// wireFrameTimeout is how long the rest of a frame has to arrive once its
+// length header has (an idle connection between frames is not limited by it),
+// so that a half-sent frame cannot hold a goroutine and a buffer. A var, not a
+// const, so tests can shrink it.
+var wireFrameTimeout = 5 * time.Second
+
 // Serve survives failing Accept calls (running out of file descriptors, a
 // connection reset before it was accepted): it waits, starting at
 // wireAcceptBackoffStart and doubling up to wireAcceptBackoffMax, and tries
@@ -129,6 +135,7 @@ const (
 	wireOpKeepalive   = "keepalive"
 	wireOpCancel      = "cancel"
 	wireOpClose       = "close"
+	wireOpPlan        = "plan"
 )
 
 // wireRequest is one client-to-host frame.
@@ -139,16 +146,18 @@ type wireRequest struct {
 	Resource string `json:"resource,omitempty"`
 	Mark     uint64 `json:"mark,omitempty"`
 	Target   uint64 `json:"target,omitempty"`
+	Plan     *Plan  `json:"plan,omitempty"`
 }
 
 // wireResponse is one host-to-client frame.
 type wireResponse struct {
-	ID                 uint64     `json:"id"`
-	Error              *wireError `json:"error,omitempty"`
-	First              bool       `json:"first,omitempty"`
-	Last               bool       `json:"last,omitempty"`
-	Mark               uint64     `json:"mark,omitempty"`
-	KeepaliveTTLMillis int64      `json:"keepalive_ttl_ms,omitempty"`
+	ID                 uint64      `json:"id"`
+	Error              *wireError  `json:"error,omitempty"`
+	First              bool        `json:"first,omitempty"`
+	Last               bool        `json:"last,omitempty"`
+	Mark               uint64      `json:"mark,omitempty"`
+	KeepaliveTTLMillis int64       `json:"keepalive_ttl_ms,omitempty"`
+	PlanResult         *PlanResult `json:"plan_result,omitempty"`
 }
 
 // wireError is an error as it crosses the wire: a stable code plus the
@@ -178,6 +187,8 @@ var wireErrorTable = []struct {
 	{"canceled", context.Canceled},
 	{"deadline_exceeded", context.DeadlineExceeded},
 	{"busy", ErrWireBusy},
+	{"plan_invalid", ErrPlanInvalid},
+	{"plan_conflict", ErrPlanConflict},
 	{"protocol", ErrWireProtocol},
 }
 
@@ -277,20 +288,27 @@ func writeWireFrameWithin(nc net.Conn, v any, limit time.Duration) error {
 	return writeErr
 }
 
-// readWireFrame reads one frame into v. io.EOF (wrapped) means the peer
-// closed cleanly between frames.
-func readWireFrame(r io.Reader, v any) error {
+// readWireHeader reads the length header of a frame and returns the size it
+// announces, which is checked against wireMaxFrame. io.EOF (wrapped) means the
+// peer closed cleanly between frames.
+func readWireHeader(r io.Reader) (uint32, error) {
 	var header [wireHeaderSize]byte
 
 	if _, readErr := io.ReadFull(r, header[:]); readErr != nil {
-		return fmt.Errorf("wire: reading a frame header: %w", readErr)
+		return 0, fmt.Errorf("wire: reading a frame header: %w", readErr)
 	}
 
 	size := binary.BigEndian.Uint32(header[:])
 	if size > wireMaxFrame {
-		return fmt.Errorf("%w: %d bytes announced, limit %d", ErrWireFrameTooLarge, size, wireMaxFrame)
+		return 0, fmt.Errorf("%w: %d bytes announced, limit %d", ErrWireFrameTooLarge, size, wireMaxFrame)
 	}
 
+	return size, nil
+}
+
+// readWireBody reads the size bytes of a frame's payload and decodes them
+// into v.
+func readWireBody(r io.Reader, size uint32, v any) error {
 	// The payload buffer grows as bytes arrive, so a peer that announces a
 	// large frame and then sends nothing costs the server almost nothing
 	// (allocating the announced size up front would add up over many
@@ -313,6 +331,48 @@ func readWireFrame(r io.Reader, v any) error {
 	return nil
 }
 
+// readWireFrame reads one frame into v. io.EOF (wrapped) means the peer
+// closed cleanly between frames.
+func readWireFrame(r io.Reader, v any) error {
+	size, headerErr := readWireHeader(r)
+	if headerErr != nil {
+		return headerErr
+	}
+
+	return readWireBody(r, size, v)
+}
+
+// readWireFrameBounded is readWireFrame for a server connection: an idle
+// connection between frames is not limited, but once a frame's header has
+// arrived its payload must follow within wireFrameTimeout, so a half-sent frame
+// cannot hold a goroutine and a buffer. A payload that is late is a protocol
+// violation. The deadline is cleared once the frame is in.
+func readWireFrameBounded(nc net.Conn, r io.Reader, v any) error {
+	size, headerErr := readWireHeader(r)
+	if headerErr != nil {
+		return headerErr
+	}
+
+	if deadlineErr := nc.SetReadDeadline(time.Now().Add(wireFrameTimeout)); deadlineErr != nil {
+		return fmt.Errorf("wire: setting the frame deadline: %w", deadlineErr)
+	}
+
+	bodyErr := readWireBody(r, size, v)
+
+	switch {
+	case isTimeout(bodyErr):
+		return fmt.Errorf("%w: a frame of %d bytes was not complete within %v", ErrWireProtocol, size, wireFrameTimeout)
+	case bodyErr != nil:
+		return bodyErr
+	}
+
+	if clearErr := nc.SetReadDeadline(time.Time{}); clearErr != nil {
+		return fmt.Errorf("wire: clearing the frame deadline: %w", clearErr)
+	}
+
+	return nil
+}
+
 // ---------------------------------------------------------------------
 // Server
 
@@ -328,6 +388,7 @@ type WireServer struct {
 	authorizer    Authorizer
 	identifier    PeerIdentifier
 	allowPlainTCP bool
+	planLimit     int // 0: plans are not accepted
 
 	mu        sync.Mutex
 	closed    bool
@@ -388,6 +449,27 @@ func WithPeerIdentifier(identify PeerIdentifier) WireOption {
 // host, and for nothing else; use a named pipe or ListenTLS otherwise.
 func WithInsecurePlainTCP() WireOption {
 	return func(s *WireServer) { s.allowPlainTCP = true }
+}
+
+// WithPlans makes the server accept plans (see Plan): a client sends a
+// complete list of steps and the host runs it as one transaction. A plan may
+// have at most maxSteps steps (zero or less means DefaultPlanMaxSteps).
+//
+// Plans are off unless this is given, and they also need an Authorizer
+// (WithAuthorizer): without one every plan is refused. The authorizer is asked
+// AuthRequest{OpPlan, PlanResource}, so a policy lists the principals that may
+// submit plans under the name PlanResource. Such a principal is trusted with
+// the whole graph, not with one resource: a plan can add a session to any
+// holder Set, which per-resource authorization would not allow, so only
+// principals trusted that far should be listed.
+func WithPlans(maxSteps int) WireOption {
+	return func(s *WireServer) {
+		if maxSteps <= 0 {
+			maxSteps = DefaultPlanMaxSteps
+		}
+
+		s.planLimit = maxSteps
+	}
 }
 
 // NewWireServer returns a server for host.
@@ -723,6 +805,7 @@ func (s *WireServer) ServeConn(nc net.Conn) {
 	sc.conn = conn
 	sc.authorizer = s.authorizer
 	sc.principal = s.identify(nc)
+	sc.planLimit = s.planLimit
 
 	s.addLive(sc)
 	defer s.removeLive(sc)
@@ -757,6 +840,10 @@ type wireServerConn struct {
 	// allows everything.
 	authorizer Authorizer
 	principal  Principal
+
+	// planLimit is the most steps a plan may have, set from the server after
+	// the handshake like authorizer; 0 means plans are not accepted.
+	planLimit int
 
 	// grantMu makes "authorize an acquire and take the hold" one step with
 	// respect to Revalidate: acquires hold it for reading, Revalidate for
@@ -876,7 +963,7 @@ func (sc *wireServerConn) serve(ctx context.Context) error {
 	for {
 		var req wireRequest
 
-		if readErr := readWireFrame(sc.reader, &req); readErr != nil {
+		if readErr := readWireFrameBounded(sc.nc, sc.reader, &req); readErr != nil {
 			return readErr
 		}
 
@@ -1048,6 +1135,39 @@ func (sc *wireServerConn) revalidate(ctx context.Context) (int, error) {
 	return released, joinErrors(errs...)
 }
 
+// executePlan runs a submitted plan as one transaction on the host. It fails
+// closed: without WithPlans, or without an authorizer, every plan is refused,
+// and with one the principal must be allowed OpPlan on PlanResource. The plan
+// is validated and run by Host.RunPlan, which reports ErrPlanInvalid or
+// ErrPlanConflict. The authorization comes before anything about the plan is
+// looked at, so a refused peer learns nothing from the answer.
+func (sc *wireServerConn) executePlan(req wireRequest) wireResponse {
+	if sc.planLimit <= 0 || sc.authorizer == nil {
+		return wireErrorResponse(fmt.Errorf("%w: this server does not accept plans", ErrNotAuthorized))
+	}
+
+	if authErr := sc.authorize(AuthRequest{Operation: OpPlan, Resource: PlanResource}); authErr != nil {
+		return wireErrorResponse(authErr)
+	}
+
+	if req.Plan == nil {
+		return wireErrorResponse(fmt.Errorf("%w: a plan request carries no plan", ErrWireProtocol))
+	}
+
+	if sc.conn.isDone() {
+		return wireErrorResponse(ErrConnClosed)
+	}
+
+	sc.conn.touch()
+
+	result, runErr := sc.host.RunPlan(*req.Plan, sc.planLimit)
+	if runErr != nil {
+		return wireErrorResponse(runErr)
+	}
+
+	return wireResponse{PlanResult: &result}
+}
+
 // execute runs one operation on the session and builds its response.
 func (sc *wireServerConn) execute(ctx context.Context, req wireRequest) wireResponse {
 	if req.Op == wireOpAcquire {
@@ -1092,6 +1212,8 @@ func (sc *wireServerConn) execute(ctx context.Context, req wireRequest) wireResp
 		}
 
 		return wireResponse{}
+	case wireOpPlan:
+		return sc.executePlan(req)
 	default:
 		return wireErrorResponse(fmt.Errorf("%w: unknown operation %q", ErrWireProtocol, req.Op))
 	}
@@ -1241,6 +1363,12 @@ func (c *WireClient) send(req *wireRequest) error {
 	defer c.writeMu.Unlock()
 
 	if writeErr := writeWireFrameWithin(c.nc, req, wireWriteTimeout); writeErr != nil {
+		// A frame that is too large is refused before a byte is written, so
+		// the request fails and the connection is unharmed.
+		if errors.Is(writeErr, ErrWireFrameTooLarge) {
+			return writeErr
+		}
+
 		c.shutdown(writeErr)
 
 		return c.closedError()
@@ -1383,6 +1511,27 @@ func (c *WireClient) Keepalive(ctx context.Context) error {
 	_, err := c.call(ctx, wireRequest{Op: wireOpKeepalive})
 
 	return err
+}
+
+// RunPlan sends plan to the host, which runs it as one transaction (see Plan),
+// and returns the node each label was bound to. It needs a server that was
+// given WithPlans and an Authorizer that lets this client submit plans; the
+// errors are ErrNotAuthorized, ErrPlanInvalid (wrong whatever the graph
+// holds) and ErrPlanConflict (does not fit the graph as it is now; nothing was
+// changed). A plan too large for one frame is ErrWireFrameTooLarge and leaves
+// the connection alone. It is not part of Client: the in-process Conn has
+// closures and does not need it.
+func (c *WireClient) RunPlan(ctx context.Context, plan Plan) (PlanResult, error) {
+	resp, err := c.call(ctx, wireRequest{Op: wireOpPlan, Plan: &plan})
+	if err != nil {
+		return PlanResult{}, err
+	}
+
+	if resp.PlanResult == nil {
+		return PlanResult{}, fmt.Errorf("%w: the host answered a plan without a result", ErrWireProtocol)
+	}
+
+	return *resp.PlanResult, nil
 }
 
 // Done implements Client.

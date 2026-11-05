@@ -60,11 +60,14 @@ const (
 	OpAcquire     WireOperation = wireOpAcquire
 	OpRelease     WireOperation = wireOpRelease
 	OpWaitApplied WireOperation = wireOpWaitApplied
+	OpPlan        WireOperation = wireOpPlan
 )
 
 // AuthRequest is what an Authorizer is asked: may the principal do Operation
 // to Resource. WireServer.Revalidate asks about OpAcquire (may it hold the
-// resource at all).
+// resource at all). A plan submission is asked as OpPlan on PlanResource,
+// which is not a real resource: the policy lists the principals that may
+// submit plans under that name.
 type AuthRequest struct {
 	Operation WireOperation
 	Resource  string

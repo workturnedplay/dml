@@ -4208,6 +4208,45 @@ implementation_state.md item 78): the trie stays, forms hang off its nodes.**
 
 ---
 
+## 115. Plans: a remote transaction as data (TENTATIVE, stage 1 implemented)
+
+§107 said a Go closure cannot cross a process boundary, so a remote caller
+asks for named operations. A plan is the general form of that: the transaction
+itself, as data.
+
+- A plan is **complete when sent**: straight-line steps, no loops, no
+  conditionals, no waiting for the client in the middle. The host runs it as
+  one `Transact` through its guarded graph, so Checkers run and the closure
+  contract of §91 holds (the label map is built inside the closure, so a re-run
+  starts clean). It is all or nothing.
+- Steps name nodes by a **label** bound by an earlier step, by **NodeID**, or by
+  a registered **name**; exactly one. A reference is data, never a stored
+  graph reference (§90). A label is bound once (no shadowing).
+- **Two failures, kept apart.** `ErrPlanInvalid` is wrong whatever the graph
+  holds and is found without reading it. `ErrPlanConflict` is a plan that does
+  not fit the graph as it is now (a failed assert, a missing node or name, a
+  node that cannot be deleted), names the step, and changes nothing; the client
+  re-reads and may try again. The asserts are what make a plan a *conditional*
+  update: they are the compare of a compare-and-swap, checked in the same
+  transaction as the writes, so there is no gap for another client to use.
+- **Authorization.** Plans are off unless the server asks for them, and fail
+  closed without an `Authorizer`. The question is `AuthRequest{OpPlan,
+  PlanResource}` ("dml:plan", never a real resource), asked before anything
+  about the plan is looked at. A principal allowed to submit plans is trusted
+  with the **whole graph**, not with one resource: a plan can add a session to
+  any holder Set, so per-resource authorization does not bind it. Checkers still
+  guard every structural invariant, which makes a plan unable to corrupt the
+  graph but not unable to do what the registries allow.
+- **Limits.** One frame (1 MiB), a step count, and (reserved names) a plan
+  cannot make names the host makes itself. A half-sent frame is bounded by a
+  deadline once its header has arrived.
+- **Stage 2 (OPEN):** define operations, and the allow-lists of who may submit
+  which, in the graph itself, so a principal can be allowed some plans and not
+  others. This is the "in-graph transaction descriptor" of §89c, now with a
+  concrete first vocabulary to generalize from.
+
+---
+
 ## PART D — STATUS SUMMARY (consolidated)
 
 *(This part supersedes the early informal "explicitly not decided" list
@@ -4393,6 +4432,12 @@ kept current as sections above resolve or split further.)*
   Identification level, never by its process ID; clients must dial at that
   level or higher (`DialPipe` does), and an anonymous client is the empty
   Principal and is denied (§113).
+
+- A remote transaction is a plan: complete when sent, straight-line, run as one
+  Transact, all or nothing, with `ErrPlanInvalid` (wrong whatever the graph
+  holds) and `ErrPlanConflict` (does not fit the graph now, naming the step)
+  kept apart. Plans are off by default, fail closed, and need an Authorizer
+  that lists the principals trusted with the whole graph (§115).
 
 ### TENTATIVE
 - bbolt as the first persistent-backend spike, with the layout and
