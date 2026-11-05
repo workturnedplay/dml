@@ -282,9 +282,9 @@ func (p Plan) validate(maxSteps int) error {
 
 	bound := make(map[string]struct{}, len(p.Steps))
 
-	for i, step := range p.Steps {
-		if stepErr := step.validate(bound); stepErr != nil {
-			return fmt.Errorf("%w: step %d (%s): %w", ErrPlanInvalid, i, step.Op, stepErr)
+	for i := range p.Steps {
+		if stepErr := p.Steps[i].validate(bound); stepErr != nil {
+			return fmt.Errorf("%w: step %d (%s): %w", ErrPlanInvalid, i, p.Steps[i].Op, stepErr)
 		}
 	}
 
@@ -322,9 +322,9 @@ func (r planRunner) run(graph Transactor, plan Plan) (PlanResult, error) {
 	return transactValue(graph, func(tx Tx) (PlanResult, error) {
 		bound := make(map[string]NodeID, len(plan.Steps))
 
-		for i, step := range plan.Steps {
-			if stepErr := r.exec(tx, bound, step); stepErr != nil {
-				return PlanResult{}, planStepError(i, step.Op, stepErr)
+		for i := range plan.Steps {
+			if stepErr := r.exec(tx, bound, plan.Steps[i]); stepErr != nil {
+				return PlanResult{}, planStepError(i, plan.Steps[i].Op, stepErr)
 			}
 		}
 
@@ -403,14 +403,15 @@ func (r planRunner) resolveEnds(tx Tx, bound map[string]NodeID, step PlanStep) (
 
 // produce runs a step that yields a node.
 func (r planRunner) produce(tx Tx, step PlanStep) (NodeID, error) {
-	switch step.Op {
-	case PlanEnsureNamed:
+	if step.Op == PlanEnsureNamed {
 		return r.names.EnsureNamedNode(tx, step.Name)
-	case PlanIntern:
-		return r.text.Intern(tx, step.Text)
-	default:
-		return createNodeTx(tx)
 	}
+
+	if step.Op == PlanIntern {
+		return r.text.Intern(tx, step.Text)
+	}
+
+	return createNodeTx(tx)
 }
 
 // execEdge runs a step on a relationship.
@@ -420,25 +421,27 @@ func (r planRunner) execEdge(tx Tx, bound map[string]NodeID, step PlanStep) erro
 		return endsErr
 	}
 
-	switch step.Op {
-	case PlanAdd:
+	if step.Op == PlanAdd {
 		return addRelationshipTx(tx, from, to)
-	case PlanRemove:
-		return removeRelationshipTx(tx, from, to)
-	default:
-		has, hasErr := tx.HasRelationship(from, to)
-		if hasErr != nil {
-			return wrapInterfaceErr(hasErr)
-		}
+	}
 
-		switch {
-		case has == (step.Op == PlanAssertHas):
-			return nil
-		case has:
-			return fmt.Errorf("%w: relationship (%d,%d) exists", ErrPlanConflict, from, to)
-		default:
-			return fmt.Errorf("%w: relationship (%d,%d) does not exist", ErrPlanConflict, from, to)
-		}
+	if step.Op == PlanRemove {
+		return removeRelationshipTx(tx, from, to)
+	}
+
+	// What is left is assert_has and assert_lacks.
+	has, hasErr := tx.HasRelationship(from, to)
+	if hasErr != nil {
+		return wrapInterfaceErr(hasErr)
+	}
+
+	switch {
+	case has == (step.Op == PlanAssertHas):
+		return nil
+	case has:
+		return fmt.Errorf("%w: relationship (%d,%d) exists", ErrPlanConflict, from, to)
+	default:
+		return fmt.Errorf("%w: relationship (%d,%d) does not exist", ErrPlanConflict, from, to)
 	}
 }
 
