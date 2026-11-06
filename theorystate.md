@@ -4240,10 +4240,163 @@ itself, as data.
 - **Limits.** One frame (1 MiB), a step count, and (reserved names) a plan
   cannot make names the host makes itself. A half-sent frame is bounded by a
   deadline once its header has arrived.
-- **Stage 2 (OPEN):** define operations, and the allow-lists of who may submit
-  which, in the graph itself, so a principal can be allowed some plans and not
-  others. This is the "in-graph transaction descriptor" of §89c, now with a
-  concrete first vocabulary to generalize from.
+- **Stage 2 (TENTATIVE, designed in §116):** operations are named handlers
+  the host owner registers in Go, run by clients with named text arguments and
+  authorized by scoped allow/deny sets kept in the graph, so a principal can be
+  allowed some operations and not others. Storing an operation's steps as
+  graph structure (the "in-graph transaction descriptor" of §89c) was not
+  chosen for stage 2, but stays possible later as one more kind of handler.
+
+---
+
+## 116. Operations: host-registered named handlers with scoped authorization (TENTATIVE, designed, not implemented)
+
+Stage 2 of §115. A client can run only operations it was granted. It names an
+operation and gives named text arguments (name to string); it gets back named
+text results (rows of named text fields, plus an optional cursor string). No
+NodeIDs and no steps cross the wire. Stage 1 plans (`OpPlan`) stay as the
+separate, whole-graph trust level.
+
+**Why handlers in Go, not steps stored in the graph.** A real operation needs
+code: clamping a number, punycode, wildcard-pattern syntax, a fixed set of
+choices. §112 already decided that dml provides the mechanism and the consumer
+provides the vocabulary and the code (`Effect` is the precedent), and the first
+consumer needs exactly this. An operation stored as graph structure (a list of
+step nodes with parameter slots) remains possible later as one kind of handler
+registered through the same API, so nothing here forecloses it. It is not built
+because no consumer needs it yet; under §7b that sequences a feature, it does
+not leave a gap.
+
+**Handler contract.**
+- The host owner registers an operation by name as a read or a write handler.
+  A write handler runs inside one `Transact` together with its authorization
+  check and receives that `Tx`. It may be re-run (§91): it reads through `tx`,
+  and anything outside the graph (a compiled in-memory matcher, say) is updated
+  only from `tx.OnCommit`/`tx.OnRollback`. A read handler runs as one read
+  view and receives a `GraphReader`.
+- A handler returns an `*OperationError{Code, Message}` for what the client may
+  see ("invalid pattern"). Any other error is reported to the host's `OnError`
+  and the client sees a generic failure, so internals and secrets do not leak.
+  A panic is recovered, rolled back and reported; it never kills the wire server.
+- An unknown operation and a forbidden one answer identically (`not_authorized`),
+  so nothing is revealed about what exists.
+- Limits: a bounded number of arguments, bounded name and value lengths, and
+  results sized to fit one frame; a long listing is paged by a cursor the
+  handler defines.
+
+**Authorization: scopes.**
+- A scope is a path of segments joined by `/`, for example
+  `read/settings/upstream_urls/3` or `write/rules`. Paths are built with a dml
+  helper (`ScopePath`) that rejects empty segments and segments containing `/`:
+  a handler builds paths from client-supplied keys, and an unchecked `/` would
+  forge another scope.
+- A scope record is a node (`AllScopes`) with an allow pointer and a deny
+  pointer, each to a Set whose members are interned principal texts
+  (`tls-sha256:...`, a SID) or the text `*`. The record is found from the
+  path's own text node through a slot (`AllScopeSlots`), the same shape as a
+  form slot (§114). Four new foundational names: `AllScopes`, `AllScopeSlots`,
+  `AllScopeAllow`, `AllScopeDeny`.
+- Resolution for a principal and a path: look up (never intern) the
+  principal's text; if it was never interned the answer is deny. Then, for each
+  prefix of the path from the longest to the shortest: if the scope exists and
+  the principal or `*` is in its deny set, deny; else if the principal or `*` is
+  in its allow set, allow; otherwise go to the next shorter prefix. If nothing
+  matched, deny. So the most specific explicit decision wins, deny beats allow
+  at the same level, and the default is deny. The empty principal (an
+  unidentified peer) is always denied, even where `*` is allowed; this differs
+  on purpose from `AnyPrincipal` in a `ResourcePolicy`, which admits
+  unidentified peers.
+- Example: allow `*` at `read/settings`, deny `*` at
+  `read/settings/upstream_urls`, allow `*` at `read/settings/upstream_urls/3`.
+  Everyone reads every setting except the upstream URLs, except the third one.
+- Two layers per operation. dml checks the entry scope `run/<operation>` before
+  the handler is called ("may you call this at all"); the handler asks for finer
+  scopes (`read/...`, `write/...`) through its context for the data it touches.
+  Two grants for one capability is the price of keeping "may call" separate from
+  "which data", and it lets a principal be allowed one narrow slice without the
+  whole operation's data scope.
+- The check and the handler share one transaction (or one read view), so a
+  revocation cannot race a run. Operations are one-shot and hold nothing, so
+  there is no `Revalidate` analogue.
+- The static `Authorizer` is not consulted for operations; default deny in the
+  graph is the whole policy, and `WithOperations` does not require an
+  `Authorizer`. A `PeerIdentifier` is still needed to name the peer.
+- Grants are edited by the owner in-process (the host's own UI) through host
+  helpers (grant, revoke, deny). A principal allowed `OpPlan` can edit them too,
+  since a plan may touch the whole graph, which is one more reason to list such
+  principals only when they are trusted that far.
+- Each principal text costs about one trie node per character (§114). That is
+  accepted and documented.
+
+**Reading.** Reads are authorized by the same scopes. A sensitive value is
+never returned outside its scope: a listing returns only the entries the
+principal may read, and a get of a forbidden key is `not_authorized`, the same
+answer as for a key that does not exist.
+
+**Generic pieces dml needs (none of them knows what a rule or a setting is).**
+1. `FieldRegistry`, parameterized by tags like `PointerRegistry`. The consumer
+   bootstraps one tag node per field; a record node gets one slot per field
+   (a `PointerRegistry` under that field's tag), each slot pointing at a value.
+   It offers `Set`, `Get`, and reverse `Owners(field, value)` ("which records
+   have this value in this field"), a reverse lookup through value slots exactly
+   like `CapsulesWithValue`; the shared walk is factored out so both use it.
+   A field may be declared unique, and the Checker then declines a second owner
+   of the same value (a rule ID).
+2. `TextFormRegistry.FormsContaining(part)`: a paged reverse lookup from a
+   token node (`{**}`) to the texts whose forms use it (`CapsulesWithValue`,
+   then `ListsOf`, then `TextOf`).
+3. An optional unexported read-view interface (`view(fn func(GraphReader) error)`),
+   mirroring the pagers: one bolt read transaction on `BoltGraph`, one job on a
+   `GraphActor`, forwarded by the ROOT overlay and the host's guarded graph.
+   Without it a read handler would need a `Transact`, which costs a durable
+   commit per read.
+4. `Host.RegisterOperation`, the grant helpers, and on the wire an `OpRun`
+   operation behind `WithOperations`.
+
+**How the first consumer would model its data (illustrative; this belongs to
+the consumer, not to dml).**
+- Rules are an ordered slotted list of rule nodes, each capsule's value being
+  the rule. List order is display order only (any enabled matching rule
+  allows), so insert-after, prepend and append are enough; a move is later.
+- A rule is a record with fields type, id, pattern, enabled, comment and
+  modified, each a pointer at an interned text (no one-element list needed). A
+  pattern text may carry a form whose elements are shared wildcard tokens
+  (`{**}`, `*`, ...), so "which patterns use this token" is `FormsContaining`.
+- Editing a rule sets field pointers on the rule (one atomic replace each); the
+  capsule is not repointed, because the rule's ID is its identity. A set of the
+  live rule-ID texts constrains `set_enabled(id)`: the ID must be a member, and
+  the rule is found by `Owners(id, text)`.
+- A setting is a record with name, value, description and modified. A
+  list-valued setting points at a text list. Typed values (a number, a bool, a
+  choice) are text validated by the handler's Go code (clamping, the allowed
+  choices); the graph can constrain a stored choice to a Set of its valid
+  values (domain pointer, §10c) as a second line of defence.
+- Scopes: `read/settings`, `write/settings/<key>`, `read/rules`,
+  `write/rules`, with `read/settings/upstream_urls` denied to everyone but the
+  owner. For a list-valued setting the segment under the key should be a stable
+  element identifier, not a position, since positions shift when the list is
+  reordered.
+
+**Handler rules of thumb.**
+- Use `Lookup`, never `Intern`, on client-supplied text until it has been
+  validated, or any authorized client can mint nodes with garbage.
+- A write handler's reads and writes all go through its `tx` (§91).
+- Reading the clock inside a handler is fine; a re-run only changes the
+  timestamp it records.
+
+**Sequencing.**
+1. `FieldRegistry` and `FormsContaining`, with tests on every backend.
+2. The scope registry (four names, the resolution function, the Checker for
+   scope records) and the read-view interface.
+3. `Host.RegisterOperation`, grant helpers, atomic authorization, panic and
+   error handling.
+4. Wire `OpRun`, `WithOperations`, limits, README, and an example that mirrors
+   rules and settings without any DNS in it.
+
+**OPEN.** The exact Go signatures. Per-principal quota of interned principal
+texts. Whether a reorder ("move rule") operation needs its own primitive. Whether
+a static `Authorizer` layer is wanted on top later. Whether stored-step
+operations ever become a handler kind.
 
 ---
 
@@ -4556,7 +4709,13 @@ kept current as sections above resolve or split further.)*
   forced) conflict detection (§97), and whether the out-of-band
   corruption tests (which need a write that bypasses Checkers) should get
   a raw-write path on every backend so the registry harness can run them
-  everywhere too.
+  everywhere too (§97).
+- Operations (§116, TENTATIVE): host-registered named handlers authorized by
+  scoped allow/deny sets in the graph (most specific scope wins, deny beats
+  allow, default deny, no self-granting, no static Authorizer). Nothing is
+  built yet. Open: exact signatures, a per-principal quota of interned
+  principal texts, a reorder primitive, and whether stored-step operations
+  ever become a handler kind.
 
 ### REJECTED FOR NOW
 - Giving primitive relationships their own NodeIDs.

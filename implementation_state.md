@@ -2771,11 +2771,14 @@ Currently unaddressed yet:
   paged scan first, an optional positional index later), and there is no
   DeleteString (only when nothing extends it, nothing refers to it and it has
   no forms; interacts with the prefix index and lists).
-- Planned next, in this order: (1) stage 2 of plan-as-data, operations and
-  allow-lists defined in the graph (stage 1 is item 80); (2) notes on nodes;
-  (3) measuring a graph with many lists and a commit touching a slotted list
-  node; (4) out-of-band corruption tests on every backend; (5) docs drift
-  (Part D status lists).
+- Planned next, in this order: (1) stage 2 of plan-as-data, designed in
+  theorystate.md section 116 (stage 1 is item 80), in four batches:
+  FieldRegistry plus FormsContaining; the scope registry and the read-view
+  interface; Host.RegisterOperation with grants and atomic authorization; the
+  wire OpRun with README and an example; (2) notes on nodes; (3) measuring a
+  graph with many lists and a commit touching a slotted list node; (4)
+  out-of-band corruption tests on every backend; (5) docs drift (Part D
+  status lists).
 - ListRegistry.Append finds the tail as the child its list shares with the
   AllTails hub (item 68), so it costs about the smaller of the two child sets:
   fine with few lists, linear in the number of non-empty lists when there are
