@@ -77,7 +77,7 @@ func (rig *fieldRig) set(t *testing.T, record, field, value NodeID) {
 	}
 }
 
-func (rig *fieldRig) requireValue(t *testing.T, record, field NodeID, want NodeID, wantHas bool) {
+func (rig *fieldRig) requireValue(t *testing.T, record, field, want NodeID, wantHas bool) {
 	t.Helper()
 
 	got, has, err := rig.fields.Get(rig.graph, record, field)
