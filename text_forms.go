@@ -19,6 +19,7 @@ package dml
 import (
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 )
 
@@ -371,6 +372,87 @@ func (f *TextFormRegistry) Forms(graph GraphReader, text NodeID) ([]NodeID, erro
 	}
 
 	return forms, nil
+}
+
+// formTexts returns, for every form that has part as an element, the text the
+// form is a form of (form -> text). part must be a string node. Capsules
+// holding part are found by reverse lookup from part (CapsulesWithValue, which
+// reads part's incoming relationships in pages), then their lists; a list that
+// is not a text list, or is a text list that is not a form, is skipped. The
+// result is complete, however many references part has.
+func (f *TextFormRegistry) formTexts(graph GraphReader, part NodeID) (map[NodeID]NodeID, error) {
+	if requireErr := requireTagged(graph, part, f.text.allStrings, ErrNotString); requireErr != nil {
+		return nil, requireErr
+	}
+
+	capsules, capsulesErr := f.lists.Capsules().CapsulesWithValue(graph, part)
+	if capsulesErr != nil {
+		return nil, capsulesErr
+	}
+
+	texts := make(map[NodeID]NodeID)
+
+	for _, capsule := range capsules {
+		lists, listsErr := f.lists.ListsOf(graph, capsule)
+		if listsErr != nil {
+			return nil, wrapInterfaceErr(listsErr)
+		}
+
+		for _, list := range lists {
+			if _, seen := texts[list]; seen {
+				continue
+			}
+
+			isTextList, listErr := f.IsTextList(graph, list)
+			if listErr != nil {
+				return nil, listErr
+			}
+			if !isTextList {
+				continue
+			}
+
+			text, textErr := f.TextOf(graph, list)
+			if errors.Is(textErr, ErrNotTextForm) {
+				continue
+			}
+			if textErr != nil {
+				return nil, textErr
+			}
+
+			texts[list] = text
+		}
+	}
+
+	return texts, nil
+}
+
+// FormsContaining returns the forms that have part as an element, ascending:
+// "which spellings use this token" (a wildcard token such as "{**}", say). part
+// must be a string node (ErrNotString). It finds them by reverse lookup from
+// part, never by scanning the forms.
+func (f *TextFormRegistry) FormsContaining(graph GraphReader, part NodeID) ([]NodeID, error) {
+	texts, err := f.formTexts(graph, part)
+	if err != nil {
+		return nil, err
+	}
+
+	return slices.Sorted(maps.Keys(texts)), nil
+}
+
+// TextsContaining returns the texts that have a form with part as an element,
+// ascending and each once: "which texts are spelled with this token".
+func (f *TextFormRegistry) TextsContaining(graph GraphReader, part NodeID) ([]NodeID, error) {
+	forms, err := f.formTexts(graph, part)
+	if err != nil {
+		return nil, err
+	}
+
+	distinct := make(map[NodeID]struct{}, len(forms))
+	for _, text := range forms {
+		distinct[text] = struct{}{}
+	}
+
+	return sortedNodeSet(distinct), nil
 }
 
 // TextOf returns the text the form is a form of. A text list that is not under

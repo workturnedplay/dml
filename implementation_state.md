@@ -2766,6 +2766,26 @@ empty commit is the baseline of about 2.7 ms):
  and allow-lists defined in the graph, so a principal can be allowed some plans
  and not others.
 
+81. Stage 2 of plan-as-data, batch 1 (theorystate.md section 116), in
+ fields.go: FieldRegistry, records with named fields for a consumer's own
+ data. The consumer supplies a record tag and one tag node per field
+ (FieldSpec, optionally Unique). A record has at most one slot per field
+ (PointerRegistry under the field's tag, found by tag and checked to belong to
+ the record alone), each pointing at a value; any node can be a value, for
+ text the interned string. NewRecord, Get, Set (creates the slot, and for a
+ unique field refuses a second holder with ErrFieldValueTaken), Clear,
+ DeleteRecord (slots go with it, values stay) and Owners, the reverse lookup
+ from a value to the records holding it in a field. The Checker declines a
+ slot with no record or two, a record with two slots for one field, and a
+ unique value held twice. DRY: the reverse walk is now slotOwnersOf in
+ main.go, shared by CapsuleRegistry.CapsulesWithValue and Owners.
+ TextFormRegistry gained FormsContaining and TextsContaining (which forms and
+ texts use a token), over one shared walk (formTexts). Covered by the
+ TestField* tests and TestNewFieldRegistryRejectsBadDeclarations (every
+ backend) and TestTextFormsContainingFindsTheFormsAndTextsThatUseAToken.
+ Batches 2 to 4 (scopes and read view; Host.RegisterOperation; wire OpRun)
+ are next.
+
 Currently unaddressed yet:
 - Interned text (items 75, 78): "contains" (substring) search is not built (a
   paged scan first, an optional positional index later), and there is no

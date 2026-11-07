@@ -4342,9 +4342,12 @@ answer as for a key that does not exist.
    like `CapsulesWithValue`; the shared walk is factored out so both use it.
    A field may be declared unique, and the Checker then declines a second owner
    of the same value (a rule ID).
-2. `TextFormRegistry.FormsContaining(part)`: a paged reverse lookup from a
-   token node (`{**}`) to the texts whose forms use it (`CapsulesWithValue`,
-   then `ListsOf`, then `TextOf`).
+2. `TextFormRegistry.FormsContaining(part)` and `TextsContaining(part)`: a
+   reverse lookup from a token node (`{**}`) to the forms that use it and to
+   the texts that own those forms (`CapsulesWithValue`, then `ListsOf`, then
+   `TextOf`). The walk over the token's references is paged internally, but
+   the result is complete: an outer cursor would still need the whole walk on
+   every call, so none is offered.
 3. An optional unexported read-view interface (`view(fn func(GraphReader) error)`),
    mirroring the pagers: one bolt read transaction on `BoltGraph`, one job on a
    `GraphActor`, forwarded by the ROOT overlay and the host's guarded graph.

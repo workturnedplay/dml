@@ -7121,25 +7121,40 @@ func (c *CapsuleRegistry) SetValue(graph Transactor, capsule, value NodeID) erro
 // read in full exactly once and sliced (see pageIterator), so this never
 // costs more than the single FindIncoming it replaced.
 func (c *CapsuleRegistry) CapsulesWithValue(graph GraphReader, value NodeID) ([]NodeID, error) {
-	var capsules []NodeID
+	return slotOwnersOf(graph, value, c.valueSlots.allPointers, c.allElementCapsules)
+}
+
+// slotOwnersOf returns the owners of every slot that points at value: the
+// reverse lookup shared by CapsuleRegistry.CapsulesWithValue (slots tagged
+// as a capsule's value slot, owners tagged as capsules) and
+// FieldRegistry.Owners (slots tagged as one field, owners tagged as
+// records). It reads value's incoming relationships in pages, never the
+// owners, and keeps only those parents that carry slotTag. Each slot's owner
+// is found with findUniqueTaggedParent, deliberately a tagged lookup: a slot
+// may acquire unrelated parents, which are ignored, and only two distinct
+// ownerTag-tagged parents are ambiguous (ErrAmbiguousPointerMetadata). A slot
+// with no owner is skipped. The result is in no particular order and nil if
+// there is none. value must exist (ErrNodeNotFound).
+func slotOwnersOf(graph GraphReader, value, slotTag, ownerTag NodeID) ([]NodeID, error) {
+	var owners []NodeID
 
 	walkErr := forEachIncoming(graph, value, func(rel Relationship) error {
 		slot := rel.From
 
-		isValueSlot, isSlotErr := c.valueSlots.IsPointer(graph, slot)
-		if isSlotErr != nil {
-			return isSlotErr
+		isSlot, slotErr := graph.HasRelationship(slotTag, slot)
+		if slotErr != nil {
+			return wrapInterfaceErr(slotErr)
 		}
-		if !isValueSlot {
+		if !isSlot {
 			return nil
 		}
 
-		capsule, found, findErr := findUniqueTaggedParent(graph, slot, c.allElementCapsules)
+		owner, found, findErr := findUniqueTaggedParent(graph, slot, ownerTag)
 		if findErr != nil {
 			return findErr
 		}
 		if found {
-			capsules = append(capsules, capsule)
+			owners = append(owners, owner)
 		}
 
 		return nil
@@ -7148,7 +7163,7 @@ func (c *CapsuleRegistry) CapsulesWithValue(graph GraphReader, value NodeID) ([]
 		return nil, walkErr
 	}
 
-	return capsules, nil
+	return owners, nil
 }
 
 // capsulesWithValuePageSize bounds each internal page CapsulesWithValue
