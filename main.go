@@ -1568,6 +1568,31 @@ func nodesAfter(reader GraphReader, after NodeID, hasAfter bool, limit int) ([]N
 	return pageNodeIDs(ids, after, hasAfter, limit), nil
 }
 
+// readViewer is implemented by a GraphReader that can run several reads
+// against one consistent view of the graph without a write transaction
+// (BoltGraph: one bolt read transaction; GraphActor: one job on the actor's
+// goroutine; the ROOT overlay and the host's guarded graph forward to what
+// they wrap). It lets code that needs more than one read to agree with itself
+// (a handler of a remote read operation, theorystate.md section 116) avoid a
+// Transact, which on a durable backend costs a commit. Use readView, not this
+// interface directly. fn must read only through the reader it is given: it
+// must not call Transact, or any method of the graph view was called on.
+type readViewer interface {
+	view(fn func(reader GraphReader) error) error
+}
+
+// readView runs fn against one consistent view of graph. If graph provides
+// one (see readViewer) fn runs inside it; otherwise graph itself is that view
+// (a Tx, which sees its own writes, and the memory backends, where one
+// goroutine at a time makes consecutive reads agree). fn's error is returned.
+func readView(graph GraphReader, fn func(reader GraphReader) error) error {
+	if viewer, ok := graph.(readViewer); ok {
+		return wrapInterfaceErr(viewer.view(fn))
+	}
+
+	return fn(graph)
+}
+
 // commonChildrenFinder is implemented by a GraphReader that can find the
 // children two nodes have in common without reading either node's whole
 // child set (*Graph, BoltGraph's boltView and, through forwarding, the ROOT
@@ -2239,6 +2264,23 @@ func (ga *GraphActor) findCommonChildren(a, b NodeID, limit int) ([]NodeID, erro
 		return common, wrapInterfaceErr(err)
 	})
 }
+
+// view runs fn as one job on ga's goroutine, so all its reads agree (see
+// readViewer). If the backend has a view of its own (BoltGraph) fn runs inside
+// it; otherwise fn reads the backend directly, which is consistent because
+// nothing else runs on this goroutine meanwhile. fn must not call ga.
+func (ga *GraphActor) view(fn func(reader GraphReader) error) error {
+	var err error
+
+	ga.do(func(g GraphAPI) {
+		err = readView(g, fn)
+	})
+
+	return wrapInterfaceErr(err)
+}
+
+// Compile-time assertion that GraphActor forwards read views.
+var _ readViewer = (*GraphActor)(nil)
 
 // Compile-time assertions that GraphActor forwards paging.
 var (
@@ -3486,6 +3528,21 @@ func (g *BoltGraph) findCommonChildren(a, b NodeID, limit int) ([]NodeID, error)
 	return boltRead(g, func(v boltView) ([]NodeID, error) { return v.findCommonChildren(a, b, limit) })
 }
 
+// view runs fn in one short bolt read transaction (see readViewer). fn must
+// read only through the reader it receives: calling a method of g itself
+// would trip the concurrent-access guard.
+func (g *BoltGraph) view(fn func(reader GraphReader) error) error {
+	release := g.guard.acquire()
+	defer release()
+
+	_, err := boltRead(g, func(v boltView) (struct{}, error) { return struct{}{}, fn(v) })
+
+	return err
+}
+
+// Compile-time assertions that BoltGraph pages and gives read views.
+var _ readViewer = (*BoltGraph)(nil)
+
 // Compile-time assertions that BoltGraph pages.
 var (
 	_ nodePager     = (*BoltGraph)(nil)
@@ -4714,6 +4771,17 @@ func (v rootReader) findCommonChildren(a, b NodeID, limit int) ([]NodeID, error)
 
 	return common, wrapInterfaceErr(err)
 }
+
+// view runs fn against the underlying reader's view (see readView), handing it
+// a reader that presents the same ROOT overlay as v does.
+func (v rootReader) view(fn func(reader GraphReader) error) error {
+	return readView(v.inner, func(inner GraphReader) error {
+		return fn(rootReader{inner: inner, root: v.root})
+	})
+}
+
+// Compile-time assertion that the ROOT overlay gives read views.
+var _ readViewer = rootReader{}
 
 // Compile-time assertions that the ROOT overlay pages outgoing and
 // incoming relationships.

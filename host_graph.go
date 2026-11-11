@@ -42,6 +42,7 @@ var (
 	_ outgoingPager        = hostGraph{}
 	_ incomingPager        = hostGraph{}
 	_ commonChildrenFinder = hostGraph{}
+	_ readViewer           = hostGraph{}
 )
 
 // hostRead runs read against the host's actor while the host is entered, or
@@ -112,6 +113,18 @@ func (g hostGraph) findCommonChildren(a, b NodeID, limit int) ([]NodeID, error) 
 	return hostRead(g.host, func(actor *GraphActor) ([]NodeID, error) {
 		return actor.findCommonChildren(a, b, limit)
 	})
+}
+
+// view runs fn against one consistent view of the host's graph, guarded like
+// every other call: after Close it fails with ErrHostClosed without running
+// fn, and Close waits for a view in flight (see readViewer).
+func (g hostGraph) view(fn func(reader GraphReader) error) error {
+	if !g.host.enter() {
+		return ErrHostClosed
+	}
+	defer g.host.leave()
+
+	return readView(g.host.actor, fn)
 }
 
 // RegisterChecker registers c on the host's graph. It has no error result, so
