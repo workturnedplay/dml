@@ -4249,7 +4249,7 @@ itself, as data.
 
 ---
 
-## 116. Operations: host-registered named handlers with scoped authorization (TENTATIVE, designed, not implemented)
+## 116. Operations: host-registered named handlers with scoped authorization (TENTATIVE, designed; batches 1 and 2 implemented)
 
 Stage 2 of §115. A client can run only operations it was granted. It names an
 operation and gives named text arguments (name to string); it gets back named
@@ -4325,6 +4325,14 @@ not leave a gap.
   helpers (grant, revoke, deny). A principal allowed `OpPlan` can edit them too,
   since a plan may touch the whole graph, which is one more reason to list such
   principals only when they are trusted that far.
+- **Implemented (batch 2, implementation_state.md item 82).** `Allowed` only
+  reads (it looks up the principal and the path, never interns, so a client
+  cannot make nodes by asking), and any error from it is a deny. The Checker
+  also declines a Set held by more than one field slot across all scope
+  records: sharing one would let a grant on one path leak to another. A scope
+  record is created with both its sets, so a record missing one is corruption,
+  not a state. The decision for a path is read inside one read view where the
+  backend has one, so a handler's several reads agree with each other.
 - Each principal text costs about one trie node per character (§114). That is
   accepted and documented.
 
@@ -4388,8 +4396,8 @@ the consumer, not to dml).**
   timestamp it records.
 
 **Sequencing.**
-1. `FieldRegistry` and `FormsContaining`, with tests on every backend.
-2. The scope registry (four names, the resolution function, the Checker for
+1. (Done, implementation_state.md item 81.) `FieldRegistry` and `FormsContaining`, with tests on every backend.
+2. (Done, implementation_state.md item 82.) The scope registry (four names, the resolution function, the Checker for
    scope records) and the read-view interface.
 3. `Host.RegisterOperation`, grant helpers, atomic authorization, panic and
    error handling.
@@ -4715,7 +4723,7 @@ kept current as sections above resolve or split further.)*
   everywhere too (§97).
 - Operations (§116, TENTATIVE): host-registered named handlers authorized by
   scoped allow/deny sets in the graph (most specific scope wins, deny beats
-  allow, default deny, no self-granting, no static Authorizer). Nothing is
+  allow, default deny, no self-granting, no static Authorizer). Batches 1 and 2 (records with fields, scopes, the read view) are built, and nothing else is
   built yet. Open: exact signatures, a per-principal quota of interned
   principal texts, a reorder primitive, and whether stored-step operations
   ever become a handler kind.

@@ -2783,8 +2783,52 @@ empty commit is the baseline of about 2.7 ms):
  texts use a token), over one shared walk (formTexts). Covered by the
  TestField* tests and TestNewFieldRegistryRejectsBadDeclarations (every
  backend) and TestTextFormsContainingFindsTheFormsAndTextsThatUseAToken.
- Batches 2 to 4 (scopes and read view; Host.RegisterOperation; wire OpRun)
+ Batch 2 (scopes and read view) is item 82; batches 3 and 4 (Host.RegisterOperation; wire OpRun)
  are next.
+
+82. Stage 2 of plan-as-data, batch 2 (theorystate.md section 116): the read
+ view and the scope registry. (a) readViewer/readView (main.go): code that
+ needs several reads to agree with each other, without a write transaction
+ (which on a durable backend costs a commit), runs them in one view.
+ BoltGraph.view is one short bolt read transaction (the guard held), GraphActor
+ .view is one job on the actor's goroutine, the ROOT overlay forwards and
+ presents the same overlay inside, the host's guarded graph forwards, and any
+ other reader (a Tx, which sees its own writes, and the memory backends) is its
+ own view. fn must read only through the reader it is given. (b) scope.go:
+ ScopeRegistry, who may do what, kept in the graph, with four new foundational
+ names (AllScopes, AllScopeSlots, AllScopeAllow, AllScopeDeny). A path's text
+ node has at most one slot (a PointerRegistry) whose target is a scope record (a
+ FieldRegistry record with the fields allow and deny, each a Set of interned
+ principal texts). ScopePath joins segments and rejects a segment containing "/"
+ (a handler builds paths from client keys); Allowed resolves a principal and a
+ path from the longest prefix to the shortest (deny beats allow at one level,
+ the most specific decision wins, nothing matched is a deny, the empty principal
+ is always denied, "*" stands for every principal), reads only, and never
+ interns; Allow, Deny and Revoke take a Transactor, so they compose. The Checker
+ (local, keyed on the four tags) declines a scope slot that belongs to no text or
+ to a text with another one, a record with no slot or with an allow or deny value
+ that is missing or not a Set, and a Set held more than once across the fields of
+ all records (a shared set would leak grants). (c) registry_helpers.go: bindNames,
+ taggedCheck and registerTaggedChecker, the "copy these names out of ids" and
+ "run a check per tag of the touched nodes" steps the text, text-form and scope
+ registries share. Registries.Scopes is built by NewRegistries. Not done: the
+ host's operation handlers and grant helpers (batch 3) and the wire OpRun
+ (batch 4).
+ Covered by TestFoundationalNamesIncludeScopeNames,
+ TestScopePathJoinsSegmentsAndRejectsForgeries,
+ TestScopePrefixesAreLongestFirst,
+ TestNewScopeRegistryRequiresItsNamesAndNodes (without a socket) and, on every
+ backend, TestScopeAllowedResolvesTheMostSpecificDecision,
+ TestScopeDenyBeatsAllowAtOneLevelAndSpecificBeatsBroad,
+ TestScopeEmptyAndUnknownPrincipals, TestScopeAllowedNeverCreatesAnything,
+ TestScopeAllowAndDenyReportWhetherTheyChangedAnything,
+ TestScopeRevokeRemovesFromBothSetsAndCreatesNothing,
+ TestScopeRejectsInvalidArguments,
+ TestScopeWritesComposeAndRollBackWithEnclosingTransaction,
+ TestScopeCheckerDeclinesEachHandMadeViolation,
+ TestScopeVerifyAllAcceptsValidScopes and TestScopeAllowedReadsThroughAReadView
+ (each backend, directly and behind a GraphActor), plus
+ TestHostRegistriesCarryScopesAcrossARestart.
 
 Currently unaddressed yet:
 - Interned text (items 75, 78): "contains" (substring) search is not built (a
@@ -2794,7 +2838,7 @@ Currently unaddressed yet:
 - Planned next, in this order: (1) stage 2 of plan-as-data, designed in
   theorystate.md section 116 (stage 1 is item 80), in four batches:
   FieldRegistry plus FormsContaining; the scope registry and the read-view
-  interface; Host.RegisterOperation with grants and atomic authorization; the
+  interface (both done, items 81 and 82); Host.RegisterOperation with grants and atomic authorization; the
   wire OpRun with README and an example; (2) notes on nodes; (3) measuring a
   graph with many lists and a commit touching a slotted list node; (4)
   out-of-band corruption tests on every backend; (5) docs drift (Part D
