@@ -103,12 +103,6 @@ type stringParts struct {
 	tail, slot, char NodeID
 }
 
-// textCheck is one commit-time check, run for a touched node carrying tag.
-type textCheck struct {
-	tag NodeID
-	run func(g GraphReader, node NodeID) error
-}
-
 // TextRegistry interns text (theorystate.md section 114).
 //
 // Every string is one canonical node. A non-empty string Q is the string
@@ -151,8 +145,6 @@ type TextRegistry struct {
 	allIndexStepSlots  NodeID
 	emptyString        NodeID
 	indexRoot          NodeID
-
-	checks []textCheck
 }
 
 // NewTextRegistry creates a TextRegistry over graph. ids must hold every
@@ -163,10 +155,7 @@ type TextRegistry struct {
 func NewTextRegistry(graph GraphAPI, names *NameRegistry, ids map[string]NodeID) (*TextRegistry, error) {
 	t := &TextRegistry{names: names}
 
-	wanted := [...]struct {
-		name string
-		dest *NodeID
-	}{
+	nodes, bindErr := bindNames(ids, []nameBinding{
 		{NameAllStrings, &t.allStrings},
 		{NameAllChars, &t.allChars},
 		{NameAllIndexedStrings, &t.allIndexedStrings},
@@ -176,18 +165,9 @@ func NewTextRegistry(graph GraphAPI, names *NameRegistry, ids map[string]NodeID)
 		{NameAllIndexStepSlots, &t.allIndexStepSlots},
 		{NameEmptyString, &t.emptyString},
 		{NameIndexRoot, &t.indexRoot},
-	}
-
-	nodes := make([]NodeID, 0, len(wanted))
-
-	for _, want := range wanted {
-		id, ok := ids[want.name]
-		if !ok {
-			return nil, fmt.Errorf("%w: %q", ErrNameNotFound, want.name)
-		}
-
-		*want.dest = id
-		nodes = append(nodes, id)
+	})
+	if bindErr != nil {
+		return nil, bindErr
 	}
 
 	if existsErr := requireAllExist(graph, nodes...); existsErr != nil {
@@ -205,7 +185,7 @@ func NewTextRegistry(graph GraphAPI, names *NameRegistry, ids map[string]NodeID)
 		return nil, wrapInterfaceErr(tagErr)
 	}
 
-	t.checks = []textCheck{
+	registerTaggedChecker(graph, fmt.Sprintf("TextRegistry(tag=%d)", t.allStrings), []taggedCheck{
 		{tag: t.allStrings, run: t.checkString},
 		{tag: t.allChars, run: t.checkChar},
 		{tag: t.allStartsWithSlots, run: t.checkSlot},
@@ -213,17 +193,6 @@ func NewTextRegistry(graph GraphAPI, names *NameRegistry, ids map[string]NodeID)
 		{tag: t.allIndexNodes, run: t.checkIndexNode},
 		{tag: t.allIndexEntries, run: t.checkEntry},
 		{tag: t.allIndexedStrings, run: t.checkIndexedString},
-	}
-
-	tags := make([]NodeID, 0, len(t.checks))
-	for _, check := range t.checks {
-		tags = append(tags, check.tag)
-	}
-
-	graph.RegisterChecker(Checker{
-		Name:  fmt.Sprintf("TextRegistry(tag=%d)", t.allStrings),
-		Tags:  tags,
-		Check: t.checkTouched,
 	})
 
 	return t, nil
@@ -931,27 +900,6 @@ func (t *TextRegistry) IndexedWithPrefix(graph GraphReader, prefix string, limit
 // transaction touched. A cycle longer than a self-loop in the string chain
 // cannot come from a valid history; it is found by Text on every read and by
 // the startup sweep (VerifyAll).
-
-// checkTouched runs every check whose tag a touched node carries.
-func (t *TextRegistry) checkTouched(g GraphReader, touched map[NodeID]struct{}) error {
-	for node := range touched {
-		for _, check := range t.checks {
-			tagged, tagErr := g.HasRelationship(check.tag, node)
-			if tagErr != nil {
-				return wrapInterfaceErr(tagErr)
-			}
-			if !tagged {
-				continue
-			}
-
-			if checkErr := check.run(g, node); checkErr != nil {
-				return checkErr
-			}
-		}
-	}
-
-	return nil
-}
 
 // requireNoParent returns ErrInvalidTextStructure if node has a parent
 // tagged with any of tags.

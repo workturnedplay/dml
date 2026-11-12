@@ -96,24 +96,12 @@ type TextFormRegistry struct {
 func NewTextFormRegistry(graph GraphAPI, text *TextRegistry, lists OrderedList, ids map[string]NodeID) (*TextFormRegistry, error) {
 	f := &TextFormRegistry{text: text, lists: lists}
 
-	wanted := [...]struct {
-		name string
-		dest *NodeID
-	}{
+	nodes, bindErr := bindNames(ids, []nameBinding{
 		{NameAllTextLists, &f.allTextLists},
 		{NameAllTextFormSlots, &f.allFormSlots},
-	}
-
-	nodes := make([]NodeID, 0, len(wanted))
-
-	for _, want := range wanted {
-		id, ok := ids[want.name]
-		if !ok {
-			return nil, fmt.Errorf("%w: %q", ErrNameNotFound, want.name)
-		}
-
-		*want.dest = id
-		nodes = append(nodes, id)
+	})
+	if bindErr != nil {
+		return nil, bindErr
 	}
 
 	if existsErr := requireAllExist(graph, nodes...); existsErr != nil {
