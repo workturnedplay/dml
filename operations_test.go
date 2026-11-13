@@ -135,8 +135,10 @@ func opsDenyScope(t *testing.T, host *dml.Host, path string, principal dml.Princ
 	}
 }
 
-// opsWantOperationError fails unless err is an *OperationError with code.
-func opsWantOperationError(t *testing.T, err error, code string) *dml.OperationError {
+// opsWantOperationError fails unless err is an *OperationError with code, and
+// returns its message. It returns the message, not the error, so a caller that
+// only checks the code can ignore the result without errcheck objecting.
+func opsWantOperationError(t *testing.T, err error, code string) string {
 	t.Helper()
 
 	var opErr *dml.OperationError
@@ -148,7 +150,7 @@ func opsWantOperationError(t *testing.T, err error, code string) *dml.OperationE
 		t.Fatalf("error code = %q (%s), want %q", opErr.Code, opErr.Message, code)
 	}
 
-	return opErr
+	return opErr.Message
 }
 
 // opsTextInterned reports whether text was interned in host's graph.
@@ -353,8 +355,8 @@ func TestOperationWriteCommitsAndRollsBackAsOne(t *testing.T) {
 	}
 
 	_, failErr := run(dml.OperationArgs{"text": "lost-fail", "then": "fail"})
-	if opErr := opsWantOperationError(t, failErr, "refused"); opErr.Message != "refused on purpose" {
-		t.Fatalf("the handler's error message = %q", opErr.Message)
+	if message := opsWantOperationError(t, failErr, "refused"); message != "refused on purpose" {
+		t.Fatalf("the handler's error message = %q", message)
 	}
 
 	if opsTextInterned(t, host, "lost-fail") {
@@ -373,8 +375,8 @@ func TestOperationWriteCommitsAndRollsBackAsOne(t *testing.T) {
 	}
 
 	_, unexpectedErr := run(dml.OperationArgs{"text": "lost-unexpected", "then": "unexpected"})
-	if opErr := opsWantOperationError(t, unexpectedErr, dml.OperationCodeInternal); strings.Contains(opErr.Message, "secret") {
-		t.Fatalf("the client was shown an internal detail: %q", opErr.Message)
+	if message := opsWantOperationError(t, unexpectedErr, dml.OperationCodeInternal); strings.Contains(message, "secret") {
+		t.Fatalf("the client was shown an internal detail: %q", message)
 	}
 
 	if !reports.contains("secret detail") {

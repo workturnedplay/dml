@@ -167,13 +167,13 @@ func TestWireOperationErrorsCrossWithTheHandlersCodeAndHideInternals(t *testing.
 	client := opsWireClient(t, host, opsPeer(opsAlice), dml.WithOperations())
 
 	_, refuseErr := client.RunOperation(t.Context(), "refuse", nil)
-	if opErr := opsWantOperationError(t, refuseErr, "refused"); opErr.Message != "no thanks" {
-		t.Fatalf("the handler's message = %q", opErr.Message)
+	if message := opsWantOperationError(t, refuseErr, "refused"); message != "no thanks" {
+		t.Fatalf("the handler's message = %q", message)
 	}
 
 	_, leakErr := client.RunOperation(t.Context(), "leak", nil)
-	if opErr := opsWantOperationError(t, leakErr, dml.OperationCodeInternal); strings.Contains(opErr.Message, "secret") {
-		t.Fatalf("the client was shown an internal detail: %q", opErr.Message)
+	if message := opsWantOperationError(t, leakErr, dml.OperationCodeInternal); strings.Contains(message, "secret") {
+		t.Fatalf("the client was shown an internal detail: %q", message)
 	}
 
 	if !reports.contains("secret detail") {
