@@ -4423,6 +4423,66 @@ operations ever become a handler kind.
 
 ---
 
+## 117. Notes on nodes (TENTATIVE, implemented)
+
+A note links free text to any node. A node can have any number of notes, the
+same text can be on any number of nodes, and a note has its own identity.
+
+```text
+(AllNotes, N)                   N is a note (a FieldRegistry record)
+N -> S1   (AllNoteSubjects, S1) S1 -> the node the note is about
+N -> S2   (AllNoteTexts, S2)    S2 -> the text, an interned string (section 114)
+```
+
+**Why a record and not an edge.** The shape was chosen by what a direct edge
+from the node to its string would break:
+- On a Representation A pointer the note would be a second child
+  (`ErrTooManyPointerTargets`, section 10b).
+- On a string node it would look like a trie extension: the string already has
+  its real tail as an `AllStrings` parent, so the lookup becomes ambiguous
+  (section 114).
+- Under a `RootGraph`, ROOT is a virtual parent of every node, so any reverse
+  lookup that does not go through a tagged slot has to special-case it
+  (section 86).
+
+So a note adds no edge out of the annotated node, only an incoming one from its
+subject slot. A slot holding a Set of strings would have worked too, but it gives
+no occurrence identity, has an untagged owner, and cannot take more fields later.
+A note per record is the section 75 pattern: it lets one node carry the same text
+twice, lets a note keep its identity when its text changes, and takes more
+fields (a timestamp, an author) without redesign.
+
+**Semantics.**
+- Order carries no meaning (section 5): notes come back ascending by NodeID. If it
+  ever must, the note gets a field (a creation time), not an ordered list.
+- `AddNote` always creates a note; `EnsureNote` finds the one with this exact text
+  (the lowest ID if several) or creates it. A duplicate is not an invariant
+  violation, so the Checker does not reject it.
+- A note may have no text: its text field is not set, and `SetText(note, "")`
+  clears it. The text is never the empty string node, and the Checker declines
+  that, so there is one canonical empty form. A note with no text cannot be
+  searched for by text.
+- `SetText` re-points the text slot to another interned string. The old string
+  is left alone: whether a string is still needed is a question for a future
+  `DeleteString` (which also has to see its notes), not for notes.
+- Deleting is "delete only if empty" (section 18): the subject slot points at the
+  annotated node and the text slot at the string, so neither can be deleted while
+  a note uses it. `ClearNotes(node)` is what to do before deleting a node;
+  `RemoveNote` and `ClearNotes` never delete the node or any string.
+- Reverse lookup: `Notes(node)`, `NotesWithText(text)` and `NodesWithNote(text)`
+  go through the incoming relationships of the node or the string and filter by
+  the slot tags, as `FieldRegistry.Owners` does, with no index.
+
+**Commit-time Checker.** A note has a subject, and its text, if any, is a string
+node other than the empty one. `FieldRegistry`'s own Checker covers the slot and
+record shape.
+
+**OPEN.** Metadata fields (time, author) if a consumer needs them; whether a
+note about a note should be allowed to block `RemoveNote` as it does now (it
+follows from "delete only if empty"); reclaiming strings that nothing uses.
+
+---
+
 ## PART D — STATUS SUMMARY (consolidated)
 
 *(This part supersedes the early informal "explicitly not decided" list
@@ -4657,6 +4717,9 @@ kept current as sections above resolve or split further.)*
   prefix index (§114): implemented. The trie stays as the identity and lookup
   of text; alternative spellings are forms (ordered lists of string nodes)
   behind one slot per trie node (§114, TENTATIVE, implemented).
+- Notes on nodes (§117): a note is a record with a subject and an optional text
+  (an interned string), so a node can have several, a note keeps its identity when
+  its text changes, and the annotated node gets no new outgoing edge.
 
 ### OPEN
 - Exact Set/Pointer/List definitions; exact primitive storage; whether a

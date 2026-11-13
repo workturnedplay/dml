@@ -44,6 +44,7 @@ describe files not seen directly, only mentioned in those two documents.
 - text_forms.go: TextFormRegistry (text lists, forms, FormsContaining/TextsContaining).
 - fields.go: FieldRegistry (records with named fields, Owners).
 - scope.go: ScopeRegistry (ScopePath, Allow/Deny/Revoke/Allowed).
+- notes.go: NoteRegistry (texts linked to any node: AddNote/EnsureNote/SetText/Notes/NotesWithText/ClearNotes).
 - plan.go: Plan, PlanStep, Host.RunPlan (stage 1).
 - operations.go: host-registered operation handlers (Register*Operation, RunOperation, grant helpers, limits).
 - host_graph.go: hostGraph/hostTx, the guarded Host.Graph().
@@ -66,7 +67,7 @@ describe files not seen directly, only mentioned in those two documents.
 - registry_backends_test.go: testGraph, newTestGraph, registryTestsOnEveryBackend (add new
   fixture-based tests to this list).
 - list_differential_test.go: randomized model tests for lists and logs.
-- text_test.go, text_forms_test.go, text_forms_containing_test.go, fields_test.go, scope_test.go,
+- text_test.go, text_forms_test.go, text_forms_containing_test.go, fields_test.go, scope_test.go, notes_test.go,
   plan_test.go, wire_plan_test.go, operations_test.go and wire_operations_test.go (both package dml_test): tests of the file of the same name.
 
 ## Tests (removed from the project right now, inferred)

@@ -4536,6 +4536,9 @@ var FoundationalNames = []string{
 	NameAllScopeSlots,
 	NameAllScopeAllow,
 	NameAllScopeDeny,
+	NameAllNotes,
+	NameAllNoteSubjects,
+	NameAllNoteTexts,
 }
 
 // TagFoundational tags every foundational name with (AllFoundational, id),
@@ -11695,6 +11698,9 @@ type Registries struct {
 
 	// Scopes keeps who may do what, by path (theorystate.md section 116).
 	Scopes *ScopeRegistry
+
+	// Notes keeps texts linked to nodes (theorystate.md section 117).
+	Notes *NoteRegistry
 }
 
 // NewRegistries constructs every registry over graph. ids must hold an
@@ -11801,6 +11807,11 @@ func NewRegistries(graph GraphAPI, names *NameRegistry, ids map[string]NodeID) (
 		return nil, err
 	}
 
+	notes, err := NewNoteRegistry(graph, text, ids)
+	if err != nil {
+		return nil, err
+	}
+
 	return &Registries{
 		Pointers:    pointers,
 		SubPointers: subPointers,
@@ -11820,6 +11831,7 @@ func NewRegistries(graph GraphAPI, names *NameRegistry, ids map[string]NodeID) (
 		Text:            text,
 		TextForms:       forms,
 		Scopes:          scopes,
+		Notes:           notes,
 	}, nil
 }
 

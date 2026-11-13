@@ -2900,6 +2900,35 @@ empty commit is the baseline of about 2.7 ms):
  TestWireOperationArgumentsOverTheLimitCrossAsInvalidArguments and
  TestWireOperationLargestResultStillFitsOneFrame.
 
+85. Notes on nodes (theorystate.md section 117), in notes.go. NoteRegistry
+ over FieldRegistry: a note is a record (AllNotes) with a subject field
+ (AllNoteSubjects, pointing at any node) and an optional text field
+ (AllNoteTexts, pointing at an interned string). Three new foundational names;
+ Registries.Notes. AddNote (always creates), EnsureNote (finds by exact text,
+ "" meaning no text, or creates), Subject, Text, SetText (re-points the text
+ slot, "" clears it, requireRecord before interning so a refused call creates
+ nothing), Notes, NotesWithText, NodesWithNote (empty text is ErrInvalidNote),
+ RemoveNote, ClearNotes. A note adds no edge out of the annotated node, so
+ pointers and strings are unaffected (tested), and "delete only if empty"
+ blocks deleting an annotated node or a used string until ClearNotes. A local
+ Checker (registerTaggedChecker) declines a note with no subject and a text
+ that is not a string node or is the empty string node. The old string of a
+ changed text is never deleted. Not done: metadata fields, string reclamation.
+ Covered, in notes_test.go (every backend), by
+ TestFoundationalNamesIncludeNoteNames,
+ TestNewNoteRegistryRequiresItsNamesAndNodes, TestNoteAddAndReadBack,
+ TestNoteSeveralNotesPerNodeAndOneTextOnSeveralNodes,
+ TestNoteEnsureIsIdempotentAndAddAlwaysCreates,
+ TestNoteWithoutTextKeepsItsIdentity,
+ TestNoteSetTextMovesTheNoteToAnotherStringAndKeepsTheOldOne,
+ TestNoteRemoveAndClearLeaveTheNodeAndTheStrings,
+ TestNoteBlocksDeletingTheAnnotatedNodeUntilCleared,
+ TestNoteRejectsInvalidArgumentsAndCreatesNothing,
+ TestNoteOnPointerAndStringLeavesTheirOwnStructureAlone,
+ TestNoteCheckerDeclinesEachHandMadeViolation,
+ TestNoteVerifyAllAcceptsValidNotes and
+ TestHostRegistriesCarryNotesAcrossARestart.
+
 Currently unaddressed yet:
 - Interned text (items 75, 78): "contains" (substring) search is not built (a
   paged scan first, an optional positional index later), and there is no
@@ -2909,7 +2938,7 @@ Currently unaddressed yet:
   theorystate.md section 116 (stage 1 is item 80), in four batches:
   FieldRegistry plus FormsContaining; the scope registry and the read-view
   interface (both done, items 81 and 82); the host's operation handlers with grants and atomic authorization (done, item 83); the
-  wire OpRun with README and an example (done, item 84); (2) notes on nodes; (3) measuring a
+  wire OpRun with README and an example (done, item 84); (2) notes on nodes (done, item 85); (3) measuring a
   graph with many lists and a commit touching a slotted list node; (4)
   out-of-band corruption tests on every backend; (5) docs drift (Part D
   status lists).
