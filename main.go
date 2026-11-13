@@ -12217,6 +12217,10 @@ type Host struct {
 	// reconciler last took it (see markDirty).
 	dirtyMu sync.Mutex
 	dirty   map[*hostResource]struct{}
+
+	// operations holds the named handlers clients may run (operations.go).
+	// Its zero value is ready to use.
+	operations operationTable
 }
 
 // OpenHost performs the startup order of theorystate.md sections 110 and

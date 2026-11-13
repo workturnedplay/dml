@@ -2830,6 +2830,47 @@ empty commit is the baseline of about 2.7 ms):
  (each backend, directly and behind a GraphActor), plus
  TestHostRegistriesCarryScopesAcrossARestart.
 
+83. Stage 2 of plan-as-data, batch 3 (theorystate.md section 116), in
+ operations.go: the transport-independent core of operations. The host owner
+ registers named handlers (Host.RegisterReadOperation: a ReadOperation gets a
+ GraphReader inside one readView; Host.RegisterWriteOperation: a WriteOperation
+ gets a Tx inside one Transact on the guarded Host.Graph(), so holder-set
+ writes still wake the reconciler). Host.RunOperation(ctx, principal, name,
+ args) is the entry point (the wire's OpRun will call it): it checks the
+ argument limits (MaxOperationArgs, name and value bytes, valid UTF-8, with
+ messages that never echo input), looks the operation up (an unknown and a
+ forbidden one answer identically, an error wrapping ErrNotAuthorized with a
+ constant message), and runs the handler through executeOperation, which first
+ checks the entry scope run/<operation> (OperationScope) in the SAME view or
+ transaction, so a revocation cannot race a run, recovers a panic into an error
+ (so the transaction rolls back and the wire server is never taken down), and
+ checks the result against its limits (MaxOperationRows, fields, and
+ MaxOperationResultBytes, sized to fit one frame after JSON escaping), inside
+ the transaction, so a write with an unusable result is rolled back too.
+ operationClientError decides what the client sees: ErrHostClosed; a denial
+ (also for a handler's own ErrNotAuthorized and for a failure to read the entry
+ scope, which fails closed and is reported); an *OperationError the handler
+ chose to show (code defaulted, size and UTF-8 checked); or a generic
+ OperationCodeInternal failure with the cause sent to HostConfig.OnError. The
+ handler's OperationContext offers Principal, Operation, Registries, Allowed,
+ AllowedSegments (ScopePath, so a client key containing "/" cannot forge a
+ scope) and Require. Grant helpers GrantOperation/DenyOperation/
+ RevokeOperation (entry scope) and GrantScope/DenyScope/RevokeScope wrap
+ ScopeRegistry through one editScope. The table of operations is an
+ operationTable (zero value usable) in Host. Not done: the wire OpRun,
+ WithOperations, README and example (batch 4).
+ Covered by TestOperationReadRunsForAGrantedPrincipalOnly,
+ TestOperationEmptyPrincipalIsDeniedEvenWhenEveryoneIsAllowed,
+ TestOperationGrantDenyAndRevokeTakeEffectOnTheNextRun,
+ TestOperationGrantHelpersRejectBadInput,
+ TestOperationHandlerChecksFinerScopes,
+ TestOperationWriteCommitsAndRollsBackAsOne,
+ TestOperationArgumentLimits,
+ TestOperationResultLimitsFailTheRunAndRollItBack,
+ TestOperationRegistrationRules and
+ TestOperationRunAndRegisterFailOnceTheHostIsClosedOrTheContextEnded (package
+ dml_test, exported API only, a host per test over a temporary file).
+
 Currently unaddressed yet:
 - Interned text (items 75, 78): "contains" (substring) search is not built (a
   paged scan first, an optional positional index later), and there is no
@@ -2838,7 +2879,7 @@ Currently unaddressed yet:
 - Planned next, in this order: (1) stage 2 of plan-as-data, designed in
   theorystate.md section 116 (stage 1 is item 80), in four batches:
   FieldRegistry plus FormsContaining; the scope registry and the read-view
-  interface (both done, items 81 and 82); Host.RegisterOperation with grants and atomic authorization; the
+  interface (both done, items 81 and 82); the host's operation handlers with grants and atomic authorization (done, item 83); the
   wire OpRun with README and an example; (2) notes on nodes; (3) measuring a
   graph with many lists and a commit touching a slotted list node; (4)
   out-of-band corruption tests on every backend; (5) docs drift (Part D

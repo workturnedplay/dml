@@ -4249,7 +4249,7 @@ itself, as data.
 
 ---
 
-## 116. Operations: host-registered named handlers with scoped authorization (TENTATIVE, designed; batches 1 and 2 implemented)
+## 116. Operations: host-registered named handlers with scoped authorization (TENTATIVE, designed; batches 1 to 3 implemented)
 
 Stage 2 of §115. A client can run only operations it was granted. It names an
 operation and gives named text arguments (name to string); it gets back named
@@ -4399,8 +4399,16 @@ the consumer, not to dml).**
 1. (Done, implementation_state.md item 81.) `FieldRegistry` and `FormsContaining`, with tests on every backend.
 2. (Done, implementation_state.md item 82.) The scope registry (four names, the resolution function, the Checker for
    scope records) and the read-view interface.
-3. `Host.RegisterOperation`, grant helpers, atomic authorization, panic and
-   error handling.
+3. (Done, implementation_state.md item 83.) `Host.RegisterReadOperation` and
+   `RegisterWriteOperation` (two methods, since a handler is a read view or a
+   transaction), `Host.RunOperation(ctx, principal, name, args)` (the
+   transport-independent entry point the wire will call), grant helpers
+   (`GrantOperation`/`DenyOperation`/`RevokeOperation` for the entry scope
+   `run/<operation>`, `GrantScope`/`DenyScope`/`RevokeScope` for the finer
+   scopes), the entry-scope check in the same view or transaction as the
+   handler, argument and result limits, and error and panic handling. An
+   unknown and a forbidden operation answer identically; a failure to read the
+   entry scope is answered as a denial (fail closed) and reported.
 4. Wire `OpRun`, `WithOperations`, limits, README, and an example that mirrors
    rules and settings without any DNS in it.
 
@@ -4723,7 +4731,7 @@ kept current as sections above resolve or split further.)*
   everywhere too (§97).
 - Operations (§116, TENTATIVE): host-registered named handlers authorized by
   scoped allow/deny sets in the graph (most specific scope wins, deny beats
-  allow, default deny, no self-granting, no static Authorizer). Batches 1 and 2 (records with fields, scopes, the read view) are built, and nothing else is
+  allow, default deny, no self-granting, no static Authorizer). Batches 1 to 3 (records with fields, scopes, the read view, the host's operation handlers and grants) are built, and nothing on the wire is
   built yet. Open: exact signatures, a per-principal quota of interned
   principal texts, a reorder primitive, and whether stored-step operations
   ever become a handler kind.
