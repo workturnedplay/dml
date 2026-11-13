@@ -120,6 +120,68 @@ Things worth knowing:
 - `example_test.go` has runnable versions of these, which use in-memory pipes
   and need no sockets.
 
+## Operations
+
+Resources and effects are one way for clients to use the host. The other is
+*operations*: named handlers you register in Go, which a client runs with named
+text arguments and which return rows of named text fields (plus an optional
+cursor string for listings that continue in a later run). No node IDs and no
+transaction steps cross the wire, and what a client may run is kept in the
+graph, default deny.
+
+```go
+// A read handler runs in one consistent read view; a write handler
+// (RegisterWriteOperation) runs in one transaction with the permission check.
+err = host.RegisterReadOperation("get_setting",
+	func(opCtx *dml.OperationContext, graph dml.GraphReader, args dml.OperationArgs) (dml.OperationResult, error) {
+		// Finer scopes for the data it touches. AllowedSegments rejects a
+		// client-supplied "/" instead of letting it forge another path.
+		allowed, err := opCtx.AllowedSegments("read", "settings", args["key"])
+		if err != nil {
+			return dml.OperationResult{}, err // reported to the host, a generic failure to the client
+		}
+		if !allowed {
+			return dml.OperationResult{}, dml.ErrNotAuthorized
+		}
+		// ... read through graph (never through host.Graph()) ...
+		return dml.OperationResult{Rows: []dml.OperationRow{{"key": args["key"], "value": "..."}}}, nil
+	})
+
+// Who may do what: the entry scope "run/get_setting", then the data scopes.
+// The most specific decision wins, deny beats allow at one level, and nothing
+// matched is a deny.
+_, err = host.GrantOperation("get_setting", "S-1-5-21-...-1001")
+_, err = host.GrantScope("read/settings", "S-1-5-21-...-1001")
+_, err = host.DenyScope("read/settings/token", "S-1-5-21-...-1001")
+
+server := dml.NewWireServer(host,
+	dml.WithPeerIdentifier(dml.PipePeerPrincipal), // a peer nobody identified is always denied
+	dml.WithOperations())                          // no Authorizer is needed for operations
+```
+
+A client:
+
+```go
+result, err := client.RunOperation(ctx, "get_setting", dml.OperationArgs{"key": "name"})
+```
+
+In-process, `host.RunOperation(ctx, principal, name, args)` does the same without
+a transport.
+
+- An unknown operation and one the caller may not run give the same answer
+  (`ErrNotAuthorized`), so nothing is revealed about which exist. The same goes
+  for a handler that returns `ErrNotAuthorized` itself.
+- A handler returns `*dml.OperationError{Code, Message}` for what the client may
+  see. Any other error, and a panic, is reported to `HostConfig.OnError` and the
+  client gets code `dml.OperationCodeInternal` with a generic message; a write
+  is rolled back either way.
+- Arguments (count, name and value sizes, UTF-8) and results (rows, fields,
+  total size) have limits, `dml.MaxOperation*`. Use `Lookup`, not `Intern`, on
+  client-supplied text until it is validated, or any authorized client can mint
+  nodes.
+- Operations are held in memory, so register them again after a restart; the
+  grants are in the graph and persist. `example_test.go` has a runnable version.
+
 ## TLS certificates
 
 The wire transport over TCP is mutual TLS only. `cmd/dmlcert` makes the

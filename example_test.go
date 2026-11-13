@@ -213,3 +213,83 @@ func ExampleCertificateAuthority_Issue() {
 	// true
 	// true
 }
+
+// A client runs the operations the host owner registered, with named text
+// arguments, and may use only the data its scopes allow. Here the settings are
+// a plain map and the scopes decide who may read which key; a real handler would
+// read the graph through the reader it is given. The peer is identified as
+// "example-user".
+func ExampleWireClient_RunOperation() {
+	ctx := context.Background()
+
+	host, cleanup := openExampleHost()
+	defer cleanup()
+
+	settings := map[string]string{"name": "demo", "token": "s3cret"}
+
+	check(host.RegisterReadOperation("get_setting", func(opCtx *dml.OperationContext, _ dml.GraphReader, args dml.OperationArgs) (dml.OperationResult, error) {
+		// Scopes first, so a forbidden key and a missing one are told apart
+		// only to those allowed to read it. A client-supplied key containing
+		// "/" is an error here, not a path into another part of the tree.
+		allowed, allowedErr := opCtx.AllowedSegments("read", "settings", args["key"])
+		if allowedErr != nil {
+			return dml.OperationResult{}, fmt.Errorf("checking the key: %w", allowedErr)
+		}
+
+		if !allowed {
+			return dml.OperationResult{}, dml.ErrNotAuthorized
+		}
+
+		value, found := settings[args["key"]]
+		if !found {
+			return dml.OperationResult{}, &dml.OperationError{Code: "not_found", Message: "no such setting"}
+		}
+
+		return dml.OperationResult{Rows: []dml.OperationRow{{"key": args["key"], "value": value}}}, nil
+	}))
+
+	// What the user may do: run the operation at all, read settings, except the token.
+	_, err := host.GrantOperation("get_setting", "example-user")
+	check(err)
+
+	_, err = host.GrantScope("read/settings", "example-user")
+	check(err)
+
+	_, err = host.DenyScope("read/settings/token", "example-user")
+	check(err)
+
+	server := dml.NewWireServer(host,
+		dml.WithPeerIdentifier(func(net.Conn) (dml.Principal, error) { return "example-user", nil }),
+		dml.WithOperations(),
+	)
+
+	defer func() { check(server.Close()) }()
+
+	clientSide, serverSide := net.Pipe()
+
+	go server.ServeConn(serverSide)
+
+	client, err := dml.NewWireClient(ctx, clientSide)
+	check(err)
+
+	defer func() { check(client.Close()) }()
+
+	result, err := client.RunOperation(ctx, "get_setting", dml.OperationArgs{"key": "name"})
+	check(err)
+	fmt.Println(result.Rows[0]["key"], "=", result.Rows[0]["value"])
+
+	_, err = client.RunOperation(ctx, "get_setting", dml.OperationArgs{"key": "token"})
+	fmt.Println("token denied:", errors.Is(err, dml.ErrNotAuthorized))
+
+	_, err = client.RunOperation(ctx, "get_setting", dml.OperationArgs{"key": "missing"})
+
+	var opErr *dml.OperationError
+	if errors.As(err, &opErr) {
+		fmt.Println("missing:", opErr.Code)
+	}
+
+	// Output:
+	// name = demo
+	// token denied: true
+	// missing: not_found
+}

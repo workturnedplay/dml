@@ -2871,6 +2871,35 @@ empty commit is the baseline of about 2.7 ms):
  TestOperationRunAndRegisterFailOnceTheHostIsClosedOrTheContextEnded (package
  dml_test, exported API only, a host per test over a temporary file).
 
+84. Stage 2 of plan-as-data, batch 4 (theorystate.md section 116): operations
+ on the wire, in wire.go. A new request op "run" carries `operation` and
+ `args`; the response carries `rows` and `cursor`. WithOperations() turns it on
+ (off by default; a server without it refuses with ErrNotAuthorized like plans).
+ It needs NO Authorizer: wireServerConn.runOperation calls Host.RunOperation with
+ the connection's principal, so authorization is the graph's scopes (default
+ deny, entry scope and handler in one view or transaction), and a peer nobody
+ identified is the empty principal, which Allowed always denies. A run is a sign
+ of life. An *OperationError crosses as wire code "operation" with the handler's
+ own code in the new wireError.OperationCode (wireErrorResponse checks for it
+ before the sentinel table); RemoteError carries OperationCode, and
+ WireClient.RunOperation turns it back into an *OperationError (errors.As works
+ on both sides). The unknown-versus-forbidden answers stay identical on the
+ wire. MaxOperationResultBytes times the worst JSON escaping (six bytes for one)
+ stays under wireMaxFrame, so a legal result never ends the connection (a
+ response that did not fit would). README gained an Operations section and
+ example_test.go ExampleWireClient_RunOperation (settings in a map, scopes
+ deciding per key). Stage 2 of plan-as-data is complete.
+ Covered, in wire_operations_test.go (package dml_test, over net.Pipe, no
+ socket), by TestWireOperationRunsAndReturnsRowsAndCursor,
+ TestWireOperationsAreOffUnlessEnabled,
+ TestWireOperationDenialsAreIdentical,
+ TestWireUnidentifiedPeerIsDeniedEvenWhenEveryoneIsAllowed,
+ TestWireOperationErrorsCrossWithTheHandlersCodeAndHideInternals,
+ TestWireOperationWriteCommitsAndAPanicRollsItBack,
+ TestWireOperationRevocationAppliesToTheNextCall,
+ TestWireOperationArgumentsOverTheLimitCrossAsInvalidArguments and
+ TestWireOperationLargestResultStillFitsOneFrame.
+
 Currently unaddressed yet:
 - Interned text (items 75, 78): "contains" (substring) search is not built (a
   paged scan first, an optional positional index later), and there is no
@@ -2880,7 +2909,7 @@ Currently unaddressed yet:
   theorystate.md section 116 (stage 1 is item 80), in four batches:
   FieldRegistry plus FormsContaining; the scope registry and the read-view
   interface (both done, items 81 and 82); the host's operation handlers with grants and atomic authorization (done, item 83); the
-  wire OpRun with README and an example; (2) notes on nodes; (3) measuring a
+  wire OpRun with README and an example (done, item 84); (2) notes on nodes; (3) measuring a
   graph with many lists and a commit touching a slotted list node; (4)
   out-of-band corruption tests on every backend; (5) docs drift (Part D
   status lists).

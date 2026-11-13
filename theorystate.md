@@ -4249,7 +4249,7 @@ itself, as data.
 
 ---
 
-## 116. Operations: host-registered named handlers with scoped authorization (TENTATIVE, designed; batches 1 to 3 implemented)
+## 116. Operations: host-registered named handlers with scoped authorization (TENTATIVE, designed; all four batches implemented)
 
 Stage 2 of §115. A client can run only operations it was granted. It names an
 operation and gives named text arguments (name to string); it gets back named
@@ -4409,7 +4409,11 @@ the consumer, not to dml).**
    handler, argument and result limits, and error and panic handling. An
    unknown and a forbidden operation answer identically; a failure to read the
    entry scope is answered as a denial (fail closed) and reported.
-4. Wire `OpRun`, `WithOperations`, limits, README, and an example that mirrors
+4. (Done, implementation_state.md item 84: the wire `run` request is answered by
+   `Host.RunOperation`; `WithOperations` turns it on and needs no `Authorizer`;
+   a peer nobody identified is the empty principal and is always denied; a
+   handler's `*OperationError` crosses as wire code `operation` carrying the
+   handler's own code.) Wire `OpRun`, `WithOperations`, limits, README, and an example that mirrors
    rules and settings without any DNS in it.
 
 **OPEN.** The exact Go signatures. Per-principal quota of interned principal
@@ -4731,7 +4735,7 @@ kept current as sections above resolve or split further.)*
   everywhere too (§97).
 - Operations (§116, TENTATIVE): host-registered named handlers authorized by
   scoped allow/deny sets in the graph (most specific scope wins, deny beats
-  allow, default deny, no self-granting, no static Authorizer). Batches 1 to 3 (records with fields, scopes, the read view, the host's operation handlers and grants) are built, and nothing on the wire is
+  allow, default deny, no self-granting, no static Authorizer). All four batches (records with fields, scopes, the read view, the host's operation handlers and grants, the wire `run` request) are built, and nothing else is
   built yet. Open: exact signatures, a per-principal quota of interned
   principal texts, a reorder primitive, and whether stored-step operations
   ever become a handler kind.

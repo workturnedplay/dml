@@ -49,7 +49,7 @@ describe files not seen directly, only mentioned in those two documents.
 - host_graph.go: hostGraph/hostTx, the guarded Host.Graph().
 
 ## Wire transport
-- wire.go: framing, WireServer, WireClient, error codes, options (WithMaxConns, WithAuthorizer, WithPlans...).
+- wire.go: framing, WireServer, WireClient, error codes, options (WithMaxConns, WithAuthorizer, WithPlans, WithOperations...), RunPlan/RunOperation.
 - wire_auth.go: Principal, Authorizer, ResourcePolicy, MutablePolicy, AuthRequest, WireOperation.
 - wire_tls.go: mutual TLS (ListenTLS, DialTLS, TLSPeerPrincipal, isPlainTCP, completeTLS).
 - wire_tls_files.go: LoadServerTLS/LoadClientTLS, ReloadingServerTLS, PEM helpers.
@@ -67,7 +67,7 @@ describe files not seen directly, only mentioned in those two documents.
   fixture-based tests to this list).
 - list_differential_test.go: randomized model tests for lists and logs.
 - text_test.go, text_forms_test.go, text_forms_containing_test.go, fields_test.go, scope_test.go,
-  plan_test.go, wire_plan_test.go, operations_test.go (package dml_test): tests of the file of the same name.
+  plan_test.go, wire_plan_test.go, operations_test.go and wire_operations_test.go (both package dml_test): tests of the file of the same name.
 
 ## Tests (removed from the project right now, inferred)
 - ordered_list_test.go, slotted_list_test.go, composite_set_log_lists_test.go (both list types),
@@ -79,7 +79,7 @@ describe files not seen directly, only mentioned in those two documents.
 ## Which files to load for which work
 - New registry / foundational names: main.go (FoundationalNames, NewRegistries), registry_helpers.go,
   one similar registry (scope.go or fields.go), registry_backends_test.go, a similar *_test.go.
-- Operations (stage 2; the wire OpRun is batch 4): operations.go, wire.go, main.go (Host parts), host_graph.go, scope.go,
+- Operations (stage 2, all batches done): operations.go, wire.go, main.go (Host parts), host_graph.go, scope.go,
   plan.go, wire_auth.go, text.go.
 - Wire / authorization changes: wire.go, wire_auth.go, plan.go, wire_plan_test.go, wire_test.go.
 - TLS / PKI: wire_tls*.go, wire_tls*_test.go, cmd/dmlcert.

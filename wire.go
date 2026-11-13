@@ -136,28 +136,33 @@ const (
 	wireOpCancel      = "cancel"
 	wireOpClose       = "close"
 	wireOpPlan        = "plan"
+	wireOpRun         = "run"
 )
 
 // wireRequest is one client-to-host frame.
 type wireRequest struct {
-	ID       uint64 `json:"id"`
-	Op       string `json:"op"`
-	Version  int    `json:"version,omitempty"`
-	Resource string `json:"resource,omitempty"`
-	Mark     uint64 `json:"mark,omitempty"`
-	Target   uint64 `json:"target,omitempty"`
-	Plan     *Plan  `json:"plan,omitempty"`
+	ID        uint64        `json:"id"`
+	Op        string        `json:"op"`
+	Version   int           `json:"version,omitempty"`
+	Resource  string        `json:"resource,omitempty"`
+	Mark      uint64        `json:"mark,omitempty"`
+	Target    uint64        `json:"target,omitempty"`
+	Plan      *Plan         `json:"plan,omitempty"`
+	Operation string        `json:"operation,omitempty"`
+	Args      OperationArgs `json:"args,omitempty"`
 }
 
 // wireResponse is one host-to-client frame.
 type wireResponse struct {
-	ID                 uint64      `json:"id"`
-	Error              *wireError  `json:"error,omitempty"`
-	First              bool        `json:"first,omitempty"`
-	Last               bool        `json:"last,omitempty"`
-	Mark               uint64      `json:"mark,omitempty"`
-	KeepaliveTTLMillis int64       `json:"keepalive_ttl_ms,omitempty"`
-	PlanResult         *PlanResult `json:"plan_result,omitempty"`
+	ID                 uint64         `json:"id"`
+	Error              *wireError     `json:"error,omitempty"`
+	First              bool           `json:"first,omitempty"`
+	Last               bool           `json:"last,omitempty"`
+	Mark               uint64         `json:"mark,omitempty"`
+	KeepaliveTTLMillis int64          `json:"keepalive_ttl_ms,omitempty"`
+	PlanResult         *PlanResult    `json:"plan_result,omitempty"`
+	Rows               []OperationRow `json:"rows,omitempty"`
+	Cursor             string         `json:"cursor,omitempty"`
 }
 
 // wireError is an error as it crosses the wire: a stable code plus the
@@ -165,10 +170,21 @@ type wireResponse struct {
 type wireError struct {
 	Code    string `json:"code"`
 	Message string `json:"message"`
+
+	// OperationCode is the handler's own code, set only when Code is
+	// wireCodeOperation.
+	OperationCode string `json:"operation_code,omitempty"`
 }
 
-// wireCodeRemote is the code of an error that matches no table entry.
-const wireCodeRemote = "remote"
+const (
+	// wireCodeRemote is the code of an error that matches no table entry.
+	wireCodeRemote = "remote"
+
+	// wireCodeOperation is the code of an *OperationError: the error a
+	// handler chose to show, or the host's generic failure. It is not in the
+	// table because its meaning is in OperationCode.
+	wireCodeOperation = "operation"
+)
 
 // wireErrorTable maps each sentinel a client can see to its stable code. The
 // first matching entry wins on the host side; the client maps a code back to
@@ -216,6 +232,11 @@ func wireSentinel(code string) error {
 
 // wireErrorResponse is the response carrying err.
 func wireErrorResponse(err error) wireResponse {
+	var opErr *OperationError
+	if errors.As(err, &opErr) {
+		return wireResponse{Error: &wireError{Code: wireCodeOperation, Message: opErr.Message, OperationCode: opErr.Code}}
+	}
+
 	return wireResponse{Error: &wireError{Code: wireErrorCode(err), Message: err.Error()}}
 }
 
@@ -223,8 +244,13 @@ func wireErrorResponse(err error) wireResponse {
 // host's, and errors.Is sees the sentinel its code maps to (ErrUnknownResource,
 // ErrHoldLost, ...), or ErrRemote for a code this build does not know.
 type RemoteError struct {
-	Code     string
-	Message  string
+	Code    string
+	Message string
+
+	// OperationCode is the handler's own code when Code is "operation".
+	// WireClient.RunOperation turns such an error into an *OperationError.
+	OperationCode string
+
 	sentinel error
 }
 
@@ -244,7 +270,7 @@ func remoteError(werr *wireError) error {
 		return nil
 	}
 
-	return &RemoteError{Code: werr.Code, Message: werr.Message, sentinel: wireSentinel(werr.Code)}
+	return &RemoteError{Code: werr.Code, Message: werr.Message, OperationCode: werr.OperationCode, sentinel: wireSentinel(werr.Code)}
 }
 
 // closeQuietly closes c, ignoring the error: it is used where a close failure
@@ -390,6 +416,9 @@ type WireServer struct {
 	allowPlainTCP bool
 	planLimit     int // 0: plans are not accepted
 
+	// operations is set by WithOperations: run requests are served.
+	operations bool
+
 	mu        sync.Mutex
 	closed    bool
 	listeners map[net.Listener]struct{}
@@ -470,6 +499,21 @@ func WithPlans(maxSteps int) WireOption {
 
 		s.planLimit = maxSteps
 	}
+}
+
+// WithOperations makes the server serve run requests: a client names an
+// operation the host owner registered (Host.RegisterReadOperation,
+// RegisterWriteOperation) and gives named text arguments, and gets rows of named
+// text back (see Host.RunOperation).
+//
+// Operations are off unless this is given. Unlike resources and plans they are
+// not authorized by an Authorizer: what a principal may run is kept in the graph
+// (Host.GrantOperation and the scope helpers), default deny, checked in the same
+// view or transaction as the handler. The server still needs a PeerIdentifier
+// to name the peer; an unidentified peer is the empty principal, which is
+// always denied. An unknown operation and a forbidden one answer identically.
+func WithOperations() WireOption {
+	return func(s *WireServer) { s.operations = true }
 }
 
 // NewWireServer returns a server for host.
@@ -806,6 +850,7 @@ func (s *WireServer) ServeConn(nc net.Conn) {
 	sc.authorizer = s.authorizer
 	sc.principal = s.identify(nc)
 	sc.planLimit = s.planLimit
+	sc.operations = s.operations
 
 	s.addLive(sc)
 	defer s.removeLive(sc)
@@ -844,6 +889,10 @@ type wireServerConn struct {
 	// planLimit is the most steps a plan may have, set from the server after
 	// the handshake like authorizer; 0 means plans are not accepted.
 	planLimit int
+
+	// operations says whether run requests are served (WithOperations), set
+	// like planLimit.
+	operations bool
 
 	// grantMu makes "authorize an acquire and take the hold" one step with
 	// respect to Revalidate: acquires hold it for reading, Revalidate for
@@ -1168,6 +1217,31 @@ func (sc *wireServerConn) executePlan(req wireRequest) wireResponse {
 	return wireResponse{PlanResult: &result}
 }
 
+// runOperation runs a submitted operation for the connection's principal. It
+// fails closed: without WithOperations every run is refused. Everything else
+// (the limits, the entry scope, the handler, what the client may see of an
+// error) is Host.RunOperation's. A result is bounded by MaxOperationResultBytes
+// so that, with JSON escaping at its worst (six bytes for one), it still fits one
+// frame: a response that did not would end the connection.
+func (sc *wireServerConn) runOperation(ctx context.Context, req wireRequest) wireResponse {
+	if !sc.operations {
+		return wireErrorResponse(fmt.Errorf("%w: this server does not accept operations", ErrNotAuthorized))
+	}
+
+	if sc.conn.isDone() {
+		return wireErrorResponse(ErrConnClosed)
+	}
+
+	sc.conn.touch()
+
+	result, runErr := sc.host.RunOperation(ctx, sc.principal, req.Operation, req.Args)
+	if runErr != nil {
+		return wireErrorResponse(runErr)
+	}
+
+	return wireResponse{Rows: result.Rows, Cursor: result.Cursor}
+}
+
 // execute runs one operation on the session and builds its response.
 func (sc *wireServerConn) execute(ctx context.Context, req wireRequest) wireResponse {
 	if req.Op == wireOpAcquire {
@@ -1214,6 +1288,8 @@ func (sc *wireServerConn) execute(ctx context.Context, req wireRequest) wireResp
 		return wireResponse{}
 	case wireOpPlan:
 		return sc.executePlan(req)
+	case wireOpRun:
+		return sc.runOperation(ctx, req)
 	default:
 		return wireErrorResponse(fmt.Errorf("%w: unknown operation %q", ErrWireProtocol, req.Op))
 	}
@@ -1532,6 +1608,28 @@ func (c *WireClient) RunPlan(ctx context.Context, plan Plan) (PlanResult, error)
 	}
 
 	return *resp.PlanResult, nil
+}
+
+// RunOperation asks the host to run the operation called name with args and
+// returns its rows and cursor (see Host.RunOperation). It needs a server that
+// was given WithOperations. The errors are ErrNotAuthorized (the operation is
+// unknown or this client may not run it, indistinguishably), an *OperationError
+// (the code and message the handler chose to show, OperationCodeInvalidArguments
+// for arguments over the limits, or OperationCodeInternal for a failure the host
+// keeps to itself) and the usual connection errors. It is not part of Client:
+// the in-process caller uses Host.RunOperation.
+func (c *WireClient) RunOperation(ctx context.Context, name string, args OperationArgs) (OperationResult, error) {
+	resp, err := c.call(ctx, wireRequest{Op: wireOpRun, Operation: name, Args: args})
+	if err != nil {
+		var remote *RemoteError
+		if errors.As(err, &remote) && remote.Code == wireCodeOperation {
+			return OperationResult{}, &OperationError{Code: remote.OperationCode, Message: remote.Message}
+		}
+
+		return OperationResult{}, err
+	}
+
+	return OperationResult{Rows: resp.Rows, Cursor: resp.Cursor}, nil
 }
 
 // Done implements Client.
