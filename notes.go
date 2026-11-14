@@ -65,7 +65,8 @@ var ErrInvalidNote = errors.New("note is invalid")
 // string cannot be deleted while a note uses them ("delete only if empty",
 // theorystate.md section 18): ClearNotes first. Removing a note, or changing
 // its text, never deletes a string: whether a string is still needed is a
-// question for a future DeleteString, not for notes.
+// question for TextRegistry.DeleteString, not for notes. DeleteString refuses
+// (ErrStringInUse) a string a note still uses, and deletes it once none does.
 //
 // The Checker declines, at commit: a note with no subject, and a note whose text
 // is not a string node or is the empty string node. Like every registry,

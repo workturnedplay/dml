@@ -528,6 +528,198 @@ func TestTextCheckerDeclinesEachViolationAtCommitTime(t *testing.T) {
 	}
 }
 
+func (rig *textRig) deleteString(t *testing.T, node NodeID) {
+	t.Helper()
+
+	if err := rig.text.DeleteString(rig.graph, node); err != nil {
+		t.Fatalf("DeleteString(%d): %v", node, err)
+	}
+}
+
+func (rig *textRig) requireInterned(t *testing.T, text string, want bool) {
+	t.Helper()
+
+	_, found, err := rig.text.Lookup(rig.graph, text)
+	if err != nil || found != want {
+		t.Fatalf("Lookup(%q) = (found %v, %v), want found %v", text, found, err, want)
+	}
+}
+
+// requireInUse checks that err is DeleteString's refusal of a string that is
+// still needed, and that it is also an ErrNodeNotEmpty.
+func requireInUse(t *testing.T, label string, err error) {
+	t.Helper()
+
+	if !errors.Is(err, ErrStringInUse) || !errors.Is(err, ErrNodeNotEmpty) {
+		t.Fatalf("%s error = %v, want %v and %v", label, err, ErrStringInUse, ErrNodeNotEmpty)
+	}
+}
+
+func TestTextDeleteStringRemovesOnlyThatString(t *testing.T) {
+	forEachTextRig(t, func(t *testing.T, rig *textRig) {
+		cat := rig.intern(t, "cat")
+		at := rig.intern(t, "at")
+
+		rig.requireStrings(t, 4) // "", "t", "at", "cat"
+
+		rig.deleteString(t, cat)
+
+		rig.requireStrings(t, 3)
+		rig.requireInterned(t, "cat", false)
+		rig.requireInterned(t, "at", true)
+		rig.requireText(t, at, "at")
+
+		if _, err := rig.text.Text(rig.graph, cat); !errors.Is(err, ErrNodeNotFound) {
+			t.Fatalf("Text(deleted) error = %v, want %v", err, ErrNodeNotFound)
+		}
+
+		if err := rig.text.DeleteString(rig.graph, cat); !errors.Is(err, ErrNodeNotFound) {
+			t.Fatalf("second DeleteString(cat) error = %v, want %v", err, ErrNodeNotFound)
+		}
+
+		// The suffixes stay until deleted themselves.
+		rig.deleteString(t, at)
+		rig.deleteString(t, rig.intern(t, "t"))
+		rig.requireStrings(t, 1)
+
+		// The same text can be interned again.
+		rig.requireText(t, rig.intern(t, "cat"), "cat")
+		rig.requireStrings(t, 4)
+	})
+}
+
+func TestTextDeleteStringRefusesAStringThatIsStillExtended(t *testing.T) {
+	forEachTextRig(t, func(t *testing.T, rig *textRig) {
+		cat := rig.intern(t, "cat")
+		at := rig.intern(t, "at")
+
+		requireInUse(t, "DeleteString(at)", rig.text.DeleteString(rig.graph, at))
+
+		rig.requireStrings(t, 4)
+		rig.requireText(t, cat, "cat")
+		rig.requireText(t, at, "at")
+
+		// Once nothing extends it, it goes.
+		rig.deleteString(t, cat)
+		rig.deleteString(t, at)
+		rig.requireStrings(t, 2) // "" and "t"
+	})
+}
+
+func TestTextDeleteStringLeavesThePrefixIndexToo(t *testing.T) {
+	forEachTextRig(t, func(t *testing.T, rig *textRig) {
+		cat := rig.internIndexed(t, "cat")
+		car := rig.internIndexed(t, "car")
+
+		rig.deleteString(t, cat)
+
+		rig.requireIndexNodes(t, 4) // root, c, ca, car
+		rig.requireCount(t, "AllIndexEntries", rig.text.allIndexEntries, 1)
+		rig.requireCount(t, "AllIndexedStrings", rig.text.allIndexedStrings, 1)
+		rig.requireInterned(t, "cat", false)
+
+		got, err := rig.text.IndexedWithPrefix(rig.graph, "ca", 10)
+		if err != nil {
+			t.Fatalf("IndexedWithPrefix(ca): %v", err)
+		}
+
+		requireSameNodes(t, "IndexedWithPrefix(ca)", got, []NodeID{car})
+
+		rig.deleteString(t, car)
+		rig.requireIndexNodes(t, 1) // only the root is left
+
+		if verifyErr := VerifyAll(rig.graph, 5); verifyErr != nil {
+			t.Fatalf("VerifyAll(): %v", verifyErr)
+		}
+	})
+}
+
+// TestTextDeleteStringRefusedKeepsTheIndexEntry: the unmarking DeleteString
+// does first is rolled back with the refusal.
+func TestTextDeleteStringRefusedKeepsTheIndexEntry(t *testing.T) {
+	forEachTextRig(t, func(t *testing.T, rig *textRig) {
+		at := rig.internIndexed(t, "at")
+		rig.internIndexed(t, "cat")
+
+		requireInUse(t, "DeleteString(at)", rig.text.DeleteString(rig.graph, at))
+
+		if indexed, err := rig.text.IsIndexed(rig.graph, at); err != nil || !indexed {
+			t.Fatalf("IsIndexed(at) after the refusal = (%v,%v), want (true,nil)", indexed, err)
+		}
+
+		rig.requireIndexNodes(t, 6) // root, a, at, c, ca, cat
+		rig.requireCount(t, "AllIndexEntries", rig.text.allIndexEntries, 2)
+
+		got, err := rig.text.IndexedWithPrefix(rig.graph, "a", 10)
+		if err != nil {
+			t.Fatalf("IndexedWithPrefix(a): %v", err)
+		}
+
+		requireSameNodes(t, "IndexedWithPrefix(a)", got, []NodeID{at})
+	})
+}
+
+func TestTextDeleteStringRejectsWhatIsNotADeletableString(t *testing.T) {
+	const nonexistent NodeID = 999999
+
+	forEachTextRig(t, func(t *testing.T, rig *textRig) {
+		rig.intern(t, "a")
+
+		plain := mustCreateNode(t, rig.graph)
+		char := rig.charSlots(t, 'a').node
+		nodesBefore := len(mustFindNodes(t, rig.graph))
+
+		cases := []struct {
+			name string
+			node NodeID
+			want error
+		}{
+			{name: "the empty string", node: rig.text.EmptyString(), want: ErrCannotDeleteEmptyString},
+			{name: "a node that is not a string", node: plain, want: ErrNotString},
+			{name: "a char", node: char, want: ErrNotString},
+			{name: "a node that does not exist", node: nonexistent, want: ErrNodeNotFound},
+		}
+
+		for _, tc := range cases {
+			if err := rig.text.DeleteString(rig.graph, tc.node); !errors.Is(err, tc.want) {
+				t.Fatalf("%s: DeleteString() error = %v, want %v", tc.name, err, tc.want)
+			}
+		}
+
+		if got := len(mustFindNodes(t, rig.graph)); got != nodesBefore {
+			t.Fatalf("%d nodes after the refused calls, want %d", got, nodesBefore)
+		}
+
+		rig.requireStrings(t, 2) // "" and "a"
+	})
+}
+
+func TestTextDeleteStringRollsBackWithTheEnclosingTransaction(t *testing.T) {
+	forEachTextRig(t, func(t *testing.T, rig *textRig) {
+		cat := rig.internIndexed(t, "cat")
+		errOuter := errors.New("outer failure")
+
+		err := rig.graph.Transact(func(tx Tx) error {
+			if deleteErr := rig.text.DeleteString(tx, cat); deleteErr != nil {
+				return deleteErr
+			}
+
+			return errOuter
+		})
+		if !errors.Is(err, errOuter) {
+			t.Fatalf("Transact() error = %v, want %v", err, errOuter)
+		}
+
+		rig.requireStrings(t, 4)
+		rig.requireText(t, cat, "cat")
+		rig.requireInterned(t, "cat", true)
+
+		if indexed, indexedErr := rig.text.IsIndexed(rig.graph, cat); indexedErr != nil || !indexed {
+			t.Fatalf("IsIndexed(cat) after the rollback = (%v,%v), want (true,nil)", indexed, indexedErr)
+		}
+	})
+}
+
 func TestNewTextRegistryRequiresEveryName(t *testing.T) {
 	var g Graph
 

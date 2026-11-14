@@ -378,6 +378,45 @@ func TestTextFormsDeleteFormLeavesNothingAndKeepsStrings(t *testing.T) {
 	})
 }
 
+// TestTextFormsBlockDeletingTheStringsTheyUse: a text that has a form, and the
+// elements of a form, are still needed until the form is deleted.
+func TestTextFormsBlockDeletingTheStringsTheyUse(t *testing.T) {
+	forEachFormRig(t, func(t *testing.T, rig *formRig) {
+		cat := rig.intern(t, "cat")
+		c := rig.intern(t, "c")
+		at := rig.intern(t, "at")
+
+		form := rig.ensureForm(t, cat, c, at)
+
+		inUse := []struct {
+			name string
+			node NodeID
+		}{
+			{name: "a text that has a form", node: cat},
+			{name: "an element of a form", node: c},
+			{name: "an element that also has an extension", node: at},
+		}
+
+		for _, tc := range inUse {
+			requireInUse(t, "DeleteString("+tc.name+")", rig.text.DeleteString(rig.graph, tc.node))
+		}
+
+		rig.requireStrings(t, 5) // "", "t", "at", "cat", "c"
+		rig.requireForms(t, cat, []NodeID{form})
+
+		if err := rig.forms.DeleteForm(rig.graph, form); err != nil {
+			t.Fatalf("DeleteForm(): %v", err)
+		}
+
+		// Nothing refers to them now; cat goes first because it extends at.
+		for _, node := range []NodeID{cat, c, at} {
+			rig.deleteString(t, node)
+		}
+
+		rig.requireStrings(t, 2) // "" and "t"
+	})
+}
+
 func TestTextListIsGenericAndChecksItsElements(t *testing.T) {
 	forEachFormRig(t, func(t *testing.T, rig *formRig) {
 		the := rig.intern(t, "The")

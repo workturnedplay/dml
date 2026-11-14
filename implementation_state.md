@@ -3125,24 +3125,38 @@ empty commit is the baseline of about 2.7 ms):
  Comments saying "in this file" or "main.go" in moved code were left as they
  were; read them as "in this package".
 
+
+94. DeleteString (theorystate.md section 114), in text.go.
+ TextRegistry.DeleteString(graph, str) deletes one string node in one
+ transaction: it requires a string (ErrNodeNotFound, ErrNotString), refuses the
+ empty string (ErrCannotDeleteEmptyString), unmarks the string from the prefix
+ index (UnmarkIndexed), removes the tail and StartsWith edges and the tag, and
+ deletes the node. Whatever still extends or refers to it (longer strings, a
+ form slot, capsule values, notes, set members) makes the delete fail with
+ ErrNodeNotEmpty; DeleteString turns that into ErrStringInUse (also matching
+ ErrNodeNotEmpty) and the whole transaction, the unmarking included, rolls back.
+ Stepping-stone suffixes and chars stay. Also: removeRelationshipsTx and
+ addRelationshipsTx (tx_helpers.go) replace three hand-written edge loops in
+ text.go, and TextRegistry.requireString replaces four copies of the
+ AllStrings tag check (text.go, text_forms.go). Bug fixed on the way:
+ validateText converted the text to runes before checking the length, so a huge
+ text allocated a huge rune slice before ErrTextTooLong; it now counts runes
+ first. Covered, in text_test.go, text_forms_test.go and notes_test.go (every
+ backend), by the TestTextDeleteString* tests,
+ TestTextFormsBlockDeletingTheStringsTheyUse and
+ TestNoteStringIsDeletableOnlyWhileNoNoteUsesIt. Not done: automatic
+ reclamation of unused strings and of orphaned stepping-stone suffixes.
+
 Currently unaddressed yet:
-- Interned text (items 75, 78): "contains" (substring) search is not built (a
-  paged scan first, an optional positional index later), and there is no
-  DeleteString (only when nothing extends it, nothing refers to it and it has
-  no forms; interacts with the prefix index and lists).
+- Interned text (items 75, 78, 94): "contains" (substring) search is not built (a
+  paged scan first, an optional positional index later). Strings are deleted
+  one at a time (DeleteString); nothing reclaims unused strings or orphaned
+  stepping-stone suffixes automatically.
 - Planned next, in this order:
-  (1) DeleteString (item 75/78 gaps): delete a string only when nothing
-  extends it, nothing refers to it (capsule values, notes, scope principals,
-  set members) and it has no forms; it interacts with the prefix index
-  (UnmarkIndexed first), with text lists, and with the notes rule "delete
-  only if empty"; a note's text slot already blocks it. Files: text.go,
-  text_forms.go, notes.go, text_test.go, text_forms_test.go, notes_test.go,
-  this file and theorystate.md section 114 (plus tx_helpers.go and
-  tagged_lookup.go).
-  (2) Substring ("contains") search over interned text: a paged scan first,
+  (1) Substring ("contains") search over interned text: a paged scan first,
   an optional positional index later (theorystate.md section 114). Files:
   text.go, text_test.go, this file and theorystate.md section 114.
-  Done: stage 2 of plan-as-data (items 81-84), notes on nodes (item 85), the
+  Done: DeleteString (item 94), stage 2 of plan-as-data (items 81-84), notes on nodes (item 85), the
   docs-drift pass (item 87), the many-lists measurements (item 88), raw
   writes on every backend (item 89), the out-of-band test migration (item
   90), and the interleaved-layout benchmark with its measurements (items 91

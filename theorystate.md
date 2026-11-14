@@ -4195,7 +4195,21 @@ string nodes.
 - **AllFoundational** tags every foundational name and ROOT, so a browser can
   tell foundational parents of any node apart with one lookup each.
 
-Limits: 4096 runes per text, invalid UTF-8 is rejected, no string deletion yet.
+Limits: 4096 runes per text, invalid UTF-8 is rejected.
+
+**Deleting a string (DeleteString, implemented).** A string is deleted by
+removing its three structural edges (AllStrings tag, tail edge, StartsWith
+edge) and the node, in one transaction, after unmarking it from the prefix
+index. "Delete only if empty" (section 18) is the whole in-use test: a longer
+string that extends it, its form slot, and any other referrer (a capsule value,
+a note's text slot, a set member, a scope principal) leave the node non-empty,
+so the delete fails, the transaction rolls back (the unmarking too), and the
+caller gets ErrStringInUse (which also matches ErrNodeNotEmpty). The empty
+string is the root and cannot be deleted. Only the one string goes: the
+suffixes Intern created as stepping stones stay until deleted themselves, and
+char nodes are never deleted. Deleting a string is therefore bottom-up: first
+what extends it, its forms (DeleteForm), the notes and list elements that use it.
+Automatic reclamation of unused strings is not done.
 
 **Alternative considered (superseded by the decision below).**
 The suffix trie gives one canonical node per text only among trie nodes: an
@@ -4524,8 +4538,9 @@ fields (a timestamp, an author) without redesign.
   that, so there is one canonical empty form. A note with no text cannot be
   searched for by text.
 - `SetText` re-points the text slot to another interned string. The old string
-  is left alone: whether a string is still needed is a question for a future
-  `DeleteString` (which also has to see its notes), not for notes.
+  is left alone: whether a string is still needed is a question for
+  `DeleteString` (section 114), not for notes. `DeleteString` refuses a string a
+  note's text slot still points at, and takes it once no note does.
 - Deleting is "delete only if empty" (section 18): the subject slot points at the
   annotated node and the text slot at the string, so neither can be deleted while
   a note uses it. `ClearNotes(node)` is what to do before deleting a node;
@@ -4540,7 +4555,8 @@ record shape.
 
 **OPEN.** Metadata fields (time, author) if a consumer needs them; whether a
 note about a note should be allowed to block `RemoveNote` as it does now (it
-follows from "delete only if empty"); reclaiming strings that nothing uses.
+follows from "delete only if empty"); reclaiming strings that nothing uses automatically (`DeleteString` does it by
+hand, one string at a time).
 
 ---
 

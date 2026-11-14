@@ -153,6 +153,31 @@ func removeRelationshipTx(tx txOps, from, to NodeID) error {
 	return wrapInterfaceErr(err)
 }
 
+// addRelationshipsTx adds each of edges against tx, in order, and stops at the
+// first error. It is the shared "wire these edges" step of the registries.
+func addRelationshipsTx(tx txOps, edges ...Relationship) error {
+	for _, edge := range edges {
+		if err := addRelationshipTx(tx, edge.From, edge.To); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// removeRelationshipsTx removes each of edges against tx, in order, and stops
+// at the first error. It is the shared "unwire these edges" step of the
+// registries; the enclosing transaction's rollback restores them on failure.
+func removeRelationshipsTx(tx txOps, edges ...Relationship) error {
+	for _, edge := range edges {
+		if err := removeRelationshipTx(tx, edge.From, edge.To); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
 // deleteNodeTx is tx.DeleteNode with its error wrapped. The wrapping
 // preserves errors.Is, so callers can still test for ErrNodeNotEmpty.
 func deleteNodeTx(tx txOps, id NodeID) error {

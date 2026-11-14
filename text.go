@@ -90,6 +90,16 @@ var (
 	// ErrInvalidTextStructure is returned when the string trie or the prefix
 	// index does not have the shape TextRegistry builds.
 	ErrInvalidTextStructure = errors.New("text structure is invalid")
+
+	// ErrStringInUse is returned by DeleteString for a string that something
+	// still needs: a longer string that extends it, a form it has, or any other
+	// node that refers to it (a list element, a note, a set member). The error
+	// also matches ErrNodeNotEmpty.
+	ErrStringInUse = errors.New("string is still in use")
+
+	// ErrCannotDeleteEmptyString is returned by DeleteString for the empty
+	// string, the root of the trie.
+	ErrCannotDeleteEmptyString = errors.New("the empty string cannot be deleted")
 )
 
 // charSlots is a char node and its two slots.
@@ -125,7 +135,8 @@ type stringParts struct {
 //	char -> IndexStep -> Y             that char is the one added
 //	index node -> entry -> string      the entry ends the path at the string
 //
-// Only Intern and MarkIndexed/UnmarkIndexed write either structure. Chars
+// Only Intern, DeleteString and MarkIndexed/UnmarkIndexed write either
+// structure. Chars
 // are seeded through NameRegistry ("char/U+0061"), the one out-of-graph
 // part; everything above them is graph structure. Chars are case-sensitive
 // and no Unicode normalization is done: the caller normalizes.
@@ -215,12 +226,13 @@ func validateText(text string) ([]rune, error) {
 		return nil, ErrInvalidText
 	}
 
-	runes := []rune(text)
-	if len(runes) > MaxTextRunes {
-		return nil, fmt.Errorf("%w: %d runes, limit %d", ErrTextTooLong, len(runes), MaxTextRunes)
+	// Counted before converting, so over-long text is refused without first
+	// allocating a rune slice as big as it is.
+	if count := utf8.RuneCountInString(text); count > MaxTextRunes {
+		return nil, fmt.Errorf("%w: %d runes, limit %d", ErrTextTooLong, count, MaxTextRunes)
 	}
 
-	return runes, nil
+	return []rune(text), nil
 }
 
 // slotsOf finds char's two slots, each by its own tag and verified to be
@@ -430,6 +442,12 @@ func (t *TextRegistry) IsString(graph GraphReader, id NodeID) (bool, error) {
 	return has, wrapInterfaceErr(err)
 }
 
+// requireString checks that node exists and is a string node (ErrNodeNotFound,
+// ErrNotString).
+func (t *TextRegistry) requireString(g GraphReader, node NodeID) error {
+	return requireTagged(g, node, t.allStrings, ErrNotString)
+}
+
 // IsIndexed reports whether id is tagged (AllIndexedStrings, id).
 func (t *TextRegistry) IsIndexed(graph GraphReader, id NodeID) (bool, error) {
 	has, err := graph.HasRelationship(t.allIndexedStrings, id)
@@ -494,7 +512,7 @@ func (t *TextRegistry) runeOf(char NodeID) (rune, error) {
 // walking up the trie. A broken chain, or one that revisits a node, is
 // ErrInvalidTextStructure.
 func (t *TextRegistry) runesOf(g GraphReader, node NodeID) ([]rune, error) {
-	if requireErr := requireTagged(g, node, t.allStrings, ErrNotString); requireErr != nil {
+	if requireErr := t.requireString(g, node); requireErr != nil {
 		return nil, requireErr
 	}
 
@@ -648,14 +666,13 @@ func (t *TextRegistry) attachEntry(tx Tx, node, str NodeID) (bool, error) {
 		return false, createErr
 	}
 
-	for _, edge := range []Relationship{
-		{From: node, To: created},
-		{From: created, To: str},
-		{From: t.allIndexedStrings, To: str},
-	} {
-		if linkErr := addRelationshipTx(tx, edge.From, edge.To); linkErr != nil {
-			return false, linkErr
-		}
+	linkErr := addRelationshipsTx(tx,
+		Relationship{From: node, To: created},
+		Relationship{From: created, To: str},
+		Relationship{From: t.allIndexedStrings, To: str},
+	)
+	if linkErr != nil {
+		return false, linkErr
 	}
 
 	return true, nil
@@ -739,15 +756,14 @@ func (t *TextRegistry) detachEntry(tx Tx, node, str NodeID) error {
 		return ErrInvalidTextStructure
 	}
 
-	for _, edge := range []Relationship{
-		{From: node, To: entry},
-		{From: t.allIndexEntries, To: entry},
-		{From: entry, To: str},
-		{From: t.allIndexedStrings, To: str},
-	} {
-		if removeErr := removeRelationshipTx(tx, edge.From, edge.To); removeErr != nil {
-			return removeErr
-		}
+	removeErr := removeRelationshipsTx(tx,
+		Relationship{From: node, To: entry},
+		Relationship{From: t.allIndexEntries, To: entry},
+		Relationship{From: entry, To: str},
+		Relationship{From: t.allIndexedStrings, To: str},
+	)
+	if removeErr != nil {
+		return removeErr
 	}
 
 	return deleteNodeTx(tx, entry)
@@ -759,14 +775,13 @@ func (t *TextRegistry) detachEntry(tx Tx, node, str NodeID) error {
 // exactly as it was, and pruned is false.
 func (t *TextRegistry) pruneIndexNode(tx Tx, parent, step, node NodeID) (bool, error) {
 	pruned, err := transactBool(tx, func(inner Tx) (bool, error) {
-		for _, edge := range []Relationship{
-			{From: parent, To: node},
-			{From: step, To: node},
-			{From: t.allIndexNodes, To: node},
-		} {
-			if removeErr := removeRelationshipTx(inner, edge.From, edge.To); removeErr != nil {
-				return false, removeErr
-			}
+		removeErr := removeRelationshipsTx(inner,
+			Relationship{From: parent, To: node},
+			Relationship{From: step, To: node},
+			Relationship{From: t.allIndexNodes, To: node},
+		)
+		if removeErr != nil {
+			return false, removeErr
 		}
 
 		if deleteErr := deleteNodeTx(inner, node); deleteErr != nil {
@@ -822,6 +837,56 @@ func (t *TextRegistry) UnmarkIndexed(graph Transactor, str NodeID) (bool, error)
 
 		return true, nil
 	})
+}
+
+// DeleteString deletes the string node str, in one transaction: it leaves the
+// trie and, if it was marked with MarkIndexed, the prefix index. The empty
+// string cannot be deleted (ErrCannotDeleteEmptyString).
+//
+// A string goes only when nothing else needs it: no longer string extends it,
+// it has no forms, and nothing refers to it (a list element, a note, a set
+// member, ...). Otherwise nothing changes (the unmarking is rolled back too)
+// and the error matches both ErrStringInUse and ErrNodeNotEmpty. So "at" can
+// be deleted once "cat" and "hat" are, and a string with forms once its forms
+// are deleted (TextFormRegistry.DeleteForm). Only str goes: the shorter
+// strings Intern created for it as stepping stones stay until deleted
+// themselves, and so do the char nodes.
+func (t *TextRegistry) DeleteString(graph Transactor, str NodeID) error {
+	return wrapInterfaceErr(graph.Transact(func(tx Tx) error {
+		if requireErr := t.requireString(tx, str); requireErr != nil {
+			return requireErr
+		}
+
+		if str == t.emptyString {
+			return ErrCannotDeleteEmptyString
+		}
+
+		parts, partsErr := t.partsOf(tx, str)
+		if partsErr != nil {
+			return partsErr
+		}
+
+		if _, unmarkErr := t.UnmarkIndexed(tx, str); unmarkErr != nil {
+			return unmarkErr
+		}
+
+		unlinkErr := removeRelationshipsTx(tx,
+			Relationship{From: parts.tail, To: str},
+			Relationship{From: parts.slot, To: str},
+		)
+		if unlinkErr != nil {
+			return unlinkErr
+		}
+
+		// The tag goes with the node; whatever else still points at str, or
+		// hangs off it, makes the delete fail and the transaction roll back.
+		deleteErr := untagAndDeleteNodeTx(tx, str, t.allStrings)
+		if errors.Is(deleteErr, ErrNodeNotEmpty) {
+			return fmt.Errorf("%w: string %d: %w", ErrStringInUse, str, deleteErr)
+		}
+
+		return deleteErr
+	}))
 }
 
 // IndexedWithPrefix returns up to limit indexed strings that start with

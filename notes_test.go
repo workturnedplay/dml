@@ -443,6 +443,61 @@ func TestNoteBlocksDeletingTheAnnotatedNodeUntilCleared(t *testing.T) {
 	})
 }
 
+// TestNoteStringIsDeletableOnlyWhileNoNoteUsesIt: DeleteString refuses a string
+// a note's text slot points at, and takes it once the note moved on or went.
+func TestNoteStringIsDeletableOnlyWhileNoNoteUsesIt(t *testing.T) {
+	forEachNoteRig(t, func(t *testing.T, rig *noteRig) {
+		subject := mustCreateNode(t, rig.graph)
+		note := rig.add(t, subject, "old")
+
+		oldNode, oldFound, oldErr := rig.text.Lookup(rig.graph, "old")
+		if oldErr != nil || !oldFound {
+			t.Fatalf("Lookup(old) = (%d,%v,%v)", oldNode, oldFound, oldErr)
+		}
+
+		requireInUse(t, "DeleteString(old)", rig.text.DeleteString(rig.graph, oldNode))
+
+		// Changing the text frees the old string; the note uses the new one.
+		if setErr := rig.notes.SetText(rig.graph, note, "new"); setErr != nil {
+			t.Fatalf("SetText(): %v", setErr)
+		}
+
+		if deleteErr := rig.text.DeleteString(rig.graph, oldNode); deleteErr != nil {
+			t.Fatalf("DeleteString(old) after SetText(): %v", deleteErr)
+		}
+
+		rig.requireInterned(t, "old", false)
+		rig.requireText(t, note, "new", true)
+
+		newNode, newFound, newErr := rig.text.Lookup(rig.graph, "new")
+		if newErr != nil || !newFound {
+			t.Fatalf("Lookup(new) = (%d,%v,%v)", newNode, newFound, newErr)
+		}
+
+		requireInUse(t, "DeleteString(new)", rig.text.DeleteString(rig.graph, newNode))
+
+		// Removing the note frees the string it used.
+		if removeErr := rig.notes.RemoveNote(rig.graph, note); removeErr != nil {
+			t.Fatalf("RemoveNote(): %v", removeErr)
+		}
+
+		if deleteErr := rig.text.DeleteString(rig.graph, newNode); deleteErr != nil {
+			t.Fatalf("DeleteString(new) after RemoveNote(): %v", deleteErr)
+		}
+
+		rig.requireInterned(t, "new", false)
+
+		with, withErr := rig.notes.NotesWithText(rig.graph, "new")
+		if withErr != nil || len(with) != 0 {
+			t.Fatalf("NotesWithText(new) = (%v,%v), want (none,nil)", with, withErr)
+		}
+
+		if verifyErr := VerifyAll(rig.graph, 5); verifyErr != nil {
+			t.Fatalf("VerifyAll(): %v", verifyErr)
+		}
+	})
+}
+
 func TestNoteRejectsInvalidArgumentsAndCreatesNothing(t *testing.T) {
 	const nonexistent NodeID = 999999
 

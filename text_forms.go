@@ -131,7 +131,7 @@ func (f *TextFormRegistry) requireTextList(graph GraphReader, list NodeID) error
 
 // requirePart checks that part is a string node other than the empty string.
 func (f *TextFormRegistry) requirePart(graph GraphReader, part NodeID) error {
-	if requireErr := requireTagged(graph, part, f.text.allStrings, ErrNotString); requireErr != nil {
+	if requireErr := f.text.requireString(graph, part); requireErr != nil {
 		return requireErr
 	}
 
@@ -340,7 +340,7 @@ func (f *TextFormRegistry) EnsureForm(graph Transactor, text NodeID, parts []Nod
 // Forms returns the forms of text, ascending. A text with no form slot has
 // none.
 func (f *TextFormRegistry) Forms(graph GraphReader, text NodeID) ([]NodeID, error) {
-	if requireErr := requireTagged(graph, text, f.text.allStrings, ErrNotString); requireErr != nil {
+	if requireErr := f.text.requireString(graph, text); requireErr != nil {
 		return nil, requireErr
 	}
 
@@ -369,7 +369,7 @@ func (f *TextFormRegistry) Forms(graph GraphReader, text NodeID) ([]NodeID, erro
 // is not a text list, or is a text list that is not a form, is skipped. The
 // result is complete, however many references part has.
 func (f *TextFormRegistry) formTexts(graph GraphReader, part NodeID) (map[NodeID]NodeID, error) {
-	if requireErr := requireTagged(graph, part, f.text.allStrings, ErrNotString); requireErr != nil {
+	if requireErr := f.text.requireString(graph, part); requireErr != nil {
 		return nil, requireErr
 	}
 
