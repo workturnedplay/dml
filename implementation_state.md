@@ -3077,28 +3077,189 @@ empty commit is the baseline of about 2.7 ms):
  there. DRY: skipLargeUnderShort, benchSpareNodes, benchEmptyCommit,
  benchReadSteps, benchAppend, appendOne and addOneElementList are shared by
  BenchmarkManyListsCommitCost, buildCrowd and the new benchmark. Nothing
- has been run: the numbers are to be recorded here (see "Planned next"). No
+ was run for this item; the measurements are item 92. No
  production change.
+
+92. Measurements of BenchmarkInterleavedListsCommitCost (item 91), i7-8700K,
+ Windows, no -race, 30 iterations, ms per commit. Rows come from a -short run
+ (1,000 and 10,000), a full run (466 s; its scrollback was lost, so the
+ ListRegistry 100,000 row is from this single run) and a partial third run,
+ hence the ranges; an empty commit is 2.5 to 5.0, so differences under about
+ 1.5 are noise. Lists = 1,000 / 10,000 / 100,000:
+   step           ListRegistry                  SlottedListRegistry
+   tail-lookup    3.4-4.4 / 7.0-7.8 / 56.6      3.0-3.6 / 2.8-3.7 / 3.3
+   touch-tail     3.1-3.8 / 3.1-3.3 / 4.5       3.5-3.6 / 3.3-3.4 / 3.9
+   append         6.0-6.4 / 10.7-10.8 / 63.0    6.0-7.4 / 6.8-6.9 / 7.4
+ (a) The worst case of ListRegistry's tail lookup is real. Net of the empty
+ commit it costs about 0.43-0.51 microseconds per element at 10,000 and 0.54
+ at 100,000 (below the noise at 1,000), with allocations flat (125 / 139 /
+ 139, 10-12 KB): the cost is cursor stepping in the leapfrog join, whose
+ alternations here are about the size of the smaller run. Item 88 called
+ "about the smaller of the two" an upper bound; this layout attains it. Item
+ 73's remark that many lists are ListRegistry's weak case therefore stands
+ for an interleaved layout, which is what lists that grow over the same
+ period produce; item 88's layout (long list built after the crowd) was the
+ best case.
+ (b) Append is the tail lookup plus a constant (about 3.5 to 6 ms): 63.0 ms
+ at 100,000 against 7.4 for the slotted list. Appending one element at a
+ time to a 100,000-element list in this layout would therefore cost about
+ 0.5 microseconds x n^2 / 2, roughly 40 minutes (an estimate, not measured);
+ AppendMany looks the tail up once and is not affected.
+ (c) Building with InsertAfter after the last capsule is linear, as
+ intended: ListRegistry.InsertAfter does not look for the tail (read from
+ main.go, and the whole 100,000 run, builds included, took 466 s).
+ (d) The slotted list is flat in every step. ListRegistry's touch-tail is
+ flat too (item 88).
+ Decision: a documented limit, not a fix. The cause is the structure (head
+ and tail as tags found through a hub with one member per non-empty list);
+ the remedy is SlottedListRegistry, which the host already uses for logs and
+ text forms. The ListRegistry doc comment states the limit and the numbers.
+ Only a comment changed in production code.
 
 Currently unaddressed yet:
 - Interned text (items 75, 78): "contains" (substring) search is not built (a
   paged scan first, an optional positional index later), and there is no
   DeleteString (only when nothing extends it, nothing refers to it and it has
   no forms; interacts with the prefix index and lists).
-- Planned next: run BenchmarkInterleavedListsCommitCost (item 91) and record
-  its numbers here and in theorystate.md section 105a; if ListRegistry's tail
-  lookup turns out to grow with the list there, decide whether ListRegistry
-  needs a fix or only a note (the slotted list does not have the
-  dependence). Stage 2 of plan-as-data (items 81-84), notes on nodes (item
-  85), the docs-drift pass (item 87), the many-lists measurements (item 88),
-  raw writes on every backend (item 89) and the out-of-band test migration
-  (item 90) are done.
-- ListRegistry.Append finds the tail as the child its list shares with the
-  AllTails hub (item 68), by a leapfrog join whose cost is bounded by about
-  the smaller of the two child sets (times a seek). Measured with a crowd of
-  up to 100,000 other lists (item 88) it did not depend on the number of
-  lists; only a layout with interleaved NodeID ranges could make it.
-  SlottedListRegistry (item 72) does not have that dependence at all.
+- Planned next, in this order:
+  (1) Split main.go into one file per subsystem, the way main_test.go was
+  split. A pure move: no code, comment or behaviour change, only declarations
+  cut from main.go and pasted into new files (each with the license header and
+  its own imports, organized by goimports), so that a task can load only the
+  subsystem it touches (main.go alone is too large to load next to other
+  files). Do it in a few batches, each its own commit, and after each one
+  build, run go vet and the tests, and compare the linter output (it must be
+  unchanged). Never separate a type from its methods. Target layout (names
+  from main.go, in its order):
+    doc.go              the package doc comment only (main.go then disappears).
+    graph.go            NodeID, Relationship, ErrNodeNotFound, ErrNodeNotEmpty,
+                        ErrNodeIDExhausted, ErrGraphStoreUnavailable,
+                        concurrentAccessGuard, Graph and every method of it
+                        (the *Core ones, queries, RegisterChecker, Transact,
+                        resurrectNode, ensureInitialized, nodeExists,
+                        findCommonChildren and its Core).
+    graph_api.go        GraphReader, GraphStore, GraphAPI, Transactor, Tx and
+                        the assertions var _ GraphAPI / var _ Tx.
+    txn.go              Txn and all its methods (writes, reads, Transact),
+                        txMark, txLog and its methods, touchNodes.
+    checker.go          Checker, graphCoreReader, Graph.runCheckers,
+                        runCheckersOver, checkerRelevant.
+    paging.go           nodePager, pageNodeIDs, nodesAfter, readViewer,
+                        readView, commonChildrenFinder and its assertions,
+                        outgoingPager, incomingPager, pageSorted,
+                        errPagingUnsupported, relationshipTarget,
+                        relationshipSource, pageIterator, outgoingPages,
+                        incomingPages.
+    verify.go           ErrLoadVerification, defaultVerifyPageSize, VerifyAll.
+    graph_actor.go      the reentrancy tripwire (graphActorReentrancy-
+                        DetectionEnabled, Enable/Disable, currentGoroutineID),
+                        GraphActor and all methods, actorPage.
+    bolt_view.go        ErrStoreCorrupt, ErrStoreFormat, ErrStoreLocked, the
+                        bucket vars, boltIDSize, boltFormatVersion, boltKey8,
+                        boltKey16, boltID, wrapBoltErr, boltScanPrefix,
+                        boltHasPrefix, boltView and its methods.
+    bolt_txn.go         boltTxn and its methods, boltNameRecordSize,
+                        encodeNameRecord, decodeNameRecord.
+    bolt_graph.go       BoltGraph, boltOpenTimeout and the open guard
+                        (boltOpenResult, finishBoltOpen, openBoltDB), the
+                        format record helpers, OpenBoltGraph, Close,
+                        CheckStore, boltRead and the BoltGraph methods.
+    names.go            the ErrName* block, NameRegistry, nameState,
+                        nameRecord, nameRecordStore, nameRecordProvider,
+                        nameStoreOf, NewNameRegistry and every method.
+    foundational_names.go  the Name* constants, FoundationalNames,
+                        TagFoundational.
+    root_graph.go       ErrCannotDeleteRoot, ErrRootGraphOverActor,
+                        rootReader, rootStore, rootTx, newRootTx,
+                        newRootStore, RootGraph, NewRootGraph.
+    errors.go           the registry error var block (ErrNotPointer ...
+                        ErrListCycle).
+    tx_helpers.go       txOps, txReader, wrapInterfaceErr, joinErrors,
+                        transactValue, transactBool, tagNodeTx, createNodeTx,
+                        addRelationshipTx, removeRelationshipTx, deleteNodeTx,
+                        untagAndDeleteNodeTx, createTaggedNodeTx,
+                        newPointerTx, setPointerTargetTx,
+                        singleChildTargetSetTx, singleChildTargetRemoveTx,
+                        requireTagged, requireExists, requireAllExist.
+    tagged_lookup.go    singleChildTarget, findUniqueTaggedParent,
+                        findUniqueTaggedChild, uniqueNode, scanTaggedChild,
+                        exactlyOneTag.
+    pointer.go          PointerRegistry and its methods.
+    pointer_metadata.go locateBySubjectSlot, ensureMetadataWithSubjectSlotTx,
+                        subjectMetadataBase, PointerMetadataRegistry and
+                        PointerMetadataRegistryD with their methods.
+    capsule.go          CapsuleRegistry and its methods, buildCapsuleTx,
+                        slotOwnersOf, capsulesWithValuePageSize,
+                        forEachIncoming.
+    ordered_list.go     OrderedList and its assertion.
+    list.go             ListRegistry and its methods (not the shared helpers).
+    list_shared.go      the helpers both list types use: capsuleLinks,
+                        requireNeighbour, checkStaleLink (from main.go) and
+                        findOwnedSlot, checkCapsuleInChain, validateChain,
+                        stepBackWithin, verifyLists (from slotted_list.go).
+    set.go              SetRegistry and its methods.
+    operand_descriptor.go  sortedNodeSet, operandDescriptorAxes,
+                        buildOperandDescriptorTx, clearOperandDescriptorEdgesTx,
+                        deleteOperandDescriptorTx, operandTargetGeneric,
+                        operandCarriesKnownSetTag, requireOperand,
+                        domainContainsGeneric, resolveSetOperandGeneric,
+                        resolveOperandGeneric, setReverseLookup and its methods.
+    composite_set.go    CompositeSetRegistry and its methods (with
+                        operandAxisTags).
+    composite_set_log.go  CompositeSetLogRegistry and its methods.
+    domain_pointer.go   domainConstraint and its methods (including
+                        anchorTargetFunc, registerChecker, affectedAnchors,
+                        addAnchorsExpanding, isOperandDescriptor,
+                        addSlotOwners, reverseLookup, domainSlotsOf),
+                        DomainPointerRegistryB and DomainPointerRegistryD.
+    lease.go            LeaseRegistry and its methods.
+    registries.go       Registries, NewRegistries.
+    host_config.go      the default* constants, HostConfig, durationOrDefault,
+                        positiveOrDefault, defaultHostOnError, withDefaults.
+    host.go             the Host error block, resourcePrefix, Effect, Host,
+                        OpenHost, startHost, finishHostStart, Registries/
+                        Graph/monoNow/report/enter/leave, Close,
+                        shutdownConns, RegisterResource, addResource,
+                        lookupResource, resourceSnapshot.
+    conn.go             AcquireResult, Client, AcquireAndWait, Conn and its
+                        methods, waitErr, and the Host methods about
+                        connections (Connect, watchConn, dropConn,
+                        releaseConn, closeSession, reapLoop, reapOnce,
+                        expiredConns).
+    reconciler.go       passOutcome, hostResource and its methods, the Host
+                        reconciler methods (kickReconciler, markDirty,
+                        markDirtyNodes, takeDirty, clearDirty, reconcileLoop,
+                        nextWake, pendingResources, reconcileSet,
+                        reconcileAll, graceRemaining, failPass, reconcile).
+  When done: update FILES.md, the "Current implementation" and "Editing
+  convention" bullets here, the "The spike lives in main.go" sentence of
+  theorystate.md section 102, and any code comment that says "in main.go".
+  Files for the task: main.go, slotted_list.go (its shared helpers move),
+  FILES.md and this file.
+  (2) DeleteString (item 75/78 gaps): delete a string only when nothing
+  extends it, nothing refers to it (capsule values, notes, scope principals,
+  set members) and it has no forms; it interacts with the prefix index
+  (UnmarkIndexed first), with text lists, and with the notes rule "delete
+  only if empty"; a note's text slot already blocks it. Files: text.go,
+  text_forms.go, notes.go, text_test.go, text_forms_test.go, notes_test.go,
+  this file and theorystate.md section 114 (plus tx_helpers.go and
+  tagged_lookup.go once the split exists, otherwise main.go).
+  (3) Substring ("contains") search over interned text: a paged scan first,
+  an optional positional index later (theorystate.md section 114). Files:
+  text.go, text_test.go, this file and theorystate.md section 114.
+  Done: stage 2 of plan-as-data (items 81-84), notes on nodes (item 85), the
+  docs-drift pass (item 87), the many-lists measurements (item 88), raw
+  writes on every backend (item 89), the out-of-band test migration (item
+  90), and the interleaved-layout benchmark with its measurements (items 91
+  and 92).
+- ListRegistry.Append (and Head/Tail) find the tail as the child the list
+  shares with the AllTails hub (item 68), by a leapfrog join bounded by about
+  twice the smaller of the two child sets. With the long list built after the
+  other lists it is flat (item 88); with the NodeIDs interleaved it reaches
+  the bound, about 0.5 microseconds per element, 57 ms at 100,000 (item 92).
+  This is a documented limit (the ListRegistry doc comment), not a fix: the
+  structure is the cause, and SlottedListRegistry (item 72) has no such
+  dependence. A bulk load should use AppendMany.
 - Paged reads beyond a single node's own outgoing/incoming edges
   (theorystate.md section 105, items 43/46): FindRelationships and
   rootReader.FindRelationships are still O(graph) on BoltGraph, as

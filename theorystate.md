@@ -3580,7 +3580,7 @@ global properties stay with `Elements` and `VerifyStructures`. Both list types
 implement one `OrderedList` contract and run the same behaviour suite.
 `ListRegistry` is kept: it is the simpler structure, with a tail lookup whose
 cost can depend on how many lists exist (see the measurements below, which
-only show it for the whole-list validation), and the reference for
+show it for the whole-list validation and, interleaved, for the tail lookup), and the reference for
 comparison.
 
 **Measuring it (implementation_state.md items 86 and 88).**
@@ -3612,7 +3612,21 @@ lists:
   Its worst case needs the long list's capsules interleaved by NodeID with
   the tails of other lists (`BenchmarkInterleavedListsCommitCost` builds that
   by alternating one append to the long list with one new one-element list),
-  which has not been run yet; its results are to be recorded here.
+  and it is real (the next point).
+- *Interleaved, `ListRegistry`'s tail lookup does grow with the list*
+  (implementation_state.md items 91 and 92; ms per commit, lists = 1,000 /
+  10,000 / 100,000, ranges from repeated runs): tail lookup 3.4–4.4 /
+  7.0–7.8 / 56.6 against 3.0–3.6 / 2.8–3.7 / 3.3 for the slotted list, and
+  append 6.0–6.4 / 10.7–10.8 / 63.0 against 6.0–7.4 / 6.8–6.9 / 7.4. Net of
+  the empty commit that is about 0.5 microseconds per element, with
+  allocations flat: the cost is the join's cursor stepping, and its bound
+  ("about twice the smaller of the two") is attained when the long list's
+  capsules alternate by NodeID with the tails of other lists, which is what
+  lists growing over the same period produce. Appending one element at a
+  time to a very long list is then quadratic (about 40 minutes at 100,000,
+  an estimate); `AppendMany` looks the tail up once. Decision: a documented
+  limit, not a fix: the structure is the cause and `SlottedListRegistry` is
+  the remedy (the `ListRegistry` doc comment states the limit).
 - *The slotted list pays about twice the allocations for the local
   operations* (touch tail 2,907 against 1,453 to 1,868, append about 15.5k
   against 10.0k to 12.9k), flat in size; the times differ by less than the

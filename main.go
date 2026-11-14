@@ -7478,6 +7478,19 @@ func (c *CapsuleRegistry) DeleteCapsule(graph Transactor, capsule NodeID) error 
 // As with every other registry in this file, list structure is
 // re-derived fresh from the Graph on every call rather than cached.
 //
+// Cost limit (implementation_state.md items 88 and 92). Head and tail are tags
+// on capsules, found as the child the list shares with the AllHeads/AllTails
+// hub, and the hub has one member per non-empty list. That lookup is a
+// leapfrog join whose cost is bounded by about twice the smaller of the two
+// child sets and reaches the bound when the NodeIDs interleave (the long
+// list's capsules alternating with the tails of other lists, which is what
+// happens when lists grow over the same period). Measured for Tail and so for
+// Append: about 0.5 microseconds per element, 57 ms at 100,000 elements. A
+// commit touching only the list node validates the whole list. AppendMany
+// looks the tail up once, so a bulk load does not pay it per element.
+// SlottedListRegistry has none of these dependences: prefer it for a list that
+// can grow long.
+//
 // Two removal paths are available: RemoveWithoutDeletingCapsule unlinks
 // capsule from list only, leaving it standalone and intact (no cascading
 // node deletion, consistent with theorystate.md section 18's
