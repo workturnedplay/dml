@@ -19,4 +19,7 @@ echo Current DIR: "!SCRIPT_DIR!"
 go test -run TestBoltGraphReportCommitLatencyAndFileSize -v
 go test -run "^$" -bench BoltGraphCommit -benchtime 300x
 go test -run "^$" -bench ListCommitCost -benchtime 30x -timeout 60m
+
+go test -run "^$" -bench "ManyListsCommitCost/ListRegistry/lists=1000" -benchtime 30x
+go test -run "^$" -bench ManyListsCommitCost -benchtime 30x -timeout 120m
 pause
