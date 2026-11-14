@@ -29,13 +29,14 @@ place only: theorystate.md Part D. It is deliberately not repeated here.
 Current implementation:
 - Go 1.27 implementation. This is the foundation the project builds on,
   not a prototype (theorystate.md section 7b).
-- The graph engine, the backends (Graph, BoltGraph), RootGraph, GraphActor,
-  Host and the core registries are consolidated in main.go. Larger
-  subsystems have their own files (slotted_list.go, text.go, text_forms.go,
-  fields.go, scope.go, notes.go, operations.go, plan.go, host_graph.go,
-  registry_helpers.go and the wire files named under "Editing convention").
-  The tests are split across several *_test.go files by area; main_test.go no
-  longer exists.
+- The package is split into one file per subsystem (graph.go, txn.go,
+  bolt_*.go, names.go, root_graph.go, pointer.go, capsule.go, list.go,
+  set.go, host.go, reconciler.go, ... , the full list with contents is in
+  FILES.md), plus the files of the larger subsystems (slotted_list.go,
+  text.go, text_forms.go, fields.go, scope.go, notes.go, operations.go,
+  plan.go, host_graph.go, registry_helpers.go and the wire files named under
+  "Editing convention"). main.go no longer exists. The tests are split across
+  several *_test.go files by area; main_test.go no longer exists.
 - Primitive Graph implemented and tested.
 - Graph.Transact / Txn implemented and tested, giving failure-atomicity
   (not concurrency isolation) to multi-step primitive operations.
@@ -149,14 +150,11 @@ Important constraints:
 - Keep alternative representations open where theory has not decided them.
 
 Editing convention:
-- The graph engine, backends, registries and Host are consolidated in
-  main.go. A subsystem that is a separate layer, or needs build tags, has its
-  own files with its own tests: the wire transport (wire.go, wire_auth.go,
-  wire_tls.go, wire_tls_files.go, wire_tls_pki.go, pipe_windows.go,
-  private_file*.go, cmd/dmlcert), slotted_list.go, text.go, text_forms.go,
-  fields.go, scope.go, notes.go, operations.go, plan.go, host_graph.go and
-  registry_helpers.go. Tests are split across *_test.go files by area
-  (main_test.go no longer exists).
+- One file per subsystem, listed in FILES.md (main.go no longer exists). A
+  subsystem that needs build tags has its own files with its own tests: the
+  wire transport (wire.go, wire_auth.go, wire_tls.go, wire_tls_files.go,
+  wire_tls_pki.go, pipe_windows.go, private_file*.go, cmd/dmlcert). Tests are
+  split across *_test.go files by area (main_test.go no longer exists).
 - For changes, give exact:
   Find this text:
   ...
@@ -3116,135 +3114,32 @@ empty commit is the baseline of about 2.7 ms):
  text forms. The ListRegistry doc comment states the limit and the numbers.
  Only a comment changed in production code.
 
+93. main.go split into one file per subsystem (no code, comment or behaviour
+ change). Five batches, each its own commit, done by a one-off tool that moved
+ declarations verbatim with their doc comments and recomputed each file's
+ imports (the tool was not kept). The layout and what each file holds is in
+ FILES.md; doc.go holds the package comment, main.go is gone, and the five
+ helpers both list types use (findOwnedSlot, checkCapsuleInChain,
+ validateChain, stepBackWithin, verifyLists) moved from slotted_list.go to
+ list_shared.go with capsuleLinks, requireNeighbour and checkStaleLink.
+ Comments saying "in this file" or "main.go" in moved code were left as they
+ were; read them as "in this package".
+
 Currently unaddressed yet:
 - Interned text (items 75, 78): "contains" (substring) search is not built (a
   paged scan first, an optional positional index later), and there is no
   DeleteString (only when nothing extends it, nothing refers to it and it has
   no forms; interacts with the prefix index and lists).
 - Planned next, in this order:
-  (1) Split main.go into one file per subsystem, the way main_test.go was
-  split. A pure move: no code, comment or behaviour change, only declarations
-  cut from main.go and pasted into new files (each with the license header and
-  its own imports, organized by goimports), so that a task can load only the
-  subsystem it touches (main.go alone is too large to load next to other
-  files). Do it in a few batches, each its own commit, and after each one
-  build, run go vet and the tests, and compare the linter output (it must be
-  unchanged). Never separate a type from its methods. Target layout (names
-  from main.go, in its order):
-    doc.go              the package doc comment only (main.go then disappears).
-    graph.go            NodeID, Relationship, ErrNodeNotFound, ErrNodeNotEmpty,
-                        ErrNodeIDExhausted, ErrGraphStoreUnavailable,
-                        concurrentAccessGuard, Graph and every method of it
-                        (the *Core ones, queries, RegisterChecker, Transact,
-                        resurrectNode, ensureInitialized, nodeExists,
-                        findCommonChildren and its Core).
-    graph_api.go        GraphReader, GraphStore, GraphAPI, Transactor, Tx and
-                        the assertions var _ GraphAPI / var _ Tx.
-    txn.go              Txn and all its methods (writes, reads, Transact),
-                        txMark, txLog and its methods, touchNodes.
-    checker.go          Checker, graphCoreReader, Graph.runCheckers,
-                        runCheckersOver, checkerRelevant.
-    paging.go           nodePager, pageNodeIDs, nodesAfter, readViewer,
-                        readView, commonChildrenFinder and its assertions,
-                        outgoingPager, incomingPager, pageSorted,
-                        errPagingUnsupported, relationshipTarget,
-                        relationshipSource, pageIterator, outgoingPages,
-                        incomingPages.
-    verify.go           ErrLoadVerification, defaultVerifyPageSize, VerifyAll.
-    graph_actor.go      the reentrancy tripwire (graphActorReentrancy-
-                        DetectionEnabled, Enable/Disable, currentGoroutineID),
-                        GraphActor and all methods, actorPage.
-    bolt_view.go        ErrStoreCorrupt, ErrStoreFormat, ErrStoreLocked, the
-                        bucket vars, boltIDSize, boltFormatVersion, boltKey8,
-                        boltKey16, boltID, wrapBoltErr, boltScanPrefix,
-                        boltHasPrefix, boltView and its methods.
-    bolt_txn.go         boltTxn and its methods, boltNameRecordSize,
-                        encodeNameRecord, decodeNameRecord.
-    bolt_graph.go       BoltGraph, boltOpenTimeout and the open guard
-                        (boltOpenResult, finishBoltOpen, openBoltDB), the
-                        format record helpers, OpenBoltGraph, Close,
-                        CheckStore, boltRead and the BoltGraph methods.
-    names.go            the ErrName* block, NameRegistry, nameState,
-                        nameRecord, nameRecordStore, nameRecordProvider,
-                        nameStoreOf, NewNameRegistry and every method.
-    foundational_names.go  the Name* constants, FoundationalNames,
-                        TagFoundational.
-    root_graph.go       ErrCannotDeleteRoot, ErrRootGraphOverActor,
-                        rootReader, rootStore, rootTx, newRootTx,
-                        newRootStore, RootGraph, NewRootGraph.
-    errors.go           the registry error var block (ErrNotPointer ...
-                        ErrListCycle).
-    tx_helpers.go       txOps, txReader, wrapInterfaceErr, joinErrors,
-                        transactValue, transactBool, tagNodeTx, createNodeTx,
-                        addRelationshipTx, removeRelationshipTx, deleteNodeTx,
-                        untagAndDeleteNodeTx, createTaggedNodeTx,
-                        newPointerTx, setPointerTargetTx,
-                        singleChildTargetSetTx, singleChildTargetRemoveTx,
-                        requireTagged, requireExists, requireAllExist.
-    tagged_lookup.go    singleChildTarget, findUniqueTaggedParent,
-                        findUniqueTaggedChild, uniqueNode, scanTaggedChild,
-                        exactlyOneTag.
-    pointer.go          PointerRegistry and its methods.
-    pointer_metadata.go locateBySubjectSlot, ensureMetadataWithSubjectSlotTx,
-                        subjectMetadataBase, PointerMetadataRegistry and
-                        PointerMetadataRegistryD with their methods.
-    capsule.go          CapsuleRegistry and its methods, buildCapsuleTx,
-                        slotOwnersOf, capsulesWithValuePageSize,
-                        forEachIncoming.
-    ordered_list.go     OrderedList and its assertion.
-    list.go             ListRegistry and its methods (not the shared helpers).
-    list_shared.go      the helpers both list types use: capsuleLinks,
-                        requireNeighbour, checkStaleLink (from main.go) and
-                        findOwnedSlot, checkCapsuleInChain, validateChain,
-                        stepBackWithin, verifyLists (from slotted_list.go).
-    set.go              SetRegistry and its methods.
-    operand_descriptor.go  sortedNodeSet, operandDescriptorAxes,
-                        buildOperandDescriptorTx, clearOperandDescriptorEdgesTx,
-                        deleteOperandDescriptorTx, operandTargetGeneric,
-                        operandCarriesKnownSetTag, requireOperand,
-                        domainContainsGeneric, resolveSetOperandGeneric,
-                        resolveOperandGeneric, setReverseLookup and its methods.
-    composite_set.go    CompositeSetRegistry and its methods (with
-                        operandAxisTags).
-    composite_set_log.go  CompositeSetLogRegistry and its methods.
-    domain_pointer.go   domainConstraint and its methods (including
-                        anchorTargetFunc, registerChecker, affectedAnchors,
-                        addAnchorsExpanding, isOperandDescriptor,
-                        addSlotOwners, reverseLookup, domainSlotsOf),
-                        DomainPointerRegistryB and DomainPointerRegistryD.
-    lease.go            LeaseRegistry and its methods.
-    registries.go       Registries, NewRegistries.
-    host_config.go      the default* constants, HostConfig, durationOrDefault,
-                        positiveOrDefault, defaultHostOnError, withDefaults.
-    host.go             the Host error block, resourcePrefix, Effect, Host,
-                        OpenHost, startHost, finishHostStart, Registries/
-                        Graph/monoNow/report/enter/leave, Close,
-                        shutdownConns, RegisterResource, addResource,
-                        lookupResource, resourceSnapshot.
-    conn.go             AcquireResult, Client, AcquireAndWait, Conn and its
-                        methods, waitErr, and the Host methods about
-                        connections (Connect, watchConn, dropConn,
-                        releaseConn, closeSession, reapLoop, reapOnce,
-                        expiredConns).
-    reconciler.go       passOutcome, hostResource and its methods, the Host
-                        reconciler methods (kickReconciler, markDirty,
-                        markDirtyNodes, takeDirty, clearDirty, reconcileLoop,
-                        nextWake, pendingResources, reconcileSet,
-                        reconcileAll, graceRemaining, failPass, reconcile).
-  When done: update FILES.md, the "Current implementation" and "Editing
-  convention" bullets here, the "The spike lives in main.go" sentence of
-  theorystate.md section 102, and any code comment that says "in main.go".
-  Files for the task: main.go, slotted_list.go (its shared helpers move),
-  FILES.md and this file.
-  (2) DeleteString (item 75/78 gaps): delete a string only when nothing
+  (1) DeleteString (item 75/78 gaps): delete a string only when nothing
   extends it, nothing refers to it (capsule values, notes, scope principals,
   set members) and it has no forms; it interacts with the prefix index
   (UnmarkIndexed first), with text lists, and with the notes rule "delete
   only if empty"; a note's text slot already blocks it. Files: text.go,
   text_forms.go, notes.go, text_test.go, text_forms_test.go, notes_test.go,
   this file and theorystate.md section 114 (plus tx_helpers.go and
-  tagged_lookup.go once the split exists, otherwise main.go).
-  (3) Substring ("contains") search over interned text: a paged scan first,
+  tagged_lookup.go).
+  (2) Substring ("contains") search over interned text: a paged scan first,
   an optional positional index later (theorystate.md section 114). Files:
   text.go, text_test.go, this file and theorystate.md section 114.
   Done: stage 2 of plan-as-data (items 81-84), notes on nodes (item 85), the

@@ -30,17 +30,31 @@ scripts (*.bat) have not been seen directly.
 - FILES.md: this file.
 
 ## Core engine
-- main.go (very large): primitive Graph and its guard; GraphReader/GraphStore/GraphAPI/Transactor/Tx;
-  Txn, txLog, Checker, runCheckers; pagers (nodePager, outgoingPager, incomingPager,
-  commonChildrenFinder, readViewer/readView, pageIterator); VerifyAll; GraphActor; BoltGraph/boltTxn/
-  boltView; NameRegistry and FoundationalNames; RootGraph/rootReader/rootStore/rootTx;
-  PointerRegistry, PointerMetadataRegistry(D); CapsuleRegistry; ListRegistry and the OrderedList
-  interface; SetRegistry, CompositeSetRegistry, CompositeSetLogRegistry; domainConstraint and
-  DomainPointerRegistryB/D; LeaseRegistry; Registries/NewRegistries; HostConfig, Host, Conn, Client,
-  the reconciler, hostResource, Effect.
+- doc.go: the package doc comment.
+- graph.go: NodeID, Relationship, the node errors, concurrentAccessGuard, Graph (queries, *Core writes, Transact, RegisterChecker).
+- graph_api.go: GraphReader, GraphStore, GraphAPI, Transactor, Tx.
+- txn.go: Txn, txLog (undo log, hooks, savepoints), touchNodes.
+- checker.go: Checker, graphCoreReader, runCheckers, checkerRelevant.
+- paging.go: nodePager, outgoingPager, incomingPager, commonChildrenFinder, readViewer/readView, pageIterator.
+- verify.go: VerifyAll, ErrLoadVerification.
+- graph_actor.go: GraphActor and the reentrancy tripwire.
+- bolt_view.go: BoltGraph's layout and errors, boltView (reads, paging, layout checks).
+- bolt_txn.go: boltTxn (writes, undo, name records). bolt_graph.go: BoltGraph, OpenBoltGraph, open guard, format version, CheckStore, Transact.
+- names.go: NameRegistry. foundational_names.go: the Name* constants, FoundationalNames, TagFoundational.
+- root_graph.go: RootGraph and the ROOT overlay (rootReader, rootStore, rootTx).
+- errors.go: the registry error sentinels.
+- tx_helpers.go: txOps/txReader, wrapInterfaceErr, transactValue/transactBool, the *Tx wrap helpers, requireTagged/requireExists/requireAllExist.
+- tagged_lookup.go: singleChildTarget, findUniqueTaggedParent/Child, exactlyOneTag.
+- pointer.go: PointerRegistry. pointer_metadata.go: PointerMetadataRegistry(D).
+- capsule.go: CapsuleRegistry, slotOwnersOf, forEachIncoming.
+- ordered_list.go: the OrderedList interface. list.go: ListRegistry. list_shared.go: helpers both list types use.
+- set.go: SetRegistry. operand_descriptor.go: shared operand-descriptor helpers and setReverseLookup.
+- composite_set.go: CompositeSetRegistry. composite_set_log.go: CompositeSetLogRegistry.
+- domain_pointer.go: domainConstraint, DomainPointerRegistryB/D. lease.go: LeaseRegistry. registries.go: Registries, NewRegistries.
+- host_config.go: HostConfig. host.go: Host, OpenHost, Close, RegisterResource. conn.go: Client, Conn, connection lifecycle.
+  reconciler.go: hostResource, the reconciler.
 - registry_helpers.go: bindNames, taggedCheck, registerTaggedChecker.
-- slotted_list.go: SlottedListRegistry, plus findOwnedSlot, checkCapsuleInChain, validateChain,
-  stepBackWithin, verifyLists shared with ListRegistry.
+- slotted_list.go: SlottedListRegistry.
 - text.go: TextRegistry (interned string trie, prefix index).
 - text_forms.go: TextFormRegistry (text lists, forms, FormsContaining/TextsContaining).
 - fields.go: FieldRegistry (records with named fields, Owners).
@@ -99,13 +113,13 @@ scripts (*.bat) have not been seen directly.
 - Not seen: cmd/*/main_cert_test.go, test.bat, measure.bat, prebuilt_check.bat.
 
 ## Which files to load for which work
-- New registry / foundational names: main.go (FoundationalNames, NewRegistries), registry_helpers.go,
+- New registry / foundational names: foundational_names.go, registries.go, tx_helpers.go, registry_helpers.go,
   one similar registry (scope.go or fields.go), registry_backends_test.go, testutil_test.go, a similar *_test.go.
-- Operations: operations.go, wire.go, main.go (Host parts), host_graph.go, scope.go, plan.go, wire_auth.go, text.go.
+- Operations: operations.go, wire.go, host.go, conn.go, host_graph.go, scope.go, plan.go, wire_auth.go, text.go.
 - Wire / authorization changes: wire.go, wire_auth.go, plan.go, wire_test.go, wire_plan_test.go, host_testutil_test.go.
 - TLS / PKI: wire_tls*.go, wire_tls*_test.go, cmd/dmlcert.
-- Lists / logs: main.go (ListRegistry, composites), slotted_list.go, ordered_list_test.go, list_test.go,
-  list_differential_test.go.
-- Persistence / BoltGraph: main.go, bolt_graph_test.go, verify_test.go, testutil_test.go.
-- Host / reconciler: main.go (Host parts), host_test.go, host_testutil_test.go.
+- Lists / logs: list.go, list_shared.go, slotted_list.go, ordered_list.go, composite_set_log.go, ordered_list_test.go,
+  list_test.go, list_differential_test.go.
+- Persistence / BoltGraph: bolt_view.go, bolt_txn.go, bolt_graph.go, names.go, bolt_graph_test.go, verify_test.go, testutil_test.go.
+- Host / reconciler: host.go, conn.go, reconciler.go, host_config.go, host_test.go, host_testutil_test.go.
 - Docs-only changes: theorystate.md, implementation_state.md.

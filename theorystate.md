@@ -3366,8 +3366,8 @@ Known from bbolt's documentation: on Windows, mmapping can grow the file, and
 `InitialMmapSize` apparently sets the on-disk size there (on other platforms
 the file grows only with data), so it is left at its default; its `Timeout`
 open option is documented only for Darwin and Linux, so on Windows opening an
-already-locked database may block indefinitely. The spike lives in main.go and
-the package's test files, per the consolidation convention, which means every build of the
+already-locked database may block indefinitely. The spike lives in bolt_view.go,
+bolt_txn.go, bolt_graph.go and the package's test files, which means every build of the
 package links bbolt.
 
 ## 103. Names on a KV backend: same-transaction records, tombstones, Purge
