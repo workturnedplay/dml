@@ -85,6 +85,41 @@ func openListBenchHost(b *testing.B) *Host {
 	return h
 }
 
+// benchCommit times step as one transaction per iteration. Shared by every
+// list benchmark.
+func benchCommit(b *testing.B, graph GraphAPI, step func(tx Tx) error) {
+	b.Helper()
+	b.ReportAllocs()
+
+	for b.Loop() {
+		if txErr := graph.Transact(step); txErr != nil {
+			b.Fatalf("Transact(): %v", txErr)
+		}
+	}
+}
+
+// buildInChunks makes total items in transactions of at most chunk items each
+// (one transaction for everything would make bolt's transaction, and every
+// commit-time Checker pass over it, needlessly large). step makes count items
+// inside tx; it may be re-run, so it must not keep state outside tx. what names
+// the items in the failure message.
+func buildInChunks(b *testing.B, graph GraphAPI, what string, total, chunk int, step func(tx Tx, count int) error) {
+	b.Helper()
+
+	for built := 0; built < total; {
+		count := min(chunk, total-built)
+
+		txErr := graph.Transact(func(tx Tx) error {
+			return step(tx, count)
+		})
+		if txErr != nil {
+			b.Fatalf("building %s (%d of %d built): %v", what, built, total, txErr)
+		}
+
+		built += count
+	}
+}
+
 // buildBenchList makes a list of size elements with AppendMany, one chunk
 // per transaction (appending one at a time would itself be quadratic).
 func buildBenchList(b *testing.B, h *Host, lists OrderedList, size int) NodeID {
@@ -95,33 +130,54 @@ func buildBenchList(b *testing.B, h *Host, lists OrderedList, size int) NodeID {
 		b.Fatalf("NewList(): %v", err)
 	}
 
-	for built := 0; built < size; {
-		count := min(listBenchChunk, size-built)
+	what := fmt.Sprintf("the list (%d elements)", size)
 
-		txErr := h.Graph().Transact(func(tx Tx) error {
-			values := make([]NodeID, 0, count)
+	buildInChunks(b, h.Graph(), what, size, listBenchChunk, func(tx Tx, count int) error {
+		values := make([]NodeID, 0, count)
 
-			for range count {
-				value, createErr := createNodeTx(tx)
-				if createErr != nil {
-					return createErr
-				}
-
-				values = append(values, value)
+		for range count {
+			value, createErr := createNodeTx(tx)
+			if createErr != nil {
+				return createErr
 			}
 
-			_, appendErr := lists.AppendMany(tx, list, values)
-
-			return wrapInterfaceErr(appendErr)
-		})
-		if txErr != nil {
-			b.Fatalf("building the list (%d of %d built): %v", built, size, txErr)
+			values = append(values, value)
 		}
 
-		built += count
-	}
+		_, appendErr := lists.AppendMany(tx, list, values)
+
+		return wrapInterfaceErr(appendErr)
+	})
 
 	return list
+}
+
+// buildCrowd makes count lists of one element each (the "other lists" of
+// BenchmarkManyListsCommitCost), manyListsCrowdChunk lists per transaction.
+func buildCrowd(b *testing.B, h *Host, lists OrderedList, count int) {
+	b.Helper()
+
+	what := fmt.Sprintf("the crowd (%d lists)", count)
+
+	buildInChunks(b, h.Graph(), what, count, manyListsCrowdChunk, func(tx Tx, n int) error {
+		for range n {
+			list, newErr := lists.NewList(tx)
+			if newErr != nil {
+				return wrapInterfaceErr(newErr)
+			}
+
+			value, createErr := createNodeTx(tx)
+			if createErr != nil {
+				return createErr
+			}
+
+			if _, appendErr := lists.AppendMany(tx, list, []NodeID{value}); appendErr != nil {
+				return wrapInterfaceErr(appendErr)
+			}
+		}
+
+		return nil
+	})
 }
 
 func BenchmarkListCommitCost(b *testing.B) {
@@ -149,19 +205,8 @@ func BenchmarkListCommitCost(b *testing.B) {
 				b.Fatalf("CreateNode() for the value: %v", err)
 			}
 
-			commit := func(b *testing.B, step func(tx Tx) error) {
-				b.Helper()
-				b.ReportAllocs()
-
-				for b.Loop() {
-					if txErr := graph.Transact(step); txErr != nil {
-						b.Fatalf("Transact(): %v", txErr)
-					}
-				}
-			}
-
 			b.Run("empty-commit", func(b *testing.B) {
-				commit(b, func(tx Tx) error {
+				benchCommit(b, graph, func(tx Tx) error {
 					tx.Touch(bystander)
 
 					return nil
@@ -169,7 +214,7 @@ func BenchmarkListCommitCost(b *testing.B) {
 			})
 
 			b.Run("tail-scan", func(b *testing.B) {
-				commit(b, func(tx Tx) error {
+				benchCommit(b, graph, func(tx Tx) error {
 					_, _, scanErr := findUniqueTaggedChild(tx, list, lists.allTails)
 
 					return scanErr
@@ -182,7 +227,7 @@ func BenchmarkListCommitCost(b *testing.B) {
 					b.Fatalf("Tail() = (%v,%v)", hasTail, tailErr)
 				}
 
-				commit(b, func(tx Tx) error {
+				benchCommit(b, graph, func(tx Tx) error {
 					tx.Touch(tail)
 
 					return nil
@@ -190,7 +235,7 @@ func BenchmarkListCommitCost(b *testing.B) {
 			})
 
 			b.Run("checker-only", func(b *testing.B) {
-				commit(b, func(tx Tx) error {
+				benchCommit(b, graph, func(tx Tx) error {
 					tx.Touch(list)
 
 					return nil
@@ -198,10 +243,151 @@ func BenchmarkListCommitCost(b *testing.B) {
 			})
 
 			b.Run("append", func(b *testing.B) {
-				commit(b, func(tx Tx) error {
+				benchCommit(b, graph, func(tx Tx) error {
 					_, appendErr := lists.Append(tx, list, value)
 
 					return appendErr
+				})
+			})
+		})
+	}
+}
+
+// ---------------------------------------------------------------------
+// Many lists (implementation_state.md item 86). ListRegistry finds a tail as
+// the child its list shares with the AllTails hub (item 68), which costs about
+// the smaller of the two child sets, and the hub has one member per non-empty
+// list. So its worst case is a long list in a graph with as many other lists,
+// and a short list in the same graph is the control. A commit that touches
+// only a list node makes ListRegistry validate the whole list, while the
+// slotted type checks head and tail. BenchmarkManyListsCommitCost runs the same
+// steps for both list types over the production stack. Run without -race:
+//
+//	go test -run "^$" -bench ManyListsCommitCost -benchtime 30x -timeout 120m
+//
+// -short limits it to the 1,000 and 10,000 sizes. To try one size and one
+// type first:
+//
+//	go test -run "^$" -bench "ManyListsCommitCost/ListRegistry/lists=1000" -benchtime 30x
+//
+// Per size, the sub-benchmarks are empty-commit (the baseline), and for each
+// of short-list and long-list: tail-lookup (read-only, no Checker work),
+// touch-tail (a commit touching the tail capsule: the local check),
+// touch-list (a commit touching only the list node) and append (last, since it
+// lengthens the list by about 30, which does not matter at 30x).
+
+const (
+	// manyListsCrowdChunk is how many one-element lists one transaction
+	// makes while the crowd is built.
+	manyListsCrowdChunk = 5_000
+
+	// manyListsShortLen is the length of the control list.
+	manyListsShortLen = 10
+)
+
+// manyListsKinds are the list types BenchmarkManyListsCommitCost compares.
+var manyListsKinds = []struct {
+	name string
+	pick func(h *Host) OrderedList
+}{
+	{name: "ListRegistry", pick: func(h *Host) OrderedList { return h.Registries().Lists }},
+	{name: "SlottedListRegistry", pick: func(h *Host) OrderedList { return h.Registries().SlottedLists }},
+}
+
+func BenchmarkManyListsCommitCost(b *testing.B) {
+	for _, kind := range manyListsKinds {
+		b.Run(kind.name, func(b *testing.B) {
+			for _, size := range listBenchSizes {
+				b.Run(fmt.Sprintf("lists=%d", size), func(b *testing.B) {
+					benchManyLists(b, kind.pick, size)
+				})
+			}
+		})
+	}
+}
+
+// benchManyLists builds size one-element lists, then a short list and a long
+// list of size elements, over a fresh host, and times the steps on each.
+func benchManyLists(b *testing.B, pick func(h *Host) OrderedList, size int) {
+	b.Helper()
+
+	if testing.Short() && size > listBenchShortLimit {
+		b.Skipf("building %d lists takes a long time; skipped under -short", size)
+	}
+
+	h := openListBenchHost(b)
+	graph := h.Graph()
+	lists := pick(h)
+
+	start := time.Now()
+	buildCrowd(b, h, lists, size)
+	shortList := buildBenchList(b, h, lists, manyListsShortLen)
+	longList := buildBenchList(b, h, lists, size)
+	b.Logf("built %d one-element lists, a list of %d and a list of %d in %v",
+		size, manyListsShortLen, size, time.Since(start))
+
+	bystander, err := createNodeVia(graph)
+	if err != nil {
+		b.Fatalf("CreateNode() for the bystander: %v", err)
+	}
+
+	value, err := createNodeVia(graph)
+	if err != nil {
+		b.Fatalf("CreateNode() for the value: %v", err)
+	}
+
+	b.Run("empty-commit", func(b *testing.B) {
+		benchCommit(b, graph, func(tx Tx) error {
+			tx.Touch(bystander)
+
+			return nil
+		})
+	})
+
+	targets := [...]struct {
+		name string
+		list NodeID
+	}{
+		{name: "short-list", list: shortList},
+		{name: "long-list", list: longList},
+	}
+
+	for _, target := range targets {
+		b.Run(target.name, func(b *testing.B) {
+			b.Run("tail-lookup", func(b *testing.B) {
+				benchCommit(b, graph, func(tx Tx) error {
+					_, _, tailErr := lists.Tail(tx, target.list)
+
+					return wrapInterfaceErr(tailErr)
+				})
+			})
+
+			b.Run("touch-tail", func(b *testing.B) {
+				tail, hasTail, tailErr := lists.Tail(graph, target.list)
+				if tailErr != nil || !hasTail {
+					b.Fatalf("Tail() = (%v,%v)", hasTail, tailErr)
+				}
+
+				benchCommit(b, graph, func(tx Tx) error {
+					tx.Touch(tail)
+
+					return nil
+				})
+			})
+
+			b.Run("touch-list", func(b *testing.B) {
+				benchCommit(b, graph, func(tx Tx) error {
+					tx.Touch(target.list)
+
+					return nil
+				})
+			})
+
+			b.Run("append", func(b *testing.B) {
+				benchCommit(b, graph, func(tx Tx) error {
+					_, appendErr := lists.AppendMany(tx, target.list, []NodeID{value})
+
+					return wrapInterfaceErr(appendErr)
 				})
 			})
 		})

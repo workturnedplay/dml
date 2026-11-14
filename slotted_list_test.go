@@ -286,18 +286,6 @@ func TestHostRegistriesCarryBothListTypes(t *testing.T) {
 	}
 }
 
-// benchCommit times step as one transaction per iteration.
-func benchCommit(b *testing.B, graph GraphAPI, step func(tx Tx) error) {
-	b.Helper()
-	b.ReportAllocs()
-
-	for b.Loop() {
-		if txErr := graph.Transact(step); txErr != nil {
-			b.Fatalf("Transact(): %v", txErr)
-		}
-	}
-}
-
 // BenchmarkSlottedListCommitCost is BenchmarkListCommitCost for the slotted
 // list. append should be flat, about the empty commit, whatever n is. Run
 // without -race:

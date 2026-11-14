@@ -2159,8 +2159,8 @@ testing a registry in isolation, and the ability to make the eventual
 dozen struct field types. Both of those are real, present-tense benefits
 independent of whether a second backend is ever built at all.
 
-**§87a — Concrete surface to extract (TENTATIVE naming; not yet
-implemented).** The interface should cover exactly `Graph`'s current
+**§87a — Concrete surface to extract (original sketch; IMPLEMENTED, see
+the status note at the end of this paragraph).** The interface should cover exactly `Graph`'s current
 public method set, unchanged in signature: `CreateNode() (NodeID,
 error)`, `NodeExists(NodeID) bool`, `AddRelationship(a, b NodeID) (bool,
 error)`, `RemoveRelationship(a, b NodeID) (bool, error)`,
@@ -2178,6 +2178,16 @@ interface keeps the `Graph` name and the concrete type is renamed, or
 vice versa); this naming choice is deliberately left open until the
 refactor is actually written, since it has no bearing on the design
 questions below.
+
+*Status (as built).* The surface became `GraphReader` (every read; each
+now has an error result, §108, so a store failure on a disk backend is
+reported rather than a panic), `Transactor` (`Transact`), `GraphAPI`
+(`GraphReader` + `Transactor` + `RegisterChecker`) and `GraphStore` (the
+four writes), which is reachable only through the `Tx` a `Transact` closure
+receives (§92). `Transact` and `RegisterChecker` did end up on the same
+interface as the reads, as `GraphAPI`, once §89's contract was settled
+(§89a, §91). The in-memory type kept the name `Graph`. The signatures
+listed above are the original sketch and are no longer exact.
 
 ## 87b. Node enumeration, and ROOT as a decorator layer of the graph stack — DECIDED, implemented (closes the RootGraph exception)
 
@@ -2878,7 +2888,7 @@ load time belongs with any persistence work.
 
 > **Reading note (this revision).** The etcd framing below is historical:
 > etcd was withdrawn (§100), and §98/§99 are moot under the single-owner
-> decision (§107). What is current is §100–§113. §93–§97 remain valid
+> decision (§107). What is current is §100–§117. §93–§97 remain valid
 > backend-neutral design material.
 
 This part resumes Part F's storage-backend discussion (§87-92) with a
@@ -3092,7 +3102,7 @@ Representation C (`PointerMetadataRegistry`) is kept deliberately
 lower layer is useful for testing higher-layer reactions" (§73, and the
 `PointerMetadataRegistry` doc comment). The same move is applied here,
 implemented as `stagedGraph`/`stagedOverlay` (test-only, defined in
-main_test.go): a second `GraphAPI` implementation that deliberately
+the package's test files): a second `GraphAPI` implementation that deliberately
 behaves like a staged/CAS backend even though nothing requires it to.
 Every write `fn` makes is buffered in a local, per-attempt `stagedOverlay`
 and applied to `stagedGraph`'s own backing maps (`stagedGraph.publish`)
@@ -3357,7 +3367,7 @@ Known from bbolt's documentation: on Windows, mmapping can grow the file, and
 the file grows only with data), so it is left at its default; its `Timeout`
 open option is documented only for Darwin and Linux, so on Windows opening an
 already-locked database may block indefinitely. The spike lives in main.go and
-main_test.go, per the consolidation convention, which means every build of the
+the package's test files, per the consolidation convention, which means every build of the
 package links bbolt.
 
 ## 103. Names on a KV backend: same-transaction records, tombstones, Purge
@@ -3570,6 +3580,18 @@ global properties stay with `Elements` and `VerifyStructures`. Both list types
 implement one `OrderedList` contract and run the same behaviour suite.
 `ListRegistry` is kept: it is the simpler structure, with a tail lookup whose
 cost depends on how many lists exist, and the reference for comparison.
+
+**Measuring it (implementation_state.md item 86).**
+`BenchmarkManyListsCommitCost` builds a crowd of one-element lists, then a
+short list and a long list as long as the crowd, and times for both list
+types a tail lookup, a commit touching the tail capsule, a commit touching
+only the list node, and an append. What the structure predicts (not yet a
+measurement; the results are to be recorded here): for `ListRegistry` the
+tail lookup, and so Append, costs about the smaller of the list's children
+and the `AllTails` hub's, so the long list in a crowd is its worst case and
+the short list its control, and a commit touching only the list node
+validates the whole list; for `SlottedListRegistry` all of these are flat in
+both the length of the list and the number of lists.
 
 A composite Set log (§82) keeps its operations in whichever `OrderedList` its
 registry was given (the host uses the slotted one); the log's node is then
@@ -4798,8 +4820,9 @@ kept current as sections above resolve or split further.)*
   everywhere too (§97).
 - Operations (§116, TENTATIVE): host-registered named handlers authorized by
   scoped allow/deny sets in the graph (most specific scope wins, deny beats
-  allow, default deny, no self-granting, no static Authorizer). All four batches (records with fields, scopes, the read view, the host's operation handlers and grants, the wire `run` request) are built, and nothing else is
-  built yet. Open: exact signatures, a per-principal quota of interned
+  allow, default deny, no self-granting, no static Authorizer). All four
+  batches are built (records with fields, scopes and the read view, the
+  host's operation handlers and grants, the wire `run` request). Open: exact signatures, a per-principal quota of interned
   principal texts, a reorder primitive, and whether stored-step operations
   ever become a handler kind.
 

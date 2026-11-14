@@ -29,7 +29,13 @@ place only: theorystate.md Part D. It is deliberately not repeated here.
 Current implementation:
 - Go 1.27 implementation. This is the foundation the project builds on,
   not a prototype (theorystate.md section 7b).
-- Implementation consolidated into main.go and main_test.go.
+- The graph engine, the backends (Graph, BoltGraph), RootGraph, GraphActor,
+  Host and the core registries are consolidated in main.go. Larger
+  subsystems have their own files (slotted_list.go, text.go, text_forms.go,
+  fields.go, scope.go, notes.go, operations.go, plan.go, host_graph.go,
+  registry_helpers.go and the wire files named under "Editing convention").
+  The tests are split across several *_test.go files by area; main_test.go no
+  longer exists.
 - Primitive Graph implemented and tested.
 - Graph.Transact / Txn implemented and tested, giving failure-atomicity
   (not concurrency isolation) to multi-step primitive operations.
@@ -143,11 +149,14 @@ Important constraints:
 - Keep alternative representations open where theory has not decided them.
 
 Editing convention:
-- The graph engine, registries and Host are consolidated in main.go and
-  main_test.go. The wire transport has its own files (wire.go, wire_auth.go,
+- The graph engine, backends, registries and Host are consolidated in
+  main.go. A subsystem that is a separate layer, or needs build tags, has its
+  own files with its own tests: the wire transport (wire.go, wire_auth.go,
   wire_tls.go, wire_tls_files.go, wire_tls_pki.go, pipe_windows.go,
-  private_file*.go, cmd/dmlcert) with their tests, because of build tags and
-  because they are a separate layer.
+  private_file*.go, cmd/dmlcert), slotted_list.go, text.go, text_forms.go,
+  fields.go, scope.go, notes.go, operations.go, plan.go, host_graph.go and
+  registry_helpers.go. Tests are split across *_test.go files by area
+  (main_test.go no longer exists).
 - For changes, give exact:
   Find this text:
   ...
@@ -2352,7 +2361,7 @@ could be called directly.
  (theorystate.md section 105). ListRegistry's Checker runs
  validateStructure over the whole list on every commit touching it, and
  ListRegistry.Append reads every child of the list to find the tail, so
- both are O(n) per commit. Added BenchmarkListCommitCost (main_test.go,
+ both are O(n) per commit. Added BenchmarkListCommitCost (list_bench_test.go,
  run via measure.bat): per list size (1k, 10k, 100k, over the production
  stack from OpenHost) it times an empty commit, Append's tail scan alone, a
  commit that only makes the Checker validate the list, and a real Append, so
@@ -2762,9 +2771,9 @@ empty commit is the baseline of about 2.7 ms):
  TestWirePlanErrorsKeepTheirIdentity, TestWirePlanIsRefusedUnlessEnabledAndAuthorized,
  TestWirePlanFollowsTheCurrentPolicy, TestWirePlanStepLimitComesFromWithPlans,
  TestWireOversizedPlanIsRefusedAndTheConnectionSurvives and
- TestWireSlowFrameIsDroppedAfterTheFrameDeadline. Not done (stage 2): operations
- and allow-lists defined in the graph, so a principal can be allowed some plans
- and not others.
+ TestWireSlowFrameIsDroppedAfterTheFrameDeadline. Stage 2 (items 81-84) added
+ operations with scoped authorization in the graph; plans themselves stay at
+ the whole-graph trust level.
 
 81. Stage 2 of plan-as-data, batch 1 (theorystate.md section 116), in
  fields.go: FieldRegistry, records with named fields for a consumer's own
@@ -2783,8 +2792,8 @@ empty commit is the baseline of about 2.7 ms):
  texts use a token), over one shared walk (formTexts). Covered by the
  TestField* tests and TestNewFieldRegistryRejectsBadDeclarations (every
  backend) and TestTextFormsContainingFindsTheFormsAndTextsThatUseAToken.
- Batch 2 (scopes and read view) is item 82; batches 3 and 4 (Host.RegisterOperation; wire OpRun)
- are next.
+ Batch 2 (scopes and read view) is item 82; batches 3 and 4 (operation handlers; wire run) are
+ items 83 and 84.
 
 82. Stage 2 of plan-as-data, batch 2 (theorystate.md section 116): the read
  view and the scope registry. (a) readViewer/readView (main.go): code that
@@ -2811,9 +2820,8 @@ empty commit is the baseline of about 2.7 ms):
  all records (a shared set would leak grants). (c) registry_helpers.go: bindNames,
  taggedCheck and registerTaggedChecker, the "copy these names out of ids" and
  "run a check per tag of the touched nodes" steps the text, text-form and scope
- registries share. Registries.Scopes is built by NewRegistries. Not done: the
- host's operation handlers and grant helpers (batch 3) and the wire OpRun
- (batch 4).
+ registries share. Registries.Scopes is built by NewRegistries. Batch 3 (the host's operation
+ handlers and grant helpers) is item 83 and batch 4 (the wire OpRun) item 84.
  Covered by TestFoundationalNamesIncludeScopeNames,
  TestScopePathJoinsSegmentsAndRejectsForgeries,
  TestScopePrefixesAreLongestFirst,
@@ -2857,8 +2865,8 @@ empty commit is the baseline of about 2.7 ms):
  scope) and Require. Grant helpers GrantOperation/DenyOperation/
  RevokeOperation (entry scope) and GrantScope/DenyScope/RevokeScope wrap
  ScopeRegistry through one editScope. The table of operations is an
- operationTable (zero value usable) in Host. Not done: the wire OpRun,
- WithOperations, README and example (batch 4).
+ operationTable (zero value usable) in Host. The wire OpRun, WithOperations,
+ README and example are item 84.
  Covered by TestOperationReadRunsForAGrantedPrincipalOnly,
  TestOperationEmptyPrincipalIsDeniedEvenWhenEveryoneIsAllowed,
  TestOperationGrantDenyAndRevokeTakeEffectOnTheNextRun,
@@ -2929,19 +2937,53 @@ empty commit is the baseline of about 2.7 ms):
  TestNoteVerifyAllAcceptsValidNotes and
  TestHostRegistriesCarryNotesAcrossARestart.
 
+86. Benchmark for many lists and for a commit that touches a list node
+ (theorystate.md section 105a), closing the two "not measured yet" cases of
+ item 73. BenchmarkManyListsCommitCost (list_bench_test.go) runs one shared
+ body over OrderedList for both list types, over the production stack. Per
+ size (1,000, 10,000, 100,000; under -short up to 10,000) it builds that many
+ one-element lists (the crowd, buildCrowd), then a short list of
+ manyListsShortLen (10) elements and a long list of the same length as the
+ crowd. empty-commit is timed once; for each of the two lists: tail-lookup
+ (read-only), touch-tail (a commit touching the tail capsule: the local
+ check), touch-list (a commit touching only the list node: ListRegistry
+ falls back to validating the whole list, the slotted type checks head and
+ tail) and append. Why this shape: ListRegistry's tail lookup costs about the
+ smaller of the list's children and the AllTails hub's (item 68), and the hub
+ has one member per non-empty list, so its worst case is a long list among as
+ many other lists and the short list is the control. This is a prediction,
+ not a result: the benchmark has been written but not yet run, and its
+ numbers are not recorded in this file or in theorystate.md (see "Planned
+ next"). DRY: benchCommit moved from slotted_list_test.go to
+ list_bench_test.go and is used by every list benchmark (BenchmarkListCommitCost
+ had its own copy as a local closure), and buildInChunks is the shared
+ chunked-transaction loop of buildBenchList and buildCrowd. No production
+ change.
+
+87. Documentation drift pass (no behaviour change). The file layout (main.go
+ plus per-subsystem files, main_test.go gone) is stated under "Current
+ implementation" and "Editing convention". Stale "not done / next" notes of
+ items 80-83 now point at the items that did the work; item 63 names its
+ benchmark's real file. In theorystate.md: section 87a's sketch is marked as
+ built (GraphReader, Transactor, GraphAPI, GraphStore behind Tx, with the
+ error results added by section 108), the "what is current" note of Part G
+ covers sections 100-117, the section 97 and 102 file references no longer
+ name main_test.go, section 105a points at item 86, and the Part D
+ Operations entry is reworded.
+
 Currently unaddressed yet:
 - Interned text (items 75, 78): "contains" (substring) search is not built (a
   paged scan first, an optional positional index later), and there is no
   DeleteString (only when nothing extends it, nothing refers to it and it has
   no forms; interacts with the prefix index and lists).
-- Planned next, in this order: (1) stage 2 of plan-as-data, designed in
-  theorystate.md section 116 (stage 1 is item 80), in four batches:
-  FieldRegistry plus FormsContaining; the scope registry and the read-view
-  interface (both done, items 81 and 82); the host's operation handlers with grants and atomic authorization (done, item 83); the
-  wire OpRun with README and an example (done, item 84); (2) notes on nodes (done, item 85); (3) measuring a
-  graph with many lists and a commit touching a slotted list node; (4)
-  out-of-band corruption tests on every backend; (5) docs drift (Part D
-  status lists).
+- Planned next, in this order: (1) record the measurements of
+  BenchmarkManyListsCommitCost (item 86) here and in theorystate.md section
+  105a: the benchmark is written, but its numbers are not in the files yet;
+  (2) out-of-band corruption tests on every backend: a raw-write path for
+  stagedGraph and BoltGraph, so the DetectsOutOfBand* and TestAdversarial*
+  tests that are *Graph-only can join registryTestsOnEveryBackend (item 59).
+  Stage 2 of plan-as-data (items 81-84), notes on nodes (item 85) and the
+  docs-drift pass (item 87) are done.
 - ListRegistry.Append finds the tail as the child its list shares with the
   AllTails hub (item 68), so it costs about the smaller of the two child sets:
   fine with few lists, linear in the number of non-empty lists when there are
