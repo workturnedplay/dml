@@ -22,4 +22,6 @@ go test -run "^$" -bench ListCommitCost -benchtime 30x -timeout 60m
 
 go test -run "^$" -bench "ManyListsCommitCost/^ListRegistry$/^lists=1000$" -benchtime 30x
 go test -run "^$" -bench ManyListsCommitCost -benchtime 30x -timeout 120m
+
+go test -run "^$" -bench InterleavedListsCommitCost -benchtime 30x -timeout 120m
 pause

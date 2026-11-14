@@ -3609,8 +3609,10 @@ lists:
   crowd first, so every `AllTails` member of the crowd has a lower NodeID
   than every capsule of the long list, and one seek skips them all: the best
   case. "About the smaller of the two" is an upper bound (times a seek).
-  Its worst case needs interleaved NodeID ranges (lists grown round-robin),
-  which is not measured yet.
+  Its worst case needs the long list's capsules interleaved by NodeID with
+  the tails of other lists (`BenchmarkInterleavedListsCommitCost` builds that
+  by alternating one append to the long list with one new one-element list),
+  which has not been run yet; its results are to be recorded here.
 - *The slotted list pays about twice the allocations for the local
   operations* (touch tail 2,907 against 1,453 to 1,868, append about 15.5k
   against 10.0k to 12.9k), flat in size; the times differ by less than the

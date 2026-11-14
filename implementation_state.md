@@ -2998,7 +2998,9 @@ empty commit is the baseline of about 2.7 ms):
  hub member (the crowd's tails) is below every capsule of the long list and
  one seek skips them all: the best case. "About the smaller of the two" is an
  upper bound (times a seek), not the typical cost; the worst case needs
- interleaved NodeID ranges (lists grown round-robin), which is not measured.
+ interleaved NodeID ranges (the long list's capsules alternating with the
+ other lists' tails; item 91 builds that, and "round-robin growth", as this
+ first said, would not: it leaves every tail in the last round).
  Item 73's remark that few lists are ListRegistry's best case was therefore
  too pessimistic for this layout.
  (c) The slotted list pays about twice the allocations for the local
@@ -3058,18 +3060,39 @@ empty commit is the baseline of about 2.7 ms):
  GraphActor/RootGraph tests, and the backend-specific files (actor, bolt,
  staged, graph, root, paging, verify). No production change.
 
+91. Benchmark for the worst case of ListRegistry's tail lookup
+ (list_bench_test.go, theorystate.md section 105a), the case item 88 left
+ unmeasured. BenchmarkInterleavedListsCommitCost, for both list types at the
+ usual sizes, builds a long list and as many one-element lists in
+ alternation (buildInterleaved: one InsertAfter after the long list's last
+ capsule and one new one-element list, chunk by chunk, so building is
+ linear; InsertAfter does not look for the tail, an assumption the build
+ time would show to be wrong). Each one-element list's only capsule is its
+ tail, so it is a member of the AllTails hub with an ID between two of the
+ long list's capsules: the two sorted runs of the leapfrog join alternate at
+ every step, its worst case, where item 88's layout was its best.
+ Sub-benchmarks: empty-commit, tail-lookup, touch-tail and append. Item 88
+ described this worst case as "lists grown round-robin"; that was wrong (it
+ puts every tail in the last round, the best case again) and is corrected
+ there. DRY: skipLargeUnderShort, benchSpareNodes, benchEmptyCommit,
+ benchReadSteps, benchAppend, appendOne and addOneElementList are shared by
+ BenchmarkManyListsCommitCost, buildCrowd and the new benchmark. Nothing
+ has been run: the numbers are to be recorded here (see "Planned next"). No
+ production change.
+
 Currently unaddressed yet:
 - Interned text (items 75, 78): "contains" (substring) search is not built (a
   paged scan first, an optional positional index later), and there is no
   DeleteString (only when nothing extends it, nothing refers to it and it has
   no forms; interacts with the prefix index and lists).
-- Planned next: a layout for BenchmarkManyListsCommitCost with interleaved
-  NodeID ranges (lists grown round-robin), the one case in which
-  ListRegistry's tail lookup could still depend on the number of lists (item
-  88). Stage 2 of plan-as-data (items 81-84), notes on nodes (item 85), the
-  docs-drift pass (item 87), the many-lists measurements (item 88), raw
-  writes on every backend (item 89) and the out-of-band test migration (item
-  90) are done.
+- Planned next: run BenchmarkInterleavedListsCommitCost (item 91) and record
+  its numbers here and in theorystate.md section 105a; if ListRegistry's tail
+  lookup turns out to grow with the list there, decide whether ListRegistry
+  needs a fix or only a note (the slotted list does not have the
+  dependence). Stage 2 of plan-as-data (items 81-84), notes on nodes (item
+  85), the docs-drift pass (item 87), the many-lists measurements (item 88),
+  raw writes on every backend (item 89) and the out-of-band test migration
+  (item 90) are done.
 - ListRegistry.Append finds the tail as the child its list shares with the
   AllTails hub (item 68), by a leapfrog join whose cost is bounded by about
   the smaller of the two child sets (times a seek). Measured with a crowd of

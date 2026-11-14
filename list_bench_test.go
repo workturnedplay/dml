@@ -161,18 +161,8 @@ func buildCrowd(b *testing.B, h *Host, lists OrderedList, count int) {
 
 	buildInChunks(b, h.Graph(), what, count, manyListsCrowdChunk, func(tx Tx, n int) error {
 		for range n {
-			list, newErr := lists.NewList(tx)
-			if newErr != nil {
-				return wrapInterfaceErr(newErr)
-			}
-
-			value, createErr := createNodeTx(tx)
-			if createErr != nil {
-				return createErr
-			}
-
-			if _, appendErr := lists.AppendMany(tx, list, []NodeID{value}); appendErr != nil {
-				return wrapInterfaceErr(appendErr)
+			if listErr := addOneElementList(tx, lists); listErr != nil {
+				return listErr
 			}
 		}
 
@@ -316,9 +306,7 @@ func BenchmarkManyListsCommitCost(b *testing.B) {
 func benchManyLists(b *testing.B, pick func(h *Host) OrderedList, size int) {
 	b.Helper()
 
-	if testing.Short() && size > listBenchShortLimit {
-		b.Skipf("building %d lists takes a long time; skipped under -short", size)
-	}
+	skipLargeUnderShort(b, size)
 
 	h := openListBenchHost(b)
 	graph := h.Graph()
@@ -331,23 +319,9 @@ func benchManyLists(b *testing.B, pick func(h *Host) OrderedList, size int) {
 	b.Logf("built %d one-element lists, a list of %d and a list of %d in %v",
 		size, manyListsShortLen, size, time.Since(start))
 
-	bystander, err := createNodeVia(graph)
-	if err != nil {
-		b.Fatalf("CreateNode() for the bystander: %v", err)
-	}
+	bystander, value := benchSpareNodes(b, graph)
 
-	value, err := createNodeVia(graph)
-	if err != nil {
-		b.Fatalf("CreateNode() for the value: %v", err)
-	}
-
-	b.Run("empty-commit", func(b *testing.B) {
-		benchCommit(b, graph, func(tx Tx) error {
-			tx.Touch(bystander)
-
-			return nil
-		})
-	})
+	benchEmptyCommit(b, graph, bystander)
 
 	targets := [...]struct {
 		name string
@@ -359,26 +333,7 @@ func benchManyLists(b *testing.B, pick func(h *Host) OrderedList, size int) {
 
 	for _, target := range targets {
 		b.Run(target.name, func(b *testing.B) {
-			b.Run("tail-lookup", func(b *testing.B) {
-				benchCommit(b, graph, func(tx Tx) error {
-					_, _, tailErr := lists.Tail(tx, target.list)
-
-					return wrapInterfaceErr(tailErr)
-				})
-			})
-
-			b.Run("touch-tail", func(b *testing.B) {
-				tail, hasTail, tailErr := lists.Tail(graph, target.list)
-				if tailErr != nil || !hasTail {
-					b.Fatalf("Tail() = (%v,%v)", hasTail, tailErr)
-				}
-
-				benchCommit(b, graph, func(tx Tx) error {
-					tx.Touch(tail)
-
-					return nil
-				})
-			})
+			benchReadSteps(b, graph, lists, target.list)
 
 			b.Run("touch-list", func(b *testing.B) {
 				benchCommit(b, graph, func(tx Tx) error {
@@ -388,13 +343,234 @@ func benchManyLists(b *testing.B, pick func(h *Host) OrderedList, size int) {
 				})
 			})
 
-			b.Run("append", func(b *testing.B) {
-				benchCommit(b, graph, func(tx Tx) error {
-					_, appendErr := lists.AppendMany(tx, target.list, []NodeID{value})
-
-					return wrapInterfaceErr(appendErr)
-				})
-			})
+			benchAppend(b, graph, lists, target.list, value)
 		})
 	}
+}
+
+// ---------------------------------------------------------------------
+// Shared steps of the many-lists benchmarks.
+
+// skipLargeUnderShort skips b under -short when the structure to build has
+// more than listBenchShortLimit lists.
+func skipLargeUnderShort(b *testing.B, size int) {
+	b.Helper()
+
+	if testing.Short() && size > listBenchShortLimit {
+		b.Skipf("building %d lists takes a long time; skipped under -short", size)
+	}
+}
+
+// benchSpareNodes makes two plain nodes: a bystander, for a commit that
+// touches nothing a Checker is keyed on, and a value to append.
+func benchSpareNodes(b *testing.B, graph GraphAPI) (bystander, value NodeID) {
+	b.Helper()
+
+	var err error
+
+	bystander, err = createNodeVia(graph)
+	if err != nil {
+		b.Fatalf("CreateNode() for the bystander: %v", err)
+	}
+
+	value, err = createNodeVia(graph)
+	if err != nil {
+		b.Fatalf("CreateNode() for the value: %v", err)
+	}
+
+	return bystander, value
+}
+
+// benchEmptyCommit times a commit that touches only the bystander: the
+// baseline every other step is compared with.
+func benchEmptyCommit(b *testing.B, graph GraphAPI, bystander NodeID) {
+	b.Helper()
+
+	b.Run("empty-commit", func(b *testing.B) {
+		benchCommit(b, graph, func(tx Tx) error {
+			tx.Touch(bystander)
+
+			return nil
+		})
+	})
+}
+
+// benchReadSteps times tail-lookup (read-only, no Checker work) and
+// touch-tail (a commit touching the tail capsule: the local check) on list.
+func benchReadSteps(b *testing.B, graph GraphAPI, lists OrderedList, list NodeID) {
+	b.Helper()
+
+	b.Run("tail-lookup", func(b *testing.B) {
+		benchCommit(b, graph, func(tx Tx) error {
+			_, _, tailErr := lists.Tail(tx, list)
+
+			return wrapInterfaceErr(tailErr)
+		})
+	})
+
+	b.Run("touch-tail", func(b *testing.B) {
+		tail, hasTail, tailErr := lists.Tail(graph, list)
+		if tailErr != nil || !hasTail {
+			b.Fatalf("Tail() = (%v,%v)", hasTail, tailErr)
+		}
+
+		benchCommit(b, graph, func(tx Tx) error {
+			tx.Touch(tail)
+
+			return nil
+		})
+	})
+}
+
+// benchAppend times appending value to list. Run it last on a list: it
+// lengthens the list by one per iteration.
+func benchAppend(b *testing.B, graph GraphAPI, lists OrderedList, list, value NodeID) {
+	b.Helper()
+
+	b.Run("append", func(b *testing.B) {
+		benchCommit(b, graph, func(tx Tx) error {
+			_, appendErr := appendOne(tx, lists, list, value)
+
+			return appendErr
+		})
+	})
+}
+
+// appendOne appends one value to list and returns its capsule.
+func appendOne(tx Tx, lists OrderedList, list, value NodeID) (NodeID, error) {
+	capsules, err := lists.AppendMany(tx, list, []NodeID{value})
+	if err != nil {
+		return 0, wrapInterfaceErr(err)
+	}
+
+	return capsules[0], nil
+}
+
+// addOneElementList makes a list holding one fresh node. Its only capsule is
+// the list's tail, so the list joins the AllTails hub of ListRegistry.
+func addOneElementList(tx Tx, lists OrderedList) error {
+	list, newErr := lists.NewList(tx)
+	if newErr != nil {
+		return wrapInterfaceErr(newErr)
+	}
+
+	value, createErr := createNodeTx(tx)
+	if createErr != nil {
+		return createErr
+	}
+
+	_, appendErr := appendOne(tx, lists, list, value)
+
+	return appendErr
+}
+
+// ---------------------------------------------------------------------
+// Interleaved layout (implementation_state.md item 91). Item 88 measured
+// ListRegistry's tail lookup in the best case of the leapfrog join (the
+// long list's capsules all above the hub's members, so one seek skips the
+// hub). The worst case is the two runs alternating: the hub's members are
+// the tails of the other lists, so BenchmarkInterleavedListsCommitCost makes
+// the long list and the other lists in alternation, one append to the long
+// list and one new one-element list at a time, so every other capsule ID in
+// the long list's range belongs to a hub member. The tail lookup and Append of
+// ListRegistry are then expected to cost about the size of the list, where the
+// slotted list's stay flat. The list is extended with InsertAfter after its
+// last capsule, which does not look for the tail, so building is linear.
+// Run without -race (try -short first: it stops at 10,000):
+//
+//	go test -short -run "^$" -bench InterleavedListsCommitCost -benchtime 30x -timeout 60m
+//	go test -run "^$" -bench InterleavedListsCommitCost -benchtime 30x -timeout 120m
+//
+// One list type and size (anchor the parts, see BenchmarkManyListsCommitCost):
+//
+//	go test -run "^$" -bench "InterleavedListsCommitCost/^ListRegistry$/^lists=10000$" -benchtime 30x
+//
+// Per size, the sub-benchmarks are empty-commit (the baseline), tail-lookup,
+// touch-tail and append (last, since it lengthens the list).
+
+func BenchmarkInterleavedListsCommitCost(b *testing.B) {
+	for _, kind := range manyListsKinds {
+		b.Run(kind.name, func(b *testing.B) {
+			for _, size := range listBenchSizes {
+				b.Run(fmt.Sprintf("lists=%d", size), func(b *testing.B) {
+					benchInterleaved(b, kind.pick, size)
+				})
+			}
+		})
+	}
+}
+
+// buildInterleaved makes a list of size elements and size one-element lists,
+// alternating between the two, and returns the long list.
+func buildInterleaved(b *testing.B, h *Host, lists OrderedList, size int) NodeID {
+	b.Helper()
+
+	list, err := lists.NewList(h.Graph())
+	if err != nil {
+		b.Fatalf("NewList(): %v", err)
+	}
+
+	// last is the long list's last capsule. A step reads it into a local at
+	// the start and stores it back only when it has finished, so a re-run
+	// step (the closure contract) starts from the same state.
+	var last NodeID
+
+	started := false
+	what := fmt.Sprintf("the interleaved layout (%d elements and %d lists)", size, size)
+
+	buildInChunks(b, h.Graph(), what, size, manyListsCrowdChunk, func(tx Tx, count int) error {
+		cursor, hasCursor := last, started
+
+		for range count {
+			value, createErr := createNodeTx(tx)
+			if createErr != nil {
+				return createErr
+			}
+
+			var appendErr error
+
+			if hasCursor {
+				cursor, appendErr = lists.InsertAfter(tx, list, cursor, value)
+				appendErr = wrapInterfaceErr(appendErr)
+			} else {
+				cursor, appendErr = appendOne(tx, lists, list, value)
+				hasCursor = true
+			}
+
+			if appendErr != nil {
+				return appendErr
+			}
+
+			if listErr := addOneElementList(tx, lists); listErr != nil {
+				return listErr
+			}
+		}
+
+		last, started = cursor, hasCursor
+
+		return nil
+	})
+
+	return list
+}
+
+func benchInterleaved(b *testing.B, pick func(h *Host) OrderedList, size int) {
+	b.Helper()
+
+	skipLargeUnderShort(b, size)
+
+	h := openListBenchHost(b)
+	graph := h.Graph()
+	lists := pick(h)
+
+	start := time.Now()
+	longList := buildInterleaved(b, h, lists, size)
+	b.Logf("built a list of %d elements interleaved with %d one-element lists in %v",
+		size, size, time.Since(start))
+
+	bystander, value := benchSpareNodes(b, graph)
+
+	benchEmptyCommit(b, graph, bystander)
+	benchReadSteps(b, graph, lists, longList)
+	benchAppend(b, graph, lists, longList, value)
 }
