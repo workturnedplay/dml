@@ -22,6 +22,8 @@ import (
 	"sort"
 	"sync"
 	"testing"
+
+	bolt "go.etcd.io/bbolt"
 )
 
 // TestMain enables GraphActor's debug-only reentrancy tripwire
@@ -302,20 +304,35 @@ func newTestNode(t *testing.T, g testGraph) NodeID {
 }
 
 // testBackend is one GraphAPI implementation to run a shared test against.
-// open returns a testGraph (the GraphAPI plus the test-only write methods),
-// which is what the registry fixtures need (see newTestGraph).
+// open returns a testGraph (the GraphAPI plus the test-only write methods; on
+// *stagedGraph and *BoltGraph those are one-operation transactions, so
+// Checkers run for them). openRaw returns the graph the registry fixtures use
+// (see newTestGraph): the same backend, but its four direct write methods
+// bypass Checkers, so a test can inject data no Checker saw.
 type testBackend struct {
-	name string
-	open func(tb *testing.T) testGraph
+	name    string
+	open    func(tb *testing.T) testGraph
+	openRaw func(tb *testing.T) testGraph
 }
 
 // testBackends lists every GraphAPI implementation tests run against. The
 // first entry, the bare *Graph, is the default backend (activeTestBackend).
 func testBackends() []testBackend {
+	// *Graph's own test-only writes are already raw, so it needs no wrapper.
+	openGraph := func(_ *testing.T) testGraph { return &Graph{} }
+
 	return []testBackend{
-		{name: "Graph", open: func(_ *testing.T) testGraph { return &Graph{} }},
-		{name: "stagedGraph", open: func(_ *testing.T) testGraph { return newStagedGraph() }},
-		{name: "BoltGraph", open: func(tb *testing.T) testGraph { return newBoltTestGraph(tb) }},
+		{name: "Graph", open: openGraph, openRaw: openGraph},
+		{
+			name:    "stagedGraph",
+			open:    func(_ *testing.T) testGraph { return newStagedGraph() },
+			openRaw: func(_ *testing.T) testGraph { return rawStagedGraph{stagedGraph: newStagedGraph()} },
+		},
+		{
+			name:    "BoltGraph",
+			open:    func(tb *testing.T) testGraph { return newBoltTestGraph(tb) },
+			openRaw: func(tb *testing.T) testGraph { return rawBoltGraph{BoltGraph: newBoltTestGraph(tb)} },
+		},
 	}
 }
 
@@ -377,6 +394,113 @@ func (g *BoltGraph) RemoveRelationship(a, b NodeID) (bool, error) {
 
 func (g *BoltGraph) DeleteNode(id NodeID) error {
 	return deleteNodeVia(g, id)
+}
+
+// rawBackend is a backend with a test-only raw write path: rawWrite runs step
+// against the backend's own write handle and commits it at once, with no
+// Checker pass and no commit or rollback hooks -- the way data that never went
+// through this process's Checkers (loaded from storage, written by an older
+// build or another tool) reaches a graph. *Graph needs none, since its own
+// test-only write methods are raw. The registry fixtures get it through
+// rawStagedGraph and rawBoltGraph (see testBackends), which is what lets the
+// out-of-band corruption tests run on every backend.
+type rawBackend interface {
+	rawWrite(step func(w txOps) error) error
+}
+
+// Compile-time assertions that both non-Graph backends have a raw write path.
+var (
+	_ rawBackend = (*stagedGraph)(nil)
+	_ rawBackend = (*BoltGraph)(nil)
+)
+
+// rawWrite implements rawBackend: step runs inside one bolt update
+// transaction that is committed without consulting any Checker. A failing
+// step aborts the whole update, so a rejected write leaves no trace.
+func (g *BoltGraph) rawWrite(step func(w txOps) error) error {
+	release := g.guard.acquire()
+	defer release()
+
+	return wrapBoltErr("raw write", g.db.Update(func(btx *bolt.Tx) error {
+		txn, openErr := newBoltTxn(btx)
+		if openErr != nil {
+			return openErr
+		}
+
+		return wrapInterfaceErr(step(txn))
+	}))
+}
+
+// rawValue runs step through b's raw write path and returns its result, or
+// (zero value, err) if step failed.
+func rawValue[T any](b rawBackend, step func(w txOps) (T, error)) (T, error) {
+	var result T
+
+	err := b.rawWrite(func(w txOps) error {
+		var stepErr error
+
+		result, stepErr = step(w)
+
+		return wrapInterfaceErr(stepErr)
+	})
+	if err != nil {
+		var zero T
+
+		return zero, wrapInterfaceErr(err)
+	}
+
+	return result, nil
+}
+
+func rawCreateNode(b rawBackend) (NodeID, error) {
+	return rawValue(b, createNodeTx)
+}
+
+func rawAddRelationship(b rawBackend, from, to NodeID) (bool, error) {
+	return rawValue(b, func(w txOps) (bool, error) {
+		created, err := w.AddRelationship(from, to)
+
+		return created, wrapInterfaceErr(err)
+	})
+}
+
+func rawRemoveRelationship(b rawBackend, from, to NodeID) (bool, error) {
+	return rawValue(b, func(w txOps) (bool, error) {
+		removed, err := w.RemoveRelationship(from, to)
+
+		return removed, wrapInterfaceErr(err)
+	})
+}
+
+func rawDeleteNode(b rawBackend, id NodeID) error {
+	return wrapInterfaceErr(b.rawWrite(func(w txOps) error {
+		return deleteNodeTx(w, id)
+	}))
+}
+
+// rawBoltGraph is the BoltGraph the registry fixtures get (see
+// testBackends): a *BoltGraph whose four direct write methods bypass Checkers.
+// It embeds the pointer, not a GraphAPI, so every other method -- including
+// the unexported pagers, read view and common-children lookup -- is promoted
+// and the fixtures still exercise BoltGraph's native paths.
+type rawBoltGraph struct {
+	*BoltGraph
+}
+
+func (g rawBoltGraph) CreateNode() (NodeID, error) {
+	return rawCreateNode(g)
+}
+
+func (g rawBoltGraph) AddRelationship(a, b NodeID) (bool, error) {
+	return rawAddRelationship(g, a, b)
+}
+
+func (g rawBoltGraph) RemoveRelationship(a, b NodeID) (bool, error) {
+	return rawRemoveRelationship(g, a, b)
+}
+
+func (g rawBoltGraph) DeleteNode(id NodeID) error {
+	return rawDeleteNode(g, id)
 }
 
 func boltTestPath(t *testing.T) string {

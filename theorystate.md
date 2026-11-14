@@ -3172,8 +3172,8 @@ harness (`TestRegistriesOnEveryBackend`: the fixtures build the active
 backend, and the driver runs the fixture-based tests under `*Graph`,
 `stagedGraph` and `BoltGraph`), so portability is tested across the whole
 registry surface, not only by the hand-written tests above. The tests that
-corrupt data out-of-band stay `*Graph`-only, since on a Checker-running
-backend the corrupting write is itself declined. Giving `stagedGraph` a
+corrupt data out-of-band run there too (implementation_state.md item 89):
+the fixtures' direct writes are raw on every backend. Giving `stagedGraph` a
 real (rather than externally forced) conflict-detection mechanism is left
 for whenever an actual networked backend makes it worth the cost.
 
@@ -3579,19 +3579,42 @@ exactly one list. Commit-time checking is local, as for `ListRegistry`;
 global properties stay with `Elements` and `VerifyStructures`. Both list types
 implement one `OrderedList` contract and run the same behaviour suite.
 `ListRegistry` is kept: it is the simpler structure, with a tail lookup whose
-cost depends on how many lists exist, and the reference for comparison.
+cost can depend on how many lists exist (see the measurements below, which
+only show it for the whole-list validation), and the reference for
+comparison.
 
-**Measuring it (implementation_state.md item 86).**
+**Measuring it (implementation_state.md items 86 and 88).**
 `BenchmarkManyListsCommitCost` builds a crowd of one-element lists, then a
 short list and a long list as long as the crowd, and times for both list
 types a tail lookup, a commit touching the tail capsule, a commit touching
-only the list node, and an append. What the structure predicts (not yet a
-measurement; the results are to be recorded here): for `ListRegistry` the
-tail lookup, and so Append, costs about the smaller of the list's children
-and the `AllTails` hub's, so the long list in a crowd is its worst case and
-the short list its control, and a commit touching only the list node
-validates the whole list; for `SlottedListRegistry` all of these are flat in
-both the length of the list and the number of lists.
+only the list node, and an append. Measured (i7-8700K, Windows, no `-race`,
+30 iterations, ms per commit; an empty commit is 2.6 to 4.1, so differences
+under about 1.5 are noise), for the long list at 1,000 / 10,000 / 100,000
+lists:
+
+| | tail lookup | touch tail | touch list | append |
+|---|---|---|---|---|
+| `ListRegistry` | 2.7 / 2.7 / 2.7 | 3.0 / 4.4 / 3.1 | **41.4 / 556.2 / 5,559.8** | 5.5 / 6.0 / 6.5 |
+| `SlottedListRegistry` | 4.4 / 4.4 / 3.5 | 5.5 / 5.4 / 4.9 | **4.7 / 5.1 / 4.3** | 6.9 / 7.4 / 7.5 |
+
+- *Touching only the list node is the decisive case.* `ListRegistry`
+  validates the whole list (about 40 to 56 microseconds per element; the
+  allocation counts, which are deterministic, are 361,694 / 4.73 million /
+  47.3 million, 2.58 GB at 100,000). The slotted list checks head and tail
+  only: 1,280 allocations and 74 KB at every size.
+- *The prediction that `ListRegistry`'s tail lookup (and so Append) depends
+  on the number of lists was not borne out* by this layout: it is flat. The
+  lookup is a leapfrog join over two sorted runs, so its cost is the number
+  of alternations, not the size of the smaller run. The benchmark builds the
+  crowd first, so every `AllTails` member of the crowd has a lower NodeID
+  than every capsule of the long list, and one seek skips them all: the best
+  case. "About the smaller of the two" is an upper bound (times a seek).
+  Its worst case needs interleaved NodeID ranges (lists grown round-robin),
+  which is not measured yet.
+- *The slotted list pays about twice the allocations for the local
+  operations* (touch tail 2,907 against 1,453 to 1,868, append about 15.5k
+  against 10.0k to 12.9k), flat in size; the times differ by less than the
+  noise.
 
 A composite Set log (§82) keeps its operations in whichever `OrderedList` its
 registry was given (the host uses the slotted one); the log's node is then
@@ -4814,10 +4837,9 @@ kept current as sections above resolve or split further.)*
   (§113), and how hosts on different machines coordinate (§107, §112,
   Part C). Production `Effect` implementations are not dml's (§112).
 - Whether stagedGraph should ever gain real (rather than externally
-  forced) conflict detection (§97), and whether the out-of-band
-  corruption tests (which need a write that bypasses Checkers) should get
-  a raw-write path on every backend so the registry harness can run them
-  everywhere too (§97).
+  forced) conflict detection (§97). (The raw-write path on every backend
+  that the out-of-band corruption tests need is built: implementation_state.md
+  item 89.)
 - Operations (§116, TENTATIVE): host-registered named handlers authorized by
   scoped allow/deny sets in the graph (most specific scope wins, deny beats
   allow, default deny, no self-granting, no static Authorizer). All four

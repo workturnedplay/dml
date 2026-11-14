@@ -63,7 +63,9 @@ scripts (*.bat) have not been seen directly.
 ## Test helpers (load these first for any new test file)
 - testutil_test.go: TestMain, test-only write methods (Graph, GraphActor, RootGraph, BoltGraph),
   *Via helpers, must* helpers, mustCreateNode, newTestNode, sortedNodeIDs, testBackends,
-  forEachBackendAndActor, runConcurrently, boltTestPath/openBoltTestGraph/newBoltTestGraph.
+  forEachBackendAndActor, runConcurrently, boltTestPath/openBoltTestGraph/newBoltTestGraph,
+  rawBackend/rawValue/rawBoltGraph (raw writes that bypass Checkers; rawStagedGraph is in
+  staged_graph_test.go and both are what newTestGraph builds).
 - host_testutil_test.go: fakeEffect, eventually, hostTestContext, openTestHost, registerTestResource,
   connectTest, requireEffectCounts, errorLog.
 - registry_backends_test.go: testGraph, newTestGraph, registryTestsOnEveryBackend (add new

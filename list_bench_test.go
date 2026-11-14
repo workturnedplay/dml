@@ -268,7 +268,12 @@ func BenchmarkListCommitCost(b *testing.B) {
 // -short limits it to the 1,000 and 10,000 sizes. To try one size and one
 // type first:
 //
-//	go test -run "^$" -bench "ManyListsCommitCost/ListRegistry/lists=1000" -benchtime 30x
+//	go test -run "^$" -bench "ManyListsCommitCost/^ListRegistry$/^lists=1000$" -benchtime 30x
+//
+// The ^ and $ matter: -bench splits its pattern at each / and matches every
+// part unanchored against the name at that level, so a bare ListRegistry
+// also selects SlottedListRegistry and a bare lists=1000 also selects
+// lists=10000 and lists=100000.
 //
 // Per size, the sub-benchmarks are empty-commit (the baseline), and for each
 // of short-list and long-list: tail-lookup (read-only, no Checker work),

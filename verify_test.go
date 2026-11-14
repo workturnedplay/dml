@@ -119,18 +119,10 @@ func TestVerifyAllFindsViolationsThatBypassedCheckersOnBoltGraph(t *testing.T) {
 		t.Fatalf("VerifyAll() on a valid store: %v", verifyErr)
 	}
 
-	rawErr := g.db.Update(func(btx *bolt.Tx) error {
-		txn, openErr := newBoltTxn(btx)
-		if openErr != nil {
-			return openErr
-		}
+	// No Checker runs for a write made this way.
+	raw := rawBoltGraph{BoltGraph: g}
 
-		// No Checker runs for a write made this way.
-		_, addErr := txn.AddRelationship(p, y)
-
-		return addErr
-	})
-	if rawErr != nil {
+	if _, rawErr := raw.AddRelationship(p, y); rawErr != nil {
 		t.Fatalf("raw write: %v", rawErr)
 	}
 

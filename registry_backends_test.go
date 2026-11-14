@@ -32,10 +32,10 @@ import (
 // that driver) every test uses a bare *Graph, as it always did.
 
 // testGraph is what a registry test needs from a graph: the whole GraphAPI
-// plus the four test-only write methods (defined near the top of
-// main_test.go, and for the other backends next to their types). On *Graph the
-// writes are raw and bypass Checkers; on every other backend each is a
-// one-operation transaction, so Checkers run.
+// plus the four test-only write methods (defined in testutil_test.go and, for
+// the other backends, next to their types). The graph a fixture gets from
+// newTestGraph has raw writes on every backend: they bypass Checkers, so a
+// test can inject data no Checker saw (rawStagedGraph, rawBoltGraph).
 type testGraph interface {
 	GraphAPI
 	GraphStore
@@ -47,6 +47,8 @@ var (
 	_ testGraph = (*stagedGraph)(nil)
 	_ testGraph = (*BoltGraph)(nil)
 	_ testGraph = (*GraphActor)(nil)
+	_ testGraph = rawStagedGraph{}
+	_ testGraph = rawBoltGraph{}
 )
 
 // activeTestBackend is the backend newTestGraph builds. It is the bare *Graph
@@ -54,12 +56,13 @@ var (
 // are not parallel, so a package variable is enough.
 var activeTestBackend = testBackends()[0]
 
-// newTestGraph returns a fresh, empty graph of the active backend. Every
-// registry fixture builds its graph through it.
+// newTestGraph returns a fresh, empty graph of the active backend, with raw
+// direct writes (see testBackend.openRaw). Every registry fixture builds its
+// graph through it.
 func newTestGraph(t *testing.T) testGraph {
 	t.Helper()
 
-	return activeTestBackend.open(t)
+	return activeTestBackend.openRaw(t)
 }
 
 // testFuncName returns the name of the top-level function test, which is the
@@ -81,8 +84,8 @@ func testFuncName(test func(*testing.T)) string {
 func TestRegistriesOnEveryBackend(t *testing.T) {
 	wantTypes := map[string]string{
 		"Graph":       "*dml.Graph",
-		"stagedGraph": "*dml.stagedGraph",
-		"BoltGraph":   "*dml.BoltGraph",
+		"stagedGraph": "dml.rawStagedGraph",
+		"BoltGraph":   "dml.rawBoltGraph",
 	}
 
 	for _, backend := range testBackends() {
@@ -107,13 +110,14 @@ func TestRegistriesOnEveryBackend(t *testing.T) {
 }
 
 // registryTestsOnEveryBackend lists the fixture-based tests that are run
-// against every backend. A test belongs here when its setup writes nothing
-// that a commit-time Checker would decline: the tests that deliberately
-// corrupt a graph out-of-band (the DetectsOutOfBand* ones, most TestAdversarial*,
-// and the like) stay *Graph-only, because they simulate data that never went
-// through this process's Checkers, and the on-read validation they exercise
-// does not depend on the backend. A test that builds its own graph instead of
-// using a fixture would not change backend, so it is not listed.
+// against every backend. The fixtures' direct writes are raw on every backend
+// (newTestGraph), so a test that deliberately corrupts a graph out-of-band
+// (the DetectsOutOfBand* and TestAdversarial* ones) can be listed like any
+// other: its corrupting writes bypass Checkers, simulating data that never
+// went through this process's Checkers, and what it then asserts (on-read
+// validation, registry calls failing loudly) must hold on every backend. A
+// test that builds its own graph instead of using a fixture would not change
+// backend, so it is not listed.
 var registryTestsOnEveryBackend = []func(*testing.T){
 	// PointerRegistry.
 	TestPointerRegistryNewPointerStartsEmpty,
@@ -336,4 +340,33 @@ var registryTestsOnEveryBackend = []func(*testing.T){
 	TestSlottedListLeavesGlobalStructureToReadsAndVerifyStructures,
 	TestSlottedListLookupsDoNotReadTheMembersNode,
 	TestSlottedListDeleteListRemovesEveryNodeItMade,
+
+	// Out-of-band corruption: the fixtures' direct writes are raw on every
+	// backend, so these inject data no Checker saw.
+	TestPointerRegistryDetectsOutOfBandInvariantViolation,
+	TestPointerMetadataRegistryDetectsOutOfBandInvariantViolation,
+	TestPointerMetadataRegistryDDetectsOutOfBandInvariantViolation,
+	TestCapsulesWithValueDetectsAmbiguousCapsuleOwnership,
+	TestAdversarialListHeadAmbiguityFailsLoudly,
+	TestAdversarialListNextCycleIsDetectedWithoutTimeout,
+	TestAdversarialListPrevCycleIsDetectedViaNextChain,
+	TestAdversarialDisconnectedListMemberIsIgnoredByElements,
+	TestAdversarialMissingValueTargetInvalidatesList,
+	TestAdversarialNonEmptyListWithoutTailIsInvalid,
+	TestAdversarialNonEmptyListWithoutHeadIsInvalid,
+	TestAdversarialEmptyListWithBoundaryTagIsInvalid,
+	TestAdversarialListChainCanContainCapsuleFromAnotherList,
+	TestAdversarialDuplicateValueSlotFailsLoudly,
+	TestAdversarialSharedRoleSlotFailsLoudly,
+	TestAdversarialMissingRoleTagMakesCapsuleUndiscoverable,
+	TestAdversarialWrongTaggedChildFailsLoudly,
+	TestAdversarialHeadPointingAtNonCapsuleFailsWhenTraversed,
+	TestAdversarialDuplicatePrevSlotFailsLoudly,
+	TestAdversarialDuplicateNextSlotFailsLoudly,
+	TestAdversarialRoleSlotWithExtraChildFailsLoudly,
+	TestAdversarialCapsuleMultipleRoleViolationsEachDetectedIndependently,
+	TestAdversarialMissingEachCapsuleRoleTagMakesThatRoleUndiscoverable,
+	TestAdversarialSelfReferentialCapsuleValueIsAllowed,
+	TestAdversarialCapsuleInTwoListsIsInvalid,
+	TestCrossRoleCorruptedLoggedOperandDoesNotCorruptSiblingStructures,
 }

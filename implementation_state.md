@@ -659,7 +659,7 @@ NodeID-keyed structure outside the primitive graph.
  unrelated parents of the role-slot node remain allowed; only competing
  capsule ownership is ambiguous and rejected.
 
- The adversarial tests appended to main_test.go cover cycles, broken
+ The adversarial tests (now in list_test.go and capsule_test.go) cover cycles, broken
  Prev/Next reciprocity, cross-list contamination, disconnected members,
  malformed head/tail metadata, missing/invalid role data, duplicate role
  metadata, and related out-of-band graph mutations. The full suite, race
@@ -2294,7 +2294,7 @@ could be called directly.
  Checkers, which on the other backends would decline the corrupting write
  itself, and the on-read validation they test is above GraphReader. A test
  that builds its own graph instead of using a fixture is not affected. A raw
- write path per backend would let those run everywhere too (not done).
+ write path per backend has since been added (item 89), and the out-of-band tests it unlocks run everywhere.
 
 60. Certificate rotation without a host restart (theorystate.md section
  113). ReloadingServerTLS (wire_tls_files.go) keeps the server certificate,
@@ -2951,10 +2951,10 @@ empty commit is the baseline of about 2.7 ms):
  tail) and append. Why this shape: ListRegistry's tail lookup costs about the
  smaller of the list's children and the AllTails hub's (item 68), and the hub
  has one member per non-empty list, so its worst case is a long list among as
- many other lists and the short list is the control. This is a prediction,
- not a result: the benchmark has been written but not yet run, and its
- numbers are not recorded in this file or in theorystate.md (see "Planned
- next"). DRY: benchCommit moved from slotted_list_test.go to
+ many other lists and the short list is the control. That was the
+ prediction; item 88 records the measurements, which bore it out only for
+ touching a list node, and the correction is in theorystate.md section 105a.
+ DRY: benchCommit moved from slotted_list_test.go to
  list_bench_test.go and is used by every list benchmark (BenchmarkListCommitCost
  had its own copy as a local closure), and buildInChunks is the shared
  chunked-transaction loop of buildBenchList and buildCrowd. No production
@@ -2971,23 +2971,98 @@ empty commit is the baseline of about 2.7 ms):
  name main_test.go, section 105a points at item 86, and the Part D
  Operations entry is reworded.
 
+88. Measurements of BenchmarkManyListsCommitCost (item 86), i7-8700K,
+ Windows, no -race, 30 iterations, ms per commit (a full run of 718 s; an
+ interrupted second run agreed: ListRegistry touch-list 43.0 and 544.7 ms at
+ 1,000 and 10,000 lists). An empty commit is 2.6 to 4.1, so differences under
+ about 1.5 are noise. Long list at 1,000 / 10,000 / 100,000 lists:
+   step           ListRegistry                  SlottedListRegistry
+   tail-lookup    2.7 / 2.7 / 2.7               4.4 / 4.4 / 3.5
+   touch-tail     3.0 / 4.4 / 3.1               5.5 / 5.4 / 4.9
+   touch-list     41.4 / 556.2 / 5,559.8        4.7 / 5.1 / 4.3
+   append         5.5 / 6.0 / 6.5               6.9 / 7.4 / 7.5
+ The short list is within noise of an empty commit for every step, except
+ ListRegistry touch-list (3.7 to 4.7, 4,271 to 5,553 allocations: it too
+ validates its whole list, which has 10 elements).
+ (a) touch-list is the decisive case. A commit touching only the list node
+ makes ListRegistry validate the whole list, about 40 to 56 microseconds per
+ element: 361,694 / 4,730,958 / 47,301,669 allocations (15 MB / 258 MB / 2.58
+ GB) for the long list. The slotted list checks head and tail only: 1,280
+ allocations and 74 KB at every size.
+ (b) The prediction of item 86 was not borne out for the tail lookup:
+ ListRegistry's tail-lookup and append do not depend on the number of lists
+ (tail-lookup 125 / 139 / 139 allocations; append about 10.0k / 12.9k /
+ 12.9k). The lookup is a leapfrog join (item 68), whose cost is the number of
+ alternations between the two sorted runs, not the size of the smaller one.
+ The benchmark builds the crowd first and the long list afterwards, so every
+ hub member (the crowd's tails) is below every capsule of the long list and
+ one seek skips them all: the best case. "About the smaller of the two" is an
+ upper bound (times a seek), not the typical cost; the worst case needs
+ interleaved NodeID ranges (lists grown round-robin), which is not measured.
+ Item 73's remark that few lists are ListRegistry's best case was therefore
+ too pessimistic for this layout.
+ (c) The slotted list pays about twice the allocations for the local
+ operations, flat in size: touch-tail 2,907 against 1,453 to 1,868, append
+ about 15.5k against 10.0k to 12.9k, tail-lookup 376 against 125 to 139.
+ Their times differ by less than the noise. ListRegistry's allocation counts
+ step up between 1,000 and 10,000 lists and are flat after (the empty commit
+ does too, 602 to 750: the depth of bolt's tree).
+ Pattern note: -bench splits its pattern at every / and matches each part
+ unanchored, so "ListRegistry" also selects SlottedListRegistry and
+ "lists=1000" also selects 10,000 and 100,000; anchor with ^ and $ (the
+ example in list_bench_test.go and measure.bat were wrong). Not measured:
+ the interleaved layout of (b).
+
+89. Raw writes on every backend (theorystate.md section 97), closing the gap
+ item 59 recorded. The registry fixtures' graphs now have direct write
+ methods (CreateNode, AddRelationship, RemoveRelationship, DeleteNode) that
+ bypass Checkers on every backend, not only on *Graph: newTestGraph builds
+ testBackend.openRaw, which is rawStagedGraph for stagedGraph and
+ rawBoltGraph for BoltGraph. Each embeds the concrete backend pointer, so the
+ unexported optional readers (pagers, readViewer, commonChildrenFinder) stay
+ promoted and the fixtures still exercise the native paths (a wrapper around
+ a GraphAPI interface value would have dropped them). The four methods go
+ through rawBackend.rawWrite (stagedGraph: a fresh overlay published at once;
+ BoltGraph: one bolt update transaction with no Checker pass and no hooks)
+ and are shared as rawValue/rawCreateNode/rawAddRelationship/
+ rawRemoveRelationship/rawDeleteNode. Tests that call newStagedGraph() or
+ newBoltTestGraph directly, and testBackend.open (forEachBackendAndActor,
+ verify_test and others), are unchanged: their direct writes are still
+ one-operation transactions on those backends, so nothing outside the
+ harness changes behaviour. Trade-off: the fixtures' setup writes on staged
+ and Bolt no longer run Checkers (they did since item 36); Checkers still
+ run for every registry method's own Transact and in the Checker tests.
+ 26 tests joined registryTestsOnEveryBackend: 3 pointer, 8 list, 14 capsule
+ and 1 domain-pointer test (the DetectsOutOfBand* and TestAdversarial* ones
+ of pointer_test.go, list_test.go, capsule_test.go and domain_pointer_test.go,
+ plus TestCapsulesWithValueDetectsAmbiguousCapsuleOwnership and
+ TestCrossRoleCorruptedLoggedOperandDoesNotCorruptSiblingStructures).
+ verify_test.go's own raw bolt write now uses rawBoltGraph. Not done: the
+ out-of-band tests in files not yet migrated (see "Planned next"). No
+ production change.
+
 Currently unaddressed yet:
 - Interned text (items 75, 78): "contains" (substring) search is not built (a
   paged scan first, an optional positional index later), and there is no
   DeleteString (only when nothing extends it, nothing refers to it and it has
   no forms; interacts with the prefix index and lists).
-- Planned next, in this order: (1) record the measurements of
-  BenchmarkManyListsCommitCost (item 86) here and in theorystate.md section
-  105a: the benchmark is written, but its numbers are not in the files yet;
-  (2) out-of-band corruption tests on every backend: a raw-write path for
-  stagedGraph and BoltGraph, so the DetectsOutOfBand* and TestAdversarial*
-  tests that are *Graph-only can join registryTestsOnEveryBackend (item 59).
-  Stage 2 of plan-as-data (items 81-84), notes on nodes (item 85) and the
-  docs-drift pass (item 87) are done.
+- Planned next, in this order: (1) move the remaining out-of-band corruption
+  tests onto every backend (item 89 did the pointer, list, capsule and
+  domain-pointer ones; the composite-set tests in set_test.go and any in
+  other files are still *Graph-only: each needs its corrupting writes to be
+  the fixtures' direct writes and an entry in registryTestsOnEveryBackend);
+  (2) a layout for BenchmarkManyListsCommitCost with interleaved NodeID
+  ranges (lists grown round-robin), the one case in which ListRegistry's tail
+  lookup could still depend on the number of lists (item 88). Stage 2 of
+  plan-as-data (items 81-84), notes on nodes (item 85), the docs-drift pass
+  (item 87), the many-lists measurements (item 88) and raw writes on every
+  backend (item 89) are done.
 - ListRegistry.Append finds the tail as the child its list shares with the
-  AllTails hub (item 68), so it costs about the smaller of the two child sets:
-  fine with few lists, linear in the number of non-empty lists when there are
-  many (item 73). SlottedListRegistry (item 72) does not have that dependence.
+  AllTails hub (item 68), by a leapfrog join whose cost is bounded by about
+  the smaller of the two child sets (times a seek). Measured with a crowd of
+  up to 100,000 other lists (item 88) it did not depend on the number of
+  lists; only a layout with interleaved NodeID ranges could make it.
+  SlottedListRegistry (item 72) does not have that dependence at all.
 - Paged reads beyond a single node's own outgoing/incoming edges
   (theorystate.md section 105, items 43/46): FindRelationships and
   rootReader.FindRelationships are still O(graph) on BoltGraph, as

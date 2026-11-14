@@ -846,6 +846,49 @@ func (g *stagedGraph) DeleteNode(id NodeID) error {
 	return deleteNodeVia(g, id)
 }
 
+// rawWrite implements rawBackend (see testutil_test.go): step runs against a
+// fresh overlay that is published at once, so the write is applied exactly as
+// a committed attempt would apply it, but with no Checker pass, no
+// forceConflict and no hooks. The overlay supplies the same existence and
+// delete-only-if-empty rules every other write has.
+func (g *stagedGraph) rawWrite(step func(w txOps) error) error {
+	release := g.guard.acquire()
+	defer release()
+
+	ov := newStagedOverlay(g)
+
+	if stepErr := step(ov); stepErr != nil {
+		return wrapInterfaceErr(stepErr)
+	}
+
+	g.publish(ov)
+
+	return nil
+}
+
+// rawStagedGraph is the stagedGraph the registry fixtures get (see
+// testBackends): a *stagedGraph whose four direct write methods bypass
+// Checkers. Embedding the pointer keeps every other method promoted.
+type rawStagedGraph struct {
+	*stagedGraph
+}
+
+func (g rawStagedGraph) CreateNode() (NodeID, error) {
+	return rawCreateNode(g)
+}
+
+func (g rawStagedGraph) AddRelationship(a, b NodeID) (bool, error) {
+	return rawAddRelationship(g, a, b)
+}
+
+func (g rawStagedGraph) RemoveRelationship(a, b NodeID) (bool, error) {
+	return rawRemoveRelationship(g, a, b)
+}
+
+func (g rawStagedGraph) DeleteNode(id NodeID) error {
+	return rawDeleteNode(g, id)
+}
+
 // Transact implements Transactor for a staged attempt already in
 // progress: fn runs as a nested transaction, a savepoint over this same
 // overlay, mirroring Txn.Transact exactly (theorystate.md section 45) --
