@@ -7,3 +7,7 @@
 bin/
 *-key.pem
 *.png
+split_main.go
+before.txt
+after.txt
+
