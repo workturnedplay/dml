@@ -369,4 +369,13 @@ var registryTestsOnEveryBackend = []func(*testing.T){
 	TestAdversarialSelfReferentialCapsuleValueIsAllowed,
 	TestAdversarialCapsuleInTwoListsIsInvalid,
 	TestCrossRoleCorruptedLoggedOperandDoesNotCorruptSiblingStructures,
+	TestCompositeSetEvaluateDetectsMalformedDescriptor,
+	TestCompositeSetLogRegistrySharesOperandDescriptorChecker,
+	TestListCheckerLeavesGlobalStructureToReadsAndVerifyStructures,
+	TestListCheckerDeclinesACapsuleLinkedIntoASecondList,
+	TestNameRegistryEnsureNamedNodeFailsOnStaleBinding,
+	TestNameRegistryCreateNamedNodeFailsOnStaleBinding,
+	TestNameRegistryBindFailsOnStaleBindingToDifferentNode,
+	TestBootstrapNamesFailsOnStaleBinding,
+	TestNameRegistryVerifyBindings,
 }

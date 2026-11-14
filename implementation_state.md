@@ -3037,26 +3037,39 @@ empty commit is the baseline of about 2.7 ms):
  of pointer_test.go, list_test.go, capsule_test.go and domain_pointer_test.go,
  plus TestCapsulesWithValueDetectsAmbiguousCapsuleOwnership and
  TestCrossRoleCorruptedLoggedOperandDoesNotCorruptSiblingStructures).
- verify_test.go's own raw bolt write now uses rawBoltGraph. Not done: the
- out-of-band tests in files not yet migrated (see "Planned next"). No
- production change.
+ verify_test.go's own raw bolt write now uses rawBoltGraph. The rest of
+ the out-of-band tests are item 90. No production change.
+
+90. The remaining out-of-band tests that use a fixture graph run on every
+ backend (item 89's raw writes). Nine joined registryTestsOnEveryBackend:
+ TestCompositeSetEvaluateDetectsMalformedDescriptor and
+ TestCompositeSetLogRegistrySharesOperandDescriptorChecker (set_test.go; the
+ second one's setup writes were declined by the operand-descriptor Checker
+ on staged and Bolt before the raw writes), two list Checker tests that had
+ only been missed (TestListCheckerLeavesGlobalStructureToReadsAndVerifyStructures,
+ TestListCheckerDeclinesACapsuleLinkedIntoASecondList), and the five
+ NameRegistry stale-binding tests (names_test.go: a raw node delete that
+ bypasses NameRegistry.DeleteNode), which built their own bare Graph and
+ now use newTestGraph. DRY: bindThenDeleteRaw is the shared "bind a name,
+ then raw-delete its node" setup of four of them. Left as they are on
+ purpose: tests that build their own graph for a reason (constructor
+ argument checks, the TestSubPointerReusesPointerRegistryUnderDifferentTag
+ and TestCapsuleRoleSlotsAreNotTaggedWithGenericAllPointers ones), the
+ GraphActor/RootGraph tests, and the backend-specific files (actor, bolt,
+ staged, graph, root, paging, verify). No production change.
 
 Currently unaddressed yet:
 - Interned text (items 75, 78): "contains" (substring) search is not built (a
   paged scan first, an optional positional index later), and there is no
   DeleteString (only when nothing extends it, nothing refers to it and it has
   no forms; interacts with the prefix index and lists).
-- Planned next, in this order: (1) move the remaining out-of-band corruption
-  tests onto every backend (item 89 did the pointer, list, capsule and
-  domain-pointer ones; the composite-set tests in set_test.go and any in
-  other files are still *Graph-only: each needs its corrupting writes to be
-  the fixtures' direct writes and an entry in registryTestsOnEveryBackend);
-  (2) a layout for BenchmarkManyListsCommitCost with interleaved NodeID
-  ranges (lists grown round-robin), the one case in which ListRegistry's tail
-  lookup could still depend on the number of lists (item 88). Stage 2 of
-  plan-as-data (items 81-84), notes on nodes (item 85), the docs-drift pass
-  (item 87), the many-lists measurements (item 88) and raw writes on every
-  backend (item 89) are done.
+- Planned next: a layout for BenchmarkManyListsCommitCost with interleaved
+  NodeID ranges (lists grown round-robin), the one case in which
+  ListRegistry's tail lookup could still depend on the number of lists (item
+  88). Stage 2 of plan-as-data (items 81-84), notes on nodes (item 85), the
+  docs-drift pass (item 87), the many-lists measurements (item 88), raw
+  writes on every backend (item 89) and the out-of-band test migration (item
+  90) are done.
 - ListRegistry.Append finds the tail as the child its list shares with the
   AllTails hub (item 68), by a leapfrog join whose cost is bounded by about
   the smaller of the two child sets (times a seek). Measured with a crowd of
