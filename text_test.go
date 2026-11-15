@@ -19,6 +19,7 @@ package dml
 import (
 	"errors"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -716,6 +717,313 @@ func TestTextDeleteStringRollsBackWithTheEnclosingTransaction(t *testing.T) {
 
 		if indexed, indexedErr := rig.text.IsIndexed(rig.graph, cat); indexedErr != nil || !indexed {
 			t.Fatalf("IsIndexed(cat) after the rollback = (%v,%v), want (true,nil)", indexed, indexedErr)
+		}
+	})
+}
+
+// collectContaining runs StringsContaining page by page, asking for limit
+// matches per call, until Done. It returns every match and the number of
+// calls, and checks that the matches are ascending and that every call made
+// progress.
+func (rig *textRig) collectContaining(t *testing.T, substr string, limit int, indexedOnly bool) ([]NodeID, int) {
+	t.Helper()
+
+	var (
+		matches []NodeID
+		cursor  TextCursor
+	)
+
+	for calls := 1; calls <= 1000; calls++ {
+		page, err := rig.text.StringsContaining(rig.graph, substr, cursor, limit, indexedOnly)
+		if err != nil {
+			t.Fatalf("StringsContaining(%q): %v", substr, err)
+		}
+
+		matches = append(matches, page.Matches...)
+
+		if page.Done {
+			if !slices.IsSorted(matches) {
+				t.Fatalf("StringsContaining(%q) matches %v are not ascending", substr, matches)
+			}
+
+			return matches, calls
+		}
+
+		if page.Cursor == cursor {
+			t.Fatalf("StringsContaining(%q) made no progress from %v", substr, cursor)
+		}
+
+		cursor = page.Cursor
+	}
+
+	t.Fatalf("StringsContaining(%q) was not Done after 1000 calls", substr)
+
+	return nil, 0
+}
+
+func TestTextStringsContainingFindsEveryStringWithTheSubstring(t *testing.T) {
+	forEachTextRig(t, func(t *testing.T, rig *textRig) {
+		rig.intern(t, "cat")
+		rig.intern(t, "hat")
+		rig.intern(t, "car")
+
+		// "", "t", "at", "cat", "hat", "r", "ar", "car": the stepping stones
+		// exist already, so interning them again creates nothing.
+		rig.requireStrings(t, 8)
+
+		node := func(text string) NodeID { return rig.intern(t, text) }
+
+		cases := []struct {
+			substr string
+			want   []NodeID
+		}{
+			{substr: "at", want: []NodeID{node("at"), node("cat"), node("hat")}},
+			{substr: "a", want: []NodeID{node("at"), node("cat"), node("hat"), node("ar"), node("car")}},
+			{substr: "ca", want: []NodeID{node("cat"), node("car")}},
+			{substr: "ar", want: []NodeID{node("ar"), node("car")}},
+			{substr: "t", want: []NodeID{node("t"), node("at"), node("cat"), node("hat")}},
+			{substr: "cat", want: []NodeID{node("cat")}},
+			{substr: "catx"},
+			{substr: "zzz"},
+			{substr: "", want: []NodeID{
+				rig.text.EmptyString(), node("t"), node("at"), node("cat"), node("hat"),
+				node("r"), node("ar"), node("car"),
+			}},
+		}
+
+		for _, tc := range cases {
+			got, _ := rig.collectContaining(t, tc.substr, 100, false)
+
+			requireSameNodes(t, "StringsContaining("+tc.substr+")", got, tc.want)
+		}
+
+		// Searching creates nothing, not even the char of a text never used.
+		rig.requireStrings(t, 8)
+
+		if _, ok := rig.names.Lookup(charName('z')); ok {
+			t.Fatal("StringsContaining() created the char node of 'z'")
+		}
+	})
+}
+
+func TestTextStringsContainingFindsSubstringsInTheMiddleAndOverlapping(t *testing.T) {
+	forEachTextRig(t, func(t *testing.T, rig *textRig) {
+		rig.intern(t, "banana")
+
+		// "", "a", "na", "ana", "nana", "anana", "banana".
+		node := func(text string) NodeID { return rig.intern(t, text) }
+
+		cases := []struct {
+			substr string
+			want   []NodeID
+		}{
+			{substr: "nan", want: []NodeID{node("nana"), node("anana"), node("banana")}},
+			{substr: "ana", want: []NodeID{node("ana"), node("nana"), node("anana"), node("banana")}},
+			// Two occurrences of "ana" overlap in "anana"; "anan" is only in the
+			// two strings long enough to hold it.
+			{substr: "anan", want: []NodeID{node("anana"), node("banana")}},
+			{substr: "banana", want: []NodeID{node("banana")}},
+			{substr: "bananas"},
+		}
+
+		for _, tc := range cases {
+			got, _ := rig.collectContaining(t, tc.substr, 100, false)
+
+			requireSameNodes(t, "StringsContaining("+tc.substr+")", got, tc.want)
+		}
+	})
+}
+
+// TestTextStringsContainingMatchesWholeRunesNotBytes checks multi-byte text
+// against a model: every suffix of the text, tested with strings.Contains.
+func TestTextStringsContainingMatchesWholeRunesNotBytes(t *testing.T) {
+	forEachTextRig(t, func(t *testing.T, rig *textRig) {
+		const text = "héllo 日本!"
+
+		rig.intern(t, text)
+
+		runes := []rune(text)
+
+		for _, substr := range []string{"日本", "é", "o 日", "本!"} {
+			var want []NodeID
+
+			for i := range runes {
+				suffix := string(runes[i:])
+				if strings.Contains(suffix, substr) {
+					want = append(want, rig.intern(t, suffix))
+				}
+			}
+
+			got, _ := rig.collectContaining(t, substr, 100, false)
+
+			requireSameNodes(t, "StringsContaining("+substr+")", got, want)
+		}
+	})
+}
+
+func TestTextStringsContainingPagesWithAResumeCursor(t *testing.T) {
+	forEachTextRig(t, func(t *testing.T, rig *textRig) {
+		rig.intern(t, "cat")
+		rig.intern(t, "hat")
+		rig.intern(t, "car")
+
+		all, allCalls := rig.collectContaining(t, "a", 100, false)
+		if len(all) != 5 || allCalls != 1 {
+			t.Fatalf("one big page = (%v, %d calls), want 5 matches in 1 call", all, allCalls)
+		}
+
+		for _, limit := range []int{1, 2, 3} {
+			got, calls := rig.collectContaining(t, "a", limit, false)
+
+			if !reflect.DeepEqual(got, all) {
+				t.Fatalf("limit %d found %v, want %v in the same order", limit, got, all)
+			}
+
+			if minCalls := (len(all) + limit - 1) / limit; calls < minCalls {
+				t.Fatalf("limit %d took %d calls, want at least %d", limit, calls, minCalls)
+			}
+		}
+
+		// A page never holds more than limit matches, and a cursor past the
+		// last string finds nothing and is Done.
+		page, err := rig.text.StringsContaining(rig.graph, "a", TextCursor{}, 2, false)
+		if err != nil || len(page.Matches) != 2 || page.Done {
+			t.Fatalf("first page = (%+v,%v), want two matches and not Done", page, err)
+		}
+
+		last := all[len(all)-1]
+
+		end, err := rig.text.StringsContaining(rig.graph, "a", TextCursor{After: last, HasAfter: true}, 2, false)
+		if err != nil || len(end.Matches) != 0 || !end.Done {
+			t.Fatalf("page after the last string = (%+v,%v), want no matches and Done", end, err)
+		}
+	})
+}
+
+func TestTextStringsContainingBoundsTheWorkOfOneCall(t *testing.T) {
+	forEachTextRig(t, func(t *testing.T, rig *textRig) {
+		rig.intern(t, "cat")
+		rig.intern(t, "hat")
+		rig.intern(t, "car")
+		rig.requireStrings(t, 8)
+
+		previous := containingScanLimit
+		containingScanLimit = 3
+
+		t.Cleanup(func() { containingScanLimit = previous })
+
+		// Nothing matches, yet one call stops after 3 of the 8 strings and says
+		// the scan is not over.
+		page, err := rig.text.StringsContaining(rig.graph, "zzz", TextCursor{}, 10, false)
+		if err != nil || len(page.Matches) != 0 || page.Done || !page.Cursor.HasAfter {
+			t.Fatalf("first call = (%+v,%v), want no matches, not Done, a cursor", page, err)
+		}
+
+		none, calls := rig.collectContaining(t, "zzz", 10, false)
+		if len(none) != 0 || calls != 3 {
+			t.Fatalf("scan for a missing substring = (%v, %d calls), want no matches in 3 calls", none, calls)
+		}
+
+		// The bound loses no match.
+		got, _ := rig.collectContaining(t, "a", 10, false)
+		if len(got) != 5 {
+			t.Fatalf("StringsContaining(a) under a scan limit of 3 found %d, want 5", len(got))
+		}
+	})
+}
+
+func TestTextStringsContainingIndexedOnlyScansTheMarkedStrings(t *testing.T) {
+	forEachTextRig(t, func(t *testing.T, rig *textRig) {
+		cat := rig.internIndexed(t, "cat")
+		hat := rig.intern(t, "hat")
+		at := rig.intern(t, "at")
+
+		got, _ := rig.collectContaining(t, "at", 10, true)
+		requireSameNodes(t, "indexed only", got, []NodeID{cat})
+
+		got, _ = rig.collectContaining(t, "at", 10, false)
+		requireSameNodes(t, "every string", got, []NodeID{at, cat, hat})
+
+		if _, err := rig.text.MarkIndexed(rig.graph, at); err != nil {
+			t.Fatalf("MarkIndexed(at): %v", err)
+		}
+
+		got, _ = rig.collectContaining(t, "at", 10, true)
+		requireSameNodes(t, "indexed only after marking at", got, []NodeID{at, cat})
+
+		if _, err := rig.text.UnmarkIndexed(rig.graph, cat); err != nil {
+			t.Fatalf("UnmarkIndexed(cat): %v", err)
+		}
+
+		got, _ = rig.collectContaining(t, "at", 10, true)
+		requireSameNodes(t, "indexed only after unmarking cat", got, []NodeID{at})
+	})
+}
+
+func TestTextStringsContainingRejectsBadInputAndHonoursANonPositiveLimit(t *testing.T) {
+	forEachTextRig(t, func(t *testing.T, rig *textRig) {
+		rig.intern(t, "cat")
+
+		if _, err := rig.text.StringsContaining(rig.graph, "\xff", TextCursor{}, 10, false); !errors.Is(err, ErrInvalidText) {
+			t.Fatalf("StringsContaining(invalid UTF-8) error = %v, want %v", err, ErrInvalidText)
+		}
+
+		tooLong := strings.Repeat("a", MaxTextRunes+1)
+		if _, err := rig.text.StringsContaining(rig.graph, tooLong, TextCursor{}, 10, false); !errors.Is(err, ErrTextTooLong) {
+			t.Fatalf("StringsContaining(too long) error = %v, want %v", err, ErrTextTooLong)
+		}
+
+		from := TextCursor{After: 5, HasAfter: true}
+
+		for _, limit := range []int{0, -1} {
+			page, err := rig.text.StringsContaining(rig.graph, "a", from, limit, false)
+			if err != nil || len(page.Matches) != 0 || page.Done || page.Cursor != from {
+				t.Fatalf("limit %d = (%+v,%v), want nothing, not Done, the cursor unchanged", limit, page, err)
+			}
+		}
+	})
+}
+
+// TestTextStringsContainingSeesTheEnclosingTransaction: inside a transaction
+// the scan sees the transaction's own writes, and they are gone after it
+// rolls back.
+func TestTextStringsContainingSeesTheEnclosingTransaction(t *testing.T) {
+	forEachTextRig(t, func(t *testing.T, rig *textRig) {
+		rig.intern(t, "cat")
+
+		errOuter := errors.New("outer failure")
+
+		var (
+			dog    NodeID
+			inside []NodeID
+		)
+
+		err := rig.graph.Transact(func(tx Tx) error {
+			node, internErr := rig.text.Intern(tx, "dog")
+			if internErr != nil {
+				return internErr
+			}
+
+			dog = node
+
+			page, searchErr := rig.text.StringsContaining(tx, "do", TextCursor{}, 10, false)
+			if searchErr != nil {
+				return searchErr
+			}
+
+			inside = page.Matches
+
+			return errOuter
+		})
+		if !errors.Is(err, errOuter) {
+			t.Fatalf("Transact() error = %v, want %v", err, errOuter)
+		}
+
+		requireSameNodes(t, "matches inside the transaction", inside, []NodeID{dog})
+
+		after, _ := rig.collectContaining(t, "do", 10, false)
+		if len(after) != 0 {
+			t.Fatalf("StringsContaining(do) after the rollback = %v, want none", after)
 		}
 	})
 }

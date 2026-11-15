@@ -28,7 +28,7 @@ import (
 
 // TestMain enables GraphActor's debug-only reentrancy tripwire
 // (theorystate.md section 90) for this entire test binary, so any test
-// anywhere in this file that reintroduces the misplaced-storage bug
+// anywhere in this package that reintroduces the misplaced-storage bug
 // class the tripwire exists to catch -- a registry reading through a
 // stored graph reference instead of through the tx/g value it was
 // actually handed -- panics loudly and immediately instead of hanging
@@ -285,11 +285,6 @@ func mustCreateNode(t *testing.T, api Transactor) NodeID {
 
 	return id
 }
-
-// The following tests cover theorystate.md section 86: a domain
-// pointer's validity depends on its domain's membership, so the shared
-// commit-time domain Checker must decline any transaction that would
-// strand a pointer outside its domain, for both Representation B and D.
 
 // newTestNode creates a fresh node in g, failing t on error.
 func newTestNode(t *testing.T, g testGraph) NodeID {

@@ -55,7 +55,7 @@ scripts (*.bat) have not been seen directly.
   reconciler.go: hostResource, the reconciler.
 - registry_helpers.go: bindNames, taggedCheck, registerTaggedChecker.
 - slotted_list.go: SlottedListRegistry.
-- text.go: TextRegistry (interned string trie, prefix index).
+- text.go: TextRegistry (interned string trie, prefix index, substring scan).
 - text_forms.go: TextFormRegistry (text lists, forms, FormsContaining/TextsContaining).
 - fields.go: FieldRegistry (records with named fields, Owners).
 - scope.go: ScopeRegistry (ScopePath, Allow/Deny/Revoke/Allowed).

@@ -960,6 +960,134 @@ func (t *TextRegistry) IndexedWithPrefix(graph GraphReader, prefix string, limit
 	return matches, nil
 }
 
+// containingFetchSize is how many hub children StringsContaining reads from
+// the pager at a time.
+const containingFetchSize = 256
+
+// containingScanLimit is the most strings one StringsContaining call
+// examines. It is a var, not a const, so tests can shrink it. Each string
+// costs a walk up the trie (its length, at most MaxTextRunes), so this bounds
+// the work of one call.
+var containingScanLimit = 10000
+
+// TextCursor says where a StringsContaining scan resumes: after the string
+// with NodeID After. The zero value starts at the beginning. HasAfter is a
+// separate flag because NodeID 0 is a valid cursor.
+type TextCursor struct {
+	After    NodeID
+	HasAfter bool
+}
+
+// TextSearchPage is one page of StringsContaining.
+//
+// Matches are in ascending NodeID order. Cursor is the last string the call
+// examined (a match or not), and passing it to the next call continues the
+// scan. Done is true once the scan has reached the end, in which case there
+// is nothing more to fetch; it can be false for a page that happened to end
+// exactly at the end, and the next call then returns no matches and Done.
+type TextSearchPage struct {
+	Matches []NodeID
+	Cursor  TextCursor
+	Done    bool
+}
+
+// StringsContaining returns up to limit strings whose text contains substr,
+// scanning from the cursor from (the zero TextCursor starts at the
+// beginning), in ascending NodeID order. It is a scan, not an index: the cost
+// is the number of strings times their length, so one call examines at most
+// containingScanLimit strings and may return fewer than limit matches while
+// the scan is not Done. Loop with the returned Cursor until Done.
+//
+// With indexedOnly only strings marked with MarkIndexed are scanned (the
+// AllIndexedStrings hub's children, so the scan is bounded by how many were
+// marked on purpose); otherwise every string is, including the stepping
+// stones Intern created, like EndingWith with indexedOnly false. An empty
+// substr matches every scanned string, the empty string included. A
+// non-positive limit returns nothing and leaves the cursor as it was.
+//
+// One call reads inside one view (readView), so its own reads agree. Between
+// calls the view can shift: a string created or deleted meanwhile may be
+// missed or skipped, which is acceptable for browsing and searching. On a
+// reader with no native pager every call reads the hub's children in full once.
+// A malformed string stops the scan with ErrInvalidTextStructure instead of
+// being skipped.
+func (t *TextRegistry) StringsContaining(graph GraphReader, substr string, from TextCursor, limit int, indexedOnly bool) (TextSearchPage, error) {
+	if _, validateErr := validateText(substr); validateErr != nil {
+		return TextSearchPage{}, validateErr
+	}
+
+	if limit <= 0 {
+		return TextSearchPage{Cursor: from}, nil
+	}
+
+	hub := t.allStrings
+	if indexedOnly {
+		hub = t.allIndexedStrings
+	}
+
+	var page TextSearchPage
+
+	viewErr := readView(graph, func(reader GraphReader) error {
+		var scanErr error
+
+		page, scanErr = t.scanContaining(reader, hub, substr, from, limit)
+
+		return scanErr
+	})
+	if viewErr != nil {
+		return TextSearchPage{}, wrapInterfaceErr(viewErr)
+	}
+
+	return page, nil
+}
+
+// scanContaining is the body of StringsContaining, over the reader of one
+// view: it walks the children of hub from the cursor, reads each string back
+// and keeps those containing substr, until limit matches or
+// containingScanLimit examined strings.
+func (t *TextRegistry) scanContaining(reader GraphReader, hub NodeID, substr string, from TextCursor, limit int) (TextSearchPage, error) {
+	pages := outgoingPages(reader, hub, containingFetchSize)
+	pages.after, pages.hasAfter = from.After, from.HasAfter
+
+	page := TextSearchPage{Cursor: from}
+	examined := 0
+
+	for {
+		batch, nextErr := pages.next()
+		if nextErr != nil {
+			return TextSearchPage{}, nextErr
+		}
+
+		if len(batch) == 0 {
+			page.Done = true
+
+			return page, nil
+		}
+
+		for i, rel := range batch {
+			runes, runesErr := t.runesOf(reader, rel.To)
+			if runesErr != nil {
+				return TextSearchPage{}, runesErr
+			}
+
+			examined++
+			page.Cursor = TextCursor{After: rel.To, HasAfter: true}
+
+			if strings.Contains(string(runes), substr) {
+				page.Matches = append(page.Matches, rel.To)
+			}
+
+			if len(page.Matches) >= limit || examined >= containingScanLimit {
+				// A short batch (the iterator is done) that ends here is the
+				// end of the scan.
+				page.Done = pages.done && i == len(batch)-1
+
+				return page, nil
+			}
+		}
+	}
+}
+
 // ---------------------------------------------------------------------
 // Commit-time Checker. Local: it costs time proportional to what the
 // transaction touched. A cycle longer than a self-loop in the string chain

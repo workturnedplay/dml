@@ -3147,16 +3147,54 @@ empty commit is the baseline of about 2.7 ms):
  TestNoteStringIsDeletableOnlyWhileNoNoteUsesIt. Not done: automatic
  reclamation of unused strings and of orphaned stepping-stone suffixes.
 
+95. Substring ("contains") search over interned text (theorystate.md section
+ 114), in text.go. TextRegistry.StringsContaining(graph, substr, from, limit,
+ indexedOnly) is a paged scan: it walks the children of the AllStrings hub
+ (or of AllIndexedStrings with indexedOnly, which is bounded by what was
+ marked on purpose) in ascending NodeID order through outgoingPages, reads
+ each string back with runesOf and keeps those for which strings.Contains
+ holds. The result is a TextSearchPage: Matches, a Cursor (the last string
+ examined, match or not, so a resume never rescans) and Done. TextCursor's
+ zero value starts at the beginning; HasAfter is a separate flag because NodeID
+ 0 is a valid cursor. The iterator's after/hasAfter are set from the cursor, so
+ it works over a native pager and over the one-full-read fallback alike. One
+ call stops at limit matches or after containingScanLimit (a var, 10,000)
+ strings, so its work is bounded even when few strings match; a page may then
+ hold fewer than limit matches while Done is false, and the caller loops. It
+ reads inside one readView, so a call's own reads agree; between calls the
+ view can shift (accepted, as for VerifyAll). An empty substring matches every
+ scanned string; a non-positive limit returns nothing with the cursor
+ unchanged; text is validated like Intern's (ErrInvalidText, ErrTextTooLong);
+ a malformed string fails the scan with ErrInvalidTextStructure. Searching
+ creates nothing (no strings, no chars). Cost is the number of strings times
+ their length (a walk up the trie per string); on a reader with no native
+ pager each call reads the hub's children in full once. Not built: a
+ positional index (only if this scan proves too slow), a result ordered by
+ length, and a substring search over the form lists. Also fixed: two stale
+ comments in testutil_test.go (a paragraph about domain-staleness tests above
+ newTestNode, and "in this file" in TestMain's doc). Covered, in text_test.go
+ (every backend), by TestTextStringsContainingFindsEveryStringWithTheSubstring,
+ ...FindsSubstringsInTheMiddleAndOverlapping,
+ ...MatchesWholeRunesNotBytes, ...PagesWithAResumeCursor,
+ ...BoundsTheWorkOfOneCall, ...IndexedOnlyScansTheMarkedStrings,
+ ...RejectsBadInputAndHonoursANonPositiveLimit and
+ ...SeesTheEnclosingTransaction.
+
 Currently unaddressed yet:
-- Interned text (items 75, 78, 94): "contains" (substring) search is not built (a
-  paged scan first, an optional positional index later). Strings are deleted
-  one at a time (DeleteString); nothing reclaims unused strings or orphaned
+- Interned text (items 75, 78, 94, 95): substring search is a scan (item 95);
+  an optional positional index is not built. Strings are deleted one at a
+  time (DeleteString); nothing reclaims unused strings or orphaned
   stepping-stone suffixes automatically.
 - Planned next, in this order:
-  (1) Substring ("contains") search over interned text: a paged scan first,
-  an optional positional index later (theorystate.md section 114). Files:
-  text.go, text_test.go, this file and theorystate.md section 114.
-  Done: DeleteString (item 94), stage 2 of plan-as-data (items 81-84), notes on nodes (item 85), the
+  (1) Reclaiming unused strings (theorystate.md section 114): a bounded
+  operation that deletes strings nothing needs (no extension, form, referrer
+  or index mark), so stepping stones left behind by DeleteString go too. A
+  tail is always created before its extensions and IDs are never reused, so
+  deleting in descending NodeID order is bottom-up, but the pagers only go
+  ascending: either repeat ascending passes until one deletes nothing, or add
+  a descending pager. Files: text.go, text_test.go, paging.go, tx_helpers.go,
+  this file and theorystate.md section 114.
+  Done: substring search (item 95), DeleteString (item 94), stage 2 of plan-as-data (items 81-84), notes on nodes (item 85), the
   docs-drift pass (item 87), the many-lists measurements (item 88), raw
   writes on every backend (item 89), the out-of-band test migration (item
   90), and the interleaved-layout benchmark with its measurements (items 91

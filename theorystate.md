@@ -4197,6 +4197,29 @@ string nodes.
 
 Limits: 4096 runes per text, invalid UTF-8 is rejected.
 
+**Substring search (StringsContaining, implemented).** "Contains" is a scan over
+the string nodes, not an index: the trie gives a node its tail and first char,
+never its middle, so a substring has no node to be looked up from. The scan
+walks the children of the AllStrings hub (or of AllIndexedStrings when only
+the strings marked on purpose are wanted, so its cost follows what was marked)
+in ascending NodeID order, reads each string back by walking up the trie and
+tests it. Choices:
+- The cursor is the last string examined, not the last match, so resuming
+  never rescans; one call stops at a match limit or at a bound on strings
+  examined (a few matches must not mean an unbounded call), and the caller
+  loops until the page says it is done.
+- A call reads inside one read view, so its own reads agree; between calls the
+  view can shift, which is acceptable for browsing and not for an exact
+  point-in-time answer (the same stance as §105's sweeps).
+- Results come in NodeID order, not by length or relevance. The stepping
+  stones Intern created are strings and are matched like any other, unless
+  only the indexed ones are asked for.
+- The cost is strings times length per full scan. A positional index (an index
+  node per position, like the prefix index but over every suffix start) would
+  answer in time proportional to the matches, at a cost in nodes proportional
+  to the total text length per indexed string; it is not built, and would
+  be optional, for marked strings only, if this scan ever proves too slow.
+
 **Deleting a string (DeleteString, implemented).** A string is deleted by
 removing its three structural edges (AllStrings tag, tail edge, StartsWith
 edge) and the node, in one transaction, after unmarking it from the prefix
@@ -4274,8 +4297,8 @@ implementation_state.md item 78): the trie stays, forms hang off its nodes.**
 - The form list is the TextList of the backlog: an ordered slotted list whose
   values must be string nodes.
 - Queries: exact lookup and suffix search are served by the trie, prefix search
-  by the index for marked strings, "contains" by a paged scan for now (an
-  optional positional index later). Walks over a trie node's children
+  by the index for marked strings, "contains" by a paged scan (StringsContaining,
+  implemented: see "Substring search" below; an optional positional index later). Walks over a trie node's children
   (EndingWith) must filter by the AllStrings tag once the slot exists.
 - Rejected: separate group nodes (redundant), forms as direct children of the
   trie node (crowds it), forms on index entries (wrong lifetime), a scan as the
