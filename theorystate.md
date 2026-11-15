@@ -4232,7 +4232,39 @@ string is the root and cannot be deleted. Only the one string goes: the
 suffixes Intern created as stepping stones stay until deleted themselves, and
 char nodes are never deleted. Deleting a string is therefore bottom-up: first
 what extends it, its forms (DeleteForm), the notes and list elements that use it.
-Automatic reclamation of unused strings is not done.
+Reclaiming the unused ones in bulk is ReclaimStrings, below; nothing runs it
+automatically.
+
+**Reclaiming unused strings (ReclaimStrings, implemented).** The bulk
+counterpart of DeleteString: it deletes the strings nothing needs, so the
+stepping stones left behind by DeleteString go too. Choices:
+- A string is reclaimable when DeleteString would succeed on it (no
+  extension, no form, no referrer) and it is not marked with MarkIndexed.
+  Marked strings are kept on purpose, so reclaim never unmarks; the empty
+  string and the char nodes are never reclaimed. "In use" has one definition:
+  the unlink-and-delete step is shared with DeleteString.
+- After a string is deleted its tail may have become unused, so the tail is
+  tried next, and so on up the chain while each is unused. A tail is created
+  before its extensions and IDs are never reused, so a tail's NodeID is always
+  the smaller; one ascending pass over the AllStrings hub then reclaims every
+  reclaimable string, because the last of a string's extensions to go is the
+  one that reaches it, whichever call that is in. The chain follows only
+  strictly smaller NodeIDs, so it never deletes ahead of the scan cursor and a
+  malformed chain ends instead of looping.
+- Rejected: repeated ascending passes until one deletes nothing (a chain of L
+  strings needs L passes) and a descending pager (a new native read on every
+  backend, for an order the chain walk already provides).
+- Each candidate costs two cheap reads (marked? any child?) before any write,
+  then the delete runs in a nested savepoint, so a string something refers to
+  is left exactly as it was.
+- Bounded like the other scans: one call is one transaction, stops after
+  `limit` strings examined or `limit` deleted, and finishes the chain it is in
+  (at most MaxTextRunes strings, the size of one Intern), because nothing would
+  revisit a tail it skipped. The cursor is the last string examined, and the
+  walk is the same one StringsContaining uses.
+- Between calls the view can shift: a string that becomes unused below the
+  cursor waits for the next scan from the start; one created meanwhile is
+  found, since NodeIDs only grow.
 
 **Alternative considered (superseded by the decision below).**
 The suffix trie gives one canonical node per text only among trie nodes: an

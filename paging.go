@@ -256,6 +256,15 @@ func outgoingPages(reader GraphReader, from NodeID, limit int) *pageIterator[Rel
 	return it
 }
 
+// hasOutgoing reports whether node has at least one outgoing relationship. It
+// reads a page of one, so with a native pager it does not read every child
+// whatever the node's fan-out.
+func hasOutgoing(reader GraphReader, node NodeID) (bool, error) {
+	page, err := outgoingPages(reader, node, 1).next()
+
+	return len(page) > 0, err
+}
+
 // incomingPages is outgoingPages' mirror for to's own incoming
 // relationships, sorted by source.
 func incomingPages(reader GraphReader, to NodeID, limit int) *pageIterator[Relationship] {

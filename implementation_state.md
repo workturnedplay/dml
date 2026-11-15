@@ -3180,21 +3180,46 @@ empty commit is the baseline of about 2.7 ms):
  ...RejectsBadInputAndHonoursANonPositiveLimit and
  ...SeesTheEnclosingTransaction.
 
+ 96. Reclaiming unused strings (theorystate.md section 114), in text.go.
+ TextRegistry.ReclaimStrings(graph, from, limit) deletes the strings nothing
+ needs: not marked with MarkIndexed, nothing extends them, no forms, no other
+ referrer. That is DeleteString's own in-use test, so the unlink-and-delete
+ half of DeleteString became removeString, shared by both (DeleteString
+ still unmarks first; ReclaimStrings never does, marked strings are kept on
+ purpose). The empty string and the char nodes are never reclaimed. It
+ returns a ReclaimPage: Deleted, a Cursor (the last string examined, as for
+ StringsContaining) and Done. No descending pager was needed: after a string
+ is deleted its tail is tried next, up the chain (reclaimChain) while each
+ one is unused, and a tail's NodeID is always smaller than its extension's, so
+ one ascending pass over the AllStrings hub reclaims everything reclaimable,
+ across calls too. The chain follows only strictly smaller NodeIDs, so it
+ never deletes ahead of the cursor and a malformed chain ends instead of
+ looping. Each candidate costs two cheap reads first (IsIndexed, and
+ hasOutgoing in paging.go: a page of one), then removeString in a nested
+ savepoint (as pruneIndexNode does), so a referenced string is left as it was.
+ One call is one transaction and stops after limit strings examined or limit
+ deleted, finishing the chain it is in, so it deletes fewer than limit plus
+ MaxTextRunes strings. A non-positive limit does nothing and keeps the cursor.
+ Also DRY: the paged hub walk of scanContaining became walkHub, shared with
+ reclaimScan (StringsContaining's behaviour is unchanged). Not built: running
+ it automatically (on the host or on a schedule), reclaiming chars, and a
+ reclaim that revisits strings that became unused below the cursor within one
+ scan. Covered, in text_test.go (every backend), by
+ TestTextReclaimStringsDeletesTheSteppingStonesDeleteStringLeft,
+ ...KeepsWhatIsStillNeeded, ...ReclaimsAWholeChainInOnePass,
+ ...FinishesTheChainItIsIn, ...GivesTheSameResultAtEveryLimit,
+ ...HonoursANonPositiveLimit and ...RollsBackWithTheEnclosingTransaction.
+
 Currently unaddressed yet:
-- Interned text (items 75, 78, 94, 95): substring search is a scan (item 95);
-  an optional positional index is not built. Strings are deleted one at a
-  time (DeleteString); nothing reclaims unused strings or orphaned
-  stepping-stone suffixes automatically.
+- Interned text (items 75, 78, 94, 95, 96): substring search is a scan (item
+  95); an optional positional index is not built. Reclaiming unused strings
+  (item 96) is an explicit call; nothing runs it automatically.
 - Planned next, in this order:
-  (1) Reclaiming unused strings (theorystate.md section 114): a bounded
-  operation that deletes strings nothing needs (no extension, form, referrer
-  or index mark), so stepping stones left behind by DeleteString go too. A
-  tail is always created before its extensions and IDs are never reused, so
-  deleting in descending NodeID order is bottom-up, but the pagers only go
-  ascending: either repeat ascending passes until one deletes nothing, or add
-  a descending pager. Files: text.go, text_test.go, paging.go, tx_helpers.go,
-  this file and theorystate.md section 114.
-  Done: substring search (item 95), DeleteString (item 94), stage 2 of plan-as-data (items 81-84), notes on nodes (item 85), the
+  (1) Paged reads beyond a single node's own outgoing/incoming edges
+  (theorystate.md section 105, items 43/46): FindRelationships (BoltGraph and
+  the ROOT overlay) and the full child-set reads of
+  ListRegistry.validateStructure and CompositeSetRegistry.
+  Done: reclaiming unused strings (item 96), substring search (item 95), DeleteString (item 94), stage 2 of plan-as-data (items 81-84), notes on nodes (item 85), the
   docs-drift pass (item 87), the many-lists measurements (item 88), raw
   writes on every backend (item 89), the out-of-band test migration (item
   90), and the interleaved-layout benchmark with its measurements (items 91

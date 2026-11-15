@@ -35,7 +35,7 @@ scripts (*.bat) have not been seen directly.
 - graph_api.go: GraphReader, GraphStore, GraphAPI, Transactor, Tx.
 - txn.go: Txn, txLog (undo log, hooks, savepoints), touchNodes.
 - checker.go: Checker, graphCoreReader, runCheckers, checkerRelevant.
-- paging.go: nodePager, outgoingPager, incomingPager, commonChildrenFinder, readViewer/readView, pageIterator.
+- paging.go: nodePager, outgoingPager, incomingPager, commonChildrenFinder, readViewer/readView, pageIterator, hasOutgoing.
 - verify.go: VerifyAll, ErrLoadVerification.
 - graph_actor.go: GraphActor and the reentrancy tripwire.
 - bolt_view.go: BoltGraph's layout and errors, boltView (reads, paging, layout checks).
@@ -55,7 +55,7 @@ scripts (*.bat) have not been seen directly.
   reconciler.go: hostResource, the reconciler.
 - registry_helpers.go: bindNames, taggedCheck, registerTaggedChecker.
 - slotted_list.go: SlottedListRegistry.
-- text.go: TextRegistry (interned string trie, prefix index, substring scan).
+- text.go: TextRegistry (interned string trie, prefix index, substring scan, delete and reclaim).
 - text_forms.go: TextFormRegistry (text lists, forms, FormsContaining/TextsContaining).
 - fields.go: FieldRegistry (records with named fields, Owners).
 - scope.go: ScopeRegistry (ScopePath, Allow/Deny/Revoke/Allowed).

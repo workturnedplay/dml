@@ -850,7 +850,8 @@ func (t *TextRegistry) UnmarkIndexed(graph Transactor, str NodeID) (bool, error)
 // be deleted once "cat" and "hat" are, and a string with forms once its forms
 // are deleted (TextFormRegistry.DeleteForm). Only str goes: the shorter
 // strings Intern created for it as stepping stones stay until deleted
-// themselves, and so do the char nodes.
+// themselves (ReclaimStrings deletes the unused ones), and so do the char
+// nodes.
 func (t *TextRegistry) DeleteString(graph Transactor, str NodeID) error {
 	return wrapInterfaceErr(graph.Transact(func(tx Tx) error {
 		if requireErr := t.requireString(tx, str); requireErr != nil {
@@ -861,32 +862,46 @@ func (t *TextRegistry) DeleteString(graph Transactor, str NodeID) error {
 			return ErrCannotDeleteEmptyString
 		}
 
-		parts, partsErr := t.partsOf(tx, str)
-		if partsErr != nil {
-			return partsErr
-		}
-
 		if _, unmarkErr := t.UnmarkIndexed(tx, str); unmarkErr != nil {
 			return unmarkErr
 		}
 
-		unlinkErr := removeRelationshipsTx(tx,
-			Relationship{From: parts.tail, To: str},
-			Relationship{From: parts.slot, To: str},
-		)
-		if unlinkErr != nil {
-			return unlinkErr
-		}
+		_, removeErr := t.removeString(tx, str)
 
-		// The tag goes with the node; whatever else still points at str, or
-		// hangs off it, makes the delete fail and the transaction roll back.
-		deleteErr := untagAndDeleteNodeTx(tx, str, t.allStrings)
-		if errors.Is(deleteErr, ErrNodeNotEmpty) {
-			return fmt.Errorf("%w: string %d: %w", ErrStringInUse, str, deleteErr)
-		}
-
-		return deleteErr
+		return removeErr
 	}))
+}
+
+// removeString unlinks str from the trie (its tail edge, its StartsWith edge
+// and its AllStrings tag) and deletes the node, against tx, and returns the
+// parts it had, so the caller knows the tail. It is the part of DeleteString
+// and ReclaimStrings that decides whether a string is in use: whatever else
+// still points at str, or hangs off it, makes the delete fail with an error
+// matching ErrStringInUse and ErrNodeNotEmpty. The edges unlinked before that
+// are not restored here, so the caller must run it in a transaction that rolls
+// back or in a nested savepoint. The caller has checked that str is a string
+// other than the empty one and has unmarked it from the prefix index.
+func (t *TextRegistry) removeString(tx Tx, str NodeID) (stringParts, error) {
+	parts, partsErr := t.partsOf(tx, str)
+	if partsErr != nil {
+		return stringParts{}, partsErr
+	}
+
+	unlinkErr := removeRelationshipsTx(tx,
+		Relationship{From: parts.tail, To: str},
+		Relationship{From: parts.slot, To: str},
+	)
+	if unlinkErr != nil {
+		return stringParts{}, unlinkErr
+	}
+
+	// The tag goes with the node.
+	deleteErr := untagAndDeleteNodeTx(tx, str, t.allStrings)
+	if errors.Is(deleteErr, ErrNodeNotEmpty) {
+		return stringParts{}, fmt.Errorf("%w: string %d: %w", ErrStringInUse, str, deleteErr)
+	}
+
+	return parts, deleteErr
 }
 
 // IndexedWithPrefix returns up to limit indexed strings that start with
@@ -960,8 +975,8 @@ func (t *TextRegistry) IndexedWithPrefix(graph GraphReader, prefix string, limit
 	return matches, nil
 }
 
-// containingFetchSize is how many hub children StringsContaining reads from
-// the pager at a time.
+// containingFetchSize is how many hub children walkHub (and so
+// StringsContaining and ReclaimStrings) reads from the pager at a time.
 const containingFetchSize = 256
 
 // containingScanLimit is the most strings one StringsContaining call
@@ -1041,51 +1056,215 @@ func (t *TextRegistry) StringsContaining(graph GraphReader, substr string, from 
 	return page, nil
 }
 
+// walkHub is the paged walk shared by scanContaining and reclaimScan. It calls
+// visit for each child of hub in ascending NodeID order, starting after the
+// cursor from, until visit reports stop (its bool) or the children run out.
+// It returns the cursor of the last child visited (from if none was) and
+// whether the walk reached the end. A walk that stops at the last child of the
+// last batch is done too. An error from visit, or from the pager, aborts the
+// walk and is returned with from as the cursor.
+func walkHub(reader GraphReader, hub NodeID, from TextCursor, visit func(node NodeID) (bool, error)) (TextCursor, bool, error) {
+	pages := outgoingPages(reader, hub, containingFetchSize)
+	pages.after, pages.hasAfter = from.After, from.HasAfter
+
+	cursor := from
+
+	for {
+		batch, nextErr := pages.next()
+		if nextErr != nil {
+			return from, false, nextErr
+		}
+
+		if len(batch) == 0 {
+			return cursor, true, nil
+		}
+
+		for i, rel := range batch {
+			stop, visitErr := visit(rel.To)
+			if visitErr != nil {
+				return from, false, wrapInterfaceErr(visitErr)
+			}
+
+			cursor = TextCursor{After: rel.To, HasAfter: true}
+
+			if stop {
+				// A short batch (the iterator is done) that ends here is the
+				// end of the walk.
+				return cursor, pages.done && i == len(batch)-1, nil
+			}
+		}
+	}
+}
+
 // scanContaining is the body of StringsContaining, over the reader of one
 // view: it walks the children of hub from the cursor, reads each string back
 // and keeps those containing substr, until limit matches or
 // containingScanLimit examined strings.
 func (t *TextRegistry) scanContaining(reader GraphReader, hub NodeID, substr string, from TextCursor, limit int) (TextSearchPage, error) {
-	pages := outgoingPages(reader, hub, containingFetchSize)
-	pages.after, pages.hasAfter = from.After, from.HasAfter
+	var matches []NodeID
 
-	page := TextSearchPage{Cursor: from}
 	examined := 0
 
-	for {
-		batch, nextErr := pages.next()
-		if nextErr != nil {
-			return TextSearchPage{}, nextErr
+	cursor, done, walkErr := walkHub(reader, hub, from, func(node NodeID) (bool, error) {
+		runes, runesErr := t.runesOf(reader, node)
+		if runesErr != nil {
+			return false, runesErr
 		}
 
-		if len(batch) == 0 {
-			page.Done = true
+		examined++
 
-			return page, nil
+		if strings.Contains(string(runes), substr) {
+			matches = append(matches, node)
 		}
 
-		for i, rel := range batch {
-			runes, runesErr := t.runesOf(reader, rel.To)
-			if runesErr != nil {
-				return TextSearchPage{}, runesErr
-			}
-
-			examined++
-			page.Cursor = TextCursor{After: rel.To, HasAfter: true}
-
-			if strings.Contains(string(runes), substr) {
-				page.Matches = append(page.Matches, rel.To)
-			}
-
-			if len(page.Matches) >= limit || examined >= containingScanLimit {
-				// A short batch (the iterator is done) that ends here is the
-				// end of the scan.
-				page.Done = pages.done && i == len(batch)-1
-
-				return page, nil
-			}
-		}
+		return len(matches) >= limit || examined >= containingScanLimit, nil
+	})
+	if walkErr != nil {
+		return TextSearchPage{}, walkErr
 	}
+
+	return TextSearchPage{Matches: matches, Cursor: cursor, Done: done}, nil
+}
+
+// ReclaimPage is one page of ReclaimStrings.
+//
+// Deleted is how many strings the call deleted. Cursor is the last string the
+// call examined (deleted or not), and passing it to the next call continues the
+// scan. Done is true once the scan has reached the end; like TextSearchPage's
+// it can be false for a page that happened to end exactly at the end, and the
+// next call then deletes nothing and is Done.
+type ReclaimPage struct {
+	Deleted int
+	Cursor  TextCursor
+	Done    bool
+}
+
+// ReclaimStrings deletes strings nothing needs, so the stepping stones that
+// Intern created and DeleteString left behind go too (theorystate.md section
+// 114). A string is reclaimed when it is not marked with MarkIndexed, no
+// longer string extends it, it has no forms and nothing refers to it (a list
+// element, a note, a set member, ...): what DeleteString refuses to delete,
+// minus the strings marked on purpose, which are never unmarked here. The
+// empty string and the char nodes are never reclaimed.
+//
+// Deleting a string can leave its tail unused, so after each deletion the tail
+// is tried next, and so on up the chain while each one is unused. One
+// ascending pass over the strings therefore reclaims every unused string,
+// however long its chain: the last extension of a string to go is the one that
+// reaches it. The chain only follows strictly smaller NodeIDs (a tail is
+// created before its extensions and IDs are never reused), so it never deletes
+// a string ahead of the cursor and a malformed chain ends instead of looping.
+//
+// The scan starts after the cursor from (the zero TextCursor starts at the
+// beginning) and runs in ascending NodeID order inside one transaction. A call
+// stops after examining limit strings, or once it has deleted limit, and
+// finishes the chain it is in, so it deletes fewer than limit plus
+// MaxTextRunes strings. Loop with the returned Cursor until Done. A
+// non-positive limit deletes nothing and leaves the cursor as it was. On a
+// reader with no native pager every call reads the hub's children in full
+// once.
+//
+// A string that becomes unused below the cursor between calls (a reference
+// dropped meanwhile) waits for the next scan from the start; one created
+// meanwhile is found, since NodeIDs only grow. A malformed string stops the
+// scan with ErrInvalidTextStructure and rolls the call back.
+func (t *TextRegistry) ReclaimStrings(graph Transactor, from TextCursor, limit int) (ReclaimPage, error) {
+	if limit <= 0 {
+		return ReclaimPage{Cursor: from}, nil
+	}
+
+	return transactValue(graph, func(tx Tx) (ReclaimPage, error) {
+		return t.reclaimScan(tx, from, limit)
+	})
+}
+
+// reclaimScan is the body of ReclaimStrings, inside its transaction: it walks
+// the children of the AllStrings hub from the cursor and reclaims the chain
+// that ends at each, until limit strings were examined or limit deleted.
+func (t *TextRegistry) reclaimScan(tx Tx, from TextCursor, limit int) (ReclaimPage, error) {
+	var page ReclaimPage
+
+	examined := 0
+
+	cursor, done, walkErr := walkHub(tx, t.allStrings, from, func(node NodeID) (bool, error) {
+		deleted, chainErr := t.reclaimChain(tx, node)
+		if chainErr != nil {
+			return false, chainErr
+		}
+
+		examined++
+		page.Deleted += deleted
+
+		return examined >= limit || page.Deleted >= limit, nil
+	})
+	if walkErr != nil {
+		return ReclaimPage{}, walkErr
+	}
+
+	page.Cursor, page.Done = cursor, done
+
+	return page, nil
+}
+
+// reclaimChain reclaims str if nothing needs it, then its tail if that is now
+// unused, and so on up the chain, and returns how many strings it deleted. It
+// stops at the first string that is still needed, at the empty string, and at a
+// tail whose NodeID is not smaller than its extension's (only reachable out of
+// band: a tail ahead of the scan is reached by the scan itself).
+func (t *TextRegistry) reclaimChain(tx Tx, str NodeID) (int, error) {
+	deleted := 0
+
+	for current := str; current != t.emptyString; {
+		tail, reclaimed, reclaimErr := t.reclaimOne(tx, current)
+		if reclaimErr != nil {
+			return 0, reclaimErr
+		}
+
+		if !reclaimed {
+			break
+		}
+
+		deleted++
+
+		if tail >= current {
+			break
+		}
+
+		current = tail
+	}
+
+	return deleted, nil
+}
+
+// reclaimOne deletes str if nothing needs it and returns its former tail.
+// reclaimed is false, and nothing changes, for a string that is marked
+// indexed, has a child (an extension or a form slot) or is referred to. The
+// two cheap reads come first so the usual stepping stone costs no write; the
+// delete itself is removeString in a nested savepoint, so a string something
+// refers to is left exactly as it was.
+func (t *TextRegistry) reclaimOne(tx Tx, str NodeID) (NodeID, bool, error) {
+	indexed, indexedErr := t.IsIndexed(tx, str)
+	if indexedErr != nil || indexed {
+		return 0, false, indexedErr
+	}
+
+	hasChild, childErr := hasOutgoing(tx, str)
+	if childErr != nil || hasChild {
+		return 0, false, childErr
+	}
+
+	parts, removeErr := transactValue(tx, func(inner Tx) (stringParts, error) {
+		return t.removeString(inner, str)
+	})
+
+	switch {
+	case errors.Is(removeErr, ErrStringInUse):
+		return 0, false, nil
+	case removeErr != nil:
+		return 0, false, removeErr
+	}
+
+	return parts.tail, true, nil
 }
 
 // ---------------------------------------------------------------------

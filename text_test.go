@@ -721,6 +721,267 @@ func TestTextDeleteStringRollsBackWithTheEnclosingTransaction(t *testing.T) {
 	})
 }
 
+// reclaimAll runs ReclaimStrings page by page, limit per call, until Done. It
+// returns how many strings were deleted in all and the number of calls, and
+// checks that every call made progress.
+func (rig *textRig) reclaimAll(t *testing.T, limit int) (int, int) {
+	t.Helper()
+
+	var (
+		total  int
+		cursor TextCursor
+	)
+
+	for calls := 1; calls <= 1000; calls++ {
+		page, err := rig.text.ReclaimStrings(rig.graph, cursor, limit)
+		if err != nil {
+			t.Fatalf("ReclaimStrings(limit %d): %v", limit, err)
+		}
+
+		total += page.Deleted
+
+		if page.Done {
+			return total, calls
+		}
+
+		if page.Cursor == cursor {
+			t.Fatalf("ReclaimStrings(limit %d) made no progress from %v", limit, cursor)
+		}
+
+		cursor = page.Cursor
+	}
+
+	t.Fatalf("ReclaimStrings(limit %d) was not Done after 1000 calls", limit)
+
+	return 0, 0
+}
+
+// reference makes a plain node that points at str, the way a list element, a
+// note or a set member refers to text, and returns it.
+func (rig *textRig) reference(t *testing.T, str NodeID) NodeID {
+	t.Helper()
+
+	ref := mustCreateNode(t, rig.graph)
+
+	if _, err := rig.graph.AddRelationship(ref, str); err != nil {
+		t.Fatalf("AddRelationship(%d,%d): %v", ref, str, err)
+	}
+
+	return ref
+}
+
+func (rig *textRig) requireVerified(t *testing.T) {
+	t.Helper()
+
+	if err := VerifyAll(rig.graph, 5); err != nil {
+		t.Fatalf("VerifyAll(): %v", err)
+	}
+}
+
+func TestTextReclaimStringsDeletesTheSteppingStonesDeleteStringLeft(t *testing.T) {
+	forEachTextRig(t, func(t *testing.T, rig *textRig) {
+		cat := rig.intern(t, "cat")
+		rig.deleteString(t, cat)
+
+		rig.requireStrings(t, 3) // "", "t", "at"
+
+		if deleted, _ := rig.reclaimAll(t, 100); deleted != 2 {
+			t.Fatalf("ReclaimStrings() deleted %d, want 2", deleted)
+		}
+
+		rig.requireStrings(t, 1)
+		rig.requireInterned(t, "at", false)
+		rig.requireInterned(t, "t", false)
+
+		// The empty string and the char nodes are never reclaimed.
+		rig.requireText(t, rig.text.EmptyString(), "")
+		rig.charSlots(t, 'c')
+
+		if deleted, _ := rig.reclaimAll(t, 100); deleted != 0 {
+			t.Fatalf("second ReclaimStrings() deleted %d, want 0", deleted)
+		}
+
+		rig.requireVerified(t)
+	})
+}
+
+func TestTextReclaimStringsKeepsWhatIsStillNeeded(t *testing.T) {
+	forEachTextRig(t, func(t *testing.T, rig *textRig) {
+		hat := rig.intern(t, "hat")
+		rig.intern(t, "cat")
+		car := rig.internIndexed(t, "car")
+		ref := rig.reference(t, hat)
+
+		rig.requireStrings(t, 8) // "", t, at, hat, cat, r, ar, car
+
+		// Only "cat" goes: "hat" is referred to, "car" is marked indexed, and
+		// "at", "r" and "ar" each still have a string that extends them.
+		if deleted, _ := rig.reclaimAll(t, 100); deleted != 1 {
+			t.Fatalf("ReclaimStrings() deleted %d, want 1", deleted)
+		}
+
+		rig.requireStrings(t, 7)
+		rig.requireInterned(t, "cat", false)
+		rig.requireInterned(t, "hat", true)
+		rig.requireInterned(t, "car", true)
+		rig.requireVerified(t)
+
+		got, err := rig.text.IndexedWithPrefix(rig.graph, "ca", 10)
+		if err != nil {
+			t.Fatalf("IndexedWithPrefix(ca): %v", err)
+		}
+
+		requireSameNodes(t, "IndexedWithPrefix(ca)", got, []NodeID{car})
+
+		// Once nothing refers to "hat", it goes, and the tails only it kept.
+		if _, removeErr := rig.graph.RemoveRelationship(ref, hat); removeErr != nil {
+			t.Fatalf("RemoveRelationship(%d,%d): %v", ref, hat, removeErr)
+		}
+
+		if deleted, _ := rig.reclaimAll(t, 100); deleted != 3 {
+			t.Fatalf("ReclaimStrings() after dropping the reference deleted %d, want 3", deleted)
+		}
+
+		rig.requireStrings(t, 4) // "", r, ar, car
+		rig.requireInterned(t, "hat", false)
+		rig.requireInterned(t, "at", false)
+		rig.requireInterned(t, "car", true)
+
+		// Unmarked, "car" and its chain go too.
+		if _, unmarkErr := rig.text.UnmarkIndexed(rig.graph, car); unmarkErr != nil {
+			t.Fatalf("UnmarkIndexed(car): %v", unmarkErr)
+		}
+
+		if deleted, _ := rig.reclaimAll(t, 100); deleted != 3 {
+			t.Fatalf("ReclaimStrings() after unmarking deleted %d, want 3", deleted)
+		}
+
+		rig.requireStrings(t, 1)
+		rig.requireIndexNodes(t, 1)
+		rig.requireVerified(t)
+	})
+}
+
+// TestTextReclaimStringsReclaimsAWholeChainInOnePass: the six strings that
+// "abcdef" needed go in one call, not one per pass.
+func TestTextReclaimStringsReclaimsAWholeChainInOnePass(t *testing.T) {
+	forEachTextRig(t, func(t *testing.T, rig *textRig) {
+		rig.intern(t, "abcdef")
+		rig.requireStrings(t, 7)
+
+		deleted, calls := rig.reclaimAll(t, 100)
+		if deleted != 6 || calls != 1 {
+			t.Fatalf("ReclaimStrings() = (%d deleted, %d calls), want (6, 1)", deleted, calls)
+		}
+
+		rig.requireStrings(t, 1)
+		rig.requireVerified(t)
+	})
+}
+
+// TestTextReclaimStringsFinishesTheChainItIsIn: a call that reaches its limit
+// still finishes the chain it is deleting, since nothing would revisit the
+// tails it skipped.
+func TestTextReclaimStringsFinishesTheChainItIsIn(t *testing.T) {
+	forEachTextRig(t, func(t *testing.T, rig *textRig) {
+		rig.intern(t, "abcdef")
+
+		// "", f, ef, def: four strings examined, none of them a leaf.
+		first, err := rig.text.ReclaimStrings(rig.graph, TextCursor{}, 4)
+		if err != nil || first.Deleted != 0 || first.Done || !first.Cursor.HasAfter {
+			t.Fatalf("first call = (%+v,%v), want nothing deleted, not Done, a cursor", first, err)
+		}
+
+		rig.requireStrings(t, 7)
+
+		// cdef, bcdef, abcdef: the leaf is reached, and its whole chain goes
+		// although that is more than the limit.
+		second, err := rig.text.ReclaimStrings(rig.graph, first.Cursor, 4)
+		if err != nil || second.Deleted != 6 || !second.Done {
+			t.Fatalf("second call = (%+v,%v), want 6 deleted and Done", second, err)
+		}
+
+		rig.requireStrings(t, 1)
+		rig.requireVerified(t)
+	})
+}
+
+func TestTextReclaimStringsGivesTheSameResultAtEveryLimit(t *testing.T) {
+	forEachTextRig(t, func(t *testing.T, rig *textRig) {
+		hat := rig.internIndexed(t, "hat")
+
+		for _, limit := range []int{1, 2, 3, 100} {
+			rig.intern(t, "cat")
+			rig.intern(t, "car")
+			rig.intern(t, "dog")
+
+			rig.requireStrings(t, 11) // "", t, at, hat, cat, r, ar, car, g, og, dog
+
+			deleted, calls := rig.reclaimAll(t, limit)
+			if deleted != 7 {
+				t.Fatalf("limit %d: ReclaimStrings() deleted %d, want 7", limit, deleted)
+			}
+
+			if limit == 100 && calls != 1 {
+				t.Fatalf("limit %d: ReclaimStrings() took %d calls, want 1", limit, calls)
+			}
+
+			rig.requireStrings(t, 4) // "", t, at, hat: "hat" is marked, so its tails stay
+			rig.requireText(t, hat, "hat")
+			rig.requireVerified(t)
+		}
+	})
+}
+
+func TestTextReclaimStringsHonoursANonPositiveLimit(t *testing.T) {
+	forEachTextRig(t, func(t *testing.T, rig *textRig) {
+		rig.intern(t, "cat")
+
+		from := TextCursor{After: 5, HasAfter: true}
+
+		for _, limit := range []int{0, -1} {
+			page, err := rig.text.ReclaimStrings(rig.graph, from, limit)
+			if err != nil || page.Deleted != 0 || page.Done || page.Cursor != from {
+				t.Fatalf("limit %d = (%+v,%v), want nothing, not Done, the cursor unchanged", limit, page, err)
+			}
+		}
+
+		rig.requireStrings(t, 4)
+	})
+}
+
+func TestTextReclaimStringsRollsBackWithTheEnclosingTransaction(t *testing.T) {
+	forEachTextRig(t, func(t *testing.T, rig *textRig) {
+		cat := rig.intern(t, "cat")
+		errOuter := errors.New("outer failure")
+
+		var inside ReclaimPage
+
+		err := rig.graph.Transact(func(tx Tx) error {
+			page, reclaimErr := rig.text.ReclaimStrings(tx, TextCursor{}, 100)
+			if reclaimErr != nil {
+				return reclaimErr
+			}
+
+			inside = page
+
+			return errOuter
+		})
+		if !errors.Is(err, errOuter) {
+			t.Fatalf("Transact() error = %v, want %v", err, errOuter)
+		}
+
+		if inside.Deleted != 3 {
+			t.Fatalf("ReclaimStrings() inside the transaction deleted %d, want 3", inside.Deleted)
+		}
+
+		rig.requireStrings(t, 4)
+		rig.requireText(t, cat, "cat")
+		rig.requireInterned(t, "at", true)
+		rig.requireVerified(t)
+	})
+}
+
 // collectContaining runs StringsContaining page by page, asking for limit
 // matches per call, until Done. It returns every match and the number of
 // calls, and checks that the matches are ascending and that every call made
